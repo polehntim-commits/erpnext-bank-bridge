@@ -73,6 +73,14 @@ class Config:
     ERPNEXT_API_KEY = os.environ.get('ERPNEXT_API_KEY', '').strip()
     ERPNEXT_API_SECRET = os.environ.get('ERPNEXT_API_SECRET', '').strip()
     ERPNEXT_DEFAULT_COMPANY = os.environ.get('ERPNEXT_DEFAULT_COMPANY', '').strip()
+    # Optional global override for the ERPNext Bank Account `account_type` used
+    # by one-click account import (see app/erpnext_accounts.py). Blank → inferred
+    # per account from the Plaid subtype: `Current` for depository-style
+    # accounts (checking/savings/CD/money market/…), `Credit` for credit cards
+    # and lines of credit. Set this if your Chart of Accounts names Bank Account
+    # Types differently and you want one value applied to every import.
+    ERPNEXT_DEFAULT_BANK_ACCOUNT_TYPE = os.environ.get(
+        'ERPNEXT_DEFAULT_BANK_ACCOUNT_TYPE', '').strip()
 
     # ── Encryption at rest ────────────────────────────────────────────────
     # Fernet key for the stored Plaid access_tokens. Blank → app autogenerates

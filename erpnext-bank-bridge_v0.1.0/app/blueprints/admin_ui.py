@@ -17,6 +17,7 @@ from flask import (Blueprint, current_app, redirect, render_template_string,
                    request, url_for)
 
 from .. import db
+from .. import erpnext_accounts
 from .. import erpnext_bank
 from .. import erpnext_settings as erps
 from .. import plaid_settings as ps
@@ -279,27 +280,49 @@ def link_bank_page():
 # ── Accounts (ERPNext Bank Account mapping) ──────────────────────
 
 ACCOUNTS_BODY = """
-<h2>Accounts</h2>
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+  <h2 style="margin:0">Linked banks</h2>
+  {% if groups %}
+  <form method="post" action="/admin/accounts/import_all" style="margin:0">
+    <button type="submit" class="primary" style="padding:10px 18px;font-size:15px"
+      {{ '' if erpnext_ok else 'disabled title=\"Configure ERPNext first\"' }}>
+      Import all supported accounts to ERPNext
+    </button>
+  </form>
+  {% endif %}
+</div>
 {% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
 <p style="font-size:14px;color:#555">
-  Map each linked bank account to an ERPNext <b>Bank Account</b> docname.
-  Only mapped + enabled accounts have their transactions posted to ERPNext.
+  <b>Create in ERPNext</b> makes the matching <b>Bank</b> + <b>Bank Account</b>
+  records for you (deduped — safe to click again) and maps + enables sync in one
+  step. Or map to an existing ERPNext Bank Account with the dropdown. Only
+  mapped + enabled accounts have their transactions posted.
+  {% if not erpnext_ok %}<br><span class="warn">ERPNext isn't configured yet —
+    set it on the <a href="/admin/erpnext_settings">ERPNext settings</a> page to
+    enable one-click import.</span>{% endif %}
   {% if erp_error %}<br><span class="warn">Couldn't load ERPNext Bank Accounts: {{ erp_error }}</span>{% endif %}
 </p>
+
+{% if groups and not any_imported %}
+<div class="banner-warn"><h3>Nothing imported yet</h3>
+  Click <b>Import all supported accounts</b> above to bring your Plaid accounts
+  into ERPNext in one click — or use the per-row <b>Create in ERPNext</b> button.
+</div>
+{% endif %}
 
 {% for grp in groups %}
 <h3>{{ grp.item.institution_name or '(unknown institution)' }}
   <span style="font-weight:400;color:#888;font-size:13px">· {{ grp.item.item_id[:14] }}…</span></h3>
 <table>
-  <tr><th>Account</th><th>Mask</th><th>Type</th><th>Balance</th>
-      <th>ERPNext Bank Account</th><th>Sync</th><th></th></tr>
+  <tr><th>Account</th><th>Mask</th><th>Type</th><th class="num">Balance</th>
+      <th>ERPNext Bank Account</th><th>Import</th></tr>
   {% for a in grp.accounts %}
   <tr>
     <td>{{ a.name or a.official_name or '(unnamed)' }}</td>
     <td><code>••{{ a.mask or '??' }}</code></td>
     <td>{{ a.type }}{% if a.subtype %} / {{ a.subtype }}{% endif %}</td>
     <td class="num">{{ '%.2f'|format(a.balance_current) if a.balance_current is not none else '—' }} {{ a.iso_currency_code }}</td>
-    <td colspan="3">
+    <td>
       <form method="post" action="/admin/accounts/map" style="display:flex;gap:8px;align-items:center;margin:0">
         <input type="hidden" name="account_id" value="{{ a.account_id }}">
         <select name="erpnext_bank_account_name" style="flex:1;padding:5px;font-size:13px">
@@ -319,6 +342,21 @@ ACCOUNTS_BODY = """
         <button type="submit" class="primary" style="padding:5px 12px">Save</button>
       </form>
     </td>
+    <td style="white-space:nowrap">
+      {% if a.erpnext_bank_account_name %}
+        <span class="pill pill-ok">imported</span>
+      {% elif supported_map.get(a.account_id) %}
+        <form method="post" action="/admin/accounts/create" style="margin:0">
+          <input type="hidden" name="account_id" value="{{ a.account_id }}">
+          <button type="submit" class="primary" style="padding:5px 12px"
+            {{ '' if erpnext_ok else 'disabled title=\"Configure ERPNext first\"' }}>
+            Create in ERPNext
+          </button>
+        </form>
+      {% else %}
+        <span class="pill pill-muted" title="Not a Bank Account in ERPNext's model">not supported</span>
+      {% endif %}
+    </td>
   </tr>
   {% endfor %}
 </table>
@@ -331,9 +369,15 @@ ACCOUNTS_BODY = """
 def accounts_page():
     items = PlaidItem.query.order_by(PlaidItem.created_at.desc()).all()
     groups = []
+    supported_map = {}
+    any_imported = False
     for it in items:
         accts = (PlaidAccount.query.filter_by(item_id=it.item_id)
                  .order_by(PlaidAccount.name).all())
+        for a in accts:
+            supported_map[a.account_id] = erpnext_accounts.is_supported(a)
+            if a.erpnext_bank_account_name:
+                any_imported = True
         groups.append({'item': it, 'accounts': accts})
     bank_accounts, erp_error = [], ''
     if erps.is_configured():
@@ -344,7 +388,56 @@ def accounts_page():
     bank_account_names = {ba['name'] for ba in bank_accounts}
     return _page(ACCOUNTS_BODY, page='accounts', groups=groups,
                  bank_accounts=bank_accounts, bank_account_names=bank_account_names,
+                 supported_map=supported_map, any_imported=any_imported,
+                 erpnext_ok=erps.is_configured(),
                  erp_error=erp_error, flash_msg=request.args.get('flash', ''))
+
+
+@bp.post('/admin/accounts/create')
+def create_account_in_erpnext():
+    """One-click: create (or find) the ERPNext Bank + Bank Account for a single
+    Plaid account and map it."""
+    account_id = (request.form.get('account_id') or '').strip()
+    if not erps.is_configured():
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'ERPNext is not configured — set the connection first.'))
+    try:
+        result = erpnext_accounts.import_plaid_account_to_erpnext(account_id)
+    except (ERPNextConfigError, ERPNextError) as e:
+        return redirect('/admin/accounts?flash=' + quote_plus(f'Create failed: {e}'))
+    except Exception as e:  # surface any unexpected ERPNext error to the operator
+        return redirect('/admin/accounts?flash=' + quote_plus(f'Create failed: {e}'))
+    status = result.get('status')
+    if status == 'imported':
+        msg = f"Created ERPNext Bank Account {result['bank_account']}."
+    elif status == 'skipped':
+        msg = 'Account is already mapped.'
+    elif status == 'unsupported':
+        msg = 'That account type is not supported for ERPNext Bank Accounts.'
+    else:
+        msg = result.get('message', 'Done.')
+    return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
+@bp.post('/admin/accounts/import_all')
+def import_all_accounts():
+    """One-click bulk: create ERPNext Bank Accounts for every unmapped supported
+    account, then land on the dashboard with a success flash."""
+    if not erps.is_configured():
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'ERPNext is not configured — set the connection first.'))
+    try:
+        stats = erpnext_accounts.import_all_supported_accounts()
+    except (ERPNextConfigError, ERPNextError) as e:
+        return redirect('/admin/accounts?flash=' + quote_plus(f'Import failed: {e}'))
+    except Exception as e:
+        return redirect('/admin/accounts?flash=' + quote_plus(f'Import failed: {e}'))
+    if stats['created'] and not stats['failed']:
+        # Success → dashboard with the spec's flash.
+        return redirect('/admin?flash=' + quote_plus(
+            f"Imported {stats['created']} accounts. Ready to sync."))
+    # Nothing created, or partial failure → stay on Accounts with the detail.
+    return redirect('/admin/accounts?flash=' + quote_plus(stats['summary']))
 
 
 @bp.post('/admin/accounts/map')

@@ -13,7 +13,7 @@ from flask_sqlalchemy import SQLAlchemy
 
 from config import Config
 
-__version__ = '0.1.0'
+__version__ = '0.1.1'
 db = SQLAlchemy()
 
 
@@ -55,6 +55,10 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     with app.app_context():
         db.create_all()
+        # create_all() adds missing tables but never new columns on an existing
+        # one — apply idempotent additive column migrations here.
+        from .migrations import run_migrations
+        run_migrations()
 
     if not app.config.get('TESTING') and app.config.get('SCHEDULER_ENABLED', True):
         try:

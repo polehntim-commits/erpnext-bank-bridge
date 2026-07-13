@@ -28,6 +28,10 @@ class FakePlaidClient:
     def get_institution_name(self, institution_id):
         return 'Wells Fargo'
 
+    def get_institution_details(self, institution_id):
+        self.calls.append(('get_institution_details', institution_id))
+        return {'name': 'Wells Fargo', 'url': 'https://wellsfargo.com'}
+
     def get_accounts(self, access_token):
         self.calls.append(('get_accounts', access_token))
         return list(self.accounts)
@@ -66,18 +70,31 @@ class FakeERPClient:
     erpnext_bank uses: list_docs, create_doc, call_method, get_logged_user.
     Tracks created docs, submits, and cancels; enforces reference_number
     idempotency the way the real Frappe list filter would."""
-    def __init__(self, bank_accounts=None, fail_create=False):
+    def __init__(self, bank_accounts=None, fail_create=False,
+                 fail_bank_account=False):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
         self.cancelled = set()
         self.calls = []
         self._counter = 0
-        self.bank_accounts = bank_accounts or []
-        self.fail_create = fail_create
+        self.bank_accounts = bank_accounts or []   # preset dropdown list
+        self.fail_create = fail_create             # fail Bank Transaction create
+        self.fail_bank_account = fail_bank_account  # fail Bank Account create
+        # Records created by the one-click account import, keyed by doctype.
+        self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {}}
 
     def get_logged_user(self):
         return 'admin@example.com'
+
+    @staticmethod
+    def _matches(doc, filters):
+        """True when doc satisfies every [field, '=', value] filter."""
+        for f in (filters or []):
+            field, op, value = f[0], f[1], f[2]
+            if op == '=' and str(doc.get(field, '')) != str(value):
+                return False
+        return True
 
     def list_docs(self, doctype, filters=None, fields=None,
                   limit_page_length=0, order_by=None):
@@ -92,22 +109,54 @@ class FakeERPClient:
                         return []
                     return [{'name': name}] if name else []
             return []
+        if doctype in ('Bank', 'Custom Field'):
+            return [{'name': n} for n, d in self.created[doctype].items()
+                    if self._matches(d, filters)]
         if doctype == 'Bank Account':
+            # A plaid_account_id (or bank_account_no) filter is a dedup lookup
+            # against created accounts; an unfiltered / disabled filter is the
+            # mapping dropdown, which reads the preset list.
+            if filters and any(f[0] in ('plaid_account_id', 'bank_account_no')
+                               for f in filters):
+                return [{'name': n} for n, d in self.created['Bank Account'].items()
+                        if self._matches(d, filters)]
             return list(self.bank_accounts)
         return []
 
     def create_doc(self, doctype, doc):
         self.calls.append(('create_doc', doctype, doc))
-        if self.fail_create:
-            from app.erpnext_client import ERPNextAPIError
-            raise ERPNextAPIError('bad', status_code=417,
-                                  response_body='{"exc":"ValidationError"}')
+        if doctype == 'Bank Transaction':
+            if self.fail_create:
+                from app.erpnext_client import ERPNextAPIError
+                raise ERPNextAPIError('bad', status_code=417,
+                                      response_body='{"exc":"ValidationError"}')
+            self._counter += 1
+            name = f'ACC-BTN-{self._counter:04d}'
+            self.docs[name] = dict(doc)
+            ref = doc.get('reference_number')
+            if ref:
+                self.by_ref[ref] = name
+            return {'name': name}
+        if doctype == 'Bank':
+            name = doc.get('bank_name')       # ERPNext Bank autonames on bank_name
+            self.created['Bank'][name] = dict(doc)
+            return {'name': name}
+        if doctype == 'Bank Account':
+            if self.fail_bank_account:
+                from app.erpnext_client import ERPNextAPIError
+                raise ERPNextAPIError('bad', status_code=417,
+                                      response_body='{"exc":"ValidationError"}')
+            self._counter += 1
+            name = f"{doc.get('account_name')} - {doc.get('bank')}"
+            self.created['Bank Account'][name] = dict(doc)
+            return {'name': name}
+        if doctype == 'Custom Field':
+            name = f"{doc.get('dt')}-{doc.get('fieldname')}"
+            self.created['Custom Field'][name] = dict(doc)
+            return {'name': name}
+        # Unknown doctype — mimic a generic create.
         self._counter += 1
-        name = f'ACC-BTN-{self._counter:04d}'
-        self.docs[name] = dict(doc)
-        ref = doc.get('reference_number')
-        if ref:
-            self.by_ref[ref] = name
+        name = f'DOC-{self._counter:04d}'
         return {'name': name}
 
     def call_method(self, method, params=None, http_method='GET', json_body=None):

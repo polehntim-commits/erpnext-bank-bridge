@@ -22,6 +22,10 @@ ERPNext  ──►  Bank Reconciliation Tool
   ever touch this app; Plaid holds them and returns a token.
 - **6-hour automatic polling** via Plaid's cursor-based `/transactions/sync`,
   plus an on-demand **Sync now** button.
+- **One-click account import** — create the matching ERPNext **Bank** +
+  **Bank Account** records straight from the linked Plaid accounts (per row or
+  all at once), deduped and auto-mapped, so there's no manual setup before
+  transactions can post.
 - **Creates ERPNext Bank Transaction records** ready for the built-in Bank
   Reconciliation Tool (deposit/withdrawal split from Plaid's amount sign).
 - **Handles the full transaction lifecycle** — pending → posted transitions,
@@ -36,8 +40,9 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.1.0 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
-with a mocked-API test suite. See the roadmap notes at the bottom.
+v0.1.1 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+with a mocked-API test suite, plus one-click import of Plaid accounts into
+ERPNext Bank / Bank Account records. See the roadmap notes at the bottom.
 
 ## How it works
 
@@ -45,7 +50,10 @@ with a mocked-API test suite. See the roadmap notes at the bottom.
    banks bounce through `/plaid/oauth_return` and back automatically.
 2. The server exchanges the Link public token for a durable **access token**,
    stored **Fernet-encrypted** in Postgres.
-3. **Map each account** (`/admin/accounts`) to an ERPNext Bank Account docname.
+3. **Import accounts into ERPNext** (`/admin/accounts`) — click **Import all
+   supported accounts** (or the per-row **Create in ERPNext** button) and the
+   bridge creates the matching **Bank** + **Bank Account** records for you and
+   maps them. Or map to an existing ERPNext Bank Account with the dropdown.
 4. A background job polls **`/transactions/sync`** every `SYNC_INTERVAL_HOURS`
    (default 6). For each transaction it upserts a local mirror row (idempotent
    on the Plaid transaction id) and posts an ERPNext **Bank Transaction**:
@@ -64,7 +72,7 @@ out of the account → withdrawal; negative = money in → deposit).
 | Table | Purpose |
 |-------|---------|
 | `plaid_items` | one linked login/institution; encrypted access token + sync cursor |
-| `plaid_accounts` | accounts within an item; ERPNext Bank Account mapping + sync toggle |
+| `plaid_accounts` | accounts within an item; ERPNext Bank Account mapping + sync toggle + import status |
 | `bank_transactions` | local mirror of Plaid transactions + ERPNext docname/state |
 | `plaid_sync_log` | audit trail (plaid_pull / erpnext_push, counts, errors) |
 | `plaid_link_state` | short-lived link-token bookkeeping for the OAuth handoff |
@@ -76,7 +84,8 @@ trusted LAN, never exposed to the Internet.
 
 - `/admin` — dashboard: linked banks, health, counts, recent sync log
 - `/admin/link_bank` — Plaid Link entry point
-- `/admin/accounts` — map Plaid accounts → ERPNext Bank Accounts, toggle sync
+- `/admin/accounts` — one-click import Plaid accounts into ERPNext Bank
+  Accounts, map to existing ones, toggle sync
 - `/admin/transactions` — filterable list + per-row Retry
 - `/admin/plaid_settings` — Client ID / secrets / environment / redirect / webhook
 - `/admin/erpnext_settings` — ERPNext URL + API key/secret + Test / Verify doctype
@@ -91,10 +100,10 @@ trusted LAN, never exposed to the Internet.
    Postgres sidecar.
 3. Open the app; you'll land on `/admin`.
 
-Docker image: `polehntim/bank-bridge:0.1.0`. To build it yourself:
+Docker image: `polehntim/bank-bridge:0.1.1`. To build it yourself:
 
 ```bash
-docker build -t polehntim/bank-bridge:0.1.0 erpnext-bank-bridge_v0.1.0
+docker build -t polehntim/bank-bridge:0.1.1 erpnext-bank-bridge_v0.1.0
 ```
 
 ## Configuration
@@ -119,6 +128,31 @@ Create an app at [dashboard.plaid.com](https://dashboard.plaid.com):
 - Point the URL at your ERPNext instance (on Umbrel, its app-proxy port).
 - Use **Test Connection** and **Verify Bank Transaction doctype** to confirm.
 
+### 3. Import accounts (`/admin/accounts`)
+
+After linking a bank, bring its accounts into ERPNext without any manual setup:
+
+- **Import all supported accounts to ERPNext** (top of the page) creates a
+  **Bank** + **Bank Account** for every unmapped, supported account across all
+  linked banks, maps each one, and enables sync — then lands you on the
+  dashboard ready to **Sync now**.
+- **Create in ERPNext** (per row) does the same for a single account.
+
+Both are **idempotent**: a Bank is reused if one with the same name already
+exists, and a Bank Account is deduped on the `plaid_account_id` custom field
+(auto-provisioned on first import, alongside `last_4`), so clicking again never
+creates duplicates. Bank Accounts are created with `is_company_account = 1` and
+the **Default Company** from ERPNext settings.
+
+**Supported** subtypes (get a button): `checking`, `savings`, `cd`,
+`money market`, `cash management`, `paypal` → account type **Current**;
+`credit card`, `line of credit` → account type **Credit**. Loans, investments,
+brokerage, and retirement accounts (mortgage, student, auto, 401k, IRA, Roth,
+HSA, brokerage) are **not** Bank Accounts in ERPNext's model and are skipped
+with a "not supported" note. Set `ERPNEXT_DEFAULT_BANK_ACCOUNT_TYPE` to force a
+single account type for every import if your Chart of Accounts names them
+differently.
+
 ### Environment variables
 
 | Var | Default | Notes |
@@ -131,7 +165,8 @@ Create an app at [dashboard.plaid.com](https://dashboard.plaid.com):
 | `PLAID_WEBHOOK_URL` | "" | optional; polling is enough |
 | `ERPNEXT_URL` | `http://umbrel.local:5300` | ERPNext base URL |
 | `ERPNEXT_API_KEY` / `ERPNEXT_API_SECRET` | "" | System Manager API pair |
-| `ERPNEXT_DEFAULT_COMPANY` | "" | fallback; company comes from the Bank Account |
+| `ERPNEXT_DEFAULT_COMPANY` | "" | company set on imported Bank Accounts; transaction company comes from the Bank Account |
+| `ERPNEXT_DEFAULT_BANK_ACCOUNT_TYPE` | "" | optional; force one Bank Account type for all imports (blank → inferred from Plaid subtype) |
 | `FERNET_KEY` | "" | blank → autogenerated + persisted to `{DATA_DIR}/fernet.key` |
 | `SYNC_INTERVAL_HOURS` | `6` | background poll cadence |
 | `SCHEDULER_ENABLED` | `true` | set false to drive syncs by external cron |
@@ -183,7 +218,8 @@ a vulnerability.
 ## Roadmap
 
 - Plaid webhook signature verification (currently the webhook is best-effort).
-- Optional automatic account→Bank Account matching by mask.
+- Merchant → ERPNext Supplier auto-suggest + transaction auto-categorization
+  (scaffolded in `app/erpnext_bank.py:_maybe_suggest_supplier`).
 - Configurable per-account category → ERPNext party/ledger hints.
 
 ## License

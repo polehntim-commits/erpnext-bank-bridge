@@ -185,6 +185,34 @@ def create_bank_transaction(client: ERPNextClient, txn, bank_account_name: str,
     return name
 
 
+# ── Phase 2 scaffold: merchant → Supplier auto-suggest ─────────────────
+#
+# NOT IMPLEMENTED — intentional stub so the next feature has a seam to grow
+# into. The plan: when a transaction is an outflow (a payment), look at its
+# merchant_name / normalized name and suggest (or auto-create + link) a matching
+# ERPNext Supplier, so a Bank Transaction can be reconciled straight against a
+# Purchase Invoice / Payment Entry instead of being categorized by hand. This is
+# where auto-categorization (Plaid personal_finance_category → ERPNext expense
+# account / party) will also hang.
+#
+# Deliberately does nothing today: no ERPNext writes, no suggestions surfaced.
+# The push path does not call it yet.
+
+def _maybe_suggest_supplier(transaction):  # noqa: ARG001 - Phase 2 placeholder
+    """(Phase 2 — scaffold only.) Suggest an ERPNext Supplier for a transaction.
+
+    `transaction` is a local BankTransaction. A future implementation will
+    fuzzy-match transaction.merchant_name (falling back to transaction.name)
+    against existing ERPNext Suppliers and return a suggestion — or, gated
+    behind an opt-in setting, find-or-create the Supplier and attach it to the
+    Bank Transaction / a draft Payment Entry.
+
+    Returns None today (no-op). See the module note above for the full intent.
+    """
+    # TODO(phase-2): implement merchant → Supplier match + auto-categorization.
+    return None
+
+
 def cancel_bank_transaction(client: ERPNextClient, name: str) -> None:
     """Cancel a posted Bank Transaction (Plaid removed / superseded). Tolerates
     an already-cancelled or missing doc."""

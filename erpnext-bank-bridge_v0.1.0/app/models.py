@@ -80,6 +80,14 @@ class PlaidAccount(db.Model):
     # unmapped → transactions are mirrored locally but not pushed.
     erpnext_bank_account_name = db.Column(db.String(255), nullable=True)
     sync_enabled = db.Column(db.Boolean, default=True)
+    # One-click-import lifecycle (see app/erpnext_accounts.py):
+    #   pending     — never auto-imported (the default / freshly linked)
+    #   imported    — a matching ERPNext Bank Account was created/found + linked
+    #   unsupported — the Plaid type/subtype isn't a Bank Account in ERPNext's
+    #                 model (loans, investments, 401k, …) so no button is offered
+    # Left deliberately un-constrained (like plaid_sync_log) so a future status
+    # never needs a migration.
+    import_status = db.Column(db.String(20), default='pending', index=True)
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -93,6 +101,7 @@ class PlaidAccount(db.Model):
             'currency': self.currency, 'iso_currency_code': self.iso_currency_code,
             'erpnext_bank_account_name': self.erpnext_bank_account_name,
             'sync_enabled': bool(self.sync_enabled),
+            'import_status': self.import_status or 'pending',
         }
 
 

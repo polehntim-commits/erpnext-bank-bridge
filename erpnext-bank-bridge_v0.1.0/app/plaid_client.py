@@ -159,6 +159,27 @@ class PlaidClient:
         inst = inst if isinstance(inst, dict) else _to_dict(inst)
         return inst.get('name', '') or ''
 
+    def get_institution_details(self, institution_id: str) -> dict:
+        """Best-effort institution metadata for enriching an ERPNext Bank
+        record → {'name', 'url'}. Plaid exposes the institution's website as
+        `url` (no SWIFT in the public schema). Returns {} on any miss."""
+        if not institution_id:
+            return {}
+        from plaid.model.institutions_get_by_id_request import \
+            InstitutionsGetByIdRequest
+        from plaid.model.country_code import CountryCode
+        api = self._get_api()
+        try:
+            resp = api.institutions_get_by_id(InstitutionsGetByIdRequest(
+                institution_id=institution_id, country_codes=[CountryCode('US')]))
+        except Exception as e:
+            log.warning('get_institution_details failed for %s: %s',
+                        institution_id, e)
+            return {}
+        inst = _resp_get(resp, 'institution') or {}
+        inst = inst if isinstance(inst, dict) else _to_dict(inst)
+        return {'name': inst.get('name', '') or '', 'url': inst.get('url', '') or ''}
+
     def get_accounts(self, access_token: str) -> list[dict]:
         """List accounts for an Item → list of normalized dicts."""
         from plaid.model.accounts_get_request import AccountsGetRequest
