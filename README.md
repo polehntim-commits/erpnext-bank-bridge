@@ -127,6 +127,9 @@ Create an app at [dashboard.plaid.com](https://dashboard.plaid.com):
   Keys**, and paste the API Key + Secret here.
 - Point the URL at your ERPNext instance (on Umbrel, its app-proxy port).
 - Use **Test Connection** and **Verify Bank Transaction doctype** to confirm.
+  **Test Connection** (and the **Ensure Bank Account fields & types** button)
+  also provision the Bank Account Type records + custom fields the importer
+  needs — idempotently, so it's safe to click repeatedly.
 
 ### 3. Import accounts (`/admin/accounts`)
 
@@ -143,6 +146,13 @@ exists, and a Bank Account is deduped on the `plaid_account_id` custom field
 (auto-provisioned on first import, alongside `last_4`), so clicking again never
 creates duplicates. Bank Accounts are created with `is_company_account = 1` and
 the **Default Company** from ERPNext settings.
+
+**No prerequisites on a stock ERPNext.** The bootstrap also creates the
+`Current` and `Credit` **Bank Account Type** records if they're missing (stock
+ERPNext ships without them), so the very first import can't fail on a missing
+link target. Bank Account Types are provisioned on Test Connection, by the
+**Ensure Bank Account fields & types** button on the ERPNext settings page, and
+as the first step of every import — always idempotent.
 
 **Supported** subtypes (get a button): `checking`, `savings`, `cd`,
 `money market`, `cash management`, `paypal` → account type **Current**;

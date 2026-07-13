@@ -71,7 +71,7 @@ class FakeERPClient:
     Tracks created docs, submits, and cancels; enforces reference_number
     idempotency the way the real Frappe list filter would."""
     def __init__(self, bank_accounts=None, fail_create=False,
-                 fail_bank_account=False):
+                 fail_bank_account=False, existing_types=None):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -81,11 +81,23 @@ class FakeERPClient:
         self.bank_accounts = bank_accounts or []   # preset dropdown list
         self.fail_create = fail_create             # fail Bank Transaction create
         self.fail_bank_account = fail_bank_account  # fail Bank Account create
+        # Bank Account Type records that already exist in ERPNext (get_doc hits).
+        self.existing_types = set(existing_types or ())
         # Records created by the one-click account import, keyed by doctype.
-        self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {}}
+        self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {},
+                        'Bank Account Type': {}}
 
     def get_logged_user(self):
         return 'admin@example.com'
+
+    def get_doc(self, doctype, name):
+        """Return a doc dict, or None on 'not found' (the real client's 404)."""
+        self.calls.append(('get_doc', doctype, name))
+        if doctype == 'Bank Account Type':
+            if name in self.existing_types or name in self.created['Bank Account Type']:
+                return {'name': name}
+            return None
+        return self.docs.get(name)
 
     @staticmethod
     def _matches(doc, filters):
@@ -149,6 +161,10 @@ class FakeERPClient:
             self._counter += 1
             name = f"{doc.get('account_name')} - {doc.get('bank')}"
             self.created['Bank Account'][name] = dict(doc)
+            return {'name': name}
+        if doctype == 'Bank Account Type':
+            name = doc.get('account_type')   # autonames on account_type
+            self.created['Bank Account Type'][name] = dict(doc)
             return {'name': name}
         if doctype == 'Custom Field':
             name = f"{doc.get('dt')}-{doc.get('fieldname')}"

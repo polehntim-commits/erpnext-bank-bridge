@@ -675,6 +675,9 @@ ERPNEXT_SETTINGS_BODY = """
   <form method="post" action="/admin/erpnext_settings/verify_doctype" style="margin:0">
     <button type="submit" class="secondary">Verify Bank Transaction doctype</button>
   </form>
+  <form method="post" action="/admin/erpnext_settings/ensure_fields" style="margin:0">
+    <button type="submit" class="secondary">Ensure Bank Account fields &amp; types</button>
+  </form>
 </div>
 
 {% if probe %}
@@ -715,7 +718,33 @@ def test_erpnext_connection():
                    'detail': 'Not configured — set URL + API key + secret first.'})
     ok, detail = erpnext_bank.test_connection()
     msg = f'Connected as {detail}' if ok else str(detail)
+    if ok:
+        # Provision the Current/Credit Bank Account Type records as part of setup
+        # validation, so the first account import can't fail on a missing one.
+        try:
+            erpnext_accounts.ensure_bank_account_types(erpnext_accounts.get_client())
+            msg += ' · Bank Account Types ready.'
+        except (ERPNextConfigError, ERPNextError) as e:
+            msg += f' · (couldn’t set up Bank Account Types: {e})'
     return _erpnext_settings_page(probe={'ok': ok, 'detail': msg})
+
+
+@bp.post('/admin/erpnext_settings/ensure_fields')
+def ensure_erpnext_fields():
+    """Idempotently provision the Bank Account Type records (Current/Credit) and
+    the custom fields (plaid_account_id, last_4) the import flow depends on."""
+    if not erps.is_configured():
+        return _erpnext_settings_page(
+            probe={'ok': False,
+                   'detail': 'Not configured — set URL + API key + secret first.'})
+    try:
+        erpnext_accounts.bootstrap(erpnext_accounts.get_client())
+    except (ERPNextConfigError, ERPNextError) as e:
+        return _erpnext_settings_page(probe={'ok': False, 'detail': str(e)})
+    return _erpnext_settings_page(probe={
+        'ok': True,
+        'detail': 'Bank Account Type records (Current, Credit) and custom fields '
+                  '(plaid_account_id, last_4) are in place.'})
 
 
 @bp.post('/admin/erpnext_settings/verify_doctype')

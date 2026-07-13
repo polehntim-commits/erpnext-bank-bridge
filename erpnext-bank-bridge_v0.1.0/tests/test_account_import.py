@@ -222,6 +222,39 @@ class TestCustomFieldBootstrap(ImportBase):
         self.assertEqual(names, {'plaid_account_id', 'last_4'})
 
 
+class TestBankAccountTypes(ImportBase):
+    def _created_types(self, erp):
+        return [c for c in erp.calls
+                if c[0] == 'create_doc' and c[1] == 'Bank Account Type']
+
+    def test_bank_account_types_created_when_missing(self):
+        erp = FakeERPClient()   # neither type exists (GET → 404)
+        erpnext_accounts.ensure_bank_account_types(erp)
+        self.assertEqual(len(self._created_types(erp)), 2)
+        names = {d['account_type'] for d in erp.created['Bank Account Type'].values()}
+        self.assertEqual(names, {'Current', 'Credit'})
+
+    def test_bank_account_types_skip_when_present(self):
+        erp = FakeERPClient(existing_types={'Current', 'Credit'})
+        erpnext_accounts.ensure_bank_account_types(erp)
+        self.assertEqual(len(self._created_types(erp)), 0)
+
+    def test_bank_account_types_partial(self):
+        erp = FakeERPClient(existing_types={'Current'})   # only Credit missing
+        erpnext_accounts.ensure_bank_account_types(erp)
+        created = self._created_types(erp)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0][2]['account_type'], 'Credit')
+
+    def test_single_import_provisions_types(self):
+        self._item()
+        self._account('acct-1', subtype='checking')
+        erp = FakeERPClient()
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertIn('Current', erp.created['Bank Account Type'])
+        self.assertIn('Credit', erp.created['Bank Account Type'])
+
+
 class TestBulkImport(ImportBase):
     def test_five_supported_three_unsupported(self):
         self._item()

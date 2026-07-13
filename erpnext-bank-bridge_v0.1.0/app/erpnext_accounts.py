@@ -40,7 +40,13 @@ log = logging.getLogger('bankbridge.erpnext.accounts')
 
 BANK_DT = 'Bank'
 BANK_ACCOUNT_DT = 'Bank Account'
+BANK_ACCOUNT_TYPE_DT = 'Bank Account Type'
 CUSTOM_FIELD_DT = 'Custom Field'
+
+# The Bank Account Type records the import flow references. Stock ERPNext ships
+# without them, so an out-of-box instance would reject a Bank Account that links
+# one — we provision them as part of the idempotent bootstrap.
+DEFAULT_BANK_ACCOUNT_TYPES = ('Current', 'Credit')
 
 # ── Plaid subtype → ERPNext support / typing ───────────────────────────────
 #
@@ -133,7 +139,21 @@ def _log(item_id: str, count: int, status: str, message: str = '') -> None:
         log.warning('failed to write account-import PlaidSyncLog row', exc_info=True)
 
 
-# ── custom field bootstrap ─────────────────────────────────────────────────
+# ── bootstrap (Bank Account Type records + custom fields) ───────────────────
+
+def ensure_bank_account_types(client: ERPNextClient) -> None:
+    """Ensure ERPNext has the 'Current' and 'Credit' Bank Account Type records
+    the import flow assigns. Stock ERPNext ships without them, so an out-of-box
+    instance would error when a Bank Account references one. Idempotent: a record
+    is only created when the GET returns 404 (no existing doc)."""
+    for name in DEFAULT_BANK_ACCOUNT_TYPES:
+        if client.get_doc(BANK_ACCOUNT_TYPE_DT, name) is not None:
+            continue
+        # Bank Account Type autonames from its `account_type` field, so the
+        # created record's docname is exactly `name`.
+        client.create_doc(BANK_ACCOUNT_TYPE_DT, {'account_type': name})
+        log.info("created Bank Account Type '%s'", name)
+
 
 def ensure_custom_fields(client: ERPNextClient) -> None:
     """Idempotently provision the Bank Account custom fields we rely on
@@ -151,6 +171,15 @@ def ensure_custom_fields(client: ERPNextClient) -> None:
         doc.update(spec)
         client.create_doc(CUSTOM_FIELD_DT, doc)
         log.info('provisioned Bank Account custom field %s', spec['fieldname'])
+
+
+def bootstrap(client: ERPNextClient) -> None:
+    """Provision everything the import flow depends on, idempotently: the
+    Current/Credit Bank Account Type records and the Bank Account custom fields.
+    Bank Account Types come first so a Bank Account create can't fail on a
+    missing link target."""
+    ensure_bank_account_types(client)
+    ensure_custom_fields(client)
 
 
 # ── Bank find-or-create ─────────────────────────────────────────────────────
@@ -277,7 +306,9 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
 
     client = client or get_client()
     if ensure_fields:
-        ensure_custom_fields(client)
+        # First step, idempotent: guarantee the Bank Account Type records +
+        # custom fields exist so the create below can't fail on a missing link.
+        bootstrap(client)
 
     item = PlaidItem.query.filter_by(item_id=account.item_id).first()
     institution = ((item.institution_name if item else '') or '').strip() or 'Bank'
@@ -325,7 +356,7 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
     linked items. Already-mapped rows are silently skipped; unsupported rows are
     marked and counted. Returns aggregate stats plus a human summary."""
     client = client or get_client()
-    ensure_custom_fields(client)  # once for the whole batch
+    bootstrap(client)  # Bank Account Types + custom fields, once for the batch
 
     stats = {'created': 0, 'unsupported': 0, 'skipped_mapped': 0,
              'failed': 0, 'considered': 0, 'errors': []}
