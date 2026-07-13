@@ -8,10 +8,17 @@ removes that friction: given a linked Plaid account it will, idempotently,
   1. ensure the `plaid_account_id` + `last_4` custom fields exist on the
      ERPNext Bank Account doctype (first-push bootstrap),
   2. find-or-create the parent `Bank` (by bank_name),
-  3. find-or-create the `Bank Account` (deduped on the `plaid_account_id`
-     custom field),
-  4. wire the result back onto the local PlaidAccount (erpnext_bank_account_name
-     + sync_enabled) and stamp import_status.
+  3. auto-create the matching GL `Account` in the company's Chart of Accounts
+     (v0.2.0) — a Bank-typed leaf under the "Bank Accounts" group — so a company
+     Bank Account can link a real `account` and keep is_company_account = 1,
+  4. find-or-create the `Bank Account` (deduped on the `plaid_account_id`
+     custom field), linking the GL account,
+  5. wire the result back onto the local PlaidAccount (erpnext_bank_account_name,
+     erpnext_gl_account_name + sync_enabled) and stamp import_status.
+
+The GL auto-create is best-effort: if the Chart of Accounts can't be walked or
+created, the import degrades to the v0.1.5 personal-account fallback (retry with
+is_company_account = 0) rather than failing.
 
 Everything is find-or-create, so re-running never double-creates a Bank or a
 Bank Account. The HTTP mechanics live in erpnext_client; this module owns the
@@ -43,6 +50,8 @@ BANK_ACCOUNT_DT = 'Bank Account'
 BANK_ACCOUNT_TYPE_DT = 'Bank Account Type'
 ACCOUNT_SUBTYPE_DT = 'Account Subtype'
 CUSTOM_FIELD_DT = 'Custom Field'
+# The Chart-of-Accounts doctype the GL auto-create (v0.2.0) walks and creates in.
+ACCOUNT_DT = 'Account'
 
 # ── unavailable-doctype registry ────────────────────────────────────────────
 #
@@ -197,6 +206,23 @@ def _default_is_company_account() -> int:
     front, so ERPNext's "Company Account is mandatory" check never fires and the
     create-side retry isn't needed."""
     return 1 if current_app.config.get('ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT', True) else 0
+
+
+def _bank_account_group_name() -> str:
+    """The Chart-of-Accounts group the per-account GL Accounts are created under
+    (ERPNEXT_BANK_ACCOUNT_GROUP_NAME, default 'Bank Accounts')."""
+    return (current_app.config.get('ERPNEXT_BANK_ACCOUNT_GROUP_NAME')
+            or 'Bank Accounts').strip() or 'Bank Accounts'
+
+
+def _account_currency(account: PlaidAccount) -> str:
+    """Currency for a created GL Account: the Plaid account's iso_currency_code
+    (or its cached currency), else ERPNEXT_BANK_ACCOUNT_CURRENCY (default USD)."""
+    for c in (account.iso_currency_code, account.currency):
+        if (c or '').strip():
+            return c.strip()
+    return (current_app.config.get('ERPNEXT_BANK_ACCOUNT_CURRENCY')
+            or 'USD').strip() or 'USD'
 
 
 def _log(item_id: str, count: int, status: str, message: str = '') -> None:
@@ -370,15 +396,168 @@ def find_or_create_bank(client: ERPNextClient, bank_name: str, *,
     return created.get('name') or bank_name
 
 
+# ── GL Account (Chart of Accounts) auto-create — v0.2.0 ──────────────────────
+#
+# A company Bank Account (`is_company_account = 1`) is required by ERPNext to
+# link a specific GL `account` of type Bank from the company's Chart of
+# Accounts. v0.1.5 dropped is_company_account to 0 when that link was missing;
+# v0.2.0 does it properly: find (or create) a "Bank Accounts" group under
+# Assets → Current Assets, create a per-account leaf GL Account under it, and
+# link that on the Bank Account so is_company_account stays 1.
+#
+# Everything here is best-effort and idempotent. If any step fails (broken CoA,
+# permission error, unusual template) the caller degrades to the v0.1.5
+# personal-account fallback — an import never fails because the GL path didn't
+# work.
+
+
+def _find_accounts(client: ERPNextClient, company: str, *, account_name=None,
+                   is_group=None, root_type=None) -> list[dict]:
+    """List Chart-of-Accounts records for `company` matching the given facets.
+    Returns the raw dicts (name / account_name / parent_account / root_type)."""
+    filters = [['company', '=', company]]
+    if account_name is not None:
+        filters.append(['account_name', '=', account_name])
+    if is_group is not None:
+        filters.append(['is_group', '=', is_group])
+    if root_type is not None:
+        filters.append(['root_type', '=', root_type])
+    return client.list_docs(
+        ACCOUNT_DT, filters=filters,
+        fields=['name', 'account_name', 'parent_account', 'root_type', 'is_group'],
+        limit_page_length=0)
+
+
+def _create_group_account(client: ERPNextClient, account_name: str,
+                          parent_account: str, company: str, *,
+                          account_type: str | None = None) -> str:
+    """Create an is_group=1 Account under `parent_account`; return its docname.
+    root_type is inherited from the parent by ERPNext, so we don't set it."""
+    doc = {'account_name': account_name, 'parent_account': parent_account,
+           'company': company, 'is_group': 1}
+    if account_type:
+        doc['account_type'] = account_type
+    created = client.create_doc(ACCOUNT_DT, doc)
+    name = created.get('name')
+    log.info("created Chart-of-Accounts group '%s' under '%s'", name or account_name,
+             parent_account)
+    return name or account_name
+
+
+def _asset_root(client: ERPNextClient, company: str) -> str | None:
+    """The company's root Asset group (the top of the Assets branch). Prefers a
+    root_type=Asset group with no parent_account; falls back to the first
+    Asset-rooted group. None if the company has no Chart of Accounts yet."""
+    groups = _find_accounts(client, company, is_group=1, root_type='Asset')
+    if not groups:
+        return None
+    for g in groups:
+        if not (g.get('parent_account') or ''):
+            return g['name']
+    return groups[0]['name']
+
+
+def ensure_bank_account_group(client: ERPNextClient, company: str) -> str | None:
+    """Find (or create) the group Account the per-account Bank GL Accounts live
+    under, for `company`; return its docname. The conventional path is
+    Assets → Current Assets → Bank Accounts, which stock ERPNext ships.
+
+    Walks down, creating only what's missing:
+      1. the configured group name (default 'Bank Accounts', is_group, Bank) —
+         reuse if present;
+      2. else find 'Current Assets' and create the group under it;
+      3. else find the Asset root, create 'Current Assets' under it, then the
+         group under that.
+    Returns None when the company has no Chart of Accounts to anchor to (fresh
+    install) — the caller then falls back to the personal-account path."""
+    group_name = _bank_account_group_name()
+    existing = _find_accounts(client, company, account_name=group_name, is_group=1)
+    if existing:
+        return existing[0]['name']
+
+    current_assets = _find_accounts(client, company, account_name='Current Assets',
+                                    is_group=1)
+    if current_assets:
+        return _create_group_account(client, group_name, current_assets[0]['name'],
+                                     company, account_type='Bank')
+
+    root = _asset_root(client, company)
+    if root:
+        current_assets_name = _create_group_account(client, 'Current Assets', root,
+                                                     company)
+        return _create_group_account(client, group_name, current_assets_name,
+                                     company, account_type='Bank')
+
+    log.info('no Chart of Accounts anchor (Bank group / Current Assets / Asset '
+             'root) found for company %r; skipping GL auto-create', company)
+    return None
+
+
+def find_or_create_gl_account_for(client: ERPNextClient, account: PlaidAccount,
+                                  parent_group: str, company: str,
+                                  account_name: str) -> str | None:
+    """Find (or create) the leaf Bank GL Account for one Plaid account under
+    `parent_group`; return its docname. Idempotent: an existing leaf with the
+    same account_name + company is reused, so re-import never duplicates. The
+    created docname follows Frappe autonaming ('<account_name> - <company_abbr>')
+    and is read back from the create response rather than computed."""
+    existing = client.list_docs(
+        ACCOUNT_DT,
+        filters=[['account_name', '=', account_name], ['company', '=', company],
+                 ['is_group', '=', 0]],
+        fields=['name'], limit_page_length=1)
+    if existing:
+        return existing[0]['name']
+    doc = {
+        'account_name': account_name,
+        'parent_account': parent_group,
+        'company': company,
+        'account_type': 'Bank',
+        'account_currency': _account_currency(account),
+        'is_group': 0,
+    }
+    created = client.create_doc(ACCOUNT_DT, doc)
+    name = created.get('name')
+    log.info("created Bank GL Account '%s' under '%s'", name or account_name,
+             parent_group)
+    return name
+
+
+def _resolve_gl_account(client: ERPNextClient, account: PlaidAccount,
+                        company: str, account_name: str) -> str | None:
+    """Best-effort: resolve the group and per-account leaf GL Account, returning
+    the leaf docname to link on the Bank Account. Returns None (logging a warning)
+    on ANY failure so the caller degrades to the v0.1.5 personal-account path —
+    the proper company-account link is best-effort, never a hard requirement."""
+    if not company:
+        return None
+    try:
+        group = ensure_bank_account_group(client, company)
+        if not group:
+            return None
+        return find_or_create_gl_account_for(client, account, group, company,
+                                             account_name)
+    except (ERPNextAPIError, ERPNextError):
+        log.warning('GL Account auto-create failed for %s; falling back to the '
+                    'personal-account path', account.account_id, exc_info=True)
+        return None
+
+
 # The Bank Account fields we will never drop on a retry — without them the doc
 # is meaningless. account_name + bank are always essential. account_type is
 # essential ONLY when bootstrap has proved the Bank Account Type doctype exists;
 # if that doctype is unavailable the field is dropped up-front (see
 # _prune_unavailable_fields) and must not be treated as un-droppable, or every
-# import on such an instance would fail. Everything else (account_subtype,
-# is_company_account, company, the custom fields) is "preferred": send it if
-# ERPNext accepts it, drop it if ERPNext rejects it as unknown.
-_BASE_ESSENTIAL_BANK_ACCOUNT_FIELDS = {'account_name', 'bank'}
+# import on such an instance would fail. `account` (the auto-created GL link) is
+# essential too: it must never be caught by the generic field-drop path — its
+# name is a substring of every other 'account…' field, so a LinkValidationError
+# on account_subtype would otherwise strip the GL link and leave a company
+# account with no `account` (an unrecoverable "Company Account is mandatory").
+# Dropping it is only ever right paired with is_company_account → 0, which the
+# dedicated company-mandatory retry does explicitly. Everything else
+# (account_subtype, is_company_account, company, the custom fields) is
+# "preferred": send it if ERPNext accepts it, drop it if ERPNext rejects it.
+_BASE_ESSENTIAL_BANK_ACCOUNT_FIELDS = {'account_name', 'bank', 'account'}
 
 # Which Bank Account payload fields link to which ERPNext doctype. If bootstrap
 # proved a doctype unavailable in this instance, the dependent field is dropped
@@ -541,14 +720,27 @@ def _find_bank_account(client: ERPNextClient, account: PlaidAccount) -> str | No
     return matches[0]['name'] if matches else None
 
 
-def build_bank_account_doc(account: PlaidAccount, bank_name: str,
-                           institution: str) -> dict:
-    """Assemble the ERPNext Bank Account payload. account_name follows
+def _bank_account_name(account: PlaidAccount, institution: str) -> str:
+    """The Bank Account (and matching GL Account) account_name — follows
     '<Institution> <TitleCasedSubtype> - <mask>' (e.g. 'Wells Fargo Checking -
-    0000'). iban / bank_account_no are left blank (Plaid doesn't expose them)."""
+    0000')."""
     subtype_title = (account.subtype or account.type or 'Account').strip().title()
     mask = (account.mask or '0000').strip()
-    account_name = f'{institution} {subtype_title} - {mask}'.strip()
+    return f'{institution} {subtype_title} - {mask}'.strip()
+
+
+def build_bank_account_doc(account: PlaidAccount, bank_name: str,
+                           institution: str, *, account_name: str | None = None,
+                           gl_account: str | None = None) -> dict:
+    """Assemble the ERPNext Bank Account payload. account_name follows
+    '<Institution> <TitleCasedSubtype> - <mask>' (e.g. 'Wells Fargo Checking -
+    0000'). iban / bank_account_no are left blank (Plaid doesn't expose them).
+
+    When `gl_account` is supplied (the auto-created Chart-of-Accounts leaf) and
+    this is a company account, it is linked via `account` so is_company_account
+    stays 1 — the v0.2.0 proper path. Without it the doc carries no `account`,
+    and a company-account create relies on the v0.1.5 personal-account retry."""
+    account_name = account_name or _bank_account_name(account, institution)
     doc = {
         'account_name': account_name,
         'bank': bank_name,
@@ -562,28 +754,45 @@ def build_bank_account_doc(account: PlaidAccount, bank_name: str,
     company = _default_company()
     if company:
         doc['company'] = company
+    # Link the auto-created GL Account only for a company account — the `account`
+    # link is meaningless (and rejected) on a personal Bank Account.
+    if gl_account and doc.get('is_company_account'):
+        doc['account'] = gl_account
     # Drop any field whose linked doctype bootstrap found unavailable in this
     # ERPNext (e.g. account_subtype when Tim's instance has no Account Subtype).
     return _prune_unavailable_fields(doc)
 
 
 def find_or_create_bank_account(client: ERPNextClient, account: PlaidAccount,
-                                bank_name: str, institution: str
-                                ) -> tuple[str, bool, bool]:
+                                bank_name: str, institution: str, *,
+                                company: str | None = None
+                                ) -> tuple[str, bool, bool, str | None]:
     """Find-or-create the Bank Account for this Plaid account. Returns
-    (docname, created, retried) — retried is True when the create succeeded only
-    after the defensive path dropped a rejected field."""
+    (docname, created, retried, gl_account) — retried is True when the create
+    succeeded only after the defensive path dropped a rejected field; gl_account
+    is the auto-created Chart-of-Accounts leaf that was linked (None if the GL
+    path was skipped or fell back).
+
+    The GL Account is resolved (and only then created) after the existing-Bank-
+    Account check, so a re-import that finds an existing account never creates an
+    orphan GL Account."""
     existing = _find_bank_account(client, account)
     if existing:
-        return existing, False, False
-    doc = build_bank_account_doc(account, bank_name, institution)
+        return existing, False, False, None
+    account_name = _bank_account_name(account, institution)
+    # Best-effort GL Account for a company import; None degrades to v0.1.5.
+    gl_account = None
+    if company and _default_is_company_account():
+        gl_account = _resolve_gl_account(client, account, company, account_name)
+    doc = build_bank_account_doc(account, bank_name, institution,
+                                 account_name=account_name, gl_account=gl_account)
     created, retried = _create_bank_account_defensive(
         client, doc, item_id=account.item_id)
     name = created.get('name')
     if not name:
         raise ERPNextAPIError('ERPNext returned no Bank Account name',
                               status_code=None)
-    return name, True, retried
+    return name, True, retried, gl_account
 
 
 # ── per-account import ──────────────────────────────────────────────────────
@@ -640,11 +849,15 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
     bank_name = find_or_create_bank(client, institution, extras=extras)
     created_bank = not banks_before
 
-    # Bank Account (find-or-create, deduped on plaid_account_id).
-    docname, created_account, retried = find_or_create_bank_account(
-        client, account, bank_name, institution)
+    # Bank Account (find-or-create, deduped on plaid_account_id). The company
+    # drives the v0.2.0 GL Account auto-create (best-effort; falls back to the
+    # v0.1.5 personal path if the Chart of Accounts can't be walked/created).
+    docname, created_account, retried, gl_account = find_or_create_bank_account(
+        client, account, bank_name, institution, company=_default_company())
 
     account.erpnext_bank_account_name = docname
+    if gl_account:
+        account.erpnext_gl_account_name = gl_account
     account.sync_enabled = True
     account.import_status = 'imported'
     db.session.commit()

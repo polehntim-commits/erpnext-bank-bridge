@@ -74,7 +74,9 @@ class FakeERPClient:
                  fail_bank_account=False, existing_types=None,
                  reject_fields=None, bank_account_error=None,
                  existing_subtypes=None, link_reject_fields=None,
-                 missing_doctypes=None, company_account_mandatory=False):
+                 missing_doctypes=None, company_account_mandatory=False,
+                 chart_accounts=None, fail_account_create=False,
+                 company_abbr='EC'):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -111,9 +113,28 @@ class FakeERPClient:
         self.existing_types = set(existing_types or ())
         # Account Subtype records that already exist in ERPNext (get_doc hits).
         self.existing_subtypes = set(existing_subtypes or ())
+        # Company abbreviation Frappe appends when autonaming an Account
+        # ('<account_name> - <abbr>'). Also the abbr for preset chart names.
+        self.company_abbr = company_abbr
+        # A preset Chart of Accounts (v0.2.0 GL auto-create). Each entry is an
+        # Account dict; account_name is required, is_group defaults to 0, and the
+        # docname is autonamed unless given. A `company` of '' matches any
+        # company filter (a wildcard, so tests don't have to restate it).
+        self.chart_accounts = {}    # name -> Account doc
+        for a in (chart_accounts or []):
+            d = dict(a)
+            d.setdefault('is_group', 0)
+            d.setdefault('company', '')
+            name = d.get('name') or f"{d['account_name']} - {company_abbr}"
+            d['name'] = name
+            self.chart_accounts[name] = d
+        # When True, every Account create (group or leaf) fails — exercises the
+        # graceful fall-through to the v0.1.5 personal-account path.
+        self.fail_account_create = fail_account_create
         # Records created by the one-click account import, keyed by doctype.
         self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {},
-                        'Bank Account Type': {}, 'Account Subtype': {}}
+                        'Bank Account Type': {}, 'Account Subtype': {},
+                        'Account': {}}
 
     def get_logged_user(self):
         return 'admin@example.com'
@@ -142,6 +163,8 @@ class FakeERPClient:
             if name in self.existing_subtypes or name in self.created['Account Subtype']:
                 return {'name': name}
             return None
+        if doctype == 'Account':
+            return ({**self.chart_accounts, **self.created['Account']}).get(name)
         return self.docs.get(name)
 
     @staticmethod
@@ -150,6 +173,20 @@ class FakeERPClient:
         for f in (filters or []):
             field, op, value = f[0], f[1], f[2]
             if op == '=' and str(doc.get(field, '')) != str(value):
+                return False
+        return True
+
+    @staticmethod
+    def _account_matches(doc, filters):
+        """Like _matches, but a stored `company` of '' is a wildcard (a preset
+        chart account matches any company filter) so tests need not restate it."""
+        for f in (filters or []):
+            field, op, value = f[0], f[1], f[2]
+            if op != '=':
+                continue
+            if field == 'company' and not doc.get('company'):
+                continue
+            if str(doc.get(field, '')) != str(value):
                 return False
         return True
 
@@ -167,6 +204,11 @@ class FakeERPClient:
                         return []
                     return [{'name': name}] if name else []
             return []
+        if doctype == 'Account':
+            pool = {**self.chart_accounts, **self.created['Account']}
+            flds = fields or ['name']
+            return [{k: d.get(k) for k in flds} for d in pool.values()
+                    if self._account_matches(d, filters)]
         if doctype in ('Bank', 'Custom Field'):
             return [{'name': n} for n, d in self.created[doctype].items()
                     if self._matches(d, filters)]
@@ -198,6 +240,16 @@ class FakeERPClient:
         if doctype == 'Bank':
             name = doc.get('bank_name')       # ERPNext Bank autonames on bank_name
             self.created['Bank'][name] = dict(doc)
+            return {'name': name}
+        if doctype == 'Account':
+            from app.erpnext_client import ERPNextAPIError
+            if self.fail_account_create:
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body='{"exception": "ValidationError: cannot create Account"}')
+            # Frappe autonames an Account '<account_name> - <company_abbr>'.
+            name = f"{doc.get('account_name')} - {self.company_abbr}"
+            self.created['Account'][name] = {**dict(doc), 'name': name}
             return {'name': name}
         if doctype == 'Bank Account':
             from app.erpnext_client import ERPNextAPIError

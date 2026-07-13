@@ -90,6 +90,21 @@ class Config:
     # account as personal from the start, skipping the retry entirely.
     ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT = _bool(
         'ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT', True)
+    # One-click account import auto-creates a matching GL Account in ERPNext's
+    # Chart of Accounts (account_type "Bank") so a company Bank Account can link
+    # a real `account` and keep `is_company_account = 1` (see
+    # app/erpnext_accounts.py). These two knobs tune that:
+    #   * the parent group the per-account GL Accounts are created under. Stock
+    #     ERPNext ships "Bank Accounts" (under Current Assets → Assets); some CoA
+    #     templates name it differently ("Bank", "Cash and Bank"). Set this to
+    #     match yours so the importer finds the existing group instead of making
+    #     a new one.
+    ERPNEXT_BANK_ACCOUNT_GROUP_NAME = os.environ.get(
+        'ERPNEXT_BANK_ACCOUNT_GROUP_NAME', 'Bank Accounts').strip() or 'Bank Accounts'
+    #   * the fallback currency for a created GL Account when the Plaid account
+    #     doesn't report an iso_currency_code.
+    ERPNEXT_BANK_ACCOUNT_CURRENCY = os.environ.get(
+        'ERPNEXT_BANK_ACCOUNT_CURRENCY', 'USD').strip() or 'USD'
 
     # ── Encryption at rest ────────────────────────────────────────────────
     # Fernet key for the stored Plaid access_tokens. Blank → app autogenerates

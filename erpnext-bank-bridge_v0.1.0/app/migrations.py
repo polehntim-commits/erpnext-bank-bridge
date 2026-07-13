@@ -106,5 +106,9 @@ def run_migrations() -> None:
         _widen_column('plaid_sync_log', 'direction', 'VARCHAR(64)', 64)
         _widen_column('plaid_sync_log', 'error_message', 'TEXT', 10 ** 9)
         _drop_not_null('plaid_sync_log', 'item_id')
+        # v0.2.0 — auto-create the matching GL Account in ERPNext's Chart of
+        # Accounts so an imported company Bank Account can link a real `account`.
+        # Record the created/linked GL Account docname on the Plaid account.
+        _add_column_if_missing('plaid_accounts', 'erpnext_gl_account_name', 'TEXT')
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)

@@ -654,6 +654,11 @@ class TestSyncLogWrites(ImportBase):
     def test_item_id_nullable(self):
         self.assertTrue(PlaidSyncLog.__table__.c.item_id.nullable)
 
+    def test_gl_account_column_present(self):
+        # v0.2.0 additive column — the create_all-built test DB must have it.
+        self.assertIn('erpnext_gl_account_name',
+                      {c.name for c in PlaidAccount.__table__.c})
+
     def test_log_persists_long_error_message(self):
         big = 'E' * 600
         erpnext_accounts._log('item-abc', 0, 'failed', big)
@@ -688,6 +693,139 @@ class TestErrorBodyCapture(unittest.TestCase):
         e = ERPNextAPIError('boom', status_code=500, response_body='x' * 5000)
         # base + ': ' + first 500 chars of body.
         self.assertEqual(len(str(e)), len('boom') + 2 + ERPNextAPIError.BODY_SNIPPET)
+
+
+class TestGLAccountAutoCreate(ImportBase):
+    """v0.2.0 — auto-create a matching GL Account in ERPNext's Chart of Accounts
+    so an imported company Bank Account links a real `account` and keeps
+    is_company_account = 1. Best-effort: it degrades to the v0.1.5 personal
+    fallback if the Chart of Accounts can't be walked/created."""
+
+    COMPANY = 'Example Company LLC'
+
+    def _bank_group(self, **kw):
+        d = {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank'}
+        d.update(kw)
+        return d
+
+    def _leaf_creates(self, erp):
+        return [c for c in erp.creates_of('Account') if c[2].get('is_group') == 0]
+
+    def test_finds_existing_bank_accounts_group(self):
+        erp = FakeERPClient(chart_accounts=[self._bank_group()])
+        group = erpnext_accounts.ensure_bank_account_group(erp, self.COMPANY)
+        self.assertEqual(group, 'Bank Accounts - EC')
+        # Reused the existing group — no Account create.
+        self.assertEqual(len(erp.creates_of('Account')), 0)
+
+    def test_creates_bank_accounts_group_when_missing(self):
+        # Only the Asset root exists → walk up, creating Current Assets AND the
+        # Bank Accounts group under it.
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Application of Funds (Assets)', 'is_group': 1,
+             'root_type': 'Asset', 'parent_account': ''}])
+        group = erpnext_accounts.ensure_bank_account_group(erp, self.COMPANY)
+        self.assertEqual(group, 'Bank Accounts - EC')
+        created = [c[2]['account_name'] for c in erp.creates_of('Account')]
+        self.assertIn('Current Assets', created)
+        self.assertIn('Bank Accounts', created)
+        ba = next(c[2] for c in erp.creates_of('Account')
+                  if c[2]['account_name'] == 'Bank Accounts')
+        # The group is created under the freshly made Current Assets, typed Bank.
+        self.assertEqual(ba['parent_account'], 'Current Assets - EC')
+        self.assertEqual(ba['account_type'], 'Bank')
+        self.assertEqual(ba['is_group'], 1)
+
+    def test_creates_gl_account_for_new_bank_account(self):
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Current Assets', 'is_group': 1, 'root_type': 'Asset'}])
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+
+        self.assertEqual(result['status'], 'imported')
+        # A Bank-typed leaf GL Account was created, matching the Bank Account name.
+        leaves = self._leaf_creates(erp)
+        self.assertEqual(len(leaves), 1)
+        gl = leaves[0][2]
+        self.assertEqual(gl['account_name'], 'Wells Fargo Checking - 0000')
+        self.assertEqual(gl['account_type'], 'Bank')
+        self.assertEqual(gl['account_currency'], 'USD')
+        self.assertEqual(gl['parent_account'], 'Bank Accounts - EC')
+        # The Bank Account links it and stays a company account.
+        ba_doc = erp.creates_of('Bank Account')[0][2]
+        self.assertEqual(ba_doc['account'], 'Wells Fargo Checking - 0000 - EC')
+        self.assertEqual(ba_doc['is_company_account'], 1)
+        # …and it's persisted back onto the Plaid account.
+        a = PlaidAccount.query.filter_by(account_id='acct-1').first()
+        self.assertEqual(a.erpnext_gl_account_name, 'Wells Fargo Checking - 0000 - EC')
+
+    def test_reuses_existing_gl_account(self):
+        self._item(institution='Wells Fargo')
+        a = self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[self._bank_group()])
+        group = erpnext_accounts.ensure_bank_account_group(erp, self.COMPANY)
+        name1 = erpnext_accounts.find_or_create_gl_account_for(
+            erp, a, group, self.COMPANY, 'Wells Fargo Checking - 0000')
+        # Second call finds the leaf created by the first — no duplicate.
+        name2 = erpnext_accounts.find_or_create_gl_account_for(
+            erp, a, group, self.COMPANY, 'Wells Fargo Checking - 0000')
+        self.assertEqual(name1, name2)
+        self.assertEqual(len(self._leaf_creates(erp)), 1)
+
+    def test_falls_back_to_personal_when_gl_creation_fails(self):
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        # The Bank Accounts group exists, but every Account create fails AND the
+        # instance enforces a GL link on company accounts → the import must
+        # degrade to the v0.1.5 personal-account retry and still succeed.
+        erp = FakeERPClient(chart_accounts=[self._bank_group()],
+                            fail_account_create=True,
+                            company_account_mandatory=True)
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+
+        self.assertEqual(result['status'], 'imported')
+        self.assertTrue(result['retried'])
+        creates = erp.creates_of('Bank Account')
+        self.assertEqual(len(creates), 2)                 # company → personal retry
+        self.assertEqual(creates[0][2]['is_company_account'], 1)
+        self.assertEqual(creates[1][2]['is_company_account'], 0)
+        self.assertNotIn('account', creates[1][2])
+        # No GL link recorded — the fallback created a personal account.
+        a = PlaidAccount.query.filter_by(account_id='acct-1').first()
+        self.assertIsNone(a.erpnext_gl_account_name)
+
+    def test_uses_config_bank_group_name_override(self):
+        self.app.config['ERPNEXT_BANK_ACCOUNT_GROUP_NAME'] = 'Cash and Bank'
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Cash and Bank', 'is_group': 1, 'account_type': 'Bank'}])
+        group = erpnext_accounts.ensure_bank_account_group(erp, self.COMPANY)
+        self.assertEqual(group, 'Cash and Bank - EC')
+        self.assertEqual(len(erp.creates_of('Account')), 0)
+
+    def test_currency_from_plaid_account(self):
+        self._item(institution='RBC')
+        a = self._account('acct-cad', subtype='checking', mask='7777')
+        a.iso_currency_code = 'CAD'
+        db.session.commit()
+        erp = FakeERPClient(chart_accounts=[self._bank_group()])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-cad', client=erp)
+        gl = self._leaf_creates(erp)[0][2]
+        self.assertEqual(gl['account_currency'], 'CAD')
+
+    def test_no_chart_of_accounts_falls_back_gracefully(self):
+        """Fresh install: no Bank group, no Current Assets, no Asset root → the
+        group resolver returns None and the import lands on the personal path
+        (with the instance enforcing a company GL link)."""
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(company_account_mandatory=True)   # empty chart
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertEqual(result['status'], 'imported')
+        self.assertTrue(result['retried'])
+        self.assertEqual(len(erp.creates_of('Account')), 0)   # nothing created
+        creates = erp.creates_of('Bank Account')
+        self.assertEqual(creates[-1][2]['is_company_account'], 0)
 
 
 if __name__ == '__main__':

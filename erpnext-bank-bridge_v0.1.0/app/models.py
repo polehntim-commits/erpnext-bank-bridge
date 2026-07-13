@@ -79,6 +79,12 @@ class PlaidAccount(db.Model):
     # Operator-assigned ERPNext Bank Account docname (dropdown-fed). NULL =
     # unmapped → transactions are mirrored locally but not pushed.
     erpnext_bank_account_name = db.Column(db.String(255), nullable=True)
+    # The ERPNext GL Account (Chart of Accounts, account_type 'Bank') that
+    # one-click import auto-creates and links on the company Bank Account so
+    # `is_company_account = 1` holds (see app/erpnext_accounts.py). NULL until an
+    # import creates/links one — or stays NULL when the GL auto-create failed and
+    # the import fell back to a personal account.
+    erpnext_gl_account_name = db.Column(db.Text, nullable=True)
     sync_enabled = db.Column(db.Boolean, default=True)
     # One-click-import lifecycle (see app/erpnext_accounts.py):
     #   pending     — never auto-imported (the default / freshly linked)
@@ -100,6 +106,7 @@ class PlaidAccount(db.Model):
             'balance_current': self.balance_current,
             'currency': self.currency, 'iso_currency_code': self.iso_currency_code,
             'erpnext_bank_account_name': self.erpnext_bank_account_name,
+            'erpnext_gl_account_name': self.erpnext_gl_account_name,
             'sync_enabled': bool(self.sync_enabled),
             'import_status': self.import_status or 'pending',
         }
