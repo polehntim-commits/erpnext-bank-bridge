@@ -72,7 +72,8 @@ class FakeERPClient:
     idempotency the way the real Frappe list filter would."""
     def __init__(self, bank_accounts=None, fail_create=False,
                  fail_bank_account=False, existing_types=None,
-                 reject_fields=None, bank_account_error=None):
+                 reject_fields=None, bank_account_error=None,
+                 existing_subtypes=None, link_reject_fields=None):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -87,14 +88,20 @@ class FakeERPClient:
         # with a Frappe-style body naming it. A retry with the field stripped
         # then succeeds — the defensive-drop path under test.
         self.reject_fields = set(reject_fields or ())
+        # Fields ERPNext rejects with a *LinkValidationError* ("Could not find
+        # <Label>: <value>") — the link target doesn't exist. The defensive path
+        # must drop the field and retry, same as an unknown field.
+        self.link_reject_fields = set(link_reject_fields or ())
         # Optional (status_code, body) for an *unrelated* Bank Account failure —
         # a rejection the defensive path must NOT retry.
         self.bank_account_error = bank_account_error
         # Bank Account Type records that already exist in ERPNext (get_doc hits).
         self.existing_types = set(existing_types or ())
+        # Account Subtype records that already exist in ERPNext (get_doc hits).
+        self.existing_subtypes = set(existing_subtypes or ())
         # Records created by the one-click account import, keyed by doctype.
         self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {},
-                        'Bank Account Type': {}}
+                        'Bank Account Type': {}, 'Account Subtype': {}}
 
     def get_logged_user(self):
         return 'admin@example.com'
@@ -104,6 +111,10 @@ class FakeERPClient:
         self.calls.append(('get_doc', doctype, name))
         if doctype == 'Bank Account Type':
             if name in self.existing_types or name in self.created['Bank Account Type']:
+                return {'name': name}
+            return None
+        if doctype == 'Account Subtype':
+            if name in self.existing_subtypes or name in self.created['Account Subtype']:
                 return {'name': name}
             return None
         return self.docs.get(name)
@@ -177,6 +188,16 @@ class FakeERPClient:
                     'bad', status_code=417,
                     response_body=('{"exception": "ValidationError: ' + bad +
                                    ' is not a valid field of Bank Account"}'))
+            bad_link = next((f for f in doc if f in self.link_reject_fields), None)
+            if bad_link is not None:
+                # Frappe LinkValidationError uses the field's Title Case label,
+                # not the snake_case fieldname: "Could not find Account Subtype:".
+                label = bad_link.replace('_', ' ').title()
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body=('{"exception": "LinkValidationError: Could '
+                                   'not find ' + label + ': ' +
+                                   str(doc.get(bad_link)) + '"}'))
             self._counter += 1
             name = f"{doc.get('account_name')} - {doc.get('bank')}"
             self.created['Bank Account'][name] = dict(doc)
@@ -184,6 +205,10 @@ class FakeERPClient:
         if doctype == 'Bank Account Type':
             name = doc.get('account_type')   # autonames on account_type
             self.created['Bank Account Type'][name] = dict(doc)
+            return {'name': name}
+        if doctype == 'Account Subtype':
+            name = doc.get('account_subtype')  # autonames on account_subtype
+            self.created['Account Subtype'][name] = dict(doc)
             return {'name': name}
         if doctype == 'Custom Field':
             name = f"{doc.get('dt')}-{doc.get('fieldname')}"

@@ -41,12 +41,25 @@ log = logging.getLogger('bankbridge.erpnext.accounts')
 BANK_DT = 'Bank'
 BANK_ACCOUNT_DT = 'Bank Account'
 BANK_ACCOUNT_TYPE_DT = 'Bank Account Type'
+ACCOUNT_SUBTYPE_DT = 'Account Subtype'
 CUSTOM_FIELD_DT = 'Custom Field'
 
 # The Bank Account Type records the import flow references. Stock ERPNext ships
 # without them, so an out-of-box instance would reject a Bank Account that links
 # one — we provision them as part of the idempotent bootstrap.
 DEFAULT_BANK_ACCOUNT_TYPES = ('Current', 'Credit')
+
+# The Account Subtype records `Bank Account.account_subtype` links to. On Tim's
+# instance that field is a Link (not a Select), so a Bank Account create fails
+# with a LinkValidationError ("Could not find Account Subtype: savings") unless
+# the target record exists. Same remedy as Bank Account Type: provision them in
+# the idempotent bootstrap. Docnames are Title Case (Frappe convention), and the
+# send-side (erpnext_account_subtype) matches — see build_bank_account_doc.
+DEFAULT_ACCOUNT_SUBTYPES = (
+    'Checking', 'Savings', 'Current', 'Other',
+    'Credit Card', 'Cd', 'Money Market',
+    'Cash Management', 'Paypal', 'Line Of Credit',
+)
 
 # ── Plaid subtype → ERPNext support / typing ───────────────────────────────
 #
@@ -102,16 +115,17 @@ def erpnext_account_type(account: PlaidAccount) -> str:
 
 
 def erpnext_account_subtype(account: PlaidAccount) -> str:
-    """Normalized `account_subtype` for the Bank Account (checking / savings /
-    current / other) — a coarser bucket than Plaid's subtype."""
+    """Normalized `account_subtype` for the Bank Account (Checking / Savings /
+    Current / Other) — a coarser bucket than Plaid's subtype. Title Case, to
+    match the Account Subtype link-target docnames provisioned in bootstrap."""
     s = (account.subtype or '').strip().lower()
     if s == 'checking':
-        return 'checking'
+        return 'Checking'
     if s == 'savings':
-        return 'savings'
+        return 'Savings'
     if s in _CURRENT_SUBTYPES:
-        return 'current'
-    return 'other'
+        return 'Current'
+    return 'Other'
 
 
 # ── client / config ────────────────────────────────────────────────────────
@@ -155,6 +169,22 @@ def ensure_bank_account_types(client: ERPNextClient) -> None:
         log.info("created Bank Account Type '%s'", name)
 
 
+def ensure_account_subtypes(client: ERPNextClient) -> None:
+    """Ensure ERPNext has the Account Subtype records the import flow links from
+    `Bank Account.account_subtype` (Checking, Savings, Current, …). Where that
+    field is a Link, an out-of-box instance has no matching target and rejects
+    the Bank Account create with a LinkValidationError. Idempotent: a record is
+    only created when the GET returns 404. Docnames are Title Case, matching the
+    values erpnext_account_subtype sends."""
+    for name in DEFAULT_ACCOUNT_SUBTYPES:
+        if client.get_doc(ACCOUNT_SUBTYPE_DT, name) is not None:
+            continue
+        # Mirror Bank Account Type: the master autonames from its titling field,
+        # so the created record's docname is exactly `name`.
+        client.create_doc(ACCOUNT_SUBTYPE_DT, {'account_subtype': name})
+        log.info("created Account Subtype '%s'", name)
+
+
 def ensure_custom_fields(client: ERPNextClient) -> None:
     """Idempotently provision the Bank Account custom fields we rely on
     (`plaid_account_id`, `last_4`). A no-op once they exist — same pattern the
@@ -175,10 +205,11 @@ def ensure_custom_fields(client: ERPNextClient) -> None:
 
 def bootstrap(client: ERPNextClient) -> None:
     """Provision everything the import flow depends on, idempotently: the
-    Current/Credit Bank Account Type records and the Bank Account custom fields.
-    Bank Account Types come first so a Bank Account create can't fail on a
-    missing link target."""
+    Current/Credit Bank Account Type records, the Account Subtype records, and
+    the Bank Account custom fields. The link-target masters come first so a Bank
+    Account create can't fail on a missing link target."""
     ensure_bank_account_types(client)
+    ensure_account_subtypes(client)
     ensure_custom_fields(client)
 
 
@@ -236,42 +267,72 @@ _UNKNOWN_FIELD_HINTS = (
     'has no field', 'no field named',
 )
 
+# Substrings that mark a Frappe Link-target rejection — the field IS valid, but
+# the *value* we sent has no matching link record (e.g. "Could not find Account
+# Subtype: savings"). Same remedy as an unknown field: drop the offending
+# preferred field and retry once, so a missing master doesn't sink the import.
+_LINK_VALIDATION_HINTS = ('could not find', 'linkvalidationerror')
+
+# A missing *required* field. We can't know which value to supply, so this is
+# logged and surfaced — never auto-retried (dropping a field can't fix it).
+_MANDATORY_HINTS = ('mandatory',)
+
 
 def _unknown_fields_in(body: str, doc: dict) -> list[str]:
-    """The preferred (droppable) doc fields explicitly named in an ERPNext
-    'unknown field' error body. Essential fields are never returned — if ERPNext
-    rejects one of those the import genuinely can't succeed and should surface."""
+    """The preferred (droppable) doc fields named in an ERPNext rejection body.
+    Matches both the snake_case fieldname ('account_subtype', from 'not a valid
+    field' errors) and its spaced label ('account subtype', from LinkValidation
+    'Could not find Account Subtype: …' errors). Essential fields are never
+    returned — if ERPNext rejects one of those the import genuinely can't
+    succeed and should surface."""
     low = (body or '').lower()
-    return [k for k in doc
-            if k not in _ESSENTIAL_BANK_ACCOUNT_FIELDS and k.lower() in low]
+    out = []
+    for k in doc:
+        if k in _ESSENTIAL_BANK_ACCOUNT_FIELDS:
+            continue
+        if k.lower() in low or k.lower().replace('_', ' ') in low:
+            out.append(k)
+    return out
 
 
 def _create_bank_account_defensive(client: ERPNextClient, doc: dict, *,
-                                   item_id: str = '') -> dict:
-    """POST a Bank Account, and if ERPNext rejects a preferred field as unknown
-    (417/422 with a 'not a valid field' style body), retry ONCE with that field
-    (or fields) stripped. The retry decision — which field, and the original
-    Frappe error — is written to the sync log so the fallback is traceable.
+                                   item_id: str = '') -> tuple[dict, bool]:
+    """POST a Bank Account, and if ERPNext rejects a preferred field — either as
+    unknown ('not a valid field') or as a broken Link ('Could not find … ' /
+    LinkValidationError) — retry ONCE with that field (or fields) stripped. The
+    retry decision is written to the sync log so the fallback is traceable.
 
-    A non-field error, or a field-error naming only essential fields, is
-    re-raised unchanged (its response body rides along on the exception)."""
+    Returns (created_doc, retried). A mandatory-field error is logged and
+    re-raised (no field to drop fixes it); any other non-field error, or a
+    field-error naming only essential fields, is re-raised unchanged (its
+    response body rides along on the exception)."""
     try:
-        return client.create_doc(BANK_ACCOUNT_DT, doc)
+        return client.create_doc(BANK_ACCOUNT_DT, doc), False
     except ERPNextAPIError as e:
         body = e.response_body or ''
         low = body.lower()
-        if e.status_code not in (417, 422) or not any(h in low for h in _UNKNOWN_FIELD_HINTS):
+        if e.status_code not in (417, 422):
+            raise
+        # A missing required field can't be repaired by dropping something —
+        # log it plainly and surface, per spec (don't auto-retry).
+        if any(h in low for h in _MANDATORY_HINTS):
+            log.warning('Bank Account create failed on a mandatory field; not '
+                        'retrying: %s', str(e)[:300])
+            raise
+        is_link = any(h in low for h in _LINK_VALIDATION_HINTS)
+        if not (is_link or any(h in low for h in _UNKNOWN_FIELD_HINTS)):
             raise
         drop = _unknown_fields_in(body, doc)
         if not drop:
             raise
         retry_doc = {k: v for k, v in doc.items() if k not in drop}
-        msg = (f"ERPNext rejected Bank Account field(s) {', '.join(drop)}; "
-               f'retrying once without them. Original error: {str(e)[:400]}')
-        log.warning('Bank Account create rejected %s; retrying without: %s',
-                    drop, str(e)[:200])
+        reason = 'LinkValidationError' if is_link else 'unknown field'
+        msg = (f"Retry: dropped {', '.join(drop)} due to {reason}. "
+               f'Original error: {str(e)[:400]}')
+        log.warning('Bank Account create rejected %s (%s); retrying without it',
+                    drop, reason)
         _log(item_id, 0, 'retry', msg)
-        return client.create_doc(BANK_ACCOUNT_DT, retry_doc)
+        return client.create_doc(BANK_ACCOUNT_DT, retry_doc), True
 
 
 # ── Bank Account find-or-create ─────────────────────────────────────────────
@@ -311,19 +372,22 @@ def build_bank_account_doc(account: PlaidAccount, bank_name: str,
 
 
 def find_or_create_bank_account(client: ERPNextClient, account: PlaidAccount,
-                                bank_name: str, institution: str) -> tuple[str, bool]:
+                                bank_name: str, institution: str
+                                ) -> tuple[str, bool, bool]:
     """Find-or-create the Bank Account for this Plaid account. Returns
-    (docname, created)."""
+    (docname, created, retried) — retried is True when the create succeeded only
+    after the defensive path dropped a rejected field."""
     existing = _find_bank_account(client, account)
     if existing:
-        return existing, False
+        return existing, False, False
     doc = build_bank_account_doc(account, bank_name, institution)
-    created = _create_bank_account_defensive(client, doc, item_id=account.item_id)
+    created, retried = _create_bank_account_defensive(
+        client, doc, item_id=account.item_id)
     name = created.get('name')
     if not name:
         raise ERPNextAPIError('ERPNext returned no Bank Account name',
                               status_code=None)
-    return name, True
+    return name, True, retried
 
 
 # ── per-account import ──────────────────────────────────────────────────────
@@ -347,13 +411,14 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
     if account.erpnext_bank_account_name:
         return {'status': 'skipped', 'bank_account': account.erpnext_bank_account_name,
                 'bank': None, 'created_account': False, 'created_bank': False,
-                'message': 'already mapped'}
+                'retried': False, 'message': 'already mapped'}
 
     if not is_supported(account):
         account.import_status = 'unsupported'
         db.session.commit()
         return {'status': 'unsupported', 'bank_account': None, 'bank': None,
                 'created_account': False, 'created_bank': False,
+                'retried': False,
                 'message': f'{account.type}/{account.subtype} not supported'}
 
     client = client or get_client()
@@ -373,7 +438,7 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
     created_bank = not banks_before
 
     # Bank Account (find-or-create, deduped on plaid_account_id).
-    docname, created_account = find_or_create_bank_account(
+    docname, created_account, retried = find_or_create_bank_account(
         client, account, bank_name, institution)
 
     account.erpnext_bank_account_name = docname
@@ -387,7 +452,7 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
     log.info('import: %s → %s', account.account_id, docname)
     return {'status': 'imported', 'bank_account': docname, 'bank': bank_name,
             'created_account': created_account, 'created_bank': created_bank,
-            'message': msg}
+            'retried': retried, 'message': msg}
 
 
 def _bank_exists(client: ERPNextClient, bank_name: str) -> bool:
@@ -411,7 +476,7 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
     bootstrap(client)  # Bank Account Types + custom fields, once for the batch
 
     stats = {'created': 0, 'unsupported': 0, 'skipped_mapped': 0,
-             'failed': 0, 'considered': 0, 'errors': []}
+             'retried': 0, 'failed': 0, 'considered': 0, 'errors': []}
     for account in PlaidAccount.query.order_by(PlaidAccount.name).all():
         if account.erpnext_bank_account_name:
             stats['skipped_mapped'] += 1
@@ -428,6 +493,8 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
                 ensure_fields=False)
             if result['status'] == 'imported':
                 stats['created'] += 1
+                if result.get('retried'):
+                    stats['retried'] += 1
         except (ERPNextAPIError, ERPNextError) as e:
             db.session.rollback()
             stats['failed'] += 1
@@ -441,7 +508,9 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
     total = stats['created'] + stats['unsupported'] + stats['failed']
     parts = [f"Created {stats['created']}/{total} accounts"]
     if stats['unsupported']:
-        parts.append(f"skipped {stats['unsupported']} unsupported types")
+        parts.append(f"skipped {stats['unsupported']} unsupported")
+    if stats['retried']:
+        parts.append(f"{stats['retried']} retried successfully")
     if stats['failed']:
         parts.append(f"{stats['failed']} failed")
     stats['summary'] = ', '.join(parts) + '.'

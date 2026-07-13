@@ -255,6 +255,46 @@ class TestBankAccountTypes(ImportBase):
         self.assertIn('Credit', erp.created['Bank Account Type'])
 
 
+class TestAccountSubtypes(ImportBase):
+    """Bug 3 — `Bank Account.account_subtype` is a Link on Tim's instance, so the
+    subtype values we send must exist as Account Subtype records. Bootstrap
+    provisions them idempotently, in Title Case."""
+
+    def _created_subtypes(self, erp):
+        return [c for c in erp.calls
+                if c[0] == 'create_doc' and c[1] == 'Account Subtype']
+
+    def test_account_subtypes_created_when_missing(self):
+        erp = FakeERPClient()   # none exist (GET → 404)
+        erpnext_accounts.ensure_account_subtypes(erp)
+        created = self._created_subtypes(erp)
+        self.assertEqual(len(created),
+                         len(erpnext_accounts.DEFAULT_ACCOUNT_SUBTYPES))
+        names = set(erp.created['Account Subtype'].keys())
+        self.assertEqual(names, set(erpnext_accounts.DEFAULT_ACCOUNT_SUBTYPES))
+        # Title Case, per Frappe docname convention.
+        self.assertIn('Checking', names)
+        self.assertIn('Credit Card', names)
+        self.assertNotIn('checking', names)
+
+    def test_account_subtypes_skip_when_present(self):
+        erp = FakeERPClient(
+            existing_subtypes=set(erpnext_accounts.DEFAULT_ACCOUNT_SUBTYPES))
+        erpnext_accounts.ensure_account_subtypes(erp)
+        self.assertEqual(len(self._created_subtypes(erp)), 0)
+
+    def test_bootstrap_provisions_subtypes(self):
+        self._item()
+        self._account('acct-1', subtype='checking')
+        erp = FakeERPClient()
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertIn('Checking', erp.created['Account Subtype'])
+        self.assertIn('Savings', erp.created['Account Subtype'])
+        # And the send-side value matches the provisioned docname (Title Case).
+        ba_doc = erp.creates_of('Bank Account')[0][2]
+        self.assertEqual(ba_doc['account_subtype'], 'Checking')
+
+
 class TestBulkImport(ImportBase):
     def test_five_supported_three_unsupported(self):
         self._item()
@@ -274,6 +314,19 @@ class TestBulkImport(ImportBase):
         mapped = PlaidAccount.query.filter(
             PlaidAccount.erpnext_bank_account_name.isnot(None)).count()
         self.assertEqual(mapped, 5)
+
+    def test_bulk_summary_includes_retried_count(self):
+        self._item()
+        self._account('acct-1', subtype='checking')
+        self._account('acct-2', subtype='savings')
+        # Both accounts hit the LinkValidationError, drop account_subtype, retry
+        # and succeed → 2 created, 2 retried.
+        erp = FakeERPClient(link_reject_fields={'account_subtype'})
+        stats = erpnext_accounts.import_all_supported_accounts(client=erp)
+        self.assertEqual(stats['created'], 2)
+        self.assertEqual(stats['retried'], 2)
+        self.assertEqual(stats['failed'], 0)
+        self.assertIn('2 retried successfully', stats['summary'])
 
     def test_already_mapped_silently_skipped(self):
         self._item()
@@ -364,6 +417,49 @@ class TestDefensiveFieldDrop(ImportBase):
         retry_rows = PlaidSyncLog.query.filter_by(status='retry').all()
         self.assertEqual(len(retry_rows), 1)
         self.assertIn('account_subtype', retry_rows[0].error_message)
+
+    def test_retry_drops_account_subtype_on_link_validation_error(self):
+        """Bug 3 — ERPNext rejects account_subtype with a LinkValidationError
+        ('Could not find Account Subtype: savings') because the link target is
+        missing. The defensive path drops the field and retries once."""
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='savings', mask='0000')
+        erp = FakeERPClient(link_reject_fields={'account_subtype'})
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+
+        self.assertEqual(result['status'], 'imported')
+        self.assertTrue(result['created_account'])
+        self.assertTrue(result['retried'])
+        # Two POSTs: the first (rejected) with the field, the retry without it.
+        creates = erp.creates_of('Bank Account')
+        self.assertEqual(len(creates), 2)
+        self.assertIn('account_subtype', creates[0][2])
+        self.assertNotIn('account_subtype', creates[1][2])
+        # The retry decision names the field and the LinkValidationError cause.
+        retry_rows = PlaidSyncLog.query.filter_by(status='retry').all()
+        self.assertEqual(len(retry_rows), 1)
+        self.assertIn('account_subtype', retry_rows[0].error_message)
+        self.assertIn('LinkValidationError', retry_rows[0].error_message)
+
+    def test_could_not_find_matches_spaced_label(self):
+        # The Link error names the Title Case label ('Account Subtype'), not the
+        # snake_case fieldname — _unknown_fields_in must match the spaced form.
+        doc = {'account_name': 'X', 'bank': 'B', 'account_type': 'Current',
+               'account_subtype': 'Savings'}
+        body = 'LinkValidationError: Could not find Account Subtype: Savings'
+        self.assertEqual(
+            erpnext_accounts._unknown_fields_in(body, doc), ['account_subtype'])
+
+    def test_mandatory_error_is_not_retried(self):
+        self._item()
+        self._account('acct-1', subtype='checking')
+        # A 417 mandatory-field error → surfaced, never retried.
+        erp = FakeERPClient(bank_account_error=(
+            417, '{"exception": "MandatoryError: company is mandatory"}'))
+        stats = erpnext_accounts.import_all_supported_accounts(client=erp)
+        self.assertEqual(stats['failed'], 1)
+        self.assertEqual(stats['created'], 0)
+        self.assertEqual(len(erp.creates_of('Bank Account')), 1)   # no retry
 
     def test_unknown_fields_never_drops_essential(self):
         doc = {'account_name': 'X', 'bank': 'B', 'account_type': 'Current',

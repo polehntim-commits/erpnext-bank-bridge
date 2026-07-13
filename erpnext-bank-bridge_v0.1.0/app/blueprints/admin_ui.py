@@ -719,20 +719,24 @@ def test_erpnext_connection():
     ok, detail = erpnext_bank.test_connection()
     msg = f'Connected as {detail}' if ok else str(detail)
     if ok:
-        # Provision the Current/Credit Bank Account Type records as part of setup
-        # validation, so the first account import can't fail on a missing one.
+        # Provision the Current/Credit Bank Account Type records and the Account
+        # Subtype link targets as part of setup validation, so the first account
+        # import can't fail on a missing one.
         try:
-            erpnext_accounts.ensure_bank_account_types(erpnext_accounts.get_client())
-            msg += ' · Bank Account Types ready.'
+            _client = erpnext_accounts.get_client()
+            erpnext_accounts.ensure_bank_account_types(_client)
+            erpnext_accounts.ensure_account_subtypes(_client)
+            msg += ' · Bank Account Types & Subtypes ready.'
         except (ERPNextConfigError, ERPNextError) as e:
-            msg += f' · (couldn’t set up Bank Account Types: {e})'
+            msg += f' · (couldn’t set up Bank Account Types/Subtypes: {e})'
     return _erpnext_settings_page(probe={'ok': ok, 'detail': msg})
 
 
 @bp.post('/admin/erpnext_settings/ensure_fields')
 def ensure_erpnext_fields():
-    """Idempotently provision the Bank Account Type records (Current/Credit) and
-    the custom fields (plaid_account_id, last_4) the import flow depends on."""
+    """Idempotently provision the Bank Account Type records (Current/Credit), the
+    Account Subtype link targets, and the custom fields (plaid_account_id,
+    last_4) the import flow depends on."""
     if not erps.is_configured():
         return _erpnext_settings_page(
             probe={'ok': False,
@@ -743,8 +747,9 @@ def ensure_erpnext_fields():
         return _erpnext_settings_page(probe={'ok': False, 'detail': str(e)})
     return _erpnext_settings_page(probe={
         'ok': True,
-        'detail': 'Bank Account Type records (Current, Credit) and custom fields '
-                  '(plaid_account_id, last_4) are in place.'})
+        'detail': 'Bank Account Type records (Current, Credit), Account Subtype '
+                  'records, and custom fields (plaid_account_id, last_4) are in '
+                  'place.'})
 
 
 @bp.post('/admin/erpnext_settings/verify_doctype')
