@@ -1,0 +1,53 @@
+version: "3.8"
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: bankbridge_db
+    restart: on-failure
+    environment:
+      POSTGRES_USER: bankbridge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev-postgres-password}
+      POSTGRES_DB: bankbridge
+    volumes:
+      - bankbridge_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bankbridge -d bankbridge"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  server:
+    build: .
+    container_name: bankbridge
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "5202:5202"
+    environment:
+      DATA_DIR: /data
+      SECRET_KEY: ${SECRET_KEY:-dev-not-for-production}
+      DATABASE_URL: postgresql://bankbridge:${POSTGRES_PASSWORD:-dev-postgres-password}@db:5432/bankbridge
+      # Plaid — blank by default; configure at /admin/plaid_settings (persisted
+      # to the data volume, wins over these). Set here only for a headless run.
+      PLAID_CLIENT_ID: ${PLAID_CLIENT_ID:-}
+      PLAID_SECRET: ${PLAID_SECRET:-}
+      PLAID_ENV: ${PLAID_ENV:-sandbox}
+      PLAID_REDIRECT_URI: ${PLAID_REDIRECT_URI:-http://umbrel.local:5202/plaid/oauth_return}
+      # ERPNext — blank by default; configure at /admin/erpnext_settings.
+      ERPNEXT_URL: ${ERPNEXT_URL:-http://umbrel.local:5300}
+      ERPNEXT_API_KEY: ${ERPNEXT_API_KEY:-}
+      ERPNEXT_API_SECRET: ${ERPNEXT_API_SECRET:-}
+      ERPNEXT_DEFAULT_COMPANY: ${ERPNEXT_DEFAULT_COMPANY:-}
+      # Fernet key for access-token encryption — blank autogenerates + persists
+      # to {DATA_DIR}/fernet.key. Set to pin/rotate a known key.
+      FERNET_KEY: ${FERNET_KEY:-}
+      SYNC_INTERVAL_HOURS: ${SYNC_INTERVAL_HOURS:-6}
+    volumes:
+      # /data holds the Fernet key + plaid/erpnext settings JSON + scheduler
+      # lock. Postgres data lives on its own named volume above.
+      - bankbridge_data:/data
+
+volumes:
+  bankbridge_data:
+  bankbridge_pgdata:
