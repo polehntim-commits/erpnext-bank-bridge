@@ -73,7 +73,8 @@ class FakeERPClient:
     def __init__(self, bank_accounts=None, fail_create=False,
                  fail_bank_account=False, existing_types=None,
                  reject_fields=None, bank_account_error=None,
-                 existing_subtypes=None, link_reject_fields=None):
+                 existing_subtypes=None, link_reject_fields=None,
+                 missing_doctypes=None):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -95,6 +96,12 @@ class FakeERPClient:
         # Optional (status_code, body) for an *unrelated* Bank Account failure —
         # a rejection the defensive path must NOT retry.
         self.bank_account_error = bank_account_error
+        # Doctypes this ERPNext doesn't have installed at all — the existence
+        # probe (get_doc / list_docs) raises the exact 500 ImportError Frappe
+        # returns for a missing module, e.g. Tim's broken Account Subtype:
+        #   {"exception":"Error: No module named
+        #    'frappe.core.doctype.account_subtype'","exc_type":"ImportError"}
+        self.missing_doctypes = set(missing_doctypes or ())
         # Bank Account Type records that already exist in ERPNext (get_doc hits).
         self.existing_types = set(existing_types or ())
         # Account Subtype records that already exist in ERPNext (get_doc hits).
@@ -106,9 +113,22 @@ class FakeERPClient:
     def get_logged_user(self):
         return 'admin@example.com'
 
+    def _maybe_missing(self, doctype):
+        """Raise the 500 ImportError Frappe returns when a doctype's Python
+        module isn't installed — for doctypes flagged as missing on this fake."""
+        if doctype in self.missing_doctypes:
+            from app.erpnext_client import ERPNextAPIError
+            module = doctype.lower().replace(' ', '_')
+            raise ERPNextAPIError(
+                f'GET /api/resource/{doctype} -> 500', status_code=500,
+                response_body=('{"exception":"Error: No module named '
+                               f"'frappe.core.doctype.{module}'\",\"exc_type\""
+                               ':"ImportError"}'))
+
     def get_doc(self, doctype, name):
         """Return a doc dict, or None on 'not found' (the real client's 404)."""
         self.calls.append(('get_doc', doctype, name))
+        self._maybe_missing(doctype)
         if doctype == 'Bank Account Type':
             if name in self.existing_types or name in self.created['Bank Account Type']:
                 return {'name': name}
@@ -131,6 +151,7 @@ class FakeERPClient:
     def list_docs(self, doctype, filters=None, fields=None,
                   limit_page_length=0, order_by=None):
         self.calls.append(('list_docs', doctype, filters))
+        self._maybe_missing(doctype)
         if doctype == 'Bank Transaction' and filters:
             for f in filters:
                 if f[0] == 'reference_number' and f[1] == '=':

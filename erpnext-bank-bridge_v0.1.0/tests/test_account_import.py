@@ -23,6 +23,7 @@ os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 
 from app import create_app, db, crypto  # noqa: E402
 from app import erpnext_accounts, erpnext_settings  # noqa: E402
+from app.erpnext_client import ERPNextError  # noqa: E402
 from app.models import PlaidAccount, PlaidItem, PlaidSyncLog  # noqa: E402
 
 from tests.fakes import FakeERPClient  # noqa: E402
@@ -486,6 +487,96 @@ class TestDefensiveFieldDrop(ImportBase):
         self.assertTrue(rows)
         self.assertTrue(any('LinkValidationError' in (r.error_message or '')
                             for r in rows))
+
+
+class TestMissingLinkedDoctypes(ImportBase):
+    """Fix 4 — some ERPNext instances don't have (or have a broken) linked
+    doctype. Tim's returns HTTP 500 'No module named …' for the Account Subtype
+    probe. Bootstrap must survive it (log-warn, mark unavailable, don't raise),
+    and the send-side must drop the dependent field so the import still runs."""
+
+    def test_bootstrap_survives_missing_account_subtype_doctype(self):
+        erp = FakeERPClient(missing_doctypes={'Account Subtype'})
+        with self.assertLogs('bankbridge.erpnext.accounts', level='WARNING') as cm:
+            status = erpnext_accounts.bootstrap(erp)   # must NOT raise
+        self.assertFalse(status[erpnext_accounts.ACCOUNT_SUBTYPE_DT])
+        self.assertTrue(status[erpnext_accounts.BANK_ACCOUNT_TYPE_DT])
+        self.assertTrue(status['partial'])
+        self.assertTrue(erpnext_accounts.is_doctype_unavailable('Account Subtype'))
+        # Nothing provisioned for the missing doctype.
+        self.assertEqual(len(erp.created['Account Subtype']), 0)
+        self.assertTrue(any('Account Subtype doctype unavailable' in m
+                            for m in cm.output))
+
+    def test_send_side_drops_account_subtype_when_unavailable(self):
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(missing_doctypes={'Account Subtype'})
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+
+        self.assertEqual(result['status'], 'imported')
+        self.assertTrue(result['created_account'])
+        # A single, clean POST — the field was dropped up-front, not retried.
+        creates = erp.creates_of('Bank Account')
+        self.assertEqual(len(creates), 1)
+        self.assertNotIn('account_subtype', creates[0][2])
+        # The other fields still ride along.
+        self.assertEqual(creates[0][2]['account_type'], 'Current')
+        self.assertEqual(creates[0][2]['plaid_account_id'], 'acct-1')
+
+    def test_bootstrap_survives_missing_bank_account_type_doctype(self):
+        erp = FakeERPClient(missing_doctypes={'Bank Account Type'})
+        status = erpnext_accounts.bootstrap(erp)   # must NOT raise
+        self.assertFalse(status[erpnext_accounts.BANK_ACCOUNT_TYPE_DT])
+        self.assertTrue(status[erpnext_accounts.ACCOUNT_SUBTYPE_DT])
+        self.assertTrue(erpnext_accounts.is_doctype_unavailable('Bank Account Type'))
+        self.assertEqual(len(erp.created['Bank Account Type']), 0)
+
+    def test_send_side_drops_account_type_when_unavailable(self):
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(missing_doctypes={'Bank Account Type'})
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+
+        self.assertEqual(result['status'], 'imported')
+        creates = erp.creates_of('Bank Account')
+        self.assertEqual(len(creates), 1)
+        # account_type dropped (its Bank Account Type doctype is unavailable) …
+        self.assertNotIn('account_type', creates[0][2])
+        # … and it's no longer treated as an essential (never-dropped) field.
+        self.assertNotIn('account_type',
+                         erpnext_accounts._essential_bank_account_fields())
+
+    def test_admin_page_survives_bootstrap_failure(self):
+        """The Accounts page must render even when ERPNext is broken and a
+        bootstrap step failed — with the partial-bootstrap banner."""
+        self._item()
+        self._account('acct-1', subtype='checking')
+        erp = FakeERPClient(missing_doctypes={'Account Subtype'})
+        # An import triggers the partial bootstrap (marks Account Subtype
+        # unavailable) but must not poison the session or raise.
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        client = self.app.test_client()
+        # ERPNext is unreachable for the dropdown too — the page still loads.
+        with mock.patch('app.erpnext_bank.list_bank_accounts',
+                        side_effect=ERPNextError('ERPNext down')):
+            r = client.get('/admin/accounts')
+        self.assertEqual(r.status_code, 200)
+        body = r.get_data(as_text=True)
+        self.assertIn('ERPNext bootstrap partially failed', body)
+        self.assertIn('Account Subtype', body)
+
+    def test_test_connection_reports_per_doctype_status(self):
+        erpnext_settings.save('http://erp.test', 'K', 'SECRET', 'Example Company LLC')
+        erp = FakeERPClient(missing_doctypes={'Account Subtype'})
+        client = self.app.test_client()
+        with mock.patch('app.erpnext_bank.get_client', return_value=erp):
+            r = client.post('/admin/erpnext_settings/test')
+        self.assertEqual(r.status_code, 200)
+        body = r.get_data(as_text=True)
+        self.assertIn('Bank Account Types: ready', body)
+        self.assertIn('Account Subtypes: unavailable', body)
+        self.assertIn('Custom fields: ready', body)
 
 
 class TestSyncLogWrites(ImportBase):

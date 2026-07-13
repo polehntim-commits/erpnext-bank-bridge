@@ -44,6 +44,57 @@ BANK_ACCOUNT_TYPE_DT = 'Bank Account Type'
 ACCOUNT_SUBTYPE_DT = 'Account Subtype'
 CUSTOM_FIELD_DT = 'Custom Field'
 
+# ── unavailable-doctype registry ────────────────────────────────────────────
+#
+# Some ERPNext / Frappe instances don't ship (or have a broken) `Account
+# Subtype` — Tim's returns HTTP 500 "No module named
+# 'frappe.core.doctype.account_subtype'" for the existence probe. Bootstrap must
+# not crash on that; instead it records the doctype as *unavailable* and the
+# send-side drops the fields that link to it. The registry is a per-app set so
+# it's process-local and resets on restart (bootstrap then re-discovers), and so
+# tests — each of which builds a fresh app — start clean. When there's no app
+# context (defensive), we fall back to a module-level set.
+_UNAVAILABLE_KEY = 'bankbridge_unavailable_doctypes'
+_fallback_unavailable: set[str] = set()
+
+
+def _unavailable_registry() -> set:
+    """The per-app set of ERPNext doctypes discovered to be unavailable."""
+    try:
+        store = current_app.extensions
+    except RuntimeError:  # pragma: no cover - no app context (defensive)
+        return _fallback_unavailable
+    return store.setdefault(_UNAVAILABLE_KEY, set())
+
+
+def _mark_doctype_unavailable(doctype: str) -> None:
+    _unavailable_registry().add(doctype)
+
+
+def _mark_doctype_available(doctype: str) -> None:
+    """Clear a prior 'unavailable' mark — bootstrap re-probed and it's back."""
+    _unavailable_registry().discard(doctype)
+
+
+def is_doctype_unavailable(doctype: str) -> bool:
+    return doctype in _unavailable_registry()
+
+
+def unavailable_doctypes() -> set:
+    """A copy of the set of doctypes bootstrap found unavailable in this
+    ERPNext (for the admin partial-bootstrap banner)."""
+    return set(_unavailable_registry())
+
+
+def _is_missing_doctype_error(e: ERPNextAPIError) -> bool:
+    """True when a Frappe error means the *doctype itself* isn't installed in
+    this ERPNext (its Python module is missing) rather than a normal
+    missing-document / permission error. Tim's instance returns HTTP 500 with
+    'No module named …' / ImportError for the Account Subtype probe."""
+    blob = ((e.response_body or '') + ' ' + str(e)).lower()
+    return e.status_code == 500 and ('no module named' in blob
+                                     or 'importerror' in blob)
+
 # The Bank Account Type records the import flow references. Stock ERPNext ships
 # without them, so an out-of-box instance would reject a Bank Account that links
 # one — we provision them as part of the idempotent bootstrap.
@@ -155,62 +206,120 @@ def _log(item_id: str, count: int, status: str, message: str = '') -> None:
 
 # ── bootstrap (Bank Account Type records + custom fields) ───────────────────
 
-def ensure_bank_account_types(client: ERPNextClient) -> None:
+def ensure_bank_account_types(client: ERPNextClient) -> bool:
     """Ensure ERPNext has the 'Current' and 'Credit' Bank Account Type records
     the import flow assigns. Stock ERPNext ships without them, so an out-of-box
     instance would error when a Bank Account references one. Idempotent: a record
-    is only created when the GET returns 404 (no existing doc)."""
+    is only created when the GET returns 404 (no existing doc).
+
+    Returns True if the doctype is available (provisioned or already present),
+    False if this ERPNext doesn't have the Bank Account Type doctype at all — in
+    which case we log-warn, mark it unavailable, and skip provisioning rather
+    than crashing bootstrap."""
     for name in DEFAULT_BANK_ACCOUNT_TYPES:
-        if client.get_doc(BANK_ACCOUNT_TYPE_DT, name) is not None:
+        try:
+            existing = client.get_doc(BANK_ACCOUNT_TYPE_DT, name)
+        except ERPNextAPIError as e:
+            if _is_missing_doctype_error(e):
+                log.warning('Bank Account Type doctype unavailable in this '
+                            'ERPNext; skipping provisioning (%s)', str(e)[:200])
+                _mark_doctype_unavailable(BANK_ACCOUNT_TYPE_DT)
+                return False
+            raise
+        if existing is not None:
             continue
         # Bank Account Type autonames from its `account_type` field, so the
         # created record's docname is exactly `name`.
         client.create_doc(BANK_ACCOUNT_TYPE_DT, {'account_type': name})
         log.info("created Bank Account Type '%s'", name)
+    _mark_doctype_available(BANK_ACCOUNT_TYPE_DT)
+    return True
 
 
-def ensure_account_subtypes(client: ERPNextClient) -> None:
+def ensure_account_subtypes(client: ERPNextClient) -> bool:
     """Ensure ERPNext has the Account Subtype records the import flow links from
     `Bank Account.account_subtype` (Checking, Savings, Current, …). Where that
     field is a Link, an out-of-box instance has no matching target and rejects
     the Bank Account create with a LinkValidationError. Idempotent: a record is
     only created when the GET returns 404. Docnames are Title Case, matching the
-    values erpnext_account_subtype sends."""
+    values erpnext_account_subtype sends.
+
+    Returns True if available, False if this ERPNext lacks the Account Subtype
+    doctype entirely (Tim's instance returns HTTP 500 'No module named …'). In
+    that case we log-warn, mark it unavailable, and skip — the send-side then
+    drops `account_subtype` so the import still succeeds."""
     for name in DEFAULT_ACCOUNT_SUBTYPES:
-        if client.get_doc(ACCOUNT_SUBTYPE_DT, name) is not None:
+        try:
+            existing = client.get_doc(ACCOUNT_SUBTYPE_DT, name)
+        except ERPNextAPIError as e:
+            if _is_missing_doctype_error(e):
+                log.warning('Account Subtype doctype unavailable in this '
+                            'ERPNext; skipping provisioning (%s)', str(e)[:200])
+                _mark_doctype_unavailable(ACCOUNT_SUBTYPE_DT)
+                return False
+            raise
+        if existing is not None:
             continue
         # Mirror Bank Account Type: the master autonames from its titling field,
         # so the created record's docname is exactly `name`.
         client.create_doc(ACCOUNT_SUBTYPE_DT, {'account_subtype': name})
         log.info("created Account Subtype '%s'", name)
+    _mark_doctype_available(ACCOUNT_SUBTYPE_DT)
+    return True
 
 
-def ensure_custom_fields(client: ERPNextClient) -> None:
+def ensure_custom_fields(client: ERPNextClient) -> bool:
     """Idempotently provision the Bank Account custom fields we rely on
     (`plaid_account_id`, `last_4`). A no-op once they exist — same pattern the
-    transaction bridge uses for its first push."""
+    transaction bridge uses for its first push.
+
+    Returns True if available, False if this ERPNext lacks the Custom Field
+    doctype (very unlikely — it's Frappe core — but handled for parity). When
+    unavailable the send-side drops the custom fields, degrading to a
+    no-dedup-key import rather than crashing bootstrap."""
     for spec in _CUSTOM_FIELDS:
-        existing = client.list_docs(
-            CUSTOM_FIELD_DT,
-            filters=[['dt', '=', BANK_ACCOUNT_DT],
-                     ['fieldname', '=', spec['fieldname']]],
-            fields=['name'], limit_page_length=1)
+        try:
+            existing = client.list_docs(
+                CUSTOM_FIELD_DT,
+                filters=[['dt', '=', BANK_ACCOUNT_DT],
+                         ['fieldname', '=', spec['fieldname']]],
+                fields=['name'], limit_page_length=1)
+        except ERPNextAPIError as e:
+            if _is_missing_doctype_error(e):
+                log.warning('Custom Field doctype unavailable in this ERPNext; '
+                            'skipping provisioning (%s)', str(e)[:200])
+                _mark_doctype_unavailable(CUSTOM_FIELD_DT)
+                return False
+            raise
         if existing:
             continue
         doc = {'dt': BANK_ACCOUNT_DT}
         doc.update(spec)
         client.create_doc(CUSTOM_FIELD_DT, doc)
         log.info('provisioned Bank Account custom field %s', spec['fieldname'])
+    _mark_doctype_available(CUSTOM_FIELD_DT)
+    return True
 
 
-def bootstrap(client: ERPNextClient) -> None:
+def bootstrap(client: ERPNextClient) -> dict:
     """Provision everything the import flow depends on, idempotently: the
     Current/Credit Bank Account Type records, the Account Subtype records, and
     the Bank Account custom fields. The link-target masters come first so a Bank
-    Account create can't fail on a missing link target."""
-    ensure_bank_account_types(client)
-    ensure_account_subtypes(client)
-    ensure_custom_fields(client)
+    Account create can't fail on a missing link target.
+
+    Resilient to instances that lack one of these linked doctypes: a missing
+    doctype is logged, recorded in the unavailable registry, and skipped — never
+    raised — so one broken doctype can't sink the whole bootstrap (or poison the
+    request that triggered it). Returns a per-doctype availability dict, e.g.
+    {'Bank Account Type': True, 'Account Subtype': False, 'Custom Field': True,
+    'partial': True}."""
+    status = {
+        BANK_ACCOUNT_TYPE_DT: ensure_bank_account_types(client),
+        ACCOUNT_SUBTYPE_DT: ensure_account_subtypes(client),
+        CUSTOM_FIELD_DT: ensure_custom_fields(client),
+    }
+    status['partial'] = not all(v for k, v in status.items() if k != 'partial')
+    return status
 
 
 # ── Bank find-or-create ─────────────────────────────────────────────────────
@@ -254,10 +363,47 @@ def find_or_create_bank(client: ERPNextClient, bank_name: str, *,
 
 
 # The Bank Account fields we will never drop on a retry — without them the doc
-# is meaningless. Everything else (account_subtype, is_company_account, company,
-# the custom fields) is "preferred": send it if ERPNext accepts it, drop it if
-# ERPNext rejects it as unknown.
-_ESSENTIAL_BANK_ACCOUNT_FIELDS = {'account_name', 'bank', 'account_type'}
+# is meaningless. account_name + bank are always essential. account_type is
+# essential ONLY when bootstrap has proved the Bank Account Type doctype exists;
+# if that doctype is unavailable the field is dropped up-front (see
+# _prune_unavailable_fields) and must not be treated as un-droppable, or every
+# import on such an instance would fail. Everything else (account_subtype,
+# is_company_account, company, the custom fields) is "preferred": send it if
+# ERPNext accepts it, drop it if ERPNext rejects it as unknown.
+_BASE_ESSENTIAL_BANK_ACCOUNT_FIELDS = {'account_name', 'bank'}
+
+# Which Bank Account payload fields link to which ERPNext doctype. If bootstrap
+# proved a doctype unavailable in this instance, the dependent field is dropped
+# from the POST — sending it would fail the whole import (missing link target or
+# unknown custom field), and we'd rather import a slightly leaner record.
+_FIELD_DOCTYPE_DEPS = {
+    'account_subtype': ACCOUNT_SUBTYPE_DT,
+    'account_type': BANK_ACCOUNT_TYPE_DT,
+    'plaid_account_id': CUSTOM_FIELD_DT,
+    'last_4': CUSTOM_FIELD_DT,
+}
+
+
+def _essential_bank_account_fields() -> set:
+    """Essential (never-dropped-on-retry) Bank Account fields, computed against
+    the unavailable registry. account_type is essential only while its Bank
+    Account Type doctype is available."""
+    fields = set(_BASE_ESSENTIAL_BANK_ACCOUNT_FIELDS)
+    if not is_doctype_unavailable(BANK_ACCOUNT_TYPE_DT):
+        fields.add('account_type')
+    return fields
+
+
+def _prune_unavailable_fields(doc: dict) -> dict:
+    """Drop payload fields whose linked doctype bootstrap found unavailable, so
+    a broken/missing ERPNext doctype degrades the import instead of failing it.
+    Mutates and returns `doc`."""
+    for field, doctype in _FIELD_DOCTYPE_DEPS.items():
+        if field in doc and is_doctype_unavailable(doctype):
+            doc.pop(field)
+            log.info('dropping Bank Account field %r (%s unavailable in this '
+                     'ERPNext)', field, doctype)
+    return doc
 
 # Substrings that mark a Frappe "you sent a field I don't have" rejection. When
 # one of these appears in a 417/422 body we retry once with the named field(s)
@@ -286,9 +432,10 @@ def _unknown_fields_in(body: str, doc: dict) -> list[str]:
     returned — if ERPNext rejects one of those the import genuinely can't
     succeed and should surface."""
     low = (body or '').lower()
+    essential = _essential_bank_account_fields()
     out = []
     for k in doc:
-        if k in _ESSENTIAL_BANK_ACCOUNT_FIELDS:
+        if k in essential:
             continue
         if k.lower() in low or k.lower().replace('_', ' ') in low:
             out.append(k)
@@ -339,7 +486,12 @@ def _create_bank_account_defensive(client: ERPNextClient, doc: dict, *,
 
 def _find_bank_account(client: ERPNextClient, account: PlaidAccount) -> str | None:
     """Existing Bank Account docname for this Plaid account, deduped on the
-    `plaid_account_id` custom field. None if not yet created."""
+    `plaid_account_id` custom field. None if not yet created. When the custom
+    field couldn't be provisioned (Custom Field doctype unavailable) there's no
+    dedup key to filter on, so we skip the lookup — the local mapping pointer is
+    then the only dedup guard."""
+    if is_doctype_unavailable(CUSTOM_FIELD_DT):
+        return None
     matches = client.list_docs(
         BANK_ACCOUNT_DT,
         filters=[['plaid_account_id', '=', account.account_id]],
@@ -368,7 +520,9 @@ def build_bank_account_doc(account: PlaidAccount, bank_name: str,
     company = _default_company()
     if company:
         doc['company'] = company
-    return doc
+    # Drop any field whose linked doctype bootstrap found unavailable in this
+    # ERPNext (e.g. account_subtype when Tim's instance has no Account Subtype).
+    return _prune_unavailable_fields(doc)
 
 
 def find_or_create_bank_account(client: ERPNextClient, account: PlaidAccount,
@@ -425,7 +579,14 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
     if ensure_fields:
         # First step, idempotent: guarantee the Bank Account Type records +
         # custom fields exist so the create below can't fail on a missing link.
-        bootstrap(client)
+        # A missing doctype is handled inside bootstrap (marked unavailable, not
+        # raised); any *other* bootstrap error is logged but must not sink the
+        # import — the create's own defensive retry is the backstop.
+        try:
+            bootstrap(client)
+        except ERPNextError:
+            log.warning('bootstrap failed before import; continuing on the '
+                        'create-side defensive path', exc_info=True)
 
     item = PlaidItem.query.filter_by(item_id=account.item_id).first()
     institution = ((item.institution_name if item else '') or '').strip() or 'Bank'
@@ -473,7 +634,15 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
     linked items. Already-mapped rows are silently skipped; unsupported rows are
     marked and counted. Returns aggregate stats plus a human summary."""
     client = client or get_client()
-    bootstrap(client)  # Bank Account Types + custom fields, once for the batch
+    # Bank Account Types + Account Subtypes + custom fields, once for the batch.
+    # Missing doctypes are marked unavailable inside bootstrap (not raised); any
+    # other bootstrap error is logged and the batch proceeds on the create-side
+    # defensive path rather than failing every account.
+    try:
+        bootstrap(client)
+    except ERPNextError:
+        log.warning('bootstrap failed before bulk import; continuing',
+                    exc_info=True)
 
     stats = {'created': 0, 'unsupported': 0, 'skipped_mapped': 0,
              'retried': 0, 'failed': 0, 'considered': 0, 'errors': []}

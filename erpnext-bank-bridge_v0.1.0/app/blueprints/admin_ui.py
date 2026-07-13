@@ -28,6 +28,21 @@ from ..models import (BankTransaction, PlaidAccount, PlaidItem, PlaidSyncLog)
 bp = Blueprint('admin_ui', __name__)
 
 
+@bp.before_request
+def _ensure_fresh_session():
+    """Guarantee every admin view starts with a usable SQLAlchemy session.
+
+    A failed ERPNext bootstrap (e.g. a broken/missing linked doctype throwing an
+    unexpected error mid-request) could otherwise leave the scoped session in an
+    aborted state, and the *next* DB query on the page would blow up with a
+    psycopg2 OperationalError. A rollback on a clean session is a harmless no-op,
+    so this is pure defense-in-depth."""
+    try:
+        db.session.rollback()
+    except Exception:  # pragma: no cover - never block a request on cleanup
+        db.session.remove()
+
+
 # ── Shared chrome ────────────────────────────────────────────────
 
 BASE_CSS = """
@@ -292,6 +307,15 @@ ACCOUNTS_BODY = """
   {% endif %}
 </div>
 {% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+{% if bootstrap_unavailable %}
+<div class="banner-warn">
+  <h3>ERPNext bootstrap partially failed — some import features may not work</h3>
+  This ERPNext instance is missing one or more linked doctypes
+  (<b>{{ bootstrap_unavailable|join(', ') }}</b>). Imports still run, but the
+  dependent fields are dropped from each Bank Account. Check the
+  <a href="/admin/sync_log">Sync Log</a> for details.
+</div>
+{% endif %}
 <p style="font-size:14px;color:#555">
   <b>Create in ERPNext</b> makes the matching <b>Bank</b> + <b>Bank Account</b>
   records for you (deduped — safe to click again) and maps + enables sync in one
@@ -390,6 +414,8 @@ def accounts_page():
                  bank_accounts=bank_accounts, bank_account_names=bank_account_names,
                  supported_map=supported_map, any_imported=any_imported,
                  erpnext_ok=erps.is_configured(),
+                 bootstrap_unavailable=sorted(
+                     erpnext_accounts.unavailable_doctypes()),
                  erp_error=erp_error, flash_msg=request.args.get('flash', ''))
 
 
@@ -710,6 +736,20 @@ def save_erpnext_settings():
     return redirect('/admin/erpnext_settings?flash=Saved')
 
 
+def _doctype_status_line(status: dict) -> str:
+    """Per-doctype availability, appended to the Test Connection message so the
+    operator sees which linked doctypes their ERPNext supports. Uses the
+    bootstrap() result dict ({doctype: bool, 'partial': bool})."""
+    def mark(ok):
+        return 'ready ✓' if ok else 'unavailable ⚠'
+    parts = [
+        f"Bank Account Types: {mark(status.get(erpnext_accounts.BANK_ACCOUNT_TYPE_DT))}",
+        f"Account Subtypes: {mark(status.get(erpnext_accounts.ACCOUNT_SUBTYPE_DT))}",
+        f"Custom fields: {mark(status.get(erpnext_accounts.CUSTOM_FIELD_DT))}",
+    ]
+    return ' · ' + ' · '.join(parts)
+
+
 @bp.post('/admin/erpnext_settings/test')
 def test_erpnext_connection():
     if not erps.is_configured():
@@ -719,16 +759,15 @@ def test_erpnext_connection():
     ok, detail = erpnext_bank.test_connection()
     msg = f'Connected as {detail}' if ok else str(detail)
     if ok:
-        # Provision the Current/Credit Bank Account Type records and the Account
-        # Subtype link targets as part of setup validation, so the first account
-        # import can't fail on a missing one.
+        # Run the full bootstrap as part of setup validation and report which
+        # linked doctypes this ERPNext actually supports, so the operator sees at
+        # a glance what will work. Bootstrap is resilient — a missing doctype is
+        # reported as unavailable, not raised.
         try:
-            _client = erpnext_accounts.get_client()
-            erpnext_accounts.ensure_bank_account_types(_client)
-            erpnext_accounts.ensure_account_subtypes(_client)
-            msg += ' · Bank Account Types & Subtypes ready.'
+            status = erpnext_accounts.bootstrap(erpnext_accounts.get_client())
+            msg += _doctype_status_line(status)
         except (ERPNextConfigError, ERPNextError) as e:
-            msg += f' · (couldn’t set up Bank Account Types/Subtypes: {e})'
+            msg += f' · (couldn’t provision linked doctypes: {e})'
     return _erpnext_settings_page(probe={'ok': ok, 'detail': msg})
 
 
@@ -742,14 +781,15 @@ def ensure_erpnext_fields():
             probe={'ok': False,
                    'detail': 'Not configured — set URL + API key + secret first.'})
     try:
-        erpnext_accounts.bootstrap(erpnext_accounts.get_client())
+        status = erpnext_accounts.bootstrap(erpnext_accounts.get_client())
     except (ERPNextConfigError, ERPNextError) as e:
         return _erpnext_settings_page(probe={'ok': False, 'detail': str(e)})
-    return _erpnext_settings_page(probe={
-        'ok': True,
-        'detail': 'Bank Account Type records (Current, Credit), Account Subtype '
-                  'records, and custom fields (plaid_account_id, last_4) are in '
-                  'place.'})
+    detail = ('Provisioned the Bank Account Type records (Current, Credit), '
+              'Account Subtype records, and custom fields (plaid_account_id, '
+              'last_4) where this ERPNext supports them.'
+              + _doctype_status_line(status))
+    return _erpnext_settings_page(probe={'ok': not status['partial'],
+                                         'detail': detail})
 
 
 @bp.post('/admin/erpnext_settings/verify_doctype')
