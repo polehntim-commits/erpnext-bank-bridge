@@ -50,10 +50,23 @@ class ERPNextAPIError(ERPNextError):
     `response_body` is the raw text (possibly a Frappe traceback / _server_
     messages blob) so callers can log it."""
 
+    # How much of the (often huge) Frappe traceback/_server_messages blob to
+    # fold into the human error string. The full body stays on .response_body.
+    BODY_SNIPPET = 500
+
     def __init__(self, message, status_code=None, response_body=''):
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body or ''
+
+    def __str__(self):
+        """Base message plus a truncated response body, so every place that
+        logs/flashes str(e) (sync log, admin flash, server log) shows the actual
+        Frappe error — not just 'POST … -> 417'."""
+        base = super().__str__()
+        if self.response_body:
+            return f'{base}: {self.response_body[:self.BODY_SNIPPET]}'
+        return base
 
 
 @dataclass
@@ -178,6 +191,12 @@ class ERPNextClient:
         if resp.status_code >= 400:
             error = f'HTTP {resp.status_code}'
             self._emit_log(method, url, resp.status_code, req_body, text, error)
+            # Surface every real 4xx in the server log with the Frappe body so a
+            # failure is diagnosable from `docker logs` alone. 404 is skipped: it
+            # is normal find-or-create control flow (get_doc probes swallow it).
+            if resp.status_code != 404:
+                log.warning('erpnext %s %s -> %d: %s', method, url,
+                            resp.status_code, text[:ERPNextAPIError.BODY_SNIPPET])
             raise ERPNextAPIError(
                 f'{method} {url} -> {resp.status_code}',
                 status_code=resp.status_code, response_body=text)

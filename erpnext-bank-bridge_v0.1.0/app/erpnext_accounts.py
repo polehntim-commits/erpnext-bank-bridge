@@ -222,6 +222,58 @@ def find_or_create_bank(client: ERPNextClient, bank_name: str, *,
     return created.get('name') or bank_name
 
 
+# The Bank Account fields we will never drop on a retry — without them the doc
+# is meaningless. Everything else (account_subtype, is_company_account, company,
+# the custom fields) is "preferred": send it if ERPNext accepts it, drop it if
+# ERPNext rejects it as unknown.
+_ESSENTIAL_BANK_ACCOUNT_FIELDS = {'account_name', 'bank', 'account_type'}
+
+# Substrings that mark a Frappe "you sent a field I don't have" rejection. When
+# one of these appears in a 417/422 body we retry once with the named field(s)
+# stripped, rather than failing the whole import.
+_UNKNOWN_FIELD_HINTS = (
+    'not a valid field', 'unknown field', 'does not have field',
+    'has no field', 'no field named',
+)
+
+
+def _unknown_fields_in(body: str, doc: dict) -> list[str]:
+    """The preferred (droppable) doc fields explicitly named in an ERPNext
+    'unknown field' error body. Essential fields are never returned — if ERPNext
+    rejects one of those the import genuinely can't succeed and should surface."""
+    low = (body or '').lower()
+    return [k for k in doc
+            if k not in _ESSENTIAL_BANK_ACCOUNT_FIELDS and k.lower() in low]
+
+
+def _create_bank_account_defensive(client: ERPNextClient, doc: dict, *,
+                                   item_id: str = '') -> dict:
+    """POST a Bank Account, and if ERPNext rejects a preferred field as unknown
+    (417/422 with a 'not a valid field' style body), retry ONCE with that field
+    (or fields) stripped. The retry decision — which field, and the original
+    Frappe error — is written to the sync log so the fallback is traceable.
+
+    A non-field error, or a field-error naming only essential fields, is
+    re-raised unchanged (its response body rides along on the exception)."""
+    try:
+        return client.create_doc(BANK_ACCOUNT_DT, doc)
+    except ERPNextAPIError as e:
+        body = e.response_body or ''
+        low = body.lower()
+        if e.status_code not in (417, 422) or not any(h in low for h in _UNKNOWN_FIELD_HINTS):
+            raise
+        drop = _unknown_fields_in(body, doc)
+        if not drop:
+            raise
+        retry_doc = {k: v for k, v in doc.items() if k not in drop}
+        msg = (f"ERPNext rejected Bank Account field(s) {', '.join(drop)}; "
+               f'retrying once without them. Original error: {str(e)[:400]}')
+        log.warning('Bank Account create rejected %s; retrying without: %s',
+                    drop, str(e)[:200])
+        _log(item_id, 0, 'retry', msg)
+        return client.create_doc(BANK_ACCOUNT_DT, retry_doc)
+
+
 # ── Bank Account find-or-create ─────────────────────────────────────────────
 
 def _find_bank_account(client: ERPNextClient, account: PlaidAccount) -> str | None:
@@ -266,7 +318,7 @@ def find_or_create_bank_account(client: ERPNextClient, account: PlaidAccount,
     if existing:
         return existing, False
     doc = build_bank_account_doc(account, bank_name, institution)
-    created = client.create_doc(BANK_ACCOUNT_DT, doc)
+    created = _create_bank_account_defensive(client, doc, item_id=account.item_id)
     name = created.get('name')
     if not name:
         raise ERPNextAPIError('ERPNext returned no Bank Account name',
@@ -379,8 +431,12 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
         except (ERPNextAPIError, ERPNextError) as e:
             db.session.rollback()
             stats['failed'] += 1
-            stats['errors'].append(f'{account.name or account.mask}: {e}')
+            detail = f'{account.name or account.mask}: {e}'
+            stats['errors'].append(detail)
             log.warning('bulk import failed for %s: %s', account.account_id, e)
+            # One sync-log row per failure carrying the actual Frappe body (via
+            # str(e)), so the operator can diagnose each rejection at /admin/sync_log.
+            _log(account.item_id, 0, 'failed', detail)
 
     total = stats['created'] + stats['unsupported'] + stats['failed']
     parts = [f"Created {stats['created']}/{total} accounts"]
@@ -389,6 +445,11 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
     if stats['failed']:
         parts.append(f"{stats['failed']} failed")
     stats['summary'] = ', '.join(parts) + '.'
+    # The final batch row folds in the individual errors so the summary line is
+    # self-contained for triage (error_message is TEXT — the detail fits).
+    summary_msg = stats['summary']
+    if stats['errors']:
+        summary_msg += ' | ' + ' ; '.join(stats['errors'][:10])
     _log('', stats['created'], 'failed' if stats['failed'] and not stats['created']
-         else 'success', stats['summary'])
+         else 'success', summary_msg)
     return stats

@@ -42,6 +42,53 @@ def _add_column_if_missing(table: str, column: str, ddl_type: str,
     log.info('migration: added %s.%s', table, column)
 
 
+def _column(table: str, column: str) -> dict | None:
+    """The live column info dict for <table>.<column>, or None if either the
+    table or the column is absent."""
+    insp = inspect(db.engine)
+    if table not in insp.get_table_names():
+        return None
+    for c in insp.get_columns(table):
+        if c['name'] == column:
+            return c
+    return None
+
+
+def _widen_column(table: str, column: str, target_ddl: str,
+                  min_length: int) -> None:
+    """Widen <table>.<column> to <target_ddl> when its current declared length
+    is smaller than <min_length>. No-op on SQLite (which doesn't enforce VARCHAR
+    length, so a fresh test DB is already correct via the model) and when the
+    column is already unbounded (TEXT → declared length is None) or wide enough.
+    Idempotent: once widened, the length check short-circuits on the next boot."""
+    if db.engine.dialect.name == 'sqlite':
+        return
+    col = _column(table, column)
+    if col is None:
+        return
+    length = getattr(col['type'], 'length', None)
+    if length is not None and length < min_length:
+        with db.engine.begin() as conn:
+            conn.execute(text(
+                f'ALTER TABLE {table} ALTER COLUMN {column} TYPE {target_ddl}'))
+        log.info('migration: widened %s.%s to %s', table, column, target_ddl)
+
+
+def _drop_not_null(table: str, column: str) -> None:
+    """Drop a NOT NULL constraint from <table>.<column> so a batch action can
+    log with a NULL/'' item_id. No-op on SQLite and when the column is already
+    nullable. Idempotent."""
+    if db.engine.dialect.name == 'sqlite':
+        return
+    col = _column(table, column)
+    if col is None or col.get('nullable', True):
+        return
+    with db.engine.begin() as conn:
+        conn.execute(text(
+            f'ALTER TABLE {table} ALTER COLUMN {column} DROP NOT NULL'))
+    log.info('migration: made %s.%s nullable', table, column)
+
+
 def run_migrations() -> None:
     """Apply all pending additive migrations. Call inside an app context, right
     after db.create_all(). Safe to call on every boot."""
@@ -50,5 +97,14 @@ def run_migrations() -> None:
         # been auto-provisioned into ERPNext.
         _add_column_if_missing('plaid_accounts', 'import_status',
                                'VARCHAR(20)', default_sql="'pending'")
+        # v0.1.2 — the account-import audit line logs direction
+        # 'erpnext_account_import' (22 chars), which overflows the original
+        # VARCHAR(20) and made the commit fail on Postgres (the log row silently
+        # never persisted). Widen direction, guarantee error_message is TEXT so
+        # a captured Frappe traceback/body fits, and drop item_id's NOT NULL so
+        # a batch action can log without a single owning item.
+        _widen_column('plaid_sync_log', 'direction', 'VARCHAR(64)', 64)
+        _widen_column('plaid_sync_log', 'error_message', 'TEXT', 10 ** 9)
+        _drop_not_null('plaid_sync_log', 'item_id')
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)

@@ -342,5 +342,105 @@ class TestEndpoints(ImportBase):
         self.assertIn('Import all supported accounts', body)
 
 
+class TestDefensiveFieldDrop(ImportBase):
+    """Bug 1b — ERPNext rejects a preferred Bank Account field as unknown; the
+    import retries once with it stripped instead of failing the whole batch."""
+
+    def test_retry_drops_unknown_field_and_succeeds(self):
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        # ERPNext on this instance has no account_subtype field on Bank Account.
+        erp = FakeERPClient(reject_fields={'account_subtype'})
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+
+        self.assertEqual(result['status'], 'imported')
+        self.assertTrue(result['created_account'])
+        # Two POSTs: the first (rejected) with the field, the retry without it.
+        creates = erp.creates_of('Bank Account')
+        self.assertEqual(len(creates), 2)
+        self.assertIn('account_subtype', creates[0][2])
+        self.assertNotIn('account_subtype', creates[1][2])
+        # The retry decision was recorded to the sync log for traceability.
+        retry_rows = PlaidSyncLog.query.filter_by(status='retry').all()
+        self.assertEqual(len(retry_rows), 1)
+        self.assertIn('account_subtype', retry_rows[0].error_message)
+
+    def test_unknown_fields_never_drops_essential(self):
+        doc = {'account_name': 'X', 'bank': 'B', 'account_type': 'Current',
+               'account_subtype': 'checking'}
+        body = 'ValidationError: account_name is not a valid field, account_subtype too'
+        # account_name is essential → protected even though it's named.
+        self.assertEqual(
+            erpnext_accounts._unknown_fields_in(body, doc), ['account_subtype'])
+
+    def test_unrelated_error_is_not_retried_and_logs_body(self):
+        self._item()
+        self._account('acct-1', subtype='checking')
+        # A 417 whose body is NOT a field error → must surface, not retry.
+        erp = FakeERPClient(bank_account_error=(
+            417, '{"exception": "LinkValidationError: company is mandatory"}'))
+        stats = erpnext_accounts.import_all_supported_accounts(client=erp)
+
+        self.assertEqual(stats['failed'], 1)
+        self.assertEqual(stats['created'], 0)
+        # Exactly one Bank Account POST — no retry.
+        self.assertEqual(len(erp.creates_of('Bank Account')), 1)
+        # The actual Frappe body reached the sync log (per-failure row).
+        rows = PlaidSyncLog.query.filter_by(status='failed').all()
+        self.assertTrue(rows)
+        self.assertTrue(any('LinkValidationError' in (r.error_message or '')
+                            for r in rows))
+
+
+class TestSyncLogWrites(ImportBase):
+    """Bug 2 — the account-import audit line must actually persist. The
+    direction label 'erpnext_account_import' (22 chars) overflowed VARCHAR(20)
+    on Postgres and silently killed the commit."""
+
+    def test_direction_column_wide_enough(self):
+        # ORM-level regression guard, engine-independent: the declared length
+        # must fit the longest direction label we log.
+        length = PlaidSyncLog.__table__.c.direction.type.length
+        self.assertGreaterEqual(length, len('erpnext_account_import'))
+
+    def test_item_id_nullable(self):
+        self.assertTrue(PlaidSyncLog.__table__.c.item_id.nullable)
+
+    def test_log_persists_long_error_message(self):
+        big = 'E' * 600
+        erpnext_accounts._log('item-abc', 0, 'failed', big)
+        row = PlaidSyncLog.query.filter_by(direction='erpnext_account_import').first()
+        self.assertIsNotNone(row)
+        self.assertEqual(row.error_message, big)
+        self.assertEqual(row.status, 'failed')
+
+    def test_log_persists_empty_item_id(self):
+        erpnext_accounts._log('', 3, 'success', 'batch done')
+        row = PlaidSyncLog.query.filter_by(direction='erpnext_account_import').first()
+        self.assertIsNotNone(row)
+        self.assertEqual(row.item_id, '')
+        self.assertEqual(row.count, 3)
+
+
+class TestErrorBodyCapture(unittest.TestCase):
+    """Bug 1a — a 4xx exception's str() carries the truncated response body so
+    every place that logs/flashes it shows the real Frappe error."""
+
+    def test_str_includes_truncated_body(self):
+        from app.erpnext_client import ERPNextAPIError
+        e = ERPNextAPIError('POST /api/resource/Bank Account -> 417',
+                            status_code=417,
+                            response_body='Not a valid field: account_subtype')
+        s = str(e)
+        self.assertIn('-> 417', s)
+        self.assertIn('Not a valid field: account_subtype', s)
+
+    def test_str_truncates_long_body(self):
+        from app.erpnext_client import ERPNextAPIError
+        e = ERPNextAPIError('boom', status_code=500, response_body='x' * 5000)
+        # base + ': ' + first 500 chars of body.
+        self.assertEqual(len(str(e)), len('boom') + 2 + ERPNextAPIError.BODY_SNIPPET)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -157,9 +157,13 @@ class PlaidSyncLog(db.Model):
     __tablename__ = 'plaid_sync_log'
     id = db.Column(db.Integer, primary_key=True)
     at = db.Column(db.DateTime, default=_now, index=True)
-    item_id = db.Column(db.String(120), default='', index=True)
-    # plaid_pull | erpnext_push
-    direction = db.Column(db.String(20), nullable=False, index=True)
+    # Nullable: batch actions (e.g. bulk account import) legitimately have no
+    # single owning item_id and log with ''/NULL.
+    item_id = db.Column(db.String(120), default='', nullable=True, index=True)
+    # plaid_pull | erpnext_push | erpnext_account_import — kept wide (64) because
+    # some action labels ('erpnext_account_import' = 22 chars) overflow a
+    # VARCHAR(20); Postgres enforces the limit and would reject the INSERT.
+    direction = db.Column(db.String(64), nullable=False, index=True)
     count = db.Column(db.Integer, default=0)          # transactions handled
     status = db.Column(db.String(12), default='success', index=True)  # success | failed
     error_message = db.Column(db.Text, nullable=True)

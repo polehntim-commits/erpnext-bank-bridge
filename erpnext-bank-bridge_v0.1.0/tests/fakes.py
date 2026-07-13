@@ -71,7 +71,8 @@ class FakeERPClient:
     Tracks created docs, submits, and cancels; enforces reference_number
     idempotency the way the real Frappe list filter would."""
     def __init__(self, bank_accounts=None, fail_create=False,
-                 fail_bank_account=False, existing_types=None):
+                 fail_bank_account=False, existing_types=None,
+                 reject_fields=None, bank_account_error=None):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -81,6 +82,14 @@ class FakeERPClient:
         self.bank_accounts = bank_accounts or []   # preset dropdown list
         self.fail_create = fail_create             # fail Bank Transaction create
         self.fail_bank_account = fail_bank_account  # fail Bank Account create
+        # Fields ERPNext will reject as "not a valid field" on a Bank Account
+        # create: any create whose doc still carries one of these raises a 417
+        # with a Frappe-style body naming it. A retry with the field stripped
+        # then succeeds — the defensive-drop path under test.
+        self.reject_fields = set(reject_fields or ())
+        # Optional (status_code, body) for an *unrelated* Bank Account failure —
+        # a rejection the defensive path must NOT retry.
+        self.bank_account_error = bank_account_error
         # Bank Account Type records that already exist in ERPNext (get_doc hits).
         self.existing_types = set(existing_types or ())
         # Records created by the one-click account import, keyed by doctype.
@@ -154,10 +163,20 @@ class FakeERPClient:
             self.created['Bank'][name] = dict(doc)
             return {'name': name}
         if doctype == 'Bank Account':
+            from app.erpnext_client import ERPNextAPIError
             if self.fail_bank_account:
-                from app.erpnext_client import ERPNextAPIError
                 raise ERPNextAPIError('bad', status_code=417,
                                       response_body='{"exc":"ValidationError"}')
+            if self.bank_account_error is not None:
+                status, body = self.bank_account_error
+                raise ERPNextAPIError('bad', status_code=status,
+                                      response_body=body)
+            bad = next((f for f in doc if f in self.reject_fields), None)
+            if bad is not None:
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body=('{"exception": "ValidationError: ' + bad +
+                                   ' is not a valid field of Bank Account"}'))
             self._counter += 1
             name = f"{doc.get('account_name')} - {doc.get('bank')}"
             self.created['Bank Account'][name] = dict(doc)
