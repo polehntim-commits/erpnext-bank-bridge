@@ -165,9 +165,20 @@ are mocked (`tests/fakes.py`), so no network access or extra wheels are needed.
 
 - Bank credentials never reach this app — Plaid Link handles authentication and
   returns a token.
-- Plaid access tokens are encrypted at rest (Fernet).
+- Plaid access tokens are encrypted at rest with Fernet; the key lives on the
+  app's data volume (`fernet.key`, mode `0600`), never in the database or git.
+- Least-privilege Plaid scope: `transactions` only.
+- Calls to Plaid use HTTPS/TLS; ERPNext is reached over the local network at an
+  operator-configured URL and never exposed to the Internet.
+- No telemetry or analytics — outbound connections go only to Plaid and your
+  ERPNext instance.
 - The admin UI is unauthenticated by design and must stay on a trusted LAN
   behind Umbrel — do not expose it to the Internet.
+- Secrets (`.env`, `fernet.key`, `*_settings.json`) are git-ignored; only
+  `.env.example` placeholders are committed.
+
+See [SECURITY.md](SECURITY.md) for the full security posture and how to report
+a vulnerability.
 
 ## Roadmap
 
