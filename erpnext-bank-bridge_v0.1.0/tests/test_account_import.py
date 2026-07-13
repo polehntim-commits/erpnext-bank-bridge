@@ -470,6 +470,67 @@ class TestDefensiveFieldDrop(ImportBase):
         self.assertEqual(
             erpnext_accounts._unknown_fields_in(body, doc), ['account_subtype'])
 
+    def test_retry_drops_is_company_account_on_mandatory_error(self):
+        """Fix 5 — a company Bank Account needs a linked GL account we can't
+        supply, so ERPNext rejects it with 'Company Account is mandatory'. The
+        defensive path retries once as a personal account (is_company_account=0)
+        and succeeds."""
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(company_account_mandatory=True)
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+
+        self.assertEqual(result['status'], 'imported')
+        self.assertTrue(result['created_account'])
+        self.assertTrue(result['retried'])
+        # Two POSTs: first as a company account (rejected), retry as personal.
+        creates = erp.creates_of('Bank Account')
+        self.assertEqual(len(creates), 2)
+        self.assertEqual(creates[0][2]['is_company_account'], 1)
+        self.assertEqual(creates[1][2]['is_company_account'], 0)
+        self.assertNotIn('account', creates[1][2])
+
+    def test_retry_logs_promote_to_company_hint(self):
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(company_account_mandatory=True)
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        retry_rows = PlaidSyncLog.query.filter_by(status='retry').all()
+        self.assertEqual(len(retry_rows), 1)
+        msg = retry_rows[0].error_message.lower()
+        # A non-developer must understand what happened and what to do.
+        self.assertIn('personal', msg)
+        self.assertIn('promote', msg)
+        self.assertIn('manually', msg)
+
+    def test_is_company_account_config_false_skips_retry(self):
+        """With ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT=False the first attempt
+        already sends is_company_account=0, so the mandatory error never fires
+        and there's no retry."""
+        self.app.config['ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT'] = False
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(company_account_mandatory=True)
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+
+        self.assertEqual(result['status'], 'imported')
+        self.assertFalse(result['retried'])
+        creates = erp.creates_of('Bank Account')
+        self.assertEqual(len(creates), 1)          # single clean POST, no retry
+        self.assertEqual(creates[0][2]['is_company_account'], 0)
+
+    def test_other_mandatory_errors_not_retried_by_this_path(self):
+        """A different mandatory-field error ('Bank is mandatory') must NOT be
+        caught by the is_company_account fallback — nothing to drop fixes it."""
+        self._item()
+        self._account('acct-1', subtype='checking')
+        erp = FakeERPClient(bank_account_error=(
+            417, '{"exception": "MandatoryError: Bank is mandatory"}'))
+        stats = erpnext_accounts.import_all_supported_accounts(client=erp)
+        self.assertEqual(stats['failed'], 1)
+        self.assertEqual(stats['created'], 0)
+        self.assertEqual(len(erp.creates_of('Bank Account')), 1)   # no retry
+
     def test_unrelated_error_is_not_retried_and_logs_body(self):
         self._item()
         self._account('acct-1', subtype='checking')

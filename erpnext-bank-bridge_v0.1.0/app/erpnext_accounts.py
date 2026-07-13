@@ -191,6 +191,14 @@ def _default_company() -> str:
     return (erpnext_settings.load().get('default_company') or '').strip()
 
 
+def _default_is_company_account() -> int:
+    """1 to mark imported Bank Accounts as company accounts, else 0. Driven by
+    ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT (default True). When False we send 0 up
+    front, so ERPNext's "Company Account is mandatory" check never fires and the
+    create-side retry isn't needed."""
+    return 1 if current_app.config.get('ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT', True) else 0
+
+
 def _log(item_id: str, count: int, status: str, message: str = '') -> None:
     """Persist one PlaidSyncLog row for an account-import batch. Best-effort —
     never masks the real outcome."""
@@ -424,6 +432,17 @@ _LINK_VALIDATION_HINTS = ('could not find', 'linkvalidationerror')
 _MANDATORY_HINTS = ('mandatory',)
 
 
+def _is_company_account_mandatory(body_low: str) -> bool:
+    """True when a Frappe rejection body means a *company* Bank Account needs a
+    linked GL account we can't supply — i.e. "Company Account is mandatory", or
+    (defensively) any body naming both "company account" and "mandatory". This is
+    the one mandatory-field error we CAN auto-repair: retry as a personal account
+    (is_company_account = 0), which needs no GL link."""
+    if 'company account is mandatory' in body_low:
+        return True
+    return 'company account' in body_low and 'mandatory' in body_low
+
+
 def _unknown_fields_in(body: str, doc: dict) -> list[str]:
     """The preferred (droppable) doc fields named in an ERPNext rejection body.
     Matches both the snake_case fieldname ('account_subtype', from 'not a valid
@@ -460,6 +479,29 @@ def _create_bank_account_defensive(client: ERPNextClient, doc: dict, *,
         low = body.lower()
         if e.status_code not in (417, 422):
             raise
+        # The one mandatory-field error we CAN repair: a company Bank Account
+        # requires a linked GL account we don't have. Retry ONCE as a personal
+        # account (is_company_account = 0, no `account` link). Checked before the
+        # generic mandatory surface below so it isn't swallowed by it.
+        if _is_company_account_mandatory(low):
+            retry_doc = {k: v for k, v in doc.items() if k != 'account'}
+            retry_doc['is_company_account'] = 0
+            msg = ('Retry: dropped is_company_account=1 → 0 due to missing GL '
+                   'account link. Bank Account created as personal — promote to '
+                   'company manually in ERPNext when your Chart of Accounts is '
+                   f'set up. Original error: {str(e)[:400]}')
+            log.warning('Bank Account create rejected (Company Account '
+                        'mandatory); retrying as a personal account')
+            _log(item_id, 0, 'retry', msg)
+            try:
+                return client.create_doc(BANK_ACCOUNT_DT, retry_doc), True
+            except ERPNextAPIError as e2:
+                # One retry max — don't chain. Log the actual error with the
+                # retried payload so the still-failing create is diagnosable.
+                _log(item_id, 0, 'failed',
+                     'Retry as personal account still failed: '
+                     f'{str(e2)[:400]} | payload fields: {sorted(retry_doc)}')
+                raise
         # A missing required field can't be repaired by dropping something —
         # log it plainly and surface, per spec (don't auto-retry).
         if any(h in low for h in _MANDATORY_HINTS):
@@ -512,7 +554,7 @@ def build_bank_account_doc(account: PlaidAccount, bank_name: str,
         'bank': bank_name,
         'account_type': erpnext_account_type(account),
         'account_subtype': erpnext_account_subtype(account),
-        'is_company_account': 1,
+        'is_company_account': _default_is_company_account(),
         # Auto-provisioned custom fields (dedup key + mask mirror).
         'plaid_account_id': account.account_id,
         'last_4': account.mask or '',

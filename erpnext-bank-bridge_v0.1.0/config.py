@@ -81,6 +81,15 @@ class Config:
     # Types differently and you want one value applied to every import.
     ERPNEXT_DEFAULT_BANK_ACCOUNT_TYPE = os.environ.get(
         'ERPNEXT_DEFAULT_BANK_ACCOUNT_TYPE', '').strip()
+    # Whether one-click account import marks Bank Accounts as company accounts
+    # (`is_company_account = 1`). ERPNext requires a company account to link a
+    # specific GL account from the Chart of Accounts; since Plaid gives us no GL
+    # link, a company-account create fails with "Company Account is mandatory" on
+    # instances that enforce it. Default True (with a create-side retry that
+    # falls back to a personal account on that error); set False to import every
+    # account as personal from the start, skipping the retry entirely.
+    ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT = _bool(
+        'ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT', True)
 
     # ── Encryption at rest ────────────────────────────────────────────────
     # Fernet key for the stored Plaid access_tokens. Blank → app autogenerates

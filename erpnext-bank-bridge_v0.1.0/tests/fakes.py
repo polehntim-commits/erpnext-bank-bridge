@@ -74,7 +74,7 @@ class FakeERPClient:
                  fail_bank_account=False, existing_types=None,
                  reject_fields=None, bank_account_error=None,
                  existing_subtypes=None, link_reject_fields=None,
-                 missing_doctypes=None):
+                 missing_doctypes=None, company_account_mandatory=False):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -102,6 +102,11 @@ class FakeERPClient:
         #   {"exception":"Error: No module named
         #    'frappe.core.doctype.account_subtype'","exc_type":"ImportError"}
         self.missing_doctypes = set(missing_doctypes or ())
+        # Mirror ERPNext instances that enforce a GL link on company Bank
+        # Accounts: a create with is_company_account truthy and no `account`
+        # link raises "Company Account is mandatory". A retry with
+        # is_company_account=0 (personal) then succeeds — the fallback under test.
+        self.company_account_mandatory = company_account_mandatory
         # Bank Account Type records that already exist in ERPNext (get_doc hits).
         self.existing_types = set(existing_types or ())
         # Account Subtype records that already exist in ERPNext (get_doc hits).
@@ -203,6 +208,12 @@ class FakeERPClient:
                 status, body = self.bank_account_error
                 raise ERPNextAPIError('bad', status_code=status,
                                       response_body=body)
+            if (self.company_account_mandatory
+                    and doc.get('is_company_account') and not doc.get('account')):
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body=('{"exception": "ValidationError: Company '
+                                   'Account is mandatory"}'))
             bad = next((f for f in doc if f in self.reject_fields), None)
             if bad is not None:
                 raise ERPNextAPIError(
