@@ -105,6 +105,18 @@ class Config:
     #     doesn't report an iso_currency_code.
     ERPNEXT_BANK_ACCOUNT_CURRENCY = os.environ.get(
         'ERPNEXT_BANK_ACCOUNT_CURRENCY', 'USD').strip() or 'USD'
+    # ── v0.3.1 · fuzzy dedup of auto-created GL Accounts ───────────────────
+    # Before auto-creating a Bank GL Account, the importer fuzzy-matches its
+    # intended account_name against the company's existing leaf Accounts
+    # (stdlib difflib similarity + last-4 mask signal). A candidate whose
+    # similarity percentage is at or above this threshold is reused instead of
+    # creating a near-duplicate (see app/erpnext_accounts.py). Range 0-100;
+    # raise it to demand closer matches, lower it to reuse more aggressively.
+    _fuzzy_threshold_raw = os.environ.get('ERPNEXT_FUZZY_MATCH_THRESHOLD', '85').strip()
+    try:
+        ERPNEXT_FUZZY_MATCH_THRESHOLD = min(100, max(0, int(_fuzzy_threshold_raw)))
+    except ValueError:
+        ERPNEXT_FUZZY_MATCH_THRESHOLD = 85
 
     # ── v0.3.0 · auto-Supplier creation ───────────────────────────────────
     # When a pushed Plaid transaction carries a merchant_name we've never seen,

@@ -106,10 +106,23 @@ def list_bank_accounts(client: ERPNextClient | None = None) -> list[dict]:
 
 def list_accounts(client: ERPNextClient | None = None) -> list[dict]:
     """Non-group ERPNext GL Accounts (Chart of Accounts leaves) for the rule
-    debit/credit-account dropdowns. Ordered by name so the datalist is tidy."""
+    debit/credit-account dropdowns. Ordered by name so the datalist is tidy.
+
+    v0.3.1: filters are scoped to real, usable posting accounts only —
+    `is_group=0` (leaves, not the parent groups the auto-CoA import creates) and
+    `disabled=0` — but deliberately NOT by account_type/root_type, so every leaf
+    (Bank, Cash, Expense, Income, …), including the auto-created Bank Accounts
+    under the '1200' group, is offered. Scoped to the configured default company
+    when one is set so a multi-company instance doesn't cross-list. `limit_page_
+    length=0` returns every match (no 20-row default cap that would hide
+    accounts)."""
     client = client or get_client()
+    filters = [['is_group', '=', 0], ['disabled', '=', 0]]
+    company = (erpnext_settings.load().get('default_company') or '').strip()
+    if company:
+        filters.append(['company', '=', company])
     return client.list_docs(
-        'Account', filters=[['is_group', '=', 0]],
+        'Account', filters=filters,
         fields=['name', 'account_type', 'root_type'],
         order_by='name asc', limit_page_length=0)
 

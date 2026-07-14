@@ -33,9 +33,12 @@ ERPNext's model, so they're marked `unsupported` and skipped.
 from __future__ import annotations
 
 import logging
+import re
+from difflib import SequenceMatcher
 
 from flask import current_app
 
+from . import audit
 from . import db
 from . import erpnext_bank
 from . import erpnext_settings
@@ -493,14 +496,136 @@ def ensure_bank_account_group(client: ERPNextClient, company: str) -> str | None
     return None
 
 
+# ── v0.3.1: child account numbering + fuzzy dedup ──────────────────────────
+#
+# Two polish behaviours on the auto-CoA create:
+#   * children of a numbered parent group (e.g. '1200 - Bank Accounts') get a
+#     sequential account_number ('1201', '1202', …) so they sit tidily in the
+#     Chart-of-Accounts hierarchy instead of being number-less leaves;
+#   * before creating a leaf we fuzzy-match the intended account_name against the
+#     company's existing leaf Accounts (stdlib difflib + last-4 mask signal) and
+#     REUSE a close-enough one rather than making a near-duplicate.
+# Both degrade to the pre-v0.3.1 behaviour (no number / create new) on any read
+# error or when the signal is absent, so neither can block an import.
+
+_MASK_SUFFIX_RE = re.compile(r'\s*-\s*[\w*]+\s*$')
+
+
+def _fuzzy_threshold() -> int:
+    """Similarity percentage (0-100) at/above which an existing GL Account is a
+    match for reuse. Driven by ERPNEXT_FUZZY_MATCH_THRESHOLD (default 85)."""
+    try:
+        return int(current_app.config.get('ERPNEXT_FUZZY_MATCH_THRESHOLD', 85))
+    except (TypeError, ValueError):
+        return 85
+
+
+def _norm(s: str) -> str:
+    return ' '.join((s or '').lower().split())
+
+
+def _strip_mask_suffix(name: str) -> str:
+    """Drop a trailing ' - <mask>' so 'Wells Fargo Checking - 0000' compares
+    equal to 'Wells Fargo Checking'."""
+    return _MASK_SUFFIX_RE.sub('', (name or '')).strip()
+
+
+def _similarity(a: str, b: str) -> float:
+    """Percentage name similarity (0-100) via stdlib difflib. Scored both
+    verbatim and with any trailing mask suffix stripped; the higher wins, so a
+    masked name still matches its unmasked twin."""
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return 0.0
+    whole = SequenceMatcher(None, na, nb).ratio()
+    bare = SequenceMatcher(None, _norm(_strip_mask_suffix(a)),
+                           _norm(_strip_mask_suffix(b))).ratio()
+    return max(whole, bare) * 100.0
+
+
+def _fuzzy_match_gl_account(client: ERPNextClient, company: str,
+                            account_name: str, mask: str | None) -> dict | None:
+    """Best existing leaf GL Account in `company` that closely matches
+    `account_name` (or shares the last-4 `mask`), for reuse instead of a
+    near-duplicate create. Returns {'name', 'account_name', 'score'} at/above the
+    configured threshold, else None. Best-effort — any read error yields None."""
+    threshold = _fuzzy_threshold()
+    try:
+        existing = client.list_docs(
+            ACCOUNT_DT,
+            filters=[['company', '=', company], ['is_group', '=', 0]],
+            fields=['name', 'account_name'], limit_page_length=0)
+    except (ERPNextAPIError, ERPNextError):
+        return None
+    mask = (mask or '').strip()
+    best = None
+    for row in existing or []:
+        docname = row.get('name')
+        if not docname:
+            continue
+        cand_name = row.get('account_name') or docname
+        score = _similarity(account_name, cand_name)
+        # Last-4 mask signal: an existing account carrying this account's mask,
+        # with a plausibly-similar base name, qualifies even if the raw ratio is
+        # a shade under the threshold.
+        if mask and mask in cand_name:
+            base = _similarity(_strip_mask_suffix(account_name),
+                               _strip_mask_suffix(cand_name))
+            if base >= 60:
+                score = max(score, float(threshold))
+        if score >= threshold and (best is None or score > best['score']):
+            best = {'name': docname, 'account_name': cand_name,
+                    'score': round(score, 1)}
+    return best
+
+
+def _next_account_number(client: ERPNextClient, company: str,
+                         parent_group: str) -> str | None:
+    """Sequential account_number for a new leaf under `parent_group`, from the
+    parent's own number: parent '1200' → first child '1201', then max existing
+    child number + 1 (monotonic; gaps are not backfilled). Returns None when the
+    parent has no numeric account_number, or on any read error, so the create
+    simply omits the field (no worse than before v0.3.1)."""
+    try:
+        parent_rows = client.list_docs(
+            ACCOUNT_DT, filters=[['name', '=', parent_group]],
+            fields=['name', 'account_number'], limit_page_length=1)
+    except (ERPNextAPIError, ERPNextError):
+        return None
+    parent_num = str((parent_rows[0].get('account_number') if parent_rows else '')
+                     or '').strip()
+    if not parent_num.isdigit():
+        log.info("parent group %r has no numeric account_number; skipping child "
+                 "auto-numbering", parent_group)
+        return None
+    base = int(parent_num)
+    try:
+        children = client.list_docs(
+            ACCOUNT_DT,
+            filters=[['parent_account', '=', parent_group],
+                     ['company', '=', company]],
+            fields=['name', 'account_number'], limit_page_length=0)
+    except (ERPNextAPIError, ERPNextError):
+        children = []
+    nums = [int(str(c.get('account_number')).strip()) for c in (children or [])
+            if str(c.get('account_number') or '').strip().isdigit()]
+    return str(max(nums + [base]) + 1)
+
+
 def find_or_create_gl_account_for(client: ERPNextClient, account: PlaidAccount,
                                   parent_group: str, company: str,
-                                  account_name: str) -> str | None:
+                                  account_name: str, *,
+                                  skip_fuzzy: bool = False) -> str | None:
     """Find (or create) the leaf Bank GL Account for one Plaid account under
     `parent_group`; return its docname. Idempotent: an existing leaf with the
     same account_name + company is reused, so re-import never duplicates. The
     created docname follows Frappe autonaming ('<account_name> - <company_abbr>')
-    and is read back from the create response rather than computed."""
+    and is read back from the create response rather than computed.
+
+    v0.3.1: when no exact leaf exists, a fuzzy-similar one is reused instead of
+    creating a near-duplicate (unless `skip_fuzzy`, the UI "create new anyway"
+    path). A freshly-created leaf under a numbered parent gets a sequential
+    account_number. Both are audited."""
     existing = client.list_docs(
         ACCOUNT_DT,
         filters=[['account_name', '=', account_name], ['company', '=', company],
@@ -508,6 +633,19 @@ def find_or_create_gl_account_for(client: ERPNextClient, account: PlaidAccount,
         fields=['name'], limit_page_length=1)
     if existing:
         return existing[0]['name']
+    if not skip_fuzzy:
+        match = _fuzzy_match_gl_account(client, company, account_name, account.mask)
+        if match:
+            log.info("reusing GL Account %r (%.1f%% match) instead of creating "
+                     "%r", match['name'], match['score'], account_name)
+            audit.record(
+                'fuzzy_match_found', subject_type='Account',
+                subject_id=match['name'],
+                notes=(f"reused '{match['account_name']}' for intended "
+                       f"'{account_name}' ({match['score']}% similar)"),
+                after={'intended_account_name': account_name,
+                       'matched_account': match['name'], 'score': match['score']})
+            return match['name']
     doc = {
         'account_name': account_name,
         'parent_account': parent_group,
@@ -516,15 +654,26 @@ def find_or_create_gl_account_for(client: ERPNextClient, account: PlaidAccount,
         'account_currency': _account_currency(account),
         'is_group': 0,
     }
+    number = _next_account_number(client, company, parent_group)
+    if number:
+        doc['account_number'] = number
     created = client.create_doc(ACCOUNT_DT, doc)
     name = created.get('name')
-    log.info("created Bank GL Account '%s' under '%s'", name or account_name,
-             parent_group)
+    log.info("created Bank GL Account '%s' under '%s'%s", name or account_name,
+             parent_group, f' as #{number}' if number else '')
+    if number:
+        audit.record(
+            'gl_account_number_assigned', subject_type='Account',
+            subject_id=name or account_name,
+            notes=f'assigned account_number {number} under {parent_group}',
+            after={'account': name or account_name, 'account_number': number,
+                   'parent_account': parent_group})
     return name
 
 
 def _resolve_gl_account(client: ERPNextClient, account: PlaidAccount,
-                        company: str, account_name: str) -> str | None:
+                        company: str, account_name: str, *,
+                        skip_fuzzy: bool = False) -> str | None:
     """Best-effort: resolve the group and per-account leaf GL Account, returning
     the leaf docname to link on the Bank Account. Returns None (logging a warning)
     on ANY failure so the caller degrades to the v0.1.5 personal-account path —
@@ -536,7 +685,7 @@ def _resolve_gl_account(client: ERPNextClient, account: PlaidAccount,
         if not group:
             return None
         return find_or_create_gl_account_for(client, account, group, company,
-                                             account_name)
+                                             account_name, skip_fuzzy=skip_fuzzy)
     except (ERPNextAPIError, ERPNextError):
         log.warning('GL Account auto-create failed for %s; falling back to the '
                     'personal-account path', account.account_id, exc_info=True)
@@ -765,13 +914,16 @@ def build_bank_account_doc(account: PlaidAccount, bank_name: str,
 
 def find_or_create_bank_account(client: ERPNextClient, account: PlaidAccount,
                                 bank_name: str, institution: str, *,
-                                company: str | None = None
+                                company: str | None = None,
+                                skip_fuzzy: bool = False
                                 ) -> tuple[str, bool, bool, str | None]:
     """Find-or-create the Bank Account for this Plaid account. Returns
     (docname, created, retried, gl_account) — retried is True when the create
     succeeded only after the defensive path dropped a rejected field; gl_account
-    is the auto-created Chart-of-Accounts leaf that was linked (None if the GL
-    path was skipped or fell back).
+    is the auto-created (or fuzzy-reused) Chart-of-Accounts leaf that was linked
+    (None if the GL path was skipped or fell back).
+
+    `skip_fuzzy` forwards the UI "create new anyway" decision to the GL resolver.
 
     The GL Account is resolved (and only then created) after the existing-Bank-
     Account check, so a re-import that finds an existing account never creates an
@@ -783,7 +935,8 @@ def find_or_create_bank_account(client: ERPNextClient, account: PlaidAccount,
     # Best-effort GL Account for a company import; None degrades to v0.1.5.
     gl_account = None
     if company and _default_is_company_account():
-        gl_account = _resolve_gl_account(client, account, company, account_name)
+        gl_account = _resolve_gl_account(client, account, company, account_name,
+                                         skip_fuzzy=skip_fuzzy)
     doc = build_bank_account_doc(account, bank_name, institution,
                                  account_name=account_name, gl_account=gl_account)
     created, retried = _create_bank_account_defensive(
@@ -800,15 +953,21 @@ def find_or_create_bank_account(client: ERPNextClient, account: PlaidAccount,
 def import_plaid_account_to_erpnext(plaid_account_id: str, *,
                                     client: ERPNextClient | None = None,
                                     plaid_client=None,
-                                    ensure_fields: bool = True) -> dict:
+                                    ensure_fields: bool = True,
+                                    fuzzy_decision: str | None = None) -> dict:
     """Create (or find) the ERPNext Bank + Bank Account for one Plaid account
     and wire the mapping back. Idempotent — a second call finds the existing
     records and re-links without creating duplicates.
+
+    `fuzzy_decision` carries the operator's answer to a fuzzy-match prompt:
+    'create_new' skips GL-Account fuzzy dedup (create a fresh leaf); None/'reuse'
+    leave the default auto-reuse-on-match behaviour in place.
 
     Returns a result dict: {'status': imported|skipped|unsupported,
     'bank_account': <docname or None>, 'bank': <bank docname or None>,
     'created_account': bool, 'created_bank': bool, 'message': str}.
     """
+    skip_fuzzy = fuzzy_decision == 'create_new'
     account = PlaidAccount.query.filter_by(account_id=plaid_account_id).first()
     if account is None:
         raise ERPNextError(f'unknown Plaid account {plaid_account_id!r}')
@@ -853,7 +1012,8 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
     # drives the v0.2.0 GL Account auto-create (best-effort; falls back to the
     # v0.1.5 personal path if the Chart of Accounts can't be walked/created).
     docname, created_account, retried, gl_account = find_or_create_bank_account(
-        client, account, bank_name, institution, company=_default_company())
+        client, account, bank_name, institution, company=_default_company(),
+        skip_fuzzy=skip_fuzzy)
 
     account.erpnext_bank_account_name = docname
     if gl_account:
@@ -879,6 +1039,42 @@ def _bank_exists(client: ERPNextClient, bank_name: str) -> bool:
         BANK_DT, filters=[['bank_name', '=', bank_name.strip()]],
         fields=['name'], limit_page_length=1)
     return bool(matches)
+
+
+def probe_fuzzy_gl_match(plaid_account_id: str, *,
+                         client: ERPNextClient | None = None) -> dict | None:
+    """UI helper (v0.3.1): would importing this Plaid account reuse an existing
+    GL Account via fuzzy match? Returns the candidate {'name', 'account_name',
+    'score'} or None. Read-only — creates nothing. Best-effort: returns None
+    whenever the account is already mapped/unsupported, the GL path wouldn't run
+    (no company / personal-account mode), an exact leaf already exists (plain
+    dedup, not a prompt-worthy fuzzy case), or ERPNext can't be reached."""
+    account = PlaidAccount.query.filter_by(account_id=plaid_account_id).first()
+    if account is None or account.erpnext_bank_account_name:
+        return None
+    if not is_supported(account):
+        return None
+    company = _default_company()
+    if not company or not _default_is_company_account():
+        return None
+    try:
+        client = client or get_client()
+    except (ERPNextConfigError, ERPNextError):
+        return None
+    item = PlaidItem.query.filter_by(item_id=account.item_id).first()
+    institution = ((item.institution_name if item else '') or '').strip() or 'Bank'
+    account_name = _bank_account_name(account, institution)
+    try:
+        exact = client.list_docs(
+            ACCOUNT_DT,
+            filters=[['account_name', '=', account_name], ['company', '=', company],
+                     ['is_group', '=', 0]],
+            fields=['name'], limit_page_length=1)
+        if exact:
+            return None
+        return _fuzzy_match_gl_account(client, company, account_name, account.mask)
+    except (ERPNextAPIError, ERPNextError):
+        return None
 
 
 # ── bulk import ─────────────────────────────────────────────────────────────

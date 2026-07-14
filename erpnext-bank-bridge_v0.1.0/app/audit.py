@@ -47,10 +47,14 @@ EVENT_TYPES = (
     'sync_run_started',
     'sync_run_completed',
     'rules_rerun',
+    # v0.3.1 — auto-CoA numbering + fuzzy dedup of GL Accounts
+    'gl_account_number_assigned',
+    'fuzzy_match_found',
+    'fuzzy_match_rejected_by_user',
 )
 
 SUBJECT_TYPES = ('Supplier', 'CategorizationRule', 'GeneratedJournalEntry',
-                 'BankTransaction', 'PlaidItem')
+                 'BankTransaction', 'PlaidItem', 'Account')
 
 _actor: contextvars.ContextVar = contextvars.ContextVar('audit_actor',
                                                          default='system')

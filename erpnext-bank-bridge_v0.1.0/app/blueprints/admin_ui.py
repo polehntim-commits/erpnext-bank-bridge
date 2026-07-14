@@ -430,16 +430,78 @@ def accounts_page():
                  erp_error=erp_error, flash_msg=request.args.get('flash', ''))
 
 
+FUZZY_MODAL_BODY = """
+<h2>Possible duplicate account</h2>
+<div class="card" style="max-width:640px">
+  <p style="font-size:14px;color:#444;margin-top:0">
+    Before creating a new GL Account for
+    <b>{{ intended or 'this Plaid account' }}</b>, we found an existing ERPNext
+    account that looks like a match:
+  </p>
+  <div style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;
+              padding:12px 14px;margin:10px 0">
+    <div style="font-size:15px;font-weight:600">{{ candidate.account_name }}</div>
+    <div style="font-size:12px;color:#777"><code>{{ candidate.name }}</code>
+      · {{ candidate.score }}% similar</div>
+  </div>
+  <p style="font-size:13px;color:#555">
+    Reuse it to avoid a near-duplicate in your Chart of Accounts, or create a
+    brand-new account anyway.
+  </p>
+  <div style="display:flex;gap:10px;align-items:center;margin-top:14px">
+    <form method="post" action="/admin/accounts/create" style="margin:0">
+      <input type="hidden" name="account_id" value="{{ account_id }}">
+      <input type="hidden" name="fuzzy_decision" value="reuse">
+      <input type="hidden" name="fuzzy_candidate" value="{{ candidate.name }}">
+      <button type="submit" class="primary" style="padding:6px 16px">Reuse existing</button>
+    </form>
+    <form method="post" action="/admin/accounts/create" style="margin:0">
+      <input type="hidden" name="account_id" value="{{ account_id }}">
+      <input type="hidden" name="fuzzy_decision" value="create_new">
+      <input type="hidden" name="fuzzy_candidate" value="{{ candidate.name }}">
+      <button type="submit" class="secondary" style="padding:6px 16px">Create new anyway</button>
+    </form>
+    <a href="/admin/accounts" style="font-size:13px;color:#888;margin-left:4px">Cancel</a>
+  </div>
+</div>
+"""
+
+
 @bp.post('/admin/accounts/create')
 def create_account_in_erpnext():
     """One-click: create (or find) the ERPNext Bank + Bank Account for a single
-    Plaid account and map it."""
+    Plaid account and map it.
+
+    v0.3.1: on the first click we probe for a fuzzy-matching existing GL Account
+    and, if found, render a confirmation modal instead of creating — the operator
+    chooses Reuse (default auto-dedup) or Create new anyway (skip fuzzy). The
+    decision rides back on a hidden `fuzzy_decision` field."""
     account_id = (request.form.get('account_id') or '').strip()
+    decision = (request.form.get('fuzzy_decision') or '').strip()
+    candidate_name = (request.form.get('fuzzy_candidate') or '').strip()
     if not erps.is_configured():
         return redirect('/admin/accounts?flash=' + quote_plus(
             'ERPNext is not configured — set the connection first.'))
+    # First click (no decision yet): probe. If a near-duplicate exists, show the
+    # modal so the operator can decide; otherwise fall through and create.
+    if not decision:
+        try:
+            candidate = erpnext_accounts.probe_fuzzy_gl_match(account_id)
+        except Exception:  # never block the create on a best-effort probe
+            candidate = None
+        if candidate:
+            return _page(FUZZY_MODAL_BODY, page='accounts', account_id=account_id,
+                         candidate=candidate,
+                         intended=candidate.get('account_name'))
+    if decision == 'create_new' and candidate_name:
+        # Record the operator's explicit rejection of the suggested reuse.
+        audit.record('fuzzy_match_rejected_by_user', subject_type='Account',
+                     subject_id=candidate_name,
+                     notes=f'operator chose to create a new account instead of '
+                           f'reusing {candidate_name}')
     try:
-        result = erpnext_accounts.import_plaid_account_to_erpnext(account_id)
+        result = erpnext_accounts.import_plaid_account_to_erpnext(
+            account_id, fuzzy_decision=(decision or None))
     except (ERPNextConfigError, ERPNextError) as e:
         return redirect('/admin/accounts?flash=' + quote_plus(f'Create failed: {e}'))
     except Exception as e:  # surface any unexpected ERPNext error to the operator

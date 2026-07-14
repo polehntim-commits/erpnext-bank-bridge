@@ -22,7 +22,7 @@ from unittest import mock
 os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 
 from app import create_app, db, crypto  # noqa: E402
-from app import erpnext_accounts, erpnext_settings  # noqa: E402
+from app import erpnext_accounts, erpnext_bank, erpnext_settings  # noqa: E402
 from app.erpnext_client import ERPNextError  # noqa: E402
 from app.models import PlaidAccount, PlaidItem, PlaidSyncLog  # noqa: E402
 
@@ -826,6 +826,288 @@ class TestGLAccountAutoCreate(ImportBase):
         self.assertEqual(len(erp.creates_of('Account')), 0)   # nothing created
         creates = erp.creates_of('Bank Account')
         self.assertEqual(creates[-1][2]['is_company_account'], 0)
+
+
+class TestRuleDropdownAccountList(ImportBase):
+    """v0.3.1 · the rule debit/credit datalist (erpnext_bank.list_accounts) must
+    return EVERY enabled leaf account — Bank, Cash, Expense, Income — including
+    the auto-created Bank Accounts under the '1200' group, scoped to the default
+    company. Groups (is_group=1) and disabled accounts are excluded."""
+
+    COMPANY = 'Example Company LLC'
+
+    def _chart(self):
+        return [
+            {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank',
+             'account_number': '1200', 'company': self.COMPANY},
+            {'account_name': 'Red Plaidypus Bank Checking', 'is_group': 0,
+             'account_type': 'Bank', 'account_number': '1201',
+             'parent_account': 'Bank Accounts - EC', 'company': self.COMPANY},
+            {'account_name': 'Cash', 'is_group': 0, 'account_type': 'Cash',
+             'company': self.COMPANY},
+            {'account_name': 'Debtors', 'is_group': 0, 'account_type': 'Receivable',
+             'company': self.COMPANY},
+            {'account_name': 'Fuel Expense', 'is_group': 0, 'account_type': 'Expense',
+             'company': self.COMPANY},
+            {'account_name': 'Old Closed Acct', 'is_group': 0, 'account_type': 'Bank',
+             'disabled': 1, 'company': self.COMPANY},
+        ]
+
+    def test_dropdown_includes_bank_and_all_leaf_types(self):
+        erp = FakeERPClient(chart_accounts=self._chart())
+        names = {a['name'] for a in erpnext_bank.list_accounts(client=erp)}
+        # Auto-created Bank leaf shows up alongside cash/debtors/expense.
+        self.assertIn('Red Plaidypus Bank Checking - EC', names)
+        self.assertIn('Cash - EC', names)
+        self.assertIn('Debtors - EC', names)
+        self.assertIn('Fuel Expense - EC', names)
+
+    def test_dropdown_excludes_groups_and_disabled(self):
+        erp = FakeERPClient(chart_accounts=self._chart())
+        names = {a['name'] for a in erpnext_bank.list_accounts(client=erp)}
+        self.assertNotIn('Bank Accounts - EC', names)     # is_group=1
+        self.assertNotIn('Old Closed Acct - EC', names)   # disabled=1
+
+    def test_dropdown_filters_are_scoped(self):
+        # The GET carries is_group=0, disabled=0, and the default-company scope,
+        # but NOT any account_type/root_type restriction.
+        erp = FakeERPClient(chart_accounts=self._chart())
+        erpnext_bank.list_accounts(client=erp)
+        call = next(c for c in erp.calls
+                    if c[0] == 'list_docs' and c[1] == 'Account')
+        filters = {f[0]: f[2] for f in call[2]}
+        self.assertEqual(filters['is_group'], 0)
+        self.assertEqual(filters['disabled'], 0)
+        self.assertEqual(filters['company'], self.COMPANY)
+        self.assertNotIn('account_type', filters)
+        self.assertNotIn('root_type', filters)
+
+
+class TestChildAccountNumbering(ImportBase):
+    """v0.3.1 · leaves under a numbered parent group get a sequential
+    account_number ('1200' parent → '1201', '1202', …); a number-less parent
+    skips numbering entirely (no worse than before)."""
+
+    COMPANY = 'Example Company LLC'
+
+    def _numbered_group(self, number='1200', **kw):
+        d = {'account_name': 'Bank Accounts', 'is_group': 1,
+             'account_type': 'Bank', 'account_number': number}
+        d.update(kw)
+        return d
+
+    def _leaf(self, erp):
+        return next(c[2] for c in erp.creates_of('Account')
+                    if c[2].get('is_group') == 0)
+
+    def test_first_child_takes_parent_plus_one(self):
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[self._numbered_group('1200')])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertEqual(self._leaf(erp)['account_number'], '1201')
+
+    def test_next_child_increments_past_max(self):
+        # Parent 1200 already has a 1201 child → new leaf is 1202.
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='savings', mask='9999')
+        erp = FakeERPClient(chart_accounts=[
+            self._numbered_group('1200'),
+            {'account_name': 'Existing Checking', 'is_group': 0,
+             'account_type': 'Bank', 'account_number': '1201',
+             'parent_account': 'Bank Accounts - EC'}])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertEqual(self._leaf(erp)['account_number'], '1202')
+
+    def test_gaps_are_not_backfilled_monotonic(self):
+        # Children 1201 and 1203 exist → new leaf is 1204, not the 1202 gap.
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='savings', mask='9999')
+        erp = FakeERPClient(chart_accounts=[
+            self._numbered_group('1200'),
+            {'account_name': 'A', 'is_group': 0, 'account_number': '1201',
+             'parent_account': 'Bank Accounts - EC'},
+            {'account_name': 'B', 'is_group': 0, 'account_number': '1203',
+             'parent_account': 'Bank Accounts - EC'}])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertEqual(self._leaf(erp)['account_number'], '1204')
+
+    def test_unnumbered_parent_skips_numbering(self):
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1,
+             'account_type': 'Bank'}])   # no account_number
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertNotIn('account_number', self._leaf(erp))
+
+    def test_numbering_writes_audit_event(self):
+        from app.models import AuditEvent
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[self._numbered_group('1200')])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        ev = AuditEvent.query.filter_by(
+            event_type='gl_account_number_assigned').first()
+        self.assertIsNotNone(ev)
+        self.assertIn('1201', ev.notes)
+
+
+class TestFuzzyMatchReuse(ImportBase):
+    """v0.3.1 · before creating a GL Account, reuse a close-enough existing leaf
+    (stdlib difflib similarity + last-4 mask signal) instead of a near-dup."""
+
+    COMPANY = 'Example Company LLC'
+
+    def _leaf_creates(self, erp):
+        return [c for c in erp.creates_of('Account') if c[2].get('is_group') == 0]
+
+    def test_high_similarity_reuses_existing(self):
+        # Existing 'Wells Fargo Checking' (no mask) ~ intended 'Wells Fargo
+        # Checking - 0000' → reuse, no new leaf created.
+        self._item(institution='Wells Fargo')
+        a = self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank'},
+            {'account_name': 'Wells Fargo Checking', 'is_group': 0,
+             'account_type': 'Bank', 'parent_account': 'Bank Accounts - EC'}])
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertEqual(result['status'], 'imported')
+        self.assertEqual(len(self._leaf_creates(erp)), 0)   # reused, not created
+        a = PlaidAccount.query.filter_by(account_id='acct-1').first()
+        self.assertEqual(a.erpnext_gl_account_name, 'Wells Fargo Checking - EC')
+
+    def test_low_similarity_creates_new(self):
+        # Existing 'Red Plaidypus Bank Checking' is NOT similar enough to the
+        # intended 'Wells Fargo Checking - 0000' → a fresh leaf is created.
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank'},
+            {'account_name': 'Red Plaidypus Bank Checking', 'is_group': 0,
+             'account_type': 'Bank', 'parent_account': 'Bank Accounts - EC'}])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        leaves = self._leaf_creates(erp)
+        self.assertEqual(len(leaves), 1)
+        self.assertEqual(leaves[0][2]['account_name'], 'Wells Fargo Checking - 0000')
+
+    def test_threshold_override_forces_create(self):
+        # Same close pair, but a threshold of 99 makes it fall below the bar →
+        # create new instead of reuse.
+        self.app.config['ERPNEXT_FUZZY_MATCH_THRESHOLD'] = 99
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank'},
+            {'account_name': 'Wells Fargo Checkings', 'is_group': 0,
+             'account_type': 'Bank', 'parent_account': 'Bank Accounts - EC'}])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertEqual(len(self._leaf_creates(erp)), 1)
+
+    def test_reuse_writes_audit_event(self):
+        from app.models import AuditEvent
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank'},
+            {'account_name': 'Wells Fargo Checking', 'is_group': 0,
+             'account_type': 'Bank', 'parent_account': 'Bank Accounts - EC'}])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        ev = AuditEvent.query.filter_by(event_type='fuzzy_match_found').first()
+        self.assertIsNotNone(ev)
+
+    def test_mask_signal_matches_when_last4_shared(self):
+        # Base names only ~partially similar, but the shared last-4 '4242' in the
+        # candidate name tips it into a reuse.
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='4242')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank'},
+            {'account_name': 'Wells Fargo Checking Acct 4242', 'is_group': 0,
+             'account_type': 'Bank', 'parent_account': 'Bank Accounts - EC'}])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertEqual(len(self._leaf_creates(erp)), 0)
+
+    def test_skip_fuzzy_creates_new_despite_match(self):
+        self._item(institution='Wells Fargo')
+        a = self._account('acct-1', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank'},
+            {'account_name': 'Wells Fargo Checking', 'is_group': 0,
+             'account_type': 'Bank', 'parent_account': 'Bank Accounts - EC'}])
+        erpnext_accounts.import_plaid_account_to_erpnext(
+            'acct-1', client=erp, fuzzy_decision='create_new')
+        self.assertEqual(len(self._leaf_creates(erp)), 1)
+
+
+class TestFuzzyProbeAndModal(ImportBase):
+    """v0.3.1 · the /admin/accounts/create modal flow: probe surfaces a
+    candidate; Reuse takes it, Create-new-anyway skips dedup."""
+
+    def setUp(self):
+        super().setUp()
+        self.client = self.app.test_client()
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='checking', mask='0000')
+
+    def _erp_with_candidate(self):
+        return FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank'},
+            {'account_name': 'Wells Fargo Checking', 'is_group': 0,
+             'account_type': 'Bank', 'parent_account': 'Bank Accounts - EC'}])
+
+    def test_probe_returns_candidate(self):
+        erp = self._erp_with_candidate()
+        cand = erpnext_accounts.probe_fuzzy_gl_match('acct-1', client=erp)
+        self.assertIsNotNone(cand)
+        self.assertEqual(cand['account_name'], 'Wells Fargo Checking')
+        self.assertGreaterEqual(cand['score'], 85)
+
+    def test_probe_none_when_no_similar_account(self):
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank'}])
+        self.assertIsNone(erpnext_accounts.probe_fuzzy_gl_match('acct-1', client=erp))
+
+    def test_create_endpoint_shows_modal_on_match(self):
+        erp = self._erp_with_candidate()
+        # Patching get_client covers both the probe and (would-be) import.
+        with mock.patch('app.erpnext_accounts.get_client', return_value=erp):
+            resp = self.client.post('/admin/accounts/create',
+                                    data={'account_id': 'acct-1'})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b'Possible duplicate account', resp.data)
+        self.assertIn(b'Wells Fargo Checking', resp.data)
+        # No import happened yet — still unmapped.
+        self.assertIsNone(
+            PlaidAccount.query.filter_by(account_id='acct-1').first()
+            .erpnext_bank_account_name)
+
+    def test_create_new_anyway_skips_dedup_and_logs_rejection(self):
+        from app.models import AuditEvent
+        erp = self._erp_with_candidate()
+        with mock.patch.object(erpnext_accounts, 'get_client', return_value=erp):
+            resp = self.client.post('/admin/accounts/create',
+                                    data={'account_id': 'acct-1',
+                                          'fuzzy_decision': 'create_new',
+                                          'fuzzy_candidate': 'Wells Fargo Checking - EC'})
+        self.assertEqual(resp.status_code, 302)
+        leaves = [c for c in erp.creates_of('Account') if c[2].get('is_group') == 0]
+        self.assertEqual(len(leaves), 1)   # a brand-new leaf, dedup skipped
+        self.assertIsNotNone(AuditEvent.query.filter_by(
+            event_type='fuzzy_match_rejected_by_user').first())
+
+    def test_reuse_maps_to_existing(self):
+        erp = self._erp_with_candidate()
+        with mock.patch.object(erpnext_accounts, 'get_client', return_value=erp):
+            resp = self.client.post('/admin/accounts/create',
+                                    data={'account_id': 'acct-1',
+                                          'fuzzy_decision': 'reuse',
+                                          'fuzzy_candidate': 'Wells Fargo Checking - EC'})
+        self.assertEqual(resp.status_code, 302)
+        leaves = [c for c in erp.creates_of('Account') if c[2].get('is_group') == 0]
+        self.assertEqual(len(leaves), 0)   # reused, nothing created
+        a = PlaidAccount.query.filter_by(account_id='acct-1').first()
+        self.assertEqual(a.erpnext_gl_account_name, 'Wells Fargo Checking - EC')
 
 
 if __name__ == '__main__':

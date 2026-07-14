@@ -47,10 +47,15 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.3.0 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.3.1 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
-rules engine that auto-generates Journal Entries. See the roadmap at the bottom.
+rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
+Accounts get sequential `account_number`s under their numbered parent group, the
+rule debit/credit dropdowns list every enabled leaf account (Bank included), and
+a fuzzy-match check reuses an existing near-duplicate GL Account instead of
+creating a new one (with an operator confirm on the accounts page). See the
+roadmap at the bottom.
 
 ## How it works
 
@@ -337,6 +342,7 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT` | `true` | import Bank Accounts as company accounts; auto-creates + links a GL account, retries as personal on "Company Account is mandatory". Set `false` to import all as personal from the start |
 | `ERPNEXT_BANK_ACCOUNT_GROUP_NAME` | `Bank Accounts` | Chart-of-Accounts group the auto-created GL accounts go under; set to match your CoA template ("Bank", "Cash and Bank") |
 | `ERPNEXT_BANK_ACCOUNT_CURRENCY` | `USD` | fallback currency for a created GL account when Plaid reports no `iso_currency_code` |
+| `ERPNEXT_FUZZY_MATCH_THRESHOLD` | `85` | v0.3.1 · name-similarity % (0–100) at/above which the importer reuses an existing GL account instead of creating a near-duplicate |
 | `ERPNEXT_AUTO_CREATE_SUPPLIERS` | `true` | v0.3.0 · find-or-create the merchant's ERPNext Supplier on push so the transaction is linkable |
 | `ERPNEXT_DEFAULT_SUPPLIER_GROUP` | `All Supplier Groups` | Supplier Group docname assigned to auto-created Suppliers (create retries without it on a link error) |
 | `ERPNEXT_DEFAULT_SUPPLIER_COUNTRY` | `United States` | country assigned to auto-created Suppliers |

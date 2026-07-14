@@ -126,6 +126,7 @@ class FakeERPClient:
             d = dict(a)
             d.setdefault('is_group', 0)
             d.setdefault('company', '')
+            d.setdefault('disabled', 0)
             name = d.get('name') or f"{d['account_name']} - {company_abbr}"
             d['name'] = name
             self.chart_accounts[name] = d
@@ -188,14 +189,19 @@ class FakeERPClient:
     @staticmethod
     def _account_matches(doc, filters):
         """Like _matches, but a stored `company` of '' is a wildcard (a preset
-        chart account matches any company filter) so tests need not restate it."""
+        chart account matches any company filter) so tests need not restate it,
+        and an unset `disabled` is treated as 0 (enabled) — mirroring ERPNext,
+        so the v0.3.1 dropdown's `disabled=0` filter matches created leaves."""
         for f in (filters or []):
             field, op, value = f[0], f[1], f[2]
             if op != '=':
                 continue
             if field == 'company' and not doc.get('company'):
                 continue
-            if str(doc.get(field, '')) != str(value):
+            actual = doc.get(field)
+            if field == 'disabled' and actual is None:
+                actual = 0
+            if str(actual if actual is not None else '') != str(value):
                 return False
         return True
 
