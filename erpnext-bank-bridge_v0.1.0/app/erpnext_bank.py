@@ -28,14 +28,25 @@ separate fields."""
 from __future__ import annotations
 
 import logging
+import re
+from datetime import datetime, timezone
 
+from flask import current_app
+
+from . import db
 from . import erpnext_settings
 from .erpnext_client import (ERPNextAPIError, ERPNextClient, ERPNextConfig,
                              ERPNextConfigError, ERPNextError)
+from .models import PlaidSyncLog, Supplier
 
 log = logging.getLogger('bankbridge.erpnext')
 
 DOCTYPE = 'Bank Transaction'
+SUPPLIER_DT = 'Supplier'
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # ── configuration / client ────────────────────────────────────────────
@@ -90,6 +101,16 @@ def list_bank_accounts(client: ERPNextClient | None = None) -> list[dict]:
         'Bank Account', filters=[['disabled', '=', 0]],
         fields=['name', 'account_name', 'bank_account_no', 'bank'],
         limit_page_length=0)
+
+
+def list_accounts(client: ERPNextClient | None = None) -> list[dict]:
+    """Non-group ERPNext GL Accounts (Chart of Accounts leaves) for the rule
+    debit/credit-account dropdowns. Ordered by name so the datalist is tidy."""
+    client = client or get_client()
+    return client.list_docs(
+        'Account', filters=[['is_group', '=', 0]],
+        fields=['name', 'account_type', 'root_type'],
+        order_by='name asc', limit_page_length=0)
 
 
 # ── field mapping ──────────────────────────────────────────────────────
@@ -185,32 +206,172 @@ def create_bank_transaction(client: ERPNextClient, txn, bank_account_name: str,
     return name
 
 
-# ── Phase 2 scaffold: merchant → Supplier auto-suggest ─────────────────
+# ── v0.3.0: merchant → Supplier auto-create ────────────────────────────
 #
-# NOT IMPLEMENTED — intentional stub so the next feature has a seam to grow
-# into. The plan: when a transaction is an outflow (a payment), look at its
-# merchant_name / normalized name and suggest (or auto-create + link) a matching
-# ERPNext Supplier, so a Bank Transaction can be reconciled straight against a
-# Purchase Invoice / Payment Entry instead of being categorized by hand. This is
-# where auto-categorization (Plaid personal_finance_category → ERPNext expense
-# account / party) will also hang.
-#
-# Deliberately does nothing today: no ERPNext writes, no suggestions surfaced.
-# The push path does not call it yet.
+# When a pushed Plaid transaction carries a merchant we've never seen, mint the
+# matching ERPNext Supplier so the Bank Transaction is linkable during
+# reconciliation. A local `Supplier` mirror caches merchant → ERPNext docname so
+# the common path is a cheap DB lookup, not an ERPNext round-trip.
 
-def _maybe_suggest_supplier(transaction):  # noqa: ARG001 - Phase 2 placeholder
-    """(Phase 2 — scaffold only.) Suggest an ERPNext Supplier for a transaction.
+# Payment-processor / point-of-sale prefixes Plaid leaves on the raw `name`
+# (and sometimes merchant_name). Stripped (case-insensitively, longest first)
+# before title-casing so "SQ *STARBUCKS" and "STARBUCKS" collapse to one
+# Supplier. Each entry is the literal leading token.
+_STRIP_PREFIXES = (
+    'paypal *', 'paypal*', 'pp *', 'pp*',   # PayPal
+    'sq *', 'sq*',                          # Square
+    'tst* ', 'tst*',                        # Toast
+    'in *', 'in*',                          # Intuit
+    'sp *', 'sp*',                          # Shopify
+    'ci* ', 'ci*',                          # ci
+    'pos ', 'pos debit ', 'pos purchase ',  # generic point-of-sale
+    'dd *', 'dd*',                          # DoorDash processor prefix
+    'chkcard ', 'chkcardpurchase ',         # bank card-purchase prefixes
+    'ach debit ', 'ach credit ',
+)
 
-    `transaction` is a local BankTransaction. A future implementation will
-    fuzzy-match transaction.merchant_name (falling back to transaction.name)
-    against existing ERPNext Suppliers and return a suggestion — or, gated
-    behind an opt-in setting, find-or-create the Supplier and attach it to the
-    Bank Transaction / a draft Payment Entry.
+# Marketplace aliases: if the (lowercased) raw string CONTAINS the key, the
+# Supplier collapses to the canonical brand regardless of the surrounding store
+# id / marketplace suffix. Order matters — first hit wins.
+_ALIASES = (
+    ('amzn mktp', 'Amazon'), ('amazon mktp', 'Amazon'), ('amzn', 'Amazon'),
+    ('amazon.com', 'Amazon'), ('amazon', 'Amazon'),
+    ('wal-mart', 'Walmart'), ('walmart', 'Walmart'), ('wm supercenter', 'Walmart'),
+    ('the home depot', 'The Home Depot'), ('home depot', 'The Home Depot'),
+)
 
-    Returns None today (no-op). See the module note above for the full intent.
-    """
-    # TODO(phase-2): implement merchant → Supplier match + auto-categorization.
-    return None
+# Trailing store / location id: an optional '#', a digit, then any run of
+# digits / dashes / spaces to end-of-string ("Chevron 0123456", "Costco #487").
+_TRAILING_ID_RE = re.compile(r'\s*#?\s*\d[\d\-\s]*$')
+
+
+def normalize_merchant_name(raw: str) -> str:
+    """Clean a raw Plaid merchant/name string into a stable Supplier key.
+
+    Rules (in order):
+      1. Marketplace alias — a known brand anywhere in the string wins
+         ("AMZN Mktp US*2X4…" → "Amazon").
+      2. Strip a leading payment-processor / POS prefix ("SQ *STARBUCKS" →
+         "STARBUCKS").
+      3. Drop a trailing store / location id ("STARBUCKS 92104" → "STARBUCKS").
+      4. Collapse leftover '*' and repeated whitespace.
+      5. Title-case an ALL-CAPS string ("STARBUCKS" → "Starbucks") while leaving
+         an already mixed-case name ("Blue Bottle") untouched.
+    Returns '' for a blank input."""
+    s = (raw or '').strip()
+    if not s:
+        return ''
+    low = s.lower()
+    for key, canonical in _ALIASES:
+        if key in low:
+            return canonical
+    for p in _STRIP_PREFIXES:
+        if low.startswith(p):
+            s = s[len(p):].strip()
+            break
+    s = _TRAILING_ID_RE.sub('', s).strip()
+    s = re.sub(r'\s+', ' ', s.replace('*', ' ')).strip()
+    if not s:
+        # The whole string was a prefix + id (e.g. "POS 12345"); fall back to
+        # the pre-strip token so we never return an empty Supplier name.
+        s = re.sub(r'\s+', ' ', (raw or '').replace('*', ' ')).strip()
+    if s and not any(c.islower() for c in s):
+        s = s.title()
+    return s
+
+
+def _supplier_log(direction: str, status: str, message: str = '') -> None:
+    """Persist one PlaidSyncLog row for a supplier auto-create. Best-effort."""
+    try:
+        db.session.add(PlaidSyncLog(
+            item_id='', direction=direction, count=1, status=status,
+            error_message=(message or None)))
+        db.session.commit()
+    except Exception:  # pragma: no cover - logging must never crash a push
+        db.session.rollback()
+        log.warning('failed to write supplier PlaidSyncLog row', exc_info=True)
+
+
+def _default_supplier_group() -> str:
+    return (current_app.config.get('ERPNEXT_DEFAULT_SUPPLIER_GROUP')
+            or 'All Supplier Groups').strip() or 'All Supplier Groups'
+
+
+def _default_supplier_country() -> str:
+    return (current_app.config.get('ERPNEXT_DEFAULT_SUPPLIER_COUNTRY')
+            or 'United States').strip() or 'United States'
+
+
+def _resolve_erpnext_supplier(client: ERPNextClient, normalized: str) -> str:
+    """Find-or-create the ERPNext Supplier for a normalized merchant name and
+    return its docname. Searches by supplier_name first (reuse an existing
+    Supplier), else creates one; on a link failure (unknown supplier_group /
+    country) retries once with those optional fields dropped."""
+    existing = client.list_docs(
+        SUPPLIER_DT, filters=[['supplier_name', '=', normalized]],
+        fields=['name'], limit_page_length=1)
+    if existing:
+        _supplier_log('erpnext_supplier_auto_create', 'success',
+                      f'matched existing Supplier {existing[0]["name"]}')
+        return existing[0]['name']
+    doc = {
+        'supplier_name': normalized,
+        'supplier_type': 'Company',
+        'supplier_group': _default_supplier_group(),
+        'country': _default_supplier_country(),
+    }
+    try:
+        created = client.create_doc(SUPPLIER_DT, doc)
+    except ERPNextAPIError:
+        # A stripped-down retry so a non-default supplier_group / country name
+        # on this ERPNext doesn't block the Supplier create entirely.
+        created = client.create_doc(
+            SUPPLIER_DT, {'supplier_name': normalized, 'supplier_type': 'Company'})
+    name = created.get('name') or normalized
+    _supplier_log('erpnext_supplier_auto_create', 'success',
+                  f'created Supplier {name}')
+    return name
+
+
+def get_or_create_supplier(client: ERPNextClient | None, merchant_name: str, *,
+                           amount: float = 0.0, txn_date=None) -> str | None:
+    """Find-or-create the Supplier for a merchant and return its ERPNext docname.
+
+    Consults the local `Supplier` mirror first (keyed on the normalized name);
+    on a miss it searches / creates the ERPNext Supplier and caches the result.
+    Also rolls the transaction into the mirror's running tally (count / total /
+    last-seen) for the /admin/suppliers dashboard. Returns None for a blank
+    merchant name. A row is always cached locally even when `client` is None or
+    the ERPNext resolve fails — `erpnext_supplier_name` just stays NULL until a
+    later run resolves it."""
+    normalized = normalize_merchant_name(merchant_name)
+    if not normalized:
+        return None
+    row = Supplier.query.filter_by(normalized_name=normalized).first()
+    if row is None:
+        row = Supplier(merchant_name=(merchant_name or '')[:255],
+                       normalized_name=normalized[:255],
+                       first_seen_at=_now(), transaction_count=0,
+                       total_amount=0.0)
+        db.session.add(row)
+    row.transaction_count = (row.transaction_count or 0) + 1
+    row.total_amount = round((row.total_amount or 0.0)
+                             + abs(float(amount or 0.0)), 2)
+    if txn_date is not None:
+        try:
+            row.last_transaction_at = datetime(
+                txn_date.year, txn_date.month, txn_date.day, tzinfo=timezone.utc)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    row.updated_at = _now()
+    if not row.erpnext_supplier_name and client is not None:
+        try:
+            row.erpnext_supplier_name = _resolve_erpnext_supplier(client, normalized)
+        except (ERPNextAPIError, ERPNextError) as e:
+            _supplier_log('erpnext_supplier_auto_create', 'failed', str(e))
+            log.warning('supplier resolve failed for %r: %s', normalized, e)
+    db.session.commit()
+    return row.erpnext_supplier_name
 
 
 def cancel_bank_transaction(client: ERPNextClient, name: str) -> None:

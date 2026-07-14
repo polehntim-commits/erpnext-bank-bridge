@@ -16,6 +16,7 @@ from urllib.parse import quote_plus
 from flask import (Blueprint, current_app, redirect, render_template_string,
                    request, url_for)
 
+from .. import categorization
 from .. import db
 from .. import erpnext_accounts
 from .. import erpnext_bank
@@ -23,7 +24,9 @@ from .. import erpnext_settings as erps
 from .. import plaid_settings as ps
 from .. import sync_engine
 from ..erpnext_client import ERPNextConfigError, ERPNextError
-from ..models import (BankTransaction, PlaidAccount, PlaidItem, PlaidSyncLog)
+from ..models import (BankTransaction, CategorizationRule,
+                      GeneratedJournalEntry, PlaidAccount, PlaidItem,
+                      PlaidSyncLog, Supplier)
 
 bp = Blueprint('admin_ui', __name__)
 
@@ -85,6 +88,9 @@ NAV_HTML = """
   <a href="/admin/link_bank" class="{{ 'active' if page == 'link_bank' else '' }}">Link a bank</a>
   <a href="/admin/accounts" class="{{ 'active' if page == 'accounts' else '' }}">Accounts</a>
   <a href="/admin/transactions" class="{{ 'active' if page == 'transactions' else '' }}">Transactions</a>
+  <a href="/admin/rules" class="{{ 'active' if page == 'rules' else '' }}">Rules</a>
+  <a href="/admin/suppliers" class="{{ 'active' if page == 'suppliers' else '' }}">Suppliers</a>
+  <a href="/admin/generated_entries" class="{{ 'active' if page == 'generated_entries' else '' }}">Generated JEs</a>
   <a href="/admin/sync_log" class="{{ 'active' if page == 'sync_log' else '' }}">Sync Log</a>
   <a href="/admin/plaid_settings" class="{{ 'active' if page == 'plaid_settings' else '' }}">Plaid</a>
   <a href="/admin/erpnext_settings" class="{{ 'active' if page == 'erpnext_settings' else '' }}">ERPNext</a>
@@ -588,6 +594,546 @@ def retry_transaction():
     ok, msg = sync_engine.retry_row(int(raw_id))
     prefix = 'Retried: ' if ok else 'Retry failed: '
     return redirect('/admin/transactions?flash=' + quote_plus(prefix + msg))
+
+
+# ── Categorization rules ─────────────────────────────────────────
+
+def _erpnext_account_names() -> list:
+    """ERPNext GL Account docnames for the rule debit/credit datalists.
+    Best-effort — an empty list (ERPNext down / unconfigured) just means the
+    fields are free-text, which still works."""
+    if not erps.is_configured():
+        return []
+    try:
+        return [a['name'] for a in erpnext_bank.list_accounts()]
+    except (ERPNextConfigError, ERPNextError):
+        return []
+
+
+RULES_BODY = """
+<h2>Categorization rules</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+{% if not je_engine_on %}
+<div class="banner-warn">
+  <h3>Journal-entry generation is OFF</h3>
+  Rules can be authored + tested here, but they won't fire until
+  <code>ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES=true</code> is set. This is
+  deliberate — an incorrect auto-JE is worse than none. Auto-Supplier creation
+  is independent and {{ 'ON' if supplier_on else 'OFF' }}.
+</div>
+{% endif %}
+
+<h3>{{ 'Edit rule #' ~ form.id if form.id else 'Add a rule' }}</h3>
+<form class="card" method="post" action="/admin/rules/save">
+  <input type="hidden" name="id" value="{{ form.id or '' }}">
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <label style="flex:2;min-width:180px">Name
+      <input name="name" value="{{ form.name or '' }}" placeholder="Fuel — Chevron">
+    </label>
+    <label style="flex:1;min-width:90px">Priority
+      <input name="priority" type="number" value="{{ form.priority if form.priority is not none else 100 }}">
+    </label>
+    <label style="flex:1;min-width:120px;display:flex;align-items:center;gap:6px;margin-top:22px">
+      <input type="checkbox" name="active" value="1" {{ 'checked' if form.active else '' }} style="width:auto"> active
+    </label>
+  </div>
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <label style="flex:1;min-width:180px">Match type
+      <select name="match_type">
+        {% for mt in match_types %}
+        <option value="{{ mt }}" {{ 'selected' if mt == form.match_type else '' }}>{{ mt }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label style="flex:2;min-width:200px">Match value
+      <input name="match_value" value="{{ form.match_value or '' }}"
+             placeholder="Chevron   ·   ^UBER   ·   [10, 500] for amount_range">
+    </label>
+  </div>
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <label style="flex:1;min-width:200px">Debit account (expense / party side)
+      <input name="debit_account" list="acctlist" value="{{ form.debit_account or '' }}" placeholder="Fuel Expense - EC">
+    </label>
+    <label style="flex:1;min-width:200px">Credit account (usually the Bank Account)
+      <input name="credit_account" list="acctlist" value="{{ form.credit_account or '' }}" placeholder="Checking - EC">
+    </label>
+  </div>
+  <datalist id="acctlist">
+    {% for n in account_names %}<option value="{{ n }}">{% endfor %}
+  </datalist>
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <label style="flex:1;min-width:150px">Party type
+      <select name="party_type">
+        <option value="" {{ 'selected' if not form.party_type else '' }}>— none —</option>
+        <option value="Supplier" {{ 'selected' if form.party_type == 'Supplier' else '' }}>Supplier</option>
+        <option value="Customer" {{ 'selected' if form.party_type == 'Customer' else '' }}>Customer</option>
+      </select>
+    </label>
+    <label style="flex:2;min-width:200px">Party name <span style="font-weight:400;color:#888">(blank → auto-Supplier for the merchant)</span>
+      <input name="party_name" value="{{ form.party_name or '' }}" placeholder="(optional)">
+    </label>
+  </div>
+  <label>Description template (Jinja) <span style="font-weight:400;color:#888">— vars: merchant_name, name, date, amount, category, supplier_name</span>
+    <input name="description_template" value="{{ form.description_template or '' }}"
+           placeholder="Fuel purchase - {{ '{{ merchant_name }}' }} - {{ '{{ date }}' }}">
+  </label>
+  <button type="submit" class="primary">{{ 'Save changes' if form.id else 'Add rule' }}</button>
+  {% if form.id %}<a href="/admin/rules" class="secondary" style="text-decoration:none;display:inline-block;margin-left:8px">Cancel edit</a>{% endif %}
+</form>
+
+<h3>Test a rule</h3>
+<form class="card" method="post" action="/admin/rules/test"
+      style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+  <label style="margin:0;flex:1;min-width:150px">Merchant
+    <input name="merchant_name" value="{{ test.merchant_name or '' }}" placeholder="Chevron">
+  </label>
+  <label style="margin:0;flex:1;min-width:150px">Description
+    <input name="description" value="{{ test.description or '' }}" placeholder="CHEVRON 0123456">
+  </label>
+  <label style="margin:0;min-width:110px">Amount
+    <input name="amount" value="{{ test.amount or '' }}" placeholder="42.50">
+  </label>
+  <label style="margin:0;flex:1;min-width:150px">Plaid category
+    <input name="category" value="{{ test.category or '' }}" placeholder="GAS_STATIONS">
+  </label>
+  <button type="submit" class="primary">Test</button>
+</form>
+{% if test_result %}
+<div class="{{ 'banner-ok' if test_result.matched else 'banner-warn' }}">
+  {% if test_result.matched %}
+    ✓ Matched rule <b>#{{ test_result.rule.id }} · {{ test_result.rule.name }}</b>
+    (priority {{ test_result.rule.priority }}).
+    <pre style="white-space:pre-wrap;background:#f7f7f7;border:1px solid #ddd;border-radius:4px;padding:10px;font-size:12px;margin-top:8px">{{ test_result.je_preview }}</pre>
+  {% else %}
+    <h3>No rule matched</h3>This transaction would be left for manual reconciliation.
+  {% endif %}
+</div>
+{% endif %}
+
+<h3>Rules ({{ rules|length }})</h3>
+<table>
+  <tr><th class="num">Prio</th><th>Name</th><th>Match</th><th>Debit</th><th>Credit</th>
+      <th>Party</th><th>Active</th><th></th></tr>
+  {% for r in rules %}
+  <tr>
+    <td class="num">{{ r.priority }}</td>
+    <td>{{ r.name }}</td>
+    <td style="font-size:12px"><code>{{ r.match_type }}</code><br>{{ (r.match_value or '')[:50] }}</td>
+    <td style="font-size:12px">{{ r.debit_account }}</td>
+    <td style="font-size:12px">{{ r.credit_account }}</td>
+    <td style="font-size:12px">{{ (r.party_type or '') }}{% if r.party_name %}: {{ r.party_name }}{% endif %}</td>
+    <td>
+      <form method="post" action="/admin/rules/toggle" style="margin:0">
+        <input type="hidden" name="id" value="{{ r.id }}">
+        <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">
+          {% if r.active %}<span class="pill pill-ok">on</span>{% else %}<span class="pill pill-muted">off</span>{% endif %}
+        </button>
+      </form>
+    </td>
+    <td style="white-space:nowrap">
+      <a href="/admin/rules?edit={{ r.id }}" class="secondary" style="text-decoration:none;padding:3px 10px;font-size:12px">Edit</a>
+      <form method="post" action="/admin/rules/delete" style="display:inline;margin:0"
+            onsubmit="return confirm('Delete rule {{ r.name }}?')">
+        <input type="hidden" name="id" value="{{ r.id }}">
+        <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">Delete</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+  {% if not rules %}<tr><td colspan="8" style="color:#888">No rules yet — add one above.</td></tr>{% endif %}
+</table>
+"""
+
+
+def _rules_page(flash_msg='', test_result=None, test=None, form=None):
+    rules = (CategorizationRule.query
+             .order_by(CategorizationRule.priority.asc(),
+                       CategorizationRule.id.asc()).all())
+    return _page(RULES_BODY, page='rules', rules=rules,
+                 match_types=categorization.MATCH_TYPES,
+                 account_names=_erpnext_account_names(),
+                 form=form or {'active': True, 'priority': 100},
+                 test=test or {}, test_result=test_result,
+                 je_engine_on=current_app.config.get(
+                     'ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES', False),
+                 supplier_on=current_app.config.get(
+                     'ERPNEXT_AUTO_CREATE_SUPPLIERS', True),
+                 flash_msg=flash_msg)
+
+
+@bp.get('/admin/rules')
+def rules_page():
+    form = {'active': True, 'priority': 100}
+    edit_id = (request.args.get('edit') or '').strip()
+    if edit_id.isdigit():
+        rule = db.session.get(CategorizationRule, int(edit_id))
+        if rule is not None:
+            form = rule.to_dict()
+    return _rules_page(flash_msg=request.args.get('flash', ''), form=form)
+
+
+def _rule_form_values():
+    """Pull + sanitize the shared rule fields from the POST form."""
+    raw_prio = (request.form.get('priority') or '').strip()
+    try:
+        priority = int(raw_prio)
+    except ValueError:
+        priority = 100
+    party_type = (request.form.get('party_type') or '').strip() or None
+    return {
+        'name': (request.form.get('name') or '').strip(),
+        'priority': priority,
+        'active': bool(request.form.get('active')),
+        'match_type': (request.form.get('match_type') or 'merchant_contains').strip(),
+        'match_value': (request.form.get('match_value') or '').strip(),
+        'debit_account': (request.form.get('debit_account') or '').strip(),
+        'credit_account': (request.form.get('credit_account') or '').strip(),
+        'party_type': party_type,
+        'party_name': (request.form.get('party_name') or '').strip() or None,
+        'description_template': (request.form.get('description_template') or '').strip(),
+    }
+
+
+@bp.post('/admin/rules/save')
+def save_rule():
+    vals = _rule_form_values()
+    if vals['match_type'] not in categorization.MATCH_TYPES:
+        return redirect('/admin/rules?flash=' + quote_plus(
+            f"Unknown match type '{vals['match_type']}'"))
+    raw_id = (request.form.get('id') or '').strip()
+    if raw_id.isdigit():
+        rule = db.session.get(CategorizationRule, int(raw_id))
+        if rule is None:
+            return redirect('/admin/rules?flash=' + quote_plus('Rule not found'))
+        for k, v in vals.items():
+            setattr(rule, k, v)
+        msg = f'Updated rule “{rule.name}”'
+    else:
+        rule = CategorizationRule(**vals)
+        db.session.add(rule)
+        msg = f'Added rule “{vals["name"]}”'
+    db.session.commit()
+    return redirect('/admin/rules?flash=' + quote_plus(msg))
+
+
+@bp.post('/admin/rules/delete')
+def delete_rule():
+    raw_id = (request.form.get('id') or '').strip()
+    if raw_id.isdigit():
+        rule = db.session.get(CategorizationRule, int(raw_id))
+        if rule is not None:
+            db.session.delete(rule)
+            db.session.commit()
+    return redirect('/admin/rules?flash=' + quote_plus('Rule deleted'))
+
+
+@bp.post('/admin/rules/toggle')
+def toggle_rule():
+    raw_id = (request.form.get('id') or '').strip()
+    if raw_id.isdigit():
+        rule = db.session.get(CategorizationRule, int(raw_id))
+        if rule is not None:
+            rule.active = not rule.active
+            db.session.commit()
+    return redirect('/admin/rules?flash=' + quote_plus('Toggled'))
+
+
+@bp.post('/admin/rules/test')
+def test_rule():
+    """Evaluate the sample transaction against every active rule and preview the
+    Journal Entry the winning rule would generate. Read-only — no ERPNext write."""
+    from types import SimpleNamespace
+    raw_amt = (request.form.get('amount') or '').strip()
+    try:
+        amount = float(raw_amt) if raw_amt else 0.0
+    except ValueError:
+        amount = 0.0
+    test = {
+        'merchant_name': (request.form.get('merchant_name') or '').strip(),
+        'description': (request.form.get('description') or '').strip(),
+        'amount': raw_amt,
+        'category': (request.form.get('category') or '').strip(),
+    }
+    sample = SimpleNamespace(
+        merchant_name=test['merchant_name'], name=test['description'],
+        category=test['category'], amount=amount, date=None,
+        plaid_transaction_id='(sample)',
+        erpnext_bank_transaction_id='(the Bank Transaction)')
+    rule = categorization.find_matching_rule(sample)
+    result = {'matched': rule is not None, 'rule': rule}
+    if rule is not None:
+        import json as _json
+        remark = categorization.render_description(rule, sample)
+        doc = categorization.build_journal_entry(
+            rule, sample, erps.load().get('default_company', '(company)'),
+            remark=remark)
+        result['je_preview'] = _json.dumps(doc, indent=2)
+    return _rules_page(test=test, test_result=result)
+
+
+# ── Suppliers ────────────────────────────────────────────────────
+
+SUPPLIERS_BODY = """
+<h2>Auto-created Suppliers</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+<p style="font-size:14px;color:#555">
+  Merchants seen on synced transactions, cached to their ERPNext Supplier so
+  Bank Transactions are linkable. Auto-Supplier creation is
+  {% if supplier_on %}<span class="pill pill-ok">ON</span>{% else %}<span class="pill pill-muted">OFF</span>{% endif %}.
+  Fix a wrong normalization or re-point the ERPNext link with <b>Edit</b>.
+</p>
+<form method="get" action="/admin/suppliers" class="card"
+      style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+  <label style="margin:0;flex:1">Search
+    <input name="q" value="{{ cur_q }}" placeholder="merchant / normalized / ERPNext name">
+  </label>
+  <button type="submit" class="primary">Filter</button>
+</form>
+<table>
+  <tr><th>Merchant (raw)</th><th>Normalized</th><th>ERPNext Supplier</th>
+      <th class="num">Txns</th><th class="num">Total</th><th>Last seen</th><th></th></tr>
+  {% for s in rows %}
+  {% if edit_id == s.id %}
+  <tr>
+    <td>{{ s.merchant_name }}</td>
+    <td colspan="2">
+      <form method="post" action="/admin/suppliers/edit" style="display:flex;gap:8px;margin:0;flex-wrap:wrap">
+        <input type="hidden" name="id" value="{{ s.id }}">
+        <input name="normalized_name" value="{{ s.normalized_name }}" style="flex:1;min-width:120px" placeholder="normalized">
+        <input name="erpnext_supplier_name" value="{{ s.erpnext_supplier_name or '' }}" style="flex:1;min-width:120px" placeholder="ERPNext Supplier">
+        <button type="submit" class="primary" style="padding:4px 12px">Save</button>
+        <a href="/admin/suppliers" class="secondary" style="text-decoration:none;padding:4px 12px">Cancel</a>
+      </form>
+    </td>
+    <td class="num">{{ s.transaction_count }}</td>
+    <td class="num">{{ '%.2f'|format(s.total_amount or 0.0) }}</td>
+    <td>{{ s.last_transaction_at.strftime('%Y-%m-%d') if s.last_transaction_at else '—' }}</td>
+    <td></td>
+  </tr>
+  {% else %}
+  <tr>
+    <td>{{ s.merchant_name }}</td>
+    <td>{{ s.normalized_name }}</td>
+    <td>{% if s.erpnext_supplier_name %}<code>{{ s.erpnext_supplier_name }}</code>{% else %}<span class="pill pill-muted">unlinked</span>{% endif %}</td>
+    <td class="num">{{ s.transaction_count }}</td>
+    <td class="num">{{ '%.2f'|format(s.total_amount or 0.0) }}</td>
+    <td>{{ s.last_transaction_at.strftime('%Y-%m-%d') if s.last_transaction_at else '—' }}</td>
+    <td><a href="/admin/suppliers?edit={{ s.id }}{% if cur_q %}&q={{ cur_q }}{% endif %}" class="secondary" style="text-decoration:none;padding:3px 10px;font-size:12px">Edit</a></td>
+  </tr>
+  {% endif %}
+  {% endfor %}
+  {% if not rows %}<tr><td colspan="7" style="color:#888">No suppliers cached yet.</td></tr>{% endif %}
+</table>
+"""
+
+
+@bp.get('/admin/suppliers')
+def suppliers_page():
+    cur_q = (request.args.get('q') or '').strip()
+    q = Supplier.query
+    if cur_q:
+        like = f'%{cur_q}%'
+        q = q.filter(db.or_(Supplier.merchant_name.ilike(like),
+                            Supplier.normalized_name.ilike(like),
+                            Supplier.erpnext_supplier_name.ilike(like)))
+    rows = q.order_by(Supplier.transaction_count.desc(),
+                      Supplier.normalized_name.asc()).limit(500).all()
+    edit_id = (request.args.get('edit') or '').strip()
+    edit_id = int(edit_id) if edit_id.isdigit() else None
+    return _page(SUPPLIERS_BODY, page='suppliers', rows=rows, cur_q=cur_q,
+                 edit_id=edit_id,
+                 supplier_on=current_app.config.get(
+                     'ERPNEXT_AUTO_CREATE_SUPPLIERS', True),
+                 flash_msg=request.args.get('flash', ''))
+
+
+@bp.post('/admin/suppliers/edit')
+def edit_supplier():
+    raw_id = (request.form.get('id') or '').strip()
+    if not raw_id.isdigit():
+        return redirect('/admin/suppliers?flash=' + quote_plus('Bad id'))
+    s = db.session.get(Supplier, int(raw_id))
+    if s is None:
+        return redirect('/admin/suppliers?flash=' + quote_plus('Supplier not found'))
+    normalized = (request.form.get('normalized_name') or '').strip()
+    erp = (request.form.get('erpnext_supplier_name') or '').strip()
+    if normalized:
+        # Guard the unique constraint: another row already owns this key.
+        clash = (Supplier.query
+                 .filter(Supplier.normalized_name == normalized,
+                         Supplier.id != s.id).first())
+        if clash is not None:
+            return redirect('/admin/suppliers?flash=' + quote_plus(
+                f'Another supplier already uses “{normalized}”'))
+        s.normalized_name = normalized
+    s.erpnext_supplier_name = erp or None
+    db.session.commit()
+    return redirect('/admin/suppliers?flash=' + quote_plus('Supplier updated'))
+
+
+# ── Generated Journal Entries (audit) ────────────────────────────
+
+GENERATED_BODY = """
+<h2>Generated Journal Entries</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+<p style="font-size:14px;color:#555">
+  Audit trail of Journal Entries the rules engine created. <b>Approve</b> submits
+  a Draft JE in ERPNext; <b>Reject</b> cancels it. State reflects the local
+  audit record.
+</p>
+<form method="get" action="/admin/generated_entries" class="card"
+      style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+  <label style="margin:0">State
+    <select name="state">
+      <option value="">(any)</option>
+      {% for st in states %}
+      <option value="{{ st }}" {{ 'selected' if cur_state == st else '' }}>{{ st }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit" class="primary">Filter</button>
+</form>
+
+<div style="margin:8px 0">
+  <form method="post" action="/admin/generated_entries/bulk" style="display:inline">
+    <input type="hidden" name="action" value="approve">
+    <button type="submit" class="secondary">Approve all pending</button>
+  </form>
+  <form method="post" action="/admin/generated_entries/bulk" style="display:inline;margin-left:8px">
+    <input type="hidden" name="action" value="reject">
+    <button type="submit" class="secondary">Reject all pending</button>
+  </form>
+</div>
+
+<table>
+  <tr><th>Created</th><th>Merchant</th><th class="num">Amount</th><th>Rule</th>
+      <th>Journal Entry</th><th>State</th><th></th></tr>
+  {% for g in rows %}
+  <tr>
+    <td style="font-size:12px">{{ g.created_at.strftime('%Y-%m-%d %H:%M') if g.created_at else '' }}</td>
+    <td>{{ g.merchant_name }}<div style="font-size:11px;color:#888">{{ (g.description or '')[:60] }}</div></td>
+    <td class="num">{{ '%.2f'|format(g.amount or 0.0) }}</td>
+    <td style="font-size:12px">{{ g.rule_name }}</td>
+    <td style="font-size:12px">{% if g.erpnext_journal_entry_name %}<code>{{ g.erpnext_journal_entry_name }}</code>{% else %}—{% endif %}
+      {% if g.error_message %}<div style="color:#a04000">{{ g.error_message[:100] }}</div>{% endif %}</td>
+    <td>
+      {% if g.state == 'approved' %}<span class="pill pill-ok">approved</span>
+      {% elif g.state == 'rejected' %}<span class="pill pill-muted">rejected</span>
+      {% elif g.state == 'error' %}<span class="pill pill-err">error</span>
+      {% else %}<span class="pill pill-muted">{{ g.state }}</span>{% endif %}
+    </td>
+    <td style="white-space:nowrap">
+      {% if g.erpnext_journal_entry_name and g.state not in ('approved',) %}
+      <form method="post" action="/admin/generated_entries/approve" style="display:inline;margin:0">
+        <input type="hidden" name="id" value="{{ g.id }}">
+        <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">Approve</button>
+      </form>
+      {% endif %}
+      {% if g.erpnext_journal_entry_name and g.state not in ('rejected',) %}
+      <form method="post" action="/admin/generated_entries/reject" style="display:inline;margin:0">
+        <input type="hidden" name="id" value="{{ g.id }}">
+        <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">Reject</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  {% if not rows %}<tr><td colspan="7" style="color:#888">No generated entries yet.</td></tr>{% endif %}
+</table>
+<p style="font-size:12px;color:#888">Showing up to {{ limit }} most recent.</p>
+"""
+
+
+@bp.get('/admin/generated_entries')
+def generated_entries_page():
+    cur_state = (request.args.get('state') or '').strip()
+    limit = 300
+    q = GeneratedJournalEntry.query
+    if cur_state:
+        q = q.filter(GeneratedJournalEntry.state == cur_state)
+    rows = q.order_by(GeneratedJournalEntry.created_at.desc(),
+                      GeneratedJournalEntry.id.desc()).limit(limit).all()
+    return _page(GENERATED_BODY, page='generated_entries', rows=rows,
+                 cur_state=cur_state, limit=limit,
+                 states=('pending_review', 'approved', 'rejected', 'error'),
+                 flash_msg=request.args.get('flash', ''))
+
+
+def _approve_entry(g) -> bool:
+    """Submit a Draft JE in ERPNext + mark approved. Returns True on success."""
+    if not g.erpnext_journal_entry_name:
+        return False
+    erp = sync_engine.get_erp_client_or_none()
+    if erp is None:
+        return False
+    try:
+        categorization._submit_je(erp, g.erpnext_journal_entry_name)
+    except (ERPNextConfigError, ERPNextError):
+        return False
+    g.state = 'approved'
+    g.updated_at = categorization._now()
+    return True
+
+
+def _reject_entry(g) -> bool:
+    """Cancel the JE in ERPNext + mark rejected. Returns True on success."""
+    g.state = 'rejected'
+    g.updated_at = categorization._now()
+    if not g.erpnext_journal_entry_name:
+        return True
+    erp = sync_engine.get_erp_client_or_none()
+    if erp is not None:
+        try:
+            erp.call_method('frappe.client.cancel', http_method='POST',
+                            json_body={'doctype': categorization.JOURNAL_ENTRY_DT,
+                                       'name': g.erpnext_journal_entry_name})
+        except (ERPNextConfigError, ERPNextError):
+            pass  # audit still flips to rejected; JE may already be draft/cancelled
+    return True
+
+
+@bp.post('/admin/generated_entries/approve')
+def approve_entry():
+    raw_id = (request.form.get('id') or '').strip()
+    if not raw_id.isdigit():
+        return redirect('/admin/generated_entries?flash=' + quote_plus('Bad id'))
+    g = db.session.get(GeneratedJournalEntry, int(raw_id))
+    if g is None:
+        return redirect('/admin/generated_entries?flash=' + quote_plus('Not found'))
+    ok = _approve_entry(g)
+    db.session.commit()
+    msg = 'Approved (submitted in ERPNext)' if ok else 'Could not submit — check ERPNext connection'
+    return redirect('/admin/generated_entries?flash=' + quote_plus(msg))
+
+
+@bp.post('/admin/generated_entries/reject')
+def reject_entry():
+    raw_id = (request.form.get('id') or '').strip()
+    if not raw_id.isdigit():
+        return redirect('/admin/generated_entries?flash=' + quote_plus('Bad id'))
+    g = db.session.get(GeneratedJournalEntry, int(raw_id))
+    if g is None:
+        return redirect('/admin/generated_entries?flash=' + quote_plus('Not found'))
+    _reject_entry(g)
+    db.session.commit()
+    return redirect('/admin/generated_entries?flash=' + quote_plus('Rejected'))
+
+
+@bp.post('/admin/generated_entries/bulk')
+def bulk_entries():
+    action = (request.form.get('action') or '').strip()
+    pending = GeneratedJournalEntry.query.filter(
+        GeneratedJournalEntry.state == 'pending_review',
+        GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None)).all()
+    n = 0
+    for g in pending:
+        if action == 'approve' and _approve_entry(g):
+            n += 1
+        elif action == 'reject' and _reject_entry(g):
+            n += 1
+    db.session.commit()
+    verb = 'Approved' if action == 'approve' else 'Rejected'
+    return redirect('/admin/generated_entries?flash=' + quote_plus(f'{verb} {n} entr(ies)'))
 
 
 # ── Plaid settings ───────────────────────────────────────────────

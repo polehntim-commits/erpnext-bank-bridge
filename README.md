@@ -28,6 +28,13 @@ ERPNext  ──►  Bank Reconciliation Tool
   transactions can post.
 - **Creates ERPNext Bank Transaction records** ready for the built-in Bank
   Reconciliation Tool (deposit/withdrawal split from Plaid's amount sign).
+- **Auto-creates ERPNext Suppliers** from merchant names (v0.3.0) — a never-seen
+  merchant is normalized ("SQ \*STARBUCKS 92104" → "Starbucks") and find-or-
+  created as a Supplier so the transaction is instantly linkable. On by default.
+- **Rules-based Journal Entry generation** (v0.3.0) — user-configured rules
+  (`/admin/rules`) match on merchant / description / Plaid category / amount and
+  auto-generate a Journal Entry (debit expense, credit bank), inserted as a
+  Draft for review. **Off by default** — opt in once your rules are trusted.
 - **Handles the full transaction lifecycle** — pending → posted transitions,
   category and merchant-name normalization, Plaid `modified` (re-post) and
   `removed` (cancel) events.
@@ -40,9 +47,10 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.1.1 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
-with a mocked-API test suite, plus one-click import of Plaid accounts into
-ERPNext Bank / Bank Account records. See the roadmap notes at the bottom.
+v0.3.0 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
+Bank / Bank Account records, auto-Supplier creation from merchant names, and a
+rules engine that auto-generates Journal Entries. See the roadmap at the bottom.
 
 ## How it works
 
@@ -60,7 +68,14 @@ ERPNext Bank / Bank Account records. See the roadmap notes at the bottom.
    - Plaid `added` → create + submit a Bank Transaction,
    - Plaid `modified` → cancel the stale doc, post a corrected replacement,
    - Plaid `removed` → cancel the doc (docstatus 2).
-5. **Reconcile** in ERPNext's built-in **Bank Reconciliation Tool**.
+5. **Auto-categorize** (v0.3.0) — right after a Bank Transaction posts, the
+   bridge (a) find-or-creates the merchant's ERPNext **Supplier** so the row is
+   linkable, and (b) if the rules engine is enabled, runs the transaction
+   through your **CategorizationRules** and generates a **Journal Entry** for
+   the first match (Draft by default). Both steps are non-destructive — a
+   failure is logged and never unwinds the posted Bank Transaction.
+6. **Reconcile** in ERPNext's built-in **Bank Reconciliation Tool** (or review
+   the generated Journal Entries at `/admin/generated_entries`).
 
 Idempotency is enforced two ways: a unique local row per Plaid transaction id,
 and an ERPNext find-or-create keyed on `reference_number` (the Plaid id). The
@@ -74,7 +89,10 @@ out of the account → withdrawal; negative = money in → deposit).
 | `plaid_items` | one linked login/institution; encrypted access token + sync cursor |
 | `plaid_accounts` | accounts within an item; ERPNext Bank Account mapping + sync toggle + import status |
 | `bank_transactions` | local mirror of Plaid transactions + ERPNext docname/state |
-| `plaid_sync_log` | audit trail (plaid_pull / erpnext_push, counts, errors) |
+| `suppliers` | merchant → ERPNext Supplier cache (normalized name, tallies) — v0.3.0 |
+| `categorization_rules` | user rules: match predicate → debit/credit accounts + party + template — v0.3.0 |
+| `generated_journal_entries` | audit trail of rules-generated JEs (state, rule, JE docname) — v0.3.0 |
+| `plaid_sync_log` | audit trail (plaid_pull / erpnext_push / erpnext_supplier_auto_create, counts, errors) |
 | `plaid_link_state` | short-lived link-token bookkeeping for the OAuth handoff |
 
 ## Admin UI (LAN-only, unauthenticated)
@@ -87,6 +105,12 @@ trusted LAN, never exposed to the Internet.
 - `/admin/accounts` — one-click import Plaid accounts into ERPNext Bank
   Accounts, map to existing ones, toggle sync
 - `/admin/transactions` — filterable list + per-row Retry
+- `/admin/rules` — CRUD for categorization rules + a **Test a rule** sandbox
+  (paste a sample merchant/amount → see which rule matches and the JE preview)
+- `/admin/suppliers` — auto-created Suppliers (tallies, ERPNext link); fix a bad
+  normalization or re-point the ERPNext Supplier
+- `/admin/generated_entries` — audit trail of rules-generated Journal Entries;
+  approve (submit) / reject (cancel) individually or in bulk
 - `/admin/plaid_settings` — Client ID / secrets / environment / redirect / webhook
 - `/admin/erpnext_settings` — ERPNext URL + API key/secret + Test / Verify doctype
 - `/admin/sync_log` — recent sync activity
@@ -188,6 +212,67 @@ with a "not supported" note. Set `ERPNEXT_DEFAULT_BANK_ACCOUNT_TYPE` to force a
 single account type for every import if your Chart of Accounts names them
 differently.
 
+### 4. Auto-Supplier + categorization rules (`/admin/rules`, v0.3.0)
+
+Once transactions are posting, two layers automate the reconciliation that used
+to be manual.
+
+**Auto-Supplier creation** (on by default). When a pushed transaction carries a
+merchant name we've never seen, the bridge normalizes it and find-or-creates a
+matching ERPNext **Supplier**, caching the mapping locally so it's a one-time
+cost per merchant. Normalization strips payment-processor / POS prefixes,
+collapses marketplace aliases, drops trailing store IDs, and title-cases
+ALL-CAPS names:
+
+| Raw Plaid string | Normalized Supplier |
+|------------------|---------------------|
+| `SQ *STARBUCKS 92104` | `Starbucks` |
+| `AMZN Mktp US*2X4B9` | `Amazon` |
+| `TST* Some Cafe` | `Some Cafe` |
+| `CHEVRON 0123456` | `Chevron` |
+| `THE HOME DEPOT #8842` | `The Home Depot` |
+| `Blue Bottle` | `Blue Bottle` (already clean) |
+
+Review / correct the cache at `/admin/suppliers`. Turn it off with
+`ERPNEXT_AUTO_CREATE_SUPPLIERS=false`.
+
+**Categorization rules → Journal Entries** (off by default). Author rules at
+`/admin/rules`; each has a **priority** (lower wins), a **match type**, a
+**debit** + **credit** account, an optional **party**, and a Jinja description
+template. On each newly-posted transaction the engine walks active rules in
+priority order and the **first match** generates a Journal Entry — debit the
+expense account, credit the bank (reversed for a deposit/refund) — inserted as a
+**Draft** for review. Nothing fires until you set
+`ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES=true`; until then you can still author and
+**Test a rule** against a sample transaction. Match types:
+
+- `merchant_exact` — `merchant_name` equals `match_value` (case-insensitive)
+- `merchant_contains` — `match_value` is a substring of `merchant_name`
+- `description_regex` — `re.search(match_value, description)` matches
+- `plaid_category_matches` — `match_value` matches the Plaid category label
+- `amount_range` — `min ≤ abs(amount) ≤ max`, with `match_value = [min, max]`
+
+**Sample rules for common categories** (credit account is your Bank Account
+docname; debit accounts are examples — match your Chart of Accounts):
+
+| Priority | Name | Match type | Match value | Debit account | Party |
+|---|---|---|---|---|---|
+| 10 | Fuel | `merchant_contains` | `Chevron` | `Fuel Expenses - EC` | Supplier (auto) |
+| 10 | Fuel (Shell) | `merchant_contains` | `Shell` | `Fuel Expenses - EC` | Supplier (auto) |
+| 20 | Groceries | `plaid_category_matches` | `GROCERIES` | `Groceries - EC` | Supplier (auto) |
+| 20 | Utilities | `plaid_category_matches` | `UTILITIES` | `Utilities - EC` | — |
+| 30 | Rent | `description_regex` | `(?i)\brent\b` | `Rent - EC` | — |
+| 40 | Payroll | `plaid_category_matches` | `PAYROLL` | `Salaries and Wages - EC` | — |
+
+A rule with an empty **party name** but a **party type** of `Supplier` links the
+auto-created Supplier for that transaction's merchant, so "Fuel → Chevron"
+automatically parties the JE to the `Chevron` Supplier. Review generated JEs at
+`/admin/generated_entries` (approve = submit in ERPNext, reject = cancel).
+
+> ⚠️ Auto-JE generation is powerful and can write **bad ledger data** if a rule
+> is wrong. It stays OFF until you explicitly opt in, and defaults to inserting
+> **Drafts** (not submitted) so a human reviews before anything hits the books.
+
 ### Environment variables
 
 | Var | Default | Notes |
@@ -205,6 +290,12 @@ differently.
 | `ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT` | `true` | import Bank Accounts as company accounts; auto-creates + links a GL account, retries as personal on "Company Account is mandatory". Set `false` to import all as personal from the start |
 | `ERPNEXT_BANK_ACCOUNT_GROUP_NAME` | `Bank Accounts` | Chart-of-Accounts group the auto-created GL accounts go under; set to match your CoA template ("Bank", "Cash and Bank") |
 | `ERPNEXT_BANK_ACCOUNT_CURRENCY` | `USD` | fallback currency for a created GL account when Plaid reports no `iso_currency_code` |
+| `ERPNEXT_AUTO_CREATE_SUPPLIERS` | `true` | v0.3.0 · find-or-create the merchant's ERPNext Supplier on push so the transaction is linkable |
+| `ERPNEXT_DEFAULT_SUPPLIER_GROUP` | `All Supplier Groups` | Supplier Group docname assigned to auto-created Suppliers (create retries without it on a link error) |
+| `ERPNEXT_DEFAULT_SUPPLIER_COUNTRY` | `United States` | country assigned to auto-created Suppliers |
+| `ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES` | `false` | v0.3.0 · master switch for the rules engine — **off by default** (a wrong auto-JE is worse than none) |
+| `ERPNEXT_JOURNAL_ENTRY_AUTO_SUBMIT` | `false` | submit generated JEs (docstatus 1) vs leave as Draft for review |
+| `ERPNEXT_JOURNAL_ENTRY_REVIEW_STATE` | `pending_review` | initial audit state for a freshly generated Draft JE |
 | `FERNET_KEY` | "" | blank → autogenerated + persisted to `{DATA_DIR}/fernet.key` |
 | `SYNC_INTERVAL_HOURS` | `6` | background poll cadence |
 | `SCHEDULER_ENABLED` | `true` | set false to drive syncs by external cron |
@@ -228,11 +319,15 @@ cd erpnext-bank-bridge_v0.1.0
 python3 -m unittest discover -s tests -v
 ```
 
-Covers Fernet encryption round-trip + key persistence, Plaid response
+136 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
-push → error + retry, and every admin page rendering. The Plaid SDK and ERPNext
-are mocked (`tests/fakes.py`), so no network access or extra wheels are needed.
+push → error + retry, one-click account import, merchant-name normalization,
+auto-Supplier cache hit/miss/config-disabled, the rules engine (every match
+type, priority ordering, JE sign handling, one-JE-per-transaction idempotency,
+non-destructive failure), the rules admin CRUD + test endpoint, and every admin
+page rendering. The Plaid SDK and ERPNext are mocked (`tests/fakes.py`), so no
+network access or extra wheels are needed.
 
 ## Security notes
 
@@ -256,9 +351,13 @@ a vulnerability.
 ## Roadmap
 
 - Plaid webhook signature verification (currently the webhook is best-effort).
-- Merchant → ERPNext Supplier auto-suggest + transaction auto-categorization
-  (scaffolded in `app/erpnext_bank.py:_maybe_suggest_supplier`).
-- Configurable per-account category → ERPNext party/ledger hints.
+- Reconcile generated Journal Entries directly against the Bank Transaction (a
+  one-click "reconcile" from `/admin/generated_entries`).
+- Fuzzy merchant → Supplier matching (beyond exact-name find-or-create).
+- Rule-authoring conveniences: clone a rule, import/export a rule set.
+
+**Done:** ~~Merchant → ERPNext Supplier auto-create + rules-based transaction
+categorization~~ (v0.3.0).
 
 ## License
 

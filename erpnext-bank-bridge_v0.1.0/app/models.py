@@ -185,6 +185,130 @@ class PlaidSyncLog(db.Model):
         }
 
 
+class Supplier(db.Model):
+    """Local mirror / cache of merchants seen on Plaid transactions → the
+    ERPNext Supplier they map to (v0.3.0). One row per `normalized_name` so the
+    auto-create path is a cheap local lookup before touching ERPNext.
+
+    `merchant_name` keeps the raw Plaid string that first minted the row;
+    `normalized_name` is the cleaned, title-cased key (see
+    erpnext_bank.normalize_merchant_name) and is what we search / create in
+    ERPNext. `erpnext_supplier_name` is the ERPNext Supplier docname once
+    resolved (NULL until then, e.g. if ERPNext wasn't reachable at push time).
+    The three tally columns power the /admin/suppliers dashboard; they are a
+    running best-effort count, not an authoritative ledger."""
+    __tablename__ = 'suppliers'
+    id = db.Column(db.Integer, primary_key=True)   # the spec's local_id
+    merchant_name = db.Column(db.String(255), default='', index=True)
+    normalized_name = db.Column(db.String(255), unique=True, nullable=False,
+                                index=True)
+    erpnext_supplier_name = db.Column(db.String(255), nullable=True, index=True)
+    first_seen_at = db.Column(db.DateTime, default=_now)
+    last_transaction_at = db.Column(db.DateTime, nullable=True)
+    transaction_count = db.Column(db.Integer, default=0)
+    total_amount = db.Column(db.Float, default=0.0)
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'merchant_name': self.merchant_name,
+            'normalized_name': self.normalized_name,
+            'erpnext_supplier_name': self.erpnext_supplier_name,
+            'first_seen_at': self.first_seen_at.isoformat() if self.first_seen_at else None,
+            'last_transaction_at': (self.last_transaction_at.isoformat()
+                                    if self.last_transaction_at else None),
+            'transaction_count': self.transaction_count or 0,
+            'total_amount': self.total_amount or 0.0,
+        }
+
+
+class CategorizationRule(db.Model):
+    """A user-configured rule that maps a Bank Transaction onto a Journal Entry
+    (v0.3.0). Rules are evaluated in `priority` ascending order (lower wins) and
+    the FIRST active rule that matches generates the JE — see
+    app/categorization.py.
+
+    `match_type` + `match_value` describe the predicate; `debit_account` /
+    `credit_account` are ERPNext Account docnames (the credit is usually the
+    Bank Account). `party_type` / `party_name` optionally link a Supplier /
+    Customer on the expense line (party_name blank → the auto-created Supplier
+    for the transaction's merchant is used). `description_template` is a Jinja
+    string rendered into the JE's user_remark. Deliberately un-constrained on
+    match_type so a new predicate never needs a migration."""
+    __tablename__ = 'categorization_rules'
+    id = db.Column(db.Integer, primary_key=True)
+    priority = db.Column(db.Integer, default=100, index=True)
+    active = db.Column(db.Boolean, default=True, index=True)
+    name = db.Column(db.String(255), default='')
+    # merchant_exact | merchant_contains | description_regex |
+    # plaid_category_matches | amount_range
+    match_type = db.Column(db.String(40), nullable=False, default='merchant_contains')
+    # Pattern / exact match, or a JSON array '[min, max]' for amount_range.
+    match_value = db.Column(db.Text, default='')
+    debit_account = db.Column(db.String(255), default='')
+    credit_account = db.Column(db.String(255), default='')
+    party_type = db.Column(db.String(20), nullable=True)    # Supplier | Customer
+    party_name = db.Column(db.String(255), nullable=True)
+    description_template = db.Column(db.Text, default='')
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'priority': self.priority, 'active': bool(self.active),
+            'name': self.name, 'match_type': self.match_type,
+            'match_value': self.match_value,
+            'debit_account': self.debit_account,
+            'credit_account': self.credit_account,
+            'party_type': self.party_type, 'party_name': self.party_name,
+            'description_template': self.description_template,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class GeneratedJournalEntry(db.Model):
+    """Audit trail of a rules-engine-generated ERPNext Journal Entry (v0.3.0).
+
+    Unique on `plaid_transaction_id` so a transaction generates AT MOST ONE JE —
+    the row's existence is the idempotency guard the sync path checks before
+    generating again. `rule_id` is the winning CategorizationRule (nullable so a
+    future manual/unmatched entry can still be audited). `state` moves
+    pending_review → approved | rejected; `error` records a generation failure
+    (with `error_message`) without blocking the underlying Bank Transaction."""
+    __tablename__ = 'generated_journal_entries'
+    id = db.Column(db.Integer, primary_key=True)
+    plaid_transaction_id = db.Column(db.String(120), unique=True,
+                                     nullable=False, index=True)
+    rule_id = db.Column(db.Integer, nullable=True, index=True)
+    erpnext_journal_entry_name = db.Column(db.String(255), nullable=True, index=True)
+    # pending_review | approved | rejected | error — left un-constrained (like
+    # plaid_sync_log) so a future state never needs a migration.
+    state = db.Column(db.String(20), default='pending_review', index=True)
+    # Denormalized snapshot for the audit dashboard (so it renders without a
+    # join back to bank_transactions / categorization_rules).
+    amount = db.Column(db.Float, default=0.0)
+    merchant_name = db.Column(db.String(255), default='')
+    description = db.Column(db.Text, default='')
+    rule_name = db.Column(db.String(255), default='')
+    error_message = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'plaid_transaction_id': self.plaid_transaction_id,
+            'rule_id': self.rule_id,
+            'erpnext_journal_entry_name': self.erpnext_journal_entry_name,
+            'state': self.state, 'amount': self.amount or 0.0,
+            'merchant_name': self.merchant_name, 'description': self.description,
+            'rule_name': self.rule_name, 'error_message': self.error_message,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class PlaidLinkState(db.Model):
     """Ephemeral link-token bookkeeping for the OAuth handoff. When Plaid Link
     is initialized for an OAuth-only bank (Wells Fargo), the redirect back to

@@ -34,6 +34,7 @@ from datetime import date, datetime, timezone
 from flask import current_app
 
 from . import db
+from . import categorization
 from . import erpnext_bank
 from . import erpnext_settings
 from . import plaid_settings
@@ -281,6 +282,9 @@ def push_pending(erp_client, item_id: str = '') -> dict:
                 stats['cancelled'] += 1
             else:
                 stats['posted'] += 1
+                # v0.3.0: auto-Supplier + rules-based JE. Best-effort and
+                # self-guarding — a failure here never unwinds the posted row.
+                categorization.categorize_after_push(erp_client, row)
         except (ERPNextAPIError, ERPNextError) as e:
             db.session.rollback()
             row = db.session.get(BankTransaction, row.id)
@@ -317,6 +321,8 @@ def retry_row(row_id: int) -> tuple[bool, str]:
         row.posted_at = None
         _push_row(erp_client, row, account)
         db.session.commit()
+        if not row.removed:
+            categorization.categorize_after_push(erp_client, row)
         return True, f'posted as {row.erpnext_bank_transaction_id}'
     except (ERPNextAPIError, ERPNextError) as e:
         db.session.rollback()

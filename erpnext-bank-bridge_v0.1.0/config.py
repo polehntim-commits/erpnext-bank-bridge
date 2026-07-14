@@ -106,6 +106,40 @@ class Config:
     ERPNEXT_BANK_ACCOUNT_CURRENCY = os.environ.get(
         'ERPNEXT_BANK_ACCOUNT_CURRENCY', 'USD').strip() or 'USD'
 
+    # ── v0.3.0 · auto-Supplier creation ───────────────────────────────────
+    # When a pushed Plaid transaction carries a merchant_name we've never seen,
+    # find-or-create a matching ERPNext Supplier so the Bank Transaction is
+    # linkable during reconciliation (see app/erpnext_bank.py). Default ON — it
+    # is non-destructive (a Supplier is a reference record, not a posting).
+    ERPNEXT_AUTO_CREATE_SUPPLIERS = _bool('ERPNEXT_AUTO_CREATE_SUPPLIERS', True)
+    # Defaults for a newly-created ERPNext Supplier. The supplier_group must be
+    # an existing Supplier Group docname; stock ERPNext ships "All Supplier
+    # Groups". If yours differs, set this so the create doesn't fail on the link
+    # (the create retries once without the group as a fallback).
+    ERPNEXT_DEFAULT_SUPPLIER_GROUP = os.environ.get(
+        'ERPNEXT_DEFAULT_SUPPLIER_GROUP', 'All Supplier Groups').strip() \
+        or 'All Supplier Groups'
+    ERPNEXT_DEFAULT_SUPPLIER_COUNTRY = os.environ.get(
+        'ERPNEXT_DEFAULT_SUPPLIER_COUNTRY', 'United States').strip() \
+        or 'United States'
+
+    # ── v0.3.0 · categorization rules → Journal Entry generation ───────────
+    # Master switch for the rules engine. Default OFF: rules can be authored and
+    # tested at /admin/rules without firing, because an incorrect auto-generated
+    # Journal Entry is worse than none. Flip to True only once your rules are
+    # trusted — then every newly-pushed transaction is run through the rules.
+    ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES = _bool(
+        'ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES', False)
+    # Submit generated Journal Entries (docstatus 1) vs leave them as Draft
+    # (docstatus 0) for human review before they hit the ledger. Default False
+    # (Draft) — the conservative choice.
+    ERPNEXT_JOURNAL_ENTRY_AUTO_SUBMIT = _bool(
+        'ERPNEXT_JOURNAL_ENTRY_AUTO_SUBMIT', False)
+    # Initial GeneratedJournalEntry.state for a freshly generated (Draft) JE.
+    ERPNEXT_JOURNAL_ENTRY_REVIEW_STATE = os.environ.get(
+        'ERPNEXT_JOURNAL_ENTRY_REVIEW_STATE', 'pending_review').strip() \
+        or 'pending_review'
+
     # ── Encryption at rest ────────────────────────────────────────────────
     # Fernet key for the stored Plaid access_tokens. Blank → app autogenerates
     # one on first boot and persists it to {DATA_DIR}/fernet.key (see

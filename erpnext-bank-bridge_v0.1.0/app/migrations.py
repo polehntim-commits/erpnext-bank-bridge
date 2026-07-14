@@ -110,5 +110,10 @@ def run_migrations() -> None:
         # Accounts so an imported company Bank Account can link a real `account`.
         # Record the created/linked GL Account docname on the Plaid account.
         _add_column_if_missing('plaid_accounts', 'erpnext_gl_account_name', 'TEXT')
+        # v0.3.0 — auto-Supplier creation + rules-based Journal Entry generation
+        # add three NEW tables (suppliers, categorization_rules,
+        # generated_journal_entries). New tables are created by db.create_all()
+        # (which runs just before this), so there is no additive-column step to
+        # apply here — the block is a no-op on both a fresh and an upgraded DB.
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)

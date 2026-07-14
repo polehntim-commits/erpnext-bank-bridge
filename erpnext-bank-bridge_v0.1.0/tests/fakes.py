@@ -76,7 +76,8 @@ class FakeERPClient:
                  existing_subtypes=None, link_reject_fields=None,
                  missing_doctypes=None, company_account_mandatory=False,
                  chart_accounts=None, fail_account_create=False,
-                 company_abbr='EC'):
+                 company_abbr='EC', existing_suppliers=None,
+                 fail_supplier_create=False, fail_je_create=False):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -131,10 +132,18 @@ class FakeERPClient:
         # When True, every Account create (group or leaf) fails — exercises the
         # graceful fall-through to the v0.1.5 personal-account path.
         self.fail_account_create = fail_account_create
+        # Suppliers that already exist in ERPNext (list_docs by supplier_name).
+        self.existing_suppliers = set(existing_suppliers or ())
+        # When True, every Supplier create fails (both attempts) so the
+        # best-effort resolve path leaves erpnext_supplier_name NULL.
+        self.fail_supplier_create = fail_supplier_create
+        # When True, every Journal Entry create fails — exercises the
+        # non-destructive `error` GeneratedJournalEntry path.
+        self.fail_je_create = fail_je_create
         # Records created by the one-click account import, keyed by doctype.
         self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {},
                         'Bank Account Type': {}, 'Account Subtype': {},
-                        'Account': {}}
+                        'Account': {}, 'Supplier': {}, 'Journal Entry': {}}
 
     def get_logged_user(self):
         return 'admin@example.com'
@@ -209,6 +218,14 @@ class FakeERPClient:
             flds = fields or ['name']
             return [{k: d.get(k) for k in flds} for d in pool.values()
                     if self._account_matches(d, filters)]
+        if doctype == 'Supplier':
+            # supplier_name filter → a dedup lookup against preset + created
+            # Suppliers (autonamed on supplier_name).
+            names = set(self.existing_suppliers) | set(self.created['Supplier'])
+            for f in (filters or []):
+                if f[0] == 'supplier_name' and f[1] == '=':
+                    return [{'name': f[2]}] if f[2] in names else []
+            return [{'name': n} for n in names]
         if doctype in ('Bank', 'Custom Field'):
             return [{'name': n} for n, d in self.created[doctype].items()
                     if self._matches(d, filters)]
@@ -293,6 +310,26 @@ class FakeERPClient:
         if doctype == 'Account Subtype':
             name = doc.get('account_subtype')  # autonames on account_subtype
             self.created['Account Subtype'][name] = dict(doc)
+            return {'name': name}
+        if doctype == 'Supplier':
+            if self.fail_supplier_create:
+                from app.erpnext_client import ERPNextAPIError
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body='{"exception": "LinkValidationError: Could not '
+                                  'find Supplier Group"}')
+            name = doc.get('supplier_name')   # ERPNext autonames on supplier_name
+            self.created['Supplier'][name] = dict(doc)
+            return {'name': name}
+        if doctype == 'Journal Entry':
+            if self.fail_je_create:
+                from app.erpnext_client import ERPNextAPIError
+                raise ERPNextAPIError('bad', status_code=417,
+                                      response_body='{"exc":"ValidationError"}')
+            self._counter += 1
+            name = f'ACC-JV-{self._counter:04d}'
+            self.created['Journal Entry'][name] = dict(doc)
+            self.docs[name] = dict(doc)
             return {'name': name}
         if doctype == 'Custom Field':
             name = f"{doc.get('dt')}-{doc.get('fieldname')}"
