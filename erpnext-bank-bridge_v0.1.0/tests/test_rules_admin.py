@@ -75,20 +75,34 @@ class TestRulesCrud(AdminBase):
         self._add(match_type='bogus')
         self.assertEqual(CategorizationRule.query.count(), 0)
 
-    def test_edit_rule(self):
+    def test_edit_rule_supersedes_non_destructively(self):
         self._add()
-        rid = CategorizationRule.query.first().id
+        old = CategorizationRule.query.first()
+        rid = old.id
         self.client.post('/admin/rules/save', data=dict(
             id=str(rid), name='Fuel v2', priority='5', active='1',
             match_type='merchant_exact', match_value='Chevron',
             debit_account='Fuel - EC', credit_account='Bank - EC',
             party_type='Supplier', party_name='', description_template=''),
             follow_redirects=True)
-        rule = db.session.get(CategorizationRule, rid)
-        self.assertEqual(rule.name, 'Fuel v2')
-        self.assertEqual(rule.priority, 5)
-        self.assertEqual(rule.match_type, 'merchant_exact')
-        self.assertEqual(rule.party_type, 'Supplier')
+        # Old version is archived + points forward; new version is current.
+        old = db.session.get(CategorizationRule, rid)
+        self.assertEqual(old.name, 'Fuel')          # unchanged (history)
+        self.assertTrue(old.archived)
+        self.assertFalse(old.active)
+        self.assertIsNotNone(old.superseded_by)
+        new_rule = db.session.get(CategorizationRule, old.superseded_by)
+        self.assertEqual(new_rule.name, 'Fuel v2')
+        self.assertEqual(new_rule.priority, 5)
+        self.assertEqual(new_rule.match_type, 'merchant_exact')
+        self.assertEqual(new_rule.party_type, 'Supplier')
+        self.assertFalse(new_rule.archived)
+        # Exactly one LIVE rule remains.
+        live = CategorizationRule.query.filter_by(archived=False).all()
+        self.assertEqual(len(live), 1)
+        self.assertEqual(live[0].id, new_rule.id)
+        # Both rows still exist — nothing hard-deleted.
+        self.assertEqual(CategorizationRule.query.count(), 2)
 
     def test_toggle_rule(self):
         self._add()
@@ -99,12 +113,17 @@ class TestRulesCrud(AdminBase):
         db.session.refresh(rule)
         self.assertFalse(rule.active)
 
-    def test_delete_rule(self):
+    def test_delete_rule_archives_not_removes(self):
         self._add()
         rid = CategorizationRule.query.first().id
         self.client.post('/admin/rules/delete', data={'id': str(rid)},
                          follow_redirects=True)
-        self.assertEqual(CategorizationRule.query.count(), 0)
+        # Row persists (audit/history) but is archived + inactive.
+        self.assertEqual(CategorizationRule.query.count(), 1)
+        rule = db.session.get(CategorizationRule, rid)
+        self.assertTrue(rule.archived)
+        self.assertFalse(rule.active)
+        self.assertEqual(CategorizationRule.query.filter_by(archived=False).count(), 0)
 
     def test_unchecked_active_is_false(self):
         self._add(active='')       # checkbox unchecked → absent

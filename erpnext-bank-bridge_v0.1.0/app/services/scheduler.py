@@ -26,7 +26,10 @@ def _run_sync(app) -> None:
     from ..sync_engine import sync_all
     from ..plaid_client import PlaidError, PlaidConfigError
     from .. import plaid_settings
+    from .. import audit
     with app.app_context():
+        # Tag every AuditEvent this poll writes as scheduler-driven.
+        audit.set_context('scheduler')
         if not plaid_settings.is_configured():
             log.info('[scheduler] Plaid not configured — skipping poll')
             return

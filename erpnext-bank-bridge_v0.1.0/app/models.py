@@ -174,6 +174,11 @@ class PlaidSyncLog(db.Model):
     count = db.Column(db.Integer, default=0)          # transactions handled
     status = db.Column(db.String(12), default='success', index=True)  # success | failed
     error_message = db.Column(db.Text, nullable=True)
+    # v0.3.0 audit cross-link: the AuditEvent.subject_id this action pertains to
+    # (e.g. a Supplier id for an erpnext_supplier_auto_create) so the audit
+    # detail view can surface the underlying HTTP-level log lines alongside the
+    # higher-level event. NULL for batch actions with no single owning subject.
+    subject_id = db.Column(db.String(120), nullable=True, index=True)
 
     def to_dict(self):
         return {
@@ -181,7 +186,7 @@ class PlaidSyncLog(db.Model):
             'at': self.at.isoformat() if self.at else None,
             'item_id': self.item_id, 'direction': self.direction,
             'count': self.count, 'status': self.status,
-            'error_message': self.error_message,
+            'error_message': self.error_message, 'subject_id': self.subject_id,
         }
 
 
@@ -251,6 +256,13 @@ class CategorizationRule(db.Model):
     party_type = db.Column(db.String(20), nullable=True)    # Supplier | Customer
     party_name = db.Column(db.String(255), nullable=True)
     description_template = db.Column(db.Text, default='')
+    # Non-destructive history (v0.3.0 audit): a rule is never mutated in place or
+    # hard-deleted. An EDIT clones the rule and points the old row's
+    # `superseded_by` at the new id (both archived=inactive); a DELETE just sets
+    # `archived`. The rules engine only ever sees active + non-archived rules, so
+    # a past auto-JE decision can always be reconstructed from the archived row.
+    superseded_by = db.Column(db.Integer, nullable=True, index=True)
+    archived = db.Column(db.Boolean, default=False, index=True)
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -263,6 +275,8 @@ class CategorizationRule(db.Model):
             'credit_account': self.credit_account,
             'party_type': self.party_type, 'party_name': self.party_name,
             'description_template': self.description_template,
+            'superseded_by': self.superseded_by,
+            'archived': bool(self.archived),
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -306,6 +320,56 @@ class GeneratedJournalEntry(db.Model):
             'rule_name': self.rule_name, 'error_message': self.error_message,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AuditEvent(db.Model):
+    """Append-only, permanent audit trail of every auditable action (v0.3.0).
+
+    One row per meaningful event — a supplier auto-created, a rule
+    created/updated/deleted, a rule evaluated against a transaction, a Journal
+    Entry generated / approved / rejected / submitted / failed, a sync run
+    starting and completing. NEVER updated or deleted (no TTL), so the count only
+    grows and the full lifecycle of any subject is reconstructable by filtering
+    on (subject_type, subject_id).
+
+    `payload_before` / `payload_after` hold JSON snapshots (stored as text for
+    Postgres+SQLite portability) so a change is fully diff-able after the fact.
+    `event_type` / `subject_type` are deliberately un-constrained strings so a
+    new event kind never needs a migration."""
+    __tablename__ = 'audit_events'
+    id = db.Column(db.Integer, primary_key=True)
+    at = db.Column(db.DateTime, default=_now, index=True)
+    event_type = db.Column(db.String(48), nullable=False, index=True)
+    # 'system' | 'scheduler' | 'admin_ui' | a user identifier.
+    actor = db.Column(db.String(120), default='system', index=True)
+    # Supplier | CategorizationRule | GeneratedJournalEntry | BankTransaction |
+    # PlaidItem  (nullable for run-level events with no single subject).
+    subject_type = db.Column(db.String(40), nullable=True, index=True)
+    subject_id = db.Column(db.String(120), nullable=True, index=True)
+    payload_before = db.Column(db.Text, nullable=True)   # JSON string | NULL
+    payload_after = db.Column(db.Text, nullable=True)    # JSON string | NULL
+    notes = db.Column(db.Text, nullable=True)
+    source_ip = db.Column(db.String(64), nullable=True)
+
+    def _parse(self, blob):
+        if not blob:
+            return None
+        try:
+            import json
+            return json.loads(blob)
+        except (ValueError, TypeError):
+            return blob
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'at': self.at.isoformat() if self.at else None,
+            'event_type': self.event_type, 'actor': self.actor,
+            'subject_type': self.subject_type, 'subject_id': self.subject_id,
+            'payload_before': self._parse(self.payload_before),
+            'payload_after': self._parse(self.payload_after),
+            'notes': self.notes, 'source_ip': self.source_ip,
         }
 
 

@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from flask import current_app
 from jinja2.sandbox import SandboxedEnvironment
 
+from . import audit
 from . import db
 from . import erpnext_bank
 from . import erpnext_settings
@@ -107,19 +108,35 @@ def rule_matches(rule: CategorizationRule, *, merchant_name: str = '',
     return False
 
 
-def find_matching_rule(row) -> CategorizationRule | None:
-    """The first ACTIVE rule (priority ascending, id as tiebreak) that matches
-    the transaction, or None."""
+def evaluate_rules(row):
+    """Walk the ACTIVE, non-archived rules in priority order and return
+    (winner_or_None, trace). `trace` is the ordered list of every rule
+    considered — {rule_id, rule_name, priority, matched} — up to and including
+    the winner, so the audit log captures exactly what was evaluated and why the
+    winner won. Evaluation stops at the first match (first-match-wins)."""
     rules = (CategorizationRule.query
-             .filter(CategorizationRule.active.is_(True))
+             .filter(CategorizationRule.active.is_(True),
+                     CategorizationRule.archived.is_(False))
              .order_by(CategorizationRule.priority.asc(),
                        CategorizationRule.id.asc()).all())
+    trace = []
     for rule in rules:
-        if rule_matches(rule, merchant_name=row.merchant_name,
-                        description=(row.name or ''), category=(row.category or ''),
-                        amount=row.amount):
-            return rule
-    return None
+        matched = rule_matches(
+            rule, merchant_name=row.merchant_name,
+            description=(row.name or ''), category=(row.category or ''),
+            amount=row.amount)
+        trace.append({'rule_id': rule.id, 'rule_name': rule.name,
+                      'priority': rule.priority, 'matched': matched})
+        if matched:
+            return rule, trace
+    return None, trace
+
+
+def find_matching_rule(row) -> CategorizationRule | None:
+    """The first ACTIVE, non-archived rule (priority ascending, id as tiebreak)
+    that matches the transaction, or None. Thin wrapper over evaluate_rules()
+    for callers that don't need the evaluation trace (e.g. the test sandbox)."""
+    return evaluate_rules(row)[0]
 
 
 # ── Journal Entry construction ─────────────────────────────────────────
@@ -213,31 +230,43 @@ def generate_journal_entry(client, row, *, supplier_name=None,
     ERPNext Journal Entry + record a GeneratedJournalEntry. Idempotent on the
     transaction id. Returns the GeneratedJournalEntry row, or None when nothing
     matched / it was already generated. Never raises — failures are recorded on
-    an `error` audit row."""
+    an `error` audit row. Emits AuditEvents (rule_matched, journal_entry_*)."""
     tid = row.plaid_transaction_id
     # Idempotency: one JE per transaction. A prior success (has a JE docname)
     # short-circuits; a prior `error` row is allowed to retry.
-    audit = GeneratedJournalEntry.query.filter_by(
-        plaid_transaction_id=tid).first()
-    if audit is not None and audit.erpnext_journal_entry_name:
-        return audit
+    gje = GeneratedJournalEntry.query.filter_by(plaid_transaction_id=tid).first()
+    if gje is not None and gje.erpnext_journal_entry_name:
+        return gje
 
-    rule = rule or find_matching_rule(row)
+    if rule is None:
+        rule, trace = evaluate_rules(row)
+    else:
+        trace = [{'rule_id': rule.id, 'rule_name': rule.name,
+                  'priority': rule.priority, 'matched': True}]
+    # Permanent record of what the engine evaluated and which rule won — the
+    # basis for reconstructing any past auto-JE decision.
+    audit.record('rule_matched', subject_type='BankTransaction', subject_id=tid,
+                 after={'winner': (rule.id if rule else None),
+                        'winner_name': (rule.name if rule else None),
+                        'merchant_name': row.merchant_name,
+                        'amount': row.amount, 'evaluated': trace},
+                 notes=f'{len(trace)} rule(s) evaluated'
+                       + ('' if rule else ' — no match'))
     if rule is None:
         return None  # no rule matched → leave for manual reconciliation
 
     company = _default_company()
     remark = render_description(rule, row, supplier_name=supplier_name)
 
-    if audit is None:
-        audit = GeneratedJournalEntry(plaid_transaction_id=tid)
-        db.session.add(audit)
-    audit.rule_id = rule.id
-    audit.rule_name = (rule.name or '')[:255]
-    audit.amount = abs(float(row.amount or 0.0))
-    audit.merchant_name = (row.merchant_name or '')[:255]
-    audit.description = remark
-    audit.updated_at = _now()
+    if gje is None:
+        gje = GeneratedJournalEntry(plaid_transaction_id=tid)
+        db.session.add(gje)
+    gje.rule_id = rule.id
+    gje.rule_name = (rule.name or '')[:255]
+    gje.amount = abs(float(row.amount or 0.0))
+    gje.merchant_name = (row.merchant_name or '')[:255]
+    gje.description = remark
+    gje.updated_at = _now()
 
     cfg = current_app.config
     try:
@@ -248,35 +277,51 @@ def generate_journal_entry(client, row, *, supplier_name=None,
         if not name:
             raise ERPNextAPIError('ERPNext returned no Journal Entry name',
                                   status_code=None)
-        audit.erpnext_journal_entry_name = name
-        if cfg.get('ERPNEXT_JOURNAL_ENTRY_AUTO_SUBMIT', False):
+        gje.erpnext_journal_entry_name = name
+        submitted = cfg.get('ERPNEXT_JOURNAL_ENTRY_AUTO_SUBMIT', False)
+        if submitted:
             _submit_je(client, name)
-            audit.state = 'approved'
+            gje.state = 'approved'
         else:
-            audit.state = cfg.get('ERPNEXT_JOURNAL_ENTRY_REVIEW_STATE',
-                                  'pending_review') or 'pending_review'
-        audit.error_message = None
+            gje.state = cfg.get('ERPNEXT_JOURNAL_ENTRY_REVIEW_STATE',
+                                'pending_review') or 'pending_review'
+        gje.error_message = None
         db.session.commit()
-        log.info('generated Journal Entry %s for %s (rule %s)',
-                 name, tid, rule.id)
+        log.info('generated Journal Entry %s for %s (rule %s)', name, tid, rule.id)
+        audit.record('journal_entry_generated',
+                     subject_type='GeneratedJournalEntry', subject_id=gje.id,
+                     after={'journal_entry': name, 'state': gje.state,
+                            'rule_id': rule.id, 'rule_name': rule.name,
+                            'plaid_transaction_id': tid, 'doc': doc},
+                     notes=f'rule “{rule.name}” → {name}')
+        if submitted:
+            audit.record('journal_entry_submitted_to_erpnext',
+                         subject_type='GeneratedJournalEntry', subject_id=gje.id,
+                         after={'journal_entry': name, 'auto_submit': True},
+                         notes='auto-submitted on generation')
     except (ERPNextAPIError, ERPNextError) as e:
         db.session.rollback()
-        # Re-load the audit row (rollback detached it) and record the failure.
-        audit = GeneratedJournalEntry.query.filter_by(
+        # Re-load the row (rollback detached it) and record the failure.
+        gje = GeneratedJournalEntry.query.filter_by(
             plaid_transaction_id=tid).first()
-        if audit is None:
-            audit = GeneratedJournalEntry(plaid_transaction_id=tid,
-                                          rule_id=rule.id)
-            db.session.add(audit)
-        audit.state = 'error'
-        audit.rule_name = (rule.name or '')[:255]
-        audit.amount = abs(float(row.amount or 0.0))
-        audit.merchant_name = (row.merchant_name or '')[:255]
-        audit.error_message = str(e)[:2000]
-        audit.updated_at = _now()
+        if gje is None:
+            gje = GeneratedJournalEntry(plaid_transaction_id=tid, rule_id=rule.id)
+            db.session.add(gje)
+        gje.state = 'error'
+        gje.rule_id = rule.id
+        gje.rule_name = (rule.name or '')[:255]
+        gje.amount = abs(float(row.amount or 0.0))
+        gje.merchant_name = (row.merchant_name or '')[:255]
+        gje.error_message = str(e)[:2000]
+        gje.updated_at = _now()
         db.session.commit()
         log.warning('Journal Entry generation failed for %s: %s', tid, e)
-    return audit
+        audit.record('journal_entry_failed',
+                     subject_type='GeneratedJournalEntry', subject_id=gje.id,
+                     after={'plaid_transaction_id': tid, 'rule_id': rule.id,
+                            'error': str(e)[:2000]},
+                     notes=f'rule “{rule.name}” failed')
+    return gje
 
 
 def categorize_after_push(erp_client, row) -> None:

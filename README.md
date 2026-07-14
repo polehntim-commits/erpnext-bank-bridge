@@ -91,8 +91,9 @@ out of the account → withdrawal; negative = money in → deposit).
 | `bank_transactions` | local mirror of Plaid transactions + ERPNext docname/state |
 | `suppliers` | merchant → ERPNext Supplier cache (normalized name, tallies) — v0.3.0 |
 | `categorization_rules` | user rules: match predicate → debit/credit accounts + party + template — v0.3.0 |
-| `generated_journal_entries` | audit trail of rules-generated JEs (state, rule, JE docname) — v0.3.0 |
-| `plaid_sync_log` | audit trail (plaid_pull / erpnext_push / erpnext_supplier_auto_create, counts, errors) |
+| `generated_journal_entries` | per-JE state record (state, rule, JE docname) — v0.3.0 |
+| `audit_events` | **permanent, append-only** audit trail of every action (before/after JSON, actor, IP) — v0.3.0 |
+| `plaid_sync_log` | HTTP-level action log (plaid_pull / erpnext_push / erpnext_supplier_auto_create, counts, errors); `subject_id` cross-links to `audit_events` |
 | `plaid_link_state` | short-lived link-token bookkeeping for the OAuth handoff |
 
 ## Admin UI (LAN-only, unauthenticated)
@@ -109,8 +110,11 @@ trusted LAN, never exposed to the Internet.
   (paste a sample merchant/amount → see which rule matches and the JE preview)
 - `/admin/suppliers` — auto-created Suppliers (tallies, ERPNext link); fix a bad
   normalization or re-point the ERPNext Supplier
-- `/admin/generated_entries` — audit trail of rules-generated Journal Entries;
-  approve (submit) / reject (cancel) individually or in bulk
+- `/admin/generated_entries` — rules-generated Journal Entries; approve (submit)
+  / reject (cancel) individually or in bulk
+- `/admin/audit` — the permanent audit trail: filter by event type / subject /
+  actor / date, drill into any event's before→after JSON, group by subject to
+  see a rule's or JE's full lifecycle, and **Export CSV**
 - `/admin/plaid_settings` — Client ID / secrets / environment / redirect / webhook
 - `/admin/erpnext_settings` — ERPNext URL + API key/secret + Test / Verify doctype
 - `/admin/sync_log` — recent sync activity
@@ -273,6 +277,49 @@ automatically parties the JE to the `Chevron` Supplier. Review generated JEs at
 > is wrong. It stays OFF until you explicitly opt in, and defaults to inserting
 > **Drafts** (not submitted) so a human reviews before anything hits the books.
 
+## Audit trail (`/admin/audit`, v0.3.0)
+
+Everything the bridge does that changes state is written to a **permanent,
+append-only** `audit_events` table — no TTL, never updated, never purged, so the
+count only grows and the full lifecycle of any rule, Journal Entry, supplier, or
+transaction is reconstructable after the fact.
+
+**What's logged** (17 event types):
+
+| Event | When |
+|-------|------|
+| `supplier_auto_created` / `supplier_edited` | a merchant's Supplier is first minted / manually relinked |
+| `rule_created` / `rule_updated` / `rule_deleted` | rule CRUD, with before→after snapshots |
+| `rule_matched` | per transaction: which rules were **evaluated** and which one **won** |
+| `journal_entry_generated` / `_failed` | a JE is created (full accounts+amounts payload) or generation fails |
+| `journal_entry_approved` / `_rejected` / `_submitted_to_erpnext` | review actions on a generated JE |
+| `journal_entry_edited` | reserved for a future JE-edit flow |
+| `bank_transaction_synced` / `bank_transaction_reconciled` | a transaction posts to ERPNext / is reconciled |
+| `sync_run_started` / `sync_run_completed` | each poll, with aggregate counts |
+| `rules_rerun` | an explicit "rerun rules" admin action |
+
+Each event records the **actor** (`system`, `scheduler`, `admin_ui`, or a user
+id), the **source IP** for UI actions, `subject_type` + `subject_id`, and JSON
+`payload_before` / `payload_after`. The `/admin/audit` page is filterable by
+every field and down to an individual subject (`?subject_type=…&subject_id=…`
+shows just that record's history), each event has a **detail view** with the
+full before→after JSON, and there's a filter-preserving **Export CSV** button.
+`plaid_sync_log` rows carry the same `subject_id`, so an event's detail page also
+surfaces the underlying ERPNext HTTP calls.
+
+**Rules are non-destructive.** Editing a rule never overwrites it: the old
+version is archived (`active=False`, `archived=True`) and linked forward via
+`superseded_by` to a freshly-created row; deleting archives rather than removes.
+The rules engine only ever sees live (active, non-archived) rules, so a past
+auto-JE decision can always be traced back to the exact rule text that produced
+it. View archived rules with **show archived / history** on `/admin/rules`.
+
+**Rule changes are not retroactive.** Editing a rule affects only future
+transactions — it never silently re-runs against history. To apply current rules
+to past posted transactions that never matched, use the explicit **Rerun rules
+on eligible transactions** button on `/admin/transactions`; it's logged as a
+`rules_rerun` event.
+
 ### Environment variables
 
 | Var | Default | Notes |
@@ -319,15 +366,17 @@ cd erpnext-bank-bridge_v0.1.0
 python3 -m unittest discover -s tests -v
 ```
 
-136 tests cover Fernet encryption round-trip + key persistence, Plaid response
+154 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
 push → error + retry, one-click account import, merchant-name normalization,
 auto-Supplier cache hit/miss/config-disabled, the rules engine (every match
 type, priority ordering, JE sign handling, one-JE-per-transaction idempotency,
-non-destructive failure), the rules admin CRUD + test endpoint, and every admin
-page rendering. The Plaid SDK and ERPNext are mocked (`tests/fakes.py`), so no
-network access or extra wheels are needed.
+non-destructive failure), the rules admin CRUD + test endpoint, the audit trail
+(every state change writes an event, count grows monotonically, rule
+supersede-vs-delete preserves history, CSV export, subject filtering), and every
+admin page rendering. The Plaid SDK and ERPNext are mocked (`tests/fakes.py`), so
+no network access or extra wheels are needed.
 
 ## Security notes
 
@@ -357,7 +406,8 @@ a vulnerability.
 - Rule-authoring conveniences: clone a rule, import/export a rule set.
 
 **Done:** ~~Merchant → ERPNext Supplier auto-create + rules-based transaction
-categorization~~ (v0.3.0).
+categorization~~ + ~~full append-only audit trail with non-destructive rule
+history~~ (v0.3.0).
 
 ## License
 

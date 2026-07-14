@@ -112,8 +112,17 @@ def run_migrations() -> None:
         _add_column_if_missing('plaid_accounts', 'erpnext_gl_account_name', 'TEXT')
         # v0.3.0 — auto-Supplier creation + rules-based Journal Entry generation
         # add three NEW tables (suppliers, categorization_rules,
-        # generated_journal_entries). New tables are created by db.create_all()
-        # (which runs just before this), so there is no additive-column step to
-        # apply here — the block is a no-op on both a fresh and an upgraded DB.
+        # generated_journal_entries) + one more (audit_events). New tables are
+        # created by db.create_all() (which runs just before this), so they need
+        # no step here. The additive COLUMNS below are only for a database that
+        # already built categorization_rules / plaid_sync_log under an earlier
+        # v0.3.0 build — on a fresh DB create_all already has them, so each check
+        # short-circuits.
+        #   * non-destructive rule history (supersede/archive)
+        _add_column_if_missing('categorization_rules', 'superseded_by', 'INTEGER')
+        _add_column_if_missing('categorization_rules', 'archived', 'BOOLEAN',
+                               default_sql='false')
+        #   * audit cross-link from the HTTP-level sync log to an AuditEvent subject
+        _add_column_if_missing('plaid_sync_log', 'subject_id', 'VARCHAR(120)')
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)

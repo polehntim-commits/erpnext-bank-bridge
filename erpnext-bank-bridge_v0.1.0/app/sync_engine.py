@@ -33,6 +33,7 @@ from datetime import date, datetime, timezone
 
 from flask import current_app
 
+from . import audit
 from . import db
 from . import categorization
 from . import erpnext_bank
@@ -282,6 +283,14 @@ def push_pending(erp_client, item_id: str = '') -> dict:
                 stats['cancelled'] += 1
             else:
                 stats['posted'] += 1
+                audit.record('bank_transaction_synced',
+                             subject_type='BankTransaction',
+                             subject_id=row.plaid_transaction_id,
+                             after={'erpnext_bank_transaction_id':
+                                    row.erpnext_bank_transaction_id,
+                                    'amount': row.amount,
+                                    'merchant_name': row.merchant_name,
+                                    'account_id': row.account_id})
                 # v0.3.0: auto-Supplier + rules-based JE. Best-effort and
                 # self-guarding — a failure here never unwinds the posted row.
                 categorization.categorize_after_push(erp_client, row)
@@ -354,11 +363,24 @@ def sync_all(plaid_client: PlaidClient = None, erp_client=None) -> dict:
     if erp_client is None:
         erp_client = get_erp_client_or_none()
     items = PlaidItem.query.filter(PlaidItem.status != 'revoked').all()
+    audit.record('sync_run_started', subject_type=None,
+                 after={'items': len(items)},
+                 notes=f'sync across {len(items)} item(s)')
     results = []
+    agg = {'added': 0, 'modified': 0, 'removed': 0, 'posted': 0,
+           'cancelled': 0, 'failed': 0}
     for item in items:
         try:
-            results.append(sync_item(item, plaid_client, erp_client))
+            res = sync_item(item, plaid_client, erp_client)
+            results.append(res)
+            for k in ('added', 'modified', 'removed'):
+                agg[k] += res.get('pull', {}).get(k, 0)
+            for k in ('posted', 'cancelled', 'failed'):
+                agg[k] += res.get('push', {}).get(k, 0)
         except (PlaidError, PlaidConfigError) as e:
             log.warning('sync failed for item %s: %s', item.item_id, e)
             results.append({'item_id': item.item_id, 'error': str(e)})
+    audit.record('sync_run_completed', subject_type=None, after=agg,
+                 notes=(f"items={len(items)} added={agg['added']} "
+                        f"posted={agg['posted']} failed={agg['failed']}"))
     return {'items': len(items), 'results': results}

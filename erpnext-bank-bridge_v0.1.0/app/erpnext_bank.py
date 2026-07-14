@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 
 from flask import current_app
 
+from . import audit
 from . import db
 from . import erpnext_settings
 from .erpnext_client import (ERPNextAPIError, ERPNextClient, ERPNextConfig,
@@ -280,12 +281,16 @@ def normalize_merchant_name(raw: str) -> str:
     return s
 
 
-def _supplier_log(direction: str, status: str, message: str = '') -> None:
-    """Persist one PlaidSyncLog row for a supplier auto-create. Best-effort."""
+def _supplier_log(direction: str, status: str, message: str = '',
+                  subject_id=None) -> None:
+    """Persist one PlaidSyncLog row for a supplier auto-create. Best-effort.
+    `subject_id` cross-links this HTTP-level line to the AuditEvent for the same
+    Supplier (see /admin/audit detail view)."""
     try:
         db.session.add(PlaidSyncLog(
             item_id='', direction=direction, count=1, status=status,
-            error_message=(message or None)))
+            error_message=(message or None),
+            subject_id=(str(subject_id) if subject_id is not None else None)))
         db.session.commit()
     except Exception:  # pragma: no cover - logging must never crash a push
         db.session.rollback()
@@ -302,7 +307,8 @@ def _default_supplier_country() -> str:
             or 'United States').strip() or 'United States'
 
 
-def _resolve_erpnext_supplier(client: ERPNextClient, normalized: str) -> str:
+def _resolve_erpnext_supplier(client: ERPNextClient, normalized: str,
+                              subject_id=None) -> str:
     """Find-or-create the ERPNext Supplier for a normalized merchant name and
     return its docname. Searches by supplier_name first (reuse an existing
     Supplier), else creates one; on a link failure (unknown supplier_group /
@@ -312,7 +318,8 @@ def _resolve_erpnext_supplier(client: ERPNextClient, normalized: str) -> str:
         fields=['name'], limit_page_length=1)
     if existing:
         _supplier_log('erpnext_supplier_auto_create', 'success',
-                      f'matched existing Supplier {existing[0]["name"]}')
+                      f'matched existing Supplier {existing[0]["name"]}',
+                      subject_id=subject_id)
         return existing[0]['name']
     doc = {
         'supplier_name': normalized,
@@ -329,7 +336,7 @@ def _resolve_erpnext_supplier(client: ERPNextClient, normalized: str) -> str:
             SUPPLIER_DT, {'supplier_name': normalized, 'supplier_type': 'Company'})
     name = created.get('name') or normalized
     _supplier_log('erpnext_supplier_auto_create', 'success',
-                  f'created Supplier {name}')
+                  f'created Supplier {name}', subject_id=subject_id)
     return name
 
 
@@ -348,12 +355,14 @@ def get_or_create_supplier(client: ERPNextClient | None, merchant_name: str, *,
     if not normalized:
         return None
     row = Supplier.query.filter_by(normalized_name=normalized).first()
-    if row is None:
+    is_new = row is None
+    if is_new:
         row = Supplier(merchant_name=(merchant_name or '')[:255],
                        normalized_name=normalized[:255],
                        first_seen_at=_now(), transaction_count=0,
                        total_amount=0.0)
         db.session.add(row)
+        db.session.flush()          # assign row.id for the audit / log cross-link
     row.transaction_count = (row.transaction_count or 0) + 1
     row.total_amount = round((row.total_amount or 0.0)
                              + abs(float(amount or 0.0)), 2)
@@ -366,11 +375,18 @@ def get_or_create_supplier(client: ERPNextClient | None, merchant_name: str, *,
     row.updated_at = _now()
     if not row.erpnext_supplier_name and client is not None:
         try:
-            row.erpnext_supplier_name = _resolve_erpnext_supplier(client, normalized)
+            row.erpnext_supplier_name = _resolve_erpnext_supplier(
+                client, normalized, subject_id=row.id)
         except (ERPNextAPIError, ERPNextError) as e:
-            _supplier_log('erpnext_supplier_auto_create', 'failed', str(e))
+            _supplier_log('erpnext_supplier_auto_create', 'failed', str(e),
+                          subject_id=row.id)
             log.warning('supplier resolve failed for %r: %s', normalized, e)
     db.session.commit()
+    if is_new:
+        # Permanent audit line for the first sighting of this merchant.
+        audit.record('supplier_auto_created', subject_type='Supplier',
+                     subject_id=row.id, after=row.to_dict(),
+                     notes=f'merchant_name={merchant_name!r} → {normalized!r}')
     return row.erpnext_supplier_name
 
 

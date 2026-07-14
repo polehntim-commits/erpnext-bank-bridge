@@ -16,6 +16,7 @@ from urllib.parse import quote_plus
 from flask import (Blueprint, current_app, redirect, render_template_string,
                    request, url_for)
 
+from .. import audit
 from .. import categorization
 from .. import db
 from .. import erpnext_accounts
@@ -24,7 +25,7 @@ from .. import erpnext_settings as erps
 from .. import plaid_settings as ps
 from .. import sync_engine
 from ..erpnext_client import ERPNextConfigError, ERPNextError
-from ..models import (BankTransaction, CategorizationRule,
+from ..models import (AuditEvent, BankTransaction, CategorizationRule,
                       GeneratedJournalEntry, PlaidAccount, PlaidItem,
                       PlaidSyncLog, Supplier)
 
@@ -44,6 +45,9 @@ def _ensure_fresh_session():
         db.session.rollback()
     except Exception:  # pragma: no cover - never block a request on cleanup
         db.session.remove()
+    # Tag every AuditEvent written while serving this request as admin-driven,
+    # with the caller's IP, so the audit trail records who/where.
+    audit.set_context('admin_ui', request.remote_addr)
 
 
 # ── Shared chrome ────────────────────────────────────────────────
@@ -91,6 +95,7 @@ NAV_HTML = """
   <a href="/admin/rules" class="{{ 'active' if page == 'rules' else '' }}">Rules</a>
   <a href="/admin/suppliers" class="{{ 'active' if page == 'suppliers' else '' }}">Suppliers</a>
   <a href="/admin/generated_entries" class="{{ 'active' if page == 'generated_entries' else '' }}">Generated JEs</a>
+  <a href="/admin/audit" class="{{ 'active' if page == 'audit' else '' }}">Audit</a>
   <a href="/admin/sync_log" class="{{ 'active' if page == 'sync_log' else '' }}">Sync Log</a>
   <a href="/admin/plaid_settings" class="{{ 'active' if page == 'plaid_settings' else '' }}">Plaid</a>
   <a href="/admin/erpnext_settings" class="{{ 'active' if page == 'erpnext_settings' else '' }}">ERPNext</a>
@@ -517,6 +522,14 @@ TRANSACTIONS_BODY = """
   <button type="submit" class="primary">Filter</button>
 </form>
 
+<div style="margin:8px 0">
+  <form method="post" action="/admin/transactions/rerun_rules" style="display:inline"
+        onsubmit="return confirm('Run the categorization rules against posted transactions that have no Journal Entry yet? This uses your CURRENT rules and is logged.')">
+    <button type="submit" class="secondary">Rerun rules on eligible transactions</button>
+  </form>
+  <span style="font-size:12px;color:#888;margin-left:8px">Explicit + logged. Editing a rule never re-runs it against past transactions — this button does, on demand.</span>
+</div>
+
 <table>
   <tr><th>Date</th><th>Account</th><th>Description</th><th class="num">Amount</th>
       <th>Status</th><th>ERPNext</th><th></th></tr>
@@ -594,6 +607,41 @@ def retry_transaction():
     ok, msg = sync_engine.retry_row(int(raw_id))
     prefix = 'Retried: ' if ok else 'Retry failed: '
     return redirect('/admin/transactions?flash=' + quote_plus(prefix + msg))
+
+
+@bp.post('/admin/transactions/rerun_rules')
+def rerun_rules():
+    """Explicit, logged re-run of the CURRENT rules against posted, non-removed
+    transactions that don't yet have a generated Journal Entry. Rule edits never
+    retroactively re-run on their own — this is the deliberate opt-in path."""
+    erp = sync_engine.get_erp_client_or_none()
+    if erp is None:
+        return redirect('/admin/transactions?flash=' + quote_plus(
+            'ERPNext not configured — cannot generate Journal Entries.'))
+    done = {row.plaid_transaction_id for row in
+            db.session.query(GeneratedJournalEntry.plaid_transaction_id)
+            .filter(GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None))}
+    eligible = (BankTransaction.query
+                .filter(BankTransaction.posted_at.isnot(None),
+                        BankTransaction.removed.is_(False)).all())
+    generated = matched = considered = 0
+    for row in eligible:
+        if row.plaid_transaction_id in done:
+            continue
+        considered += 1
+        gje = categorization.generate_journal_entry(erp, row)
+        if gje is not None:
+            matched += 1
+            if gje.erpnext_journal_entry_name:
+                generated += 1
+    audit.record('rules_rerun', subject_type=None,
+                 after={'considered': considered, 'matched': matched,
+                        'generated': generated},
+                 notes=(f'reran current rules on {considered} eligible '
+                        f'transaction(s) → {generated} JE(s)'))
+    return redirect('/admin/transactions?flash=' + quote_plus(
+        f'Reran rules on {considered} transaction(s): {generated} '
+        f'Journal Entr(ies) generated.'))
 
 
 # ── Categorization rules ─────────────────────────────────────────
@@ -710,12 +758,19 @@ RULES_BODY = """
 </div>
 {% endif %}
 
-<h3>Rules ({{ rules|length }})</h3>
+<h3 style="display:flex;justify-content:space-between;align-items:center">
+  <span>Rules ({{ rules|length }} live)</span>
+  <span style="font-size:13px;font-weight:400">
+    {% if show_archived %}<a href="/admin/rules">hide history</a>
+    {% else %}<a href="/admin/rules?archived=1">show archived / history</a>{% endif %}
+  </span>
+</h3>
 <table>
-  <tr><th class="num">Prio</th><th>Name</th><th>Match</th><th>Debit</th><th>Credit</th>
+  <tr><th class="num">#</th><th class="num">Prio</th><th>Name</th><th>Match</th><th>Debit</th><th>Credit</th>
       <th>Party</th><th>Active</th><th></th></tr>
   {% for r in rules %}
   <tr>
+    <td class="num">{{ r.id }}</td>
     <td class="num">{{ r.priority }}</td>
     <td>{{ r.name }}</td>
     <td style="font-size:12px"><code>{{ r.match_type }}</code><br>{{ (r.match_value or '')[:50] }}</td>
@@ -733,23 +788,50 @@ RULES_BODY = """
     <td style="white-space:nowrap">
       <a href="/admin/rules?edit={{ r.id }}" class="secondary" style="text-decoration:none;padding:3px 10px;font-size:12px">Edit</a>
       <form method="post" action="/admin/rules/delete" style="display:inline;margin:0"
-            onsubmit="return confirm('Delete rule {{ r.name }}?')">
+            onsubmit="return confirm('Archive rule {{ r.name }}? (kept for history)')">
         <input type="hidden" name="id" value="{{ r.id }}">
-        <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">Delete</button>
+        <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">Archive</button>
       </form>
     </td>
   </tr>
   {% endfor %}
-  {% if not rules %}<tr><td colspan="8" style="color:#888">No rules yet — add one above.</td></tr>{% endif %}
+  {% if not rules %}<tr><td colspan="9" style="color:#888">No live rules — add one above.</td></tr>{% endif %}
 </table>
+<p style="font-size:12px;color:#888">Edits never overwrite: editing a rule archives the old version and creates a new one, so past auto-JE decisions stay reconstructable. See the <a href="/admin/audit?subject_type=CategorizationRule">audit trail</a>.</p>
+
+{% if show_archived %}
+<h3>Archived / historical rules ({{ archived|length }})</h3>
+<table>
+  <tr><th class="num">#</th><th>Name</th><th>Match</th><th>Superseded by</th><th>Updated</th><th></th></tr>
+  {% for r in archived %}
+  <tr style="color:#777">
+    <td class="num">{{ r.id }}</td>
+    <td>{{ r.name }}</td>
+    <td style="font-size:12px"><code>{{ r.match_type }}</code> {{ (r.match_value or '')[:40] }}</td>
+    <td>{% if r.superseded_by %}#{{ r.superseded_by }}{% else %}<span class="pill pill-muted">deleted</span>{% endif %}</td>
+    <td style="font-size:12px">{{ r.updated_at.strftime('%Y-%m-%d %H:%M') if r.updated_at else '' }}</td>
+    <td><a href="/admin/audit?subject_type=CategorizationRule&subject_id={{ r.id }}" style="font-size:12px">lifecycle</a></td>
+  </tr>
+  {% endfor %}
+  {% if not archived %}<tr><td colspan="6" style="color:#888">No archived rules.</td></tr>{% endif %}
+</table>
+{% endif %}
 """
 
 
-def _rules_page(flash_msg='', test_result=None, test=None, form=None):
-    rules = (CategorizationRule.query
-             .order_by(CategorizationRule.priority.asc(),
-                       CategorizationRule.id.asc()).all())
-    return _page(RULES_BODY, page='rules', rules=rules,
+def _rules_page(flash_msg='', test_result=None, test=None, form=None,
+                show_archived=False):
+    live = (CategorizationRule.query
+            .filter(CategorizationRule.archived.is_(False))
+            .order_by(CategorizationRule.priority.asc(),
+                      CategorizationRule.id.asc()).all())
+    archived = []
+    if show_archived:
+        archived = (CategorizationRule.query
+                    .filter(CategorizationRule.archived.is_(True))
+                    .order_by(CategorizationRule.updated_at.desc()).all())
+    return _page(RULES_BODY, page='rules', rules=live, archived=archived,
+                 show_archived=show_archived,
                  match_types=categorization.MATCH_TYPES,
                  account_names=_erpnext_account_names(),
                  form=form or {'active': True, 'priority': 100},
@@ -769,7 +851,9 @@ def rules_page():
         rule = db.session.get(CategorizationRule, int(edit_id))
         if rule is not None:
             form = rule.to_dict()
-    return _rules_page(flash_msg=request.args.get('flash', ''), form=form)
+    show_archived = request.args.get('archived') in ('1', 'true', 'yes')
+    return _rules_page(flash_msg=request.args.get('flash', ''), form=form,
+                       show_archived=show_archived)
 
 
 def _rule_form_values():
@@ -796,35 +880,59 @@ def _rule_form_values():
 
 @bp.post('/admin/rules/save')
 def save_rule():
+    """Create a rule, or NON-DESTRUCTIVELY edit one: an edit clones the rule to a
+    new row and archives the old (active=False, superseded_by=new.id) so the
+    prior version — and therefore any past auto-JE decision — is preserved."""
     vals = _rule_form_values()
     if vals['match_type'] not in categorization.MATCH_TYPES:
         return redirect('/admin/rules?flash=' + quote_plus(
             f"Unknown match type '{vals['match_type']}'"))
     raw_id = (request.form.get('id') or '').strip()
     if raw_id.isdigit():
-        rule = db.session.get(CategorizationRule, int(raw_id))
-        if rule is None:
+        old = db.session.get(CategorizationRule, int(raw_id))
+        if old is None:
             return redirect('/admin/rules?flash=' + quote_plus('Rule not found'))
-        for k, v in vals.items():
-            setattr(rule, k, v)
-        msg = f'Updated rule “{rule.name}”'
+        before = old.to_dict()
+        # Clone → new current version.
+        new_rule = CategorizationRule(**vals)
+        db.session.add(new_rule)
+        db.session.flush()               # assign new_rule.id
+        # Archive the previous version, linking it forward.
+        old.active = False
+        old.archived = True
+        old.superseded_by = new_rule.id
+        db.session.commit()
+        audit.record('rule_updated', subject_type='CategorizationRule',
+                     subject_id=new_rule.id, before=before,
+                     after=new_rule.to_dict(),
+                     notes=f'rule #{old.id} superseded by #{new_rule.id}')
+        msg = f'Updated rule “{new_rule.name}” (v#{new_rule.id}; #{old.id} archived)'
     else:
-        rule = CategorizationRule(**vals)
-        db.session.add(rule)
+        new_rule = CategorizationRule(**vals)
+        db.session.add(new_rule)
+        db.session.commit()
+        audit.record('rule_created', subject_type='CategorizationRule',
+                     subject_id=new_rule.id, after=new_rule.to_dict())
         msg = f'Added rule “{vals["name"]}”'
-    db.session.commit()
     return redirect('/admin/rules?flash=' + quote_plus(msg))
 
 
 @bp.post('/admin/rules/delete')
 def delete_rule():
+    """Archive a rule (never a hard delete): active=False, archived=True. The
+    row stays for history + audit reconstruction."""
     raw_id = (request.form.get('id') or '').strip()
     if raw_id.isdigit():
         rule = db.session.get(CategorizationRule, int(raw_id))
         if rule is not None:
-            db.session.delete(rule)
+            before = rule.to_dict()
+            rule.active = False
+            rule.archived = True
             db.session.commit()
-    return redirect('/admin/rules?flash=' + quote_plus('Rule deleted'))
+            audit.record('rule_deleted', subject_type='CategorizationRule',
+                         subject_id=rule.id, before=before, after=rule.to_dict(),
+                         notes='archived (soft delete — history preserved)')
+    return redirect('/admin/rules?flash=' + quote_plus('Rule archived'))
 
 
 @bp.post('/admin/rules/toggle')
@@ -833,8 +941,12 @@ def toggle_rule():
     if raw_id.isdigit():
         rule = db.session.get(CategorizationRule, int(raw_id))
         if rule is not None:
+            before = rule.to_dict()
             rule.active = not rule.active
             db.session.commit()
+            audit.record('rule_updated', subject_type='CategorizationRule',
+                         subject_id=rule.id, before=before, after=rule.to_dict(),
+                         notes=f'active → {rule.active} (toggle)')
     return redirect('/admin/rules?flash=' + quote_plus('Toggled'))
 
 
@@ -955,6 +1067,7 @@ def edit_supplier():
     s = db.session.get(Supplier, int(raw_id))
     if s is None:
         return redirect('/admin/suppliers?flash=' + quote_plus('Supplier not found'))
+    before = s.to_dict()
     normalized = (request.form.get('normalized_name') or '').strip()
     erp = (request.form.get('erpnext_supplier_name') or '').strip()
     if normalized:
@@ -968,6 +1081,8 @@ def edit_supplier():
         s.normalized_name = normalized
     s.erpnext_supplier_name = erp or None
     db.session.commit()
+    audit.record('supplier_edited', subject_type='Supplier', subject_id=s.id,
+                 before=before, after=s.to_dict(), notes='manual relink/rename')
     return redirect('/admin/suppliers?flash=' + quote_plus('Supplier updated'))
 
 
@@ -1070,25 +1185,38 @@ def _approve_entry(g) -> bool:
         categorization._submit_je(erp, g.erpnext_journal_entry_name)
     except (ERPNextConfigError, ERPNextError):
         return False
+    before = g.to_dict()
     g.state = 'approved'
     g.updated_at = categorization._now()
+    audit.record('journal_entry_approved', subject_type='GeneratedJournalEntry',
+                 subject_id=g.id, before=before, after=g.to_dict(),
+                 notes=f'submitted {g.erpnext_journal_entry_name} in ERPNext',
+                 commit=False)
+    audit.record('journal_entry_submitted_to_erpnext',
+                 subject_type='GeneratedJournalEntry', subject_id=g.id,
+                 after={'journal_entry': g.erpnext_journal_entry_name},
+                 notes='submitted via admin approve', commit=False)
     return True
 
 
 def _reject_entry(g) -> bool:
     """Cancel the JE in ERPNext + mark rejected. Returns True on success."""
+    before = g.to_dict()
     g.state = 'rejected'
     g.updated_at = categorization._now()
-    if not g.erpnext_journal_entry_name:
-        return True
-    erp = sync_engine.get_erp_client_or_none()
-    if erp is not None:
-        try:
-            erp.call_method('frappe.client.cancel', http_method='POST',
-                            json_body={'doctype': categorization.JOURNAL_ENTRY_DT,
-                                       'name': g.erpnext_journal_entry_name})
-        except (ERPNextConfigError, ERPNextError):
-            pass  # audit still flips to rejected; JE may already be draft/cancelled
+    if g.erpnext_journal_entry_name:
+        erp = sync_engine.get_erp_client_or_none()
+        if erp is not None:
+            try:
+                erp.call_method(
+                    'frappe.client.cancel', http_method='POST',
+                    json_body={'doctype': categorization.JOURNAL_ENTRY_DT,
+                               'name': g.erpnext_journal_entry_name})
+            except (ERPNextConfigError, ERPNextError):
+                pass  # audit still flips to rejected; JE may already be cancelled
+    audit.record('journal_entry_rejected', subject_type='GeneratedJournalEntry',
+                 subject_id=g.id, before=before, after=g.to_dict(),
+                 notes='rejected via admin', commit=False)
     return True
 
 
@@ -1134,6 +1262,197 @@ def bulk_entries():
     db.session.commit()
     verb = 'Approved' if action == 'approve' else 'Rejected'
     return redirect('/admin/generated_entries?flash=' + quote_plus(f'{verb} {n} entr(ies)'))
+
+
+# ── Audit trail ──────────────────────────────────────────────────
+
+AUDIT_BODY = """
+<h2>Audit trail</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+<p style="font-size:14px;color:#555">
+  Append-only, permanent record of every auditable action — supplier auto-
+  creation, rule changes, JE generation / approval / rejection, sync runs.
+  {% if subject_type and subject_id %}
+  <b>Lifecycle of {{ subject_type }} #{{ subject_id }}</b> —
+  <a href="/admin/audit">clear</a>.
+  {% endif %}
+</p>
+<form method="get" action="/admin/audit" class="card"
+      style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+  <label style="margin:0">Event type
+    <select name="event_type">
+      <option value="">(any)</option>
+      {% for et in event_types %}
+      <option value="{{ et }}" {{ 'selected' if cur.event_type == et else '' }}>{{ et }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label style="margin:0">Subject type
+    <select name="subject_type">
+      <option value="">(any)</option>
+      {% for st in subject_types %}
+      <option value="{{ st }}" {{ 'selected' if cur.subject_type == st else '' }}>{{ st }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label style="margin:0">Subject id
+    <input name="subject_id" value="{{ cur.subject_id }}" style="width:110px">
+  </label>
+  <label style="margin:0">Actor
+    <input name="actor" value="{{ cur.actor }}" placeholder="admin_ui / scheduler" style="width:120px">
+  </label>
+  <label style="margin:0">From
+    <input name="date_from" type="date" value="{{ cur.date_from }}">
+  </label>
+  <label style="margin:0">To
+    <input name="date_to" type="date" value="{{ cur.date_to }}">
+  </label>
+  <button type="submit" class="primary">Filter</button>
+  <a class="secondary" style="text-decoration:none;padding:8px 16px"
+     href="/admin/audit?format=csv&{{ query_string }}">Export CSV</a>
+</form>
+
+<table>
+  <tr><th>At</th><th>Event</th><th>Actor</th><th>Subject</th><th>Notes</th><th></th></tr>
+  {% for e in rows %}
+  <tr>
+    <td style="font-size:12px;white-space:nowrap">{{ e.at.strftime('%Y-%m-%d %H:%M:%S') if e.at else '' }}</td>
+    <td style="font-size:12px"><code>{{ e.event_type }}</code></td>
+    <td style="font-size:12px">{{ e.actor }}{% if e.source_ip %}<div style="color:#888">{{ e.source_ip }}</div>{% endif %}</td>
+    <td style="font-size:12px">
+      {% if e.subject_type %}
+      <a href="/admin/audit?subject_type={{ e.subject_type }}&subject_id={{ e.subject_id }}">{{ e.subject_type }} #{{ e.subject_id }}</a>
+      {% else %}—{% endif %}
+    </td>
+    <td style="font-size:12px;max-width:280px">{{ (e.notes or '')[:140] }}</td>
+    <td><a href="/admin/audit?id={{ e.id }}" style="font-size:12px">detail</a></td>
+  </tr>
+  {% endfor %}
+  {% if not rows %}<tr><td colspan="6" style="color:#888">No audit events match.</td></tr>{% endif %}
+</table>
+<p style="font-size:12px;color:#888">Showing up to {{ limit }} most recent · {{ total }} total events (permanent — never purged).</p>
+"""
+
+AUDIT_DETAIL_BODY = """
+<h2>Audit event #{{ e.id }}</h2>
+<p><a href="/admin/audit">← back to audit trail</a></p>
+<table>
+  <tr><th>At</th><td>{{ e.at.strftime('%Y-%m-%d %H:%M:%S UTC') if e.at else '' }}</td></tr>
+  <tr><th>Event type</th><td><code>{{ e.event_type }}</code></td></tr>
+  <tr><th>Actor</th><td>{{ e.actor }}</td></tr>
+  <tr><th>Source IP</th><td>{{ e.source_ip or '—' }}</td></tr>
+  <tr><th>Subject</th><td>
+    {% if e.subject_type %}<a href="/admin/audit?subject_type={{ e.subject_type }}&subject_id={{ e.subject_id }}">{{ e.subject_type }} #{{ e.subject_id }}</a>{% else %}—{% endif %}
+  </td></tr>
+  <tr><th>Notes</th><td>{{ e.notes or '—' }}</td></tr>
+</table>
+
+<h3>Before</h3>
+<pre style="white-space:pre-wrap;background:#f7f7f7;border:1px solid #ddd;border-radius:4px;padding:10px;font-size:12px">{{ before_json }}</pre>
+<h3>After</h3>
+<pre style="white-space:pre-wrap;background:#f7f7f7;border:1px solid #ddd;border-radius:4px;padding:10px;font-size:12px">{{ after_json }}</pre>
+
+{% if sync_rows %}
+<h3>Related ERPNext sync-log lines (subject_id {{ e.subject_id }})</h3>
+<table>
+  <tr><th>At</th><th>Direction</th><th>Status</th><th>Detail</th></tr>
+  {% for r in sync_rows %}
+  <tr>
+    <td style="font-size:12px">{{ r.at.strftime('%Y-%m-%d %H:%M:%S') if r.at else '' }}</td>
+    <td style="font-size:12px">{{ r.direction }}</td>
+    <td>{% if r.status=='success' %}<span class="pill pill-ok">success</span>{% else %}<span class="pill pill-err">{{ r.status }}</span>{% endif %}</td>
+    <td style="font-size:12px;max-width:340px">{{ (r.error_message or '')[:200] }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+"""
+
+
+def _audit_query(cur):
+    """Build the filtered AuditEvent query from the parsed filter dict `cur`."""
+    from datetime import datetime, timedelta
+    q = AuditEvent.query
+    if cur['event_type']:
+        q = q.filter(AuditEvent.event_type == cur['event_type'])
+    if cur['subject_type']:
+        q = q.filter(AuditEvent.subject_type == cur['subject_type'])
+    if cur['subject_id']:
+        q = q.filter(AuditEvent.subject_id == cur['subject_id'])
+    if cur['actor']:
+        q = q.filter(AuditEvent.actor == cur['actor'])
+    for key, op in (('date_from', 'ge'), ('date_to', 'lt')):
+        val = cur[key]
+        if not val:
+            continue
+        try:
+            d = datetime.strptime(val, '%Y-%m-%d')
+        except ValueError:
+            continue
+        if op == 'ge':
+            q = q.filter(AuditEvent.at >= d)
+        else:
+            q = q.filter(AuditEvent.at < d + timedelta(days=1))
+    return q
+
+
+@bp.get('/admin/audit')
+def audit_page():
+    import json as _json
+    # Single-event detail view.
+    detail_id = (request.args.get('id') or '').strip()
+    if detail_id.isdigit():
+        e = db.session.get(AuditEvent, int(detail_id))
+        if e is None:
+            return redirect('/admin/audit?flash=' + quote_plus('Event not found'))
+        d = e.to_dict()
+        sync_rows = []
+        if e.subject_id:
+            sync_rows = (PlaidSyncLog.query
+                         .filter(PlaidSyncLog.subject_id == e.subject_id)
+                         .order_by(PlaidSyncLog.at.desc()).limit(50).all())
+        return _page(AUDIT_DETAIL_BODY, page='audit', e=e,
+                     before_json=_json.dumps(d['payload_before'], indent=2)
+                     if d['payload_before'] is not None else '(none)',
+                     after_json=_json.dumps(d['payload_after'], indent=2)
+                     if d['payload_after'] is not None else '(none)',
+                     sync_rows=sync_rows)
+
+    cur = {k: (request.args.get(k) or '').strip() for k in
+           ('event_type', 'subject_type', 'subject_id', 'actor',
+            'date_from', 'date_to')}
+    q = _audit_query(cur)
+
+    # CSV export — every field, honoring the same filters.
+    if (request.args.get('format') or '') == 'csv':
+        import csv
+        import io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(['id', 'at', 'event_type', 'actor', 'subject_type',
+                    'subject_id', 'payload_before', 'payload_after', 'notes',
+                    'source_ip'])
+        for e in q.order_by(AuditEvent.at.asc(), AuditEvent.id.asc()).all():
+            w.writerow([e.id, e.at.isoformat() if e.at else '', e.event_type,
+                        e.actor, e.subject_type or '', e.subject_id or '',
+                        e.payload_before or '', e.payload_after or '',
+                        e.notes or '', e.source_ip or ''])
+        from flask import Response
+        return Response(
+            buf.getvalue(), mimetype='text/csv',
+            headers={'Content-Disposition':
+                     'attachment; filename=audit_events.csv'})
+
+    limit = 500
+    total = q.count()
+    rows = q.order_by(AuditEvent.at.desc(), AuditEvent.id.desc()).limit(limit).all()
+    # Preserve the active filters on the CSV-export link.
+    query_string = '&'.join(f'{k}={quote_plus(v)}' for k, v in cur.items() if v)
+    return _page(AUDIT_BODY, page='audit', rows=rows, cur=cur, total=total,
+                 limit=limit, event_types=audit.EVENT_TYPES,
+                 subject_types=audit.SUBJECT_TYPES, query_string=query_string,
+                 subject_type=cur['subject_type'], subject_id=cur['subject_id'],
+                 flash_msg=request.args.get('flash', ''))
 
 
 # ── Plaid settings ───────────────────────────────────────────────
