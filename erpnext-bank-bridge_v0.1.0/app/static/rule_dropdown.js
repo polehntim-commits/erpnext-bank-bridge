@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// ERPNext Bank Bridge — reusable custom autocomplete dropdown (v0.3.3).
+// ERPNext Bank Bridge — reusable custom autocomplete dropdown (v0.3.4).
 //
 // A tiny, dependency-free replacement for <datalist> that can render rich rows
 // (merchant + txn count + $ total). Extracted from the inline rules-page script

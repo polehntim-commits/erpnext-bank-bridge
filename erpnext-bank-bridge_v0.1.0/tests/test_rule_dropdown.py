@@ -34,11 +34,33 @@ _HARNESS = (
     "process.stdout.write(JSON.stringify(out.map(function (o) { return o && o.name; })));"
 )
 
+# Same as _HARNESS but treats each option as a plain string label — the shape the
+# offset-account dropdown (v0.3.4) feeds in (ERPNext GL Account docnames), which
+# use the module's default identity getLabel rather than an object `.name`.
+_HARNESS_STR = (
+    "const m = require(process.argv[1]);"
+    "const p = JSON.parse(process.argv[2]);"
+    "const out = m.filterOptions(p.options, p.query);"
+    "process.stdout.write(JSON.stringify(out));"
+)
+
 
 def run_filter(options, query):
     """Run the shipped filterOptions against `options`/`query`, return labels."""
     res = subprocess.run(
         [NODE, '-e', _HARNESS, MODULE_PATH,
+         json.dumps({'options': options, 'query': query})],
+        capture_output=True, text=True, timeout=30)
+    if res.returncode != 0:
+        raise AssertionError('node harness failed: ' + res.stderr)
+    return json.loads(res.stdout)
+
+
+def run_filter_strings(options, query):
+    """Run the shipped filterOptions over plain-string options (default label),
+    mirroring how the offset-account dropdown filters GL Account docnames."""
+    res = subprocess.run(
+        [NODE, '-e', _HARNESS_STR, MODULE_PATH,
          json.dumps({'options': options, 'query': query})],
         capture_output=True, text=True, timeout=30)
     if res.returncode != 0:
@@ -90,6 +112,47 @@ class TestFilterOptions(unittest.TestCase):
         self.assertEqual(run_filter(self.MERCHANTS, '  shell  '), ['Shell'])
 
 
+@unittest.skipIf(NODE is None, 'node not installed — JS filter test skipped')
+class TestAccountFilterOptions(unittest.TestCase):
+    """The offset-account dropdown (v0.3.4, replacing the Safari-flaky native
+    <datalist>) feeds plain GL Account docname strings through the same shared
+    filterOptions core — here exercised with the module's default identity label
+    instead of an object `.name`."""
+
+    # ERPNext leaf-account docnames: `<number> - <name> - <company_abbr>`.
+    ACCOUNTS = [
+        '5100 - Fuel Expense - EC',
+        '5110 - Repairs & Maintenance - EC',
+        '4000 - Sales - EC',
+        '1200 - Bank Accounts - EC',
+        '5200 - Freight Expense - EC',
+    ]
+
+    def test_substring_match_on_docname(self):
+        self.assertEqual(run_filter_strings(self.ACCOUNTS, 'expense'),
+                         ['5100 - Fuel Expense - EC',
+                          '5200 - Freight Expense - EC'])
+
+    def test_match_on_account_number(self):
+        self.assertEqual(run_filter_strings(self.ACCOUNTS, '511'),
+                         ['5110 - Repairs & Maintenance - EC'])
+
+    def test_case_insensitive(self):
+        self.assertEqual(run_filter_strings(self.ACCOUNTS, 'FUEL'),
+                         ['5100 - Fuel Expense - EC'])
+
+    def test_empty_query_returns_all(self):
+        self.assertEqual(run_filter_strings(self.ACCOUNTS, ''), self.ACCOUNTS)
+
+    def test_no_match_returns_empty(self):
+        # Drives the "use as new" empty state — free-text accounts still work.
+        self.assertEqual(run_filter_strings(self.ACCOUNTS, 'zzz'), [])
+
+    def test_query_is_trimmed(self):
+        self.assertEqual(run_filter_strings(self.ACCOUNTS, '  sales  '),
+                         ['4000 - Sales - EC'])
+
+
 class _AppBase(unittest.TestCase):
     def setUp(self):
         self._dbfd, self._dbpath = tempfile.mkstemp(suffix='.sqlite')
@@ -135,6 +198,26 @@ class TestDropdownAssetWiring(_AppBase):
         # The "use as new" empty-state string must reach the page.
         r = self.client.get('/admin/rules')
         self.assertIn('as new', r.data.decode())
+
+    def test_offset_account_uses_custom_dropdown_not_datalist(self):
+        # v0.3.4: the offset_account field moved off the native <datalist> (which
+        # Safari collapsed mid-type) onto the shared BankBridgeDropdown. The
+        # datalist markup must be gone and the plain input + menu present.
+        # Check for the real element/attribute, not the bare word "datalist" —
+        # the explanatory comments still name the old element on purpose.
+        html = self.client.get('/admin/rules').data.decode()
+        self.assertNotIn('<datalist id=', html)
+        self.assertNotIn('list="acctlist"', html)
+        self.assertIn('id="offset-account"', html)
+        self.assertIn('id="oa-dd"', html)
+
+    def test_known_accounts_endpoint_returns_accounts_shape(self):
+        # The offset-account dropdown fetches from this endpoint. Unconfigured
+        # ERPNext → an empty list (field stays free-text), never an error.
+        r = self.client.get('/api/rules/known_accounts')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('json', r.headers.get('Content-Type', ''))
+        self.assertEqual(r.get_json(), {'accounts': []})
 
 
 if __name__ == '__main__':

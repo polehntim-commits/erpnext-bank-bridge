@@ -756,15 +756,28 @@ def known_categories_api():
 
 
 def _erpnext_account_names() -> list:
-    """ERPNext GL Account docnames for the rule debit/credit datalists.
+    """ERPNext GL Account docnames for the rule offset-account dropdown.
     Best-effort — an empty list (ERPNext down / unconfigured) just means the
-    fields are free-text, which still works."""
+    field is free-text, which still works."""
     if not erps.is_configured():
         return []
     try:
         return [a['name'] for a in erpnext_bank.list_accounts()]
     except (ERPNextConfigError, ERPNextError):
         return []
+
+
+@bp.get('/api/rules/known_accounts')
+def known_accounts_api():
+    """Autocomplete feed for the offset_account field: ERPNext GL Account
+    docnames (Chart-of-Accounts leaves). The docname is already the
+    `<account_number> - <account_name> - <company_abbr>` display string, so the
+    dropdown matches + renders it directly. Best-effort — an empty list
+    (ERPNext down / unconfigured) just leaves the field as free-text.
+
+    Fed to the shared BankBridgeDropdown (v0.3.4) that replaced the native
+    <datalist>, which Safari collapsed mid-type."""
+    return jsonify({'accounts': _erpnext_account_names()})
 
 
 RULES_BODY = """
@@ -822,11 +835,14 @@ RULES_BODY = """
     </label>
   </div>
   <div style="display:flex;gap:12px;flex-wrap:wrap">
-    <label style="flex:2;min-width:220px">Offset account
+    <label style="flex:2;min-width:220px;position:relative">Offset account
       <span style="font-weight:400;color:#888">— the categorized (non-bank) side</span>
-      <input name="offset_account" list="acctlist" value="{{ form.offset_account or '' }}"
+      <input name="offset_account" id="offset-account" autocomplete="off" value="{{ form.offset_account or '' }}"
              title="The account for the categorized side. The bank side is automatically determined from the transaction's linked Plaid account. Direction defaults to auto (withdrawal → offset is debit; deposit → offset is credit)."
              placeholder="Fuel Expense - EC">
+      <!-- custom account autocomplete (v0.3.4 · replaces the native <datalist>
+           Safari collapsed mid-type); options fed by /api/rules/known_accounts -->
+      <div id="oa-dd" style="display:none;position:absolute;left:0;right:0;z-index:20;background:#fff;border:1px solid #ccc;border-top:none;border-radius:0 0 4px 4px;max-height:240px;overflow:auto;box-shadow:0 4px 12px rgba(0,0,0,.12)"></div>
     </label>
     <label style="flex:1;min-width:160px">Direction
       <select name="offset_direction"
@@ -842,9 +858,6 @@ RULES_BODY = """
     account. <b>auto</b>: withdrawal → offset is debited; deposit/refund → offset
     is credited. Use <b>always_debit</b> / <b>always_credit</b> only for reversals.
   </p>
-  <datalist id="acctlist">
-    {% for n in account_names %}<option value="{{ n }}">{% endfor %}
-  </datalist>
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:1;min-width:150px">Party type
       <select name="party_type">
@@ -952,10 +965,10 @@ RULES_BODY = """
   {% if not archived %}<tr><td colspan="6" style="color:#888">No archived rules.</td></tr>{% endif %}
 </table>
 {% endif %}
-<script src="/static/rule_dropdown.js?v=0.3.3"></script>
+<script src="/static/rule_dropdown.js?v=0.3.4"></script>
 {% raw %}
 <script>
-// v0.3.3 · rule-builder autocomplete. Context-aware match-value widget +
+// v0.3.4 · rule-builder autocomplete. Context-aware match-value widget +
 // name suggestion, fed by /api/rules/known_merchants|known_categories. Vanilla
 // JS, no dependencies; data cached in sessionStorage for the session.
 (function () {
@@ -971,8 +984,11 @@ RULES_BODY = """
   var refresh = document.getElementById('ac-refresh');
   var nameEl = document.getElementById('rule-name');
   var nameHint = document.getElementById('name-hint');
-  var CK = 'bb_known_merchants', CC = 'bb_known_categories';
-  var merchants = [], categories = [];
+  var oa = document.getElementById('offset-account');
+  var oaDD = document.getElementById('oa-dd');
+  var CK = 'bb_known_merchants', CC = 'bb_known_categories',
+      CA = 'bb_known_accounts';
+  var merchants = [], categories = [], accounts = [];
 
   function money(n) { return '$' + Math.round(n || 0).toLocaleString(); }
   function esc(s) {
@@ -983,20 +999,26 @@ RULES_BODY = """
   function load(force) {
     var haveM = !force && sessionStorage.getItem(CK);
     var haveC = !force && sessionStorage.getItem(CC);
-    if (haveM && haveC) {
-      try { merchants = JSON.parse(haveM); categories = JSON.parse(haveC); }
-      catch (e) { merchants = []; categories = []; }
+    var haveA = !force && sessionStorage.getItem(CA);
+    if (haveM && haveC && haveA) {
+      try {
+        merchants = JSON.parse(haveM); categories = JSON.parse(haveC);
+        accounts = JSON.parse(haveA);
+      } catch (e) { merchants = []; categories = []; accounts = []; }
       onData(); return;
     }
     Promise.all([
       fetch('/api/rules/known_merchants').then(function (r) { return r.json(); }),
-      fetch('/api/rules/known_categories').then(function (r) { return r.json(); })
+      fetch('/api/rules/known_categories').then(function (r) { return r.json(); }),
+      fetch('/api/rules/known_accounts').then(function (r) { return r.json(); })
     ]).then(function (res) {
       merchants = (res[0] && res[0].merchants) || [];
       categories = (res[1] && res[1].categories) || [];
+      accounts = (res[2] && res[2].accounts) || [];
       try {
         sessionStorage.setItem(CK, JSON.stringify(merchants));
         sessionStorage.setItem(CC, JSON.stringify(categories));
+        sessionStorage.setItem(CA, JSON.stringify(accounts));
       } catch (e) {}
       onData();
     }).catch(function () { onData(); });
@@ -1043,10 +1065,11 @@ RULES_BODY = """
     return mt.value === 'merchant_exact' || mt.value === 'merchant_contains';
   }
 
-  // The merchant picker is the one custom (non-native) dropdown in this form —
-  // the category picker is a <select> and the offset account is a <datalist>,
-  // both native and unaffected by the v0.3.2 collapse-on-empty bug. Its
-  // filter/open/keyboard behavior lives in the shared, tested module.
+  // Two custom (non-native) dropdowns share the tested module: the merchant
+  // match-value picker (below) and the offset-account picker (further down).
+  // The category picker stays a native <select> — single-select from a fixed
+  // list, never typed into, so Safari's collapse-on-type <datalist> bug (the
+  // reason offset_account moved off <datalist> in v0.3.4) never applied to it.
   var mvDD = BankBridgeDropdown.createDropdown({
     input: mv,
     menu: dd,
@@ -1069,6 +1092,27 @@ RULES_BODY = """
         ' txns · ' + money(x.total_amount) + '</span>';
     }
   });
+
+  // Offset-account picker (v0.3.4). Was a native datalist-backed input; Safari
+  // collapsed the list mid-type (non-matching chars, deletes, arrow keys), so it
+  // moved to the same shared dropdown as the merchant field.
+  // Options are ERPNext GL Account docnames (plain strings) — the docname is
+  // already the display label, so getLabel/renderRow are the identity. A typed
+  // value the list doesn't contain is kept as-is (free-text account still works).
+  if (oa && oaDD) {
+    BankBridgeDropdown.createDropdown({
+      input: oa,
+      menu: oaDD,
+      getOptions: function () { return accounts; },
+      getLabel: function (x) { return x == null ? '' : String(x); },
+      renderRow: function (x) { return esc(x); },
+      emptyRow: function (q) {
+        var t = (q || '').trim();
+        if (!t) return null;
+        return 'No matches — press <b>Enter</b> to use “' + esc(t) + '” as new';
+      }
+    });
+  }
 
   function merchantFor(name) {
     var low = (name || '').trim().toLowerCase();
@@ -1142,7 +1186,6 @@ def _rules_page(flash_msg='', test_result=None, test=None, form=None,
                  show_archived=show_archived,
                  match_types=categorization.MATCH_TYPES,
                  offset_directions=categorization.OFFSET_DIRECTIONS,
-                 account_names=_erpnext_account_names(),
                  form=form or {'active': True, 'priority': 100},
                  test=test or {}, test_result=test_result,
                  je_engine_on=current_app.config.get(

@@ -106,7 +106,7 @@ def list_bank_accounts(client: ERPNextClient | None = None) -> list[dict]:
 
 def list_accounts(client: ERPNextClient | None = None) -> list[dict]:
     """Non-group ERPNext GL Accounts (Chart of Accounts leaves) for the rule
-    debit/credit-account dropdowns. Ordered by name so the datalist is tidy.
+    offset-account dropdown. Ordered by name so the picker is tidy.
 
     v0.3.1: filters are scoped to real, usable posting accounts only —
     `is_group=0` (leaves, not the parent groups the auto-CoA import creates) and
