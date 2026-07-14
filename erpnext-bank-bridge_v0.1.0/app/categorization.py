@@ -5,10 +5,14 @@ Given a local `BankTransaction` that's just been posted to ERPNext, walk the
 active `CategorizationRule` rows in priority order (lower = higher priority) and
 let the FIRST match generate an ERPNext Journal Entry:
 
-  * debit the rule's `debit_account` (the expense / party side)
-  * credit the rule's `credit_account` (usually the Bank Account)
-  * for an INFLOW (a Plaid deposit / refund, amount < 0) the two sides swap so
-    money lands in the bank — the rule is authored for the common outflow case.
+  * the rule supplies only the OFFSET (categorized) account; the BANK side comes
+    from the transaction's own linked Plaid account (v0.3.1 — rules are
+    bank-account-agnostic, so one rule works across every account)
+  * `offset_direction` decides which side the offset lands on: 'auto' infers it
+    from the Plaid amount sign (withdrawal → offset debited; deposit/refund →
+    offset credited), while 'always_debit' / 'always_credit' force it (rare)
+  * pre-v0.3.1 rules that still carry a debit/credit pair keep working via a
+    legacy branch (see build_journal_entry) for one release cycle.
 
 Every generated JE is recorded in `GeneratedJournalEntry`, whose UNIQUE
 `plaid_transaction_id` is the idempotency guard: a transaction generates at most
@@ -39,7 +43,7 @@ from . import db
 from . import erpnext_bank
 from . import erpnext_settings
 from .erpnext_client import ERPNextAPIError, ERPNextError
-from .models import CategorizationRule, GeneratedJournalEntry
+from .models import CategorizationRule, GeneratedJournalEntry, PlaidAccount
 
 log = logging.getLogger('bankbridge.categorization')
 
@@ -48,6 +52,10 @@ JOURNAL_ENTRY_DT = 'Journal Entry'
 # match_type values the engine understands.
 MATCH_TYPES = ('merchant_exact', 'merchant_contains', 'description_regex',
                'plaid_category_matches', 'amount_range')
+
+# offset_direction values (v0.3.1). 'auto' infers debit/credit from the amount
+# sign; the two 'always_*' overrides force the offset side (rare — reversals).
+OFFSET_DIRECTIONS = ('auto', 'always_debit', 'always_credit')
 
 _jinja = SandboxedEnvironment(autoescape=False)
 
@@ -169,26 +177,75 @@ def render_description(rule: CategorizationRule, row, supplier_name=None) -> str
         return default
 
 
+def bank_gl_account_for(row) -> str:
+    """The ERPNext GL Account (Chart-of-Accounts leaf) for the transaction's
+    linked Plaid account — the BANK side of a v0.3.1 bank-agnostic JE. Empty
+    string when the account is unmapped, has no GL link (import fell back to a
+    personal account), or the row carries no account_id."""
+    account_id = getattr(row, 'account_id', None)
+    if not account_id:
+        return ''
+    acct = PlaidAccount.query.filter_by(account_id=account_id).first()
+    return ((acct.erpnext_gl_account_name or '').strip() if acct else '')
+
+
 def build_journal_entry(rule: CategorizationRule, row, company: str, *,
-                        supplier_name=None, remark: str = '') -> dict:
+                        supplier_name=None, remark: str = '',
+                        bank_account: str | None = None) -> dict:
     """Assemble the ERPNext Journal Entry payload for a matched transaction.
 
-    Two lines: the rule's debit_account (expense/party side) and credit_account
-    (bank side). Plaid's sign convention (positive = outflow) decides which side
-    carries the debit vs credit; for an inflow the sides reverse. The optional
-    party rides the expense/party line — `rule.party_name` wins, else the
+    Two lines — the OFFSET (categorized) side and the BANK side:
+
+      * v0.3.1 bank-agnostic path (rule has `offset_account`): the rule supplies
+        only the offset account; the bank account comes from the transaction's
+        linked Plaid account (`bank_account`, else resolved from the row). Which
+        side the offset lands on is decided by `offset_direction`:
+          - 'always_debit'  → offset debited, bank credited;
+          - 'always_credit' → bank debited, offset credited;
+          - 'auto'          → Plaid sign: amount > 0 (withdrawal) debits the
+                              offset; amount ≤ 0 (deposit/refund) credits it.
+      * Legacy path (no `offset_account`, deprecated debit/credit pair): the old
+        behaviour — debit the rule's debit_account, credit its credit_account,
+        reversing on an inflow — kept for backwards compatibility.
+
+    The optional party rides the offset line — `rule.party_name` wins, else the
     auto-created Supplier for this merchant."""
     amt = round(abs(float(row.amount or 0.0)), 2)
-    outflow = float(row.amount or 0.0) >= 0
+    offset_account = (rule.offset_account or '').strip()
 
-    party_line = {'account': rule.debit_account}
-    bank_line = {'account': rule.credit_account}
-    if outflow:
-        party_line['debit_in_account_currency'] = amt
-        bank_line['credit_in_account_currency'] = amt
+    if offset_account:
+        bank = (bank_account if bank_account is not None
+                else bank_gl_account_for(row)) or rule.credit_account or ''
+        direction = (rule.offset_direction or 'auto').strip() or 'auto'
+        if direction == 'always_debit':
+            offset_is_debit = True
+        elif direction == 'always_credit':
+            offset_is_debit = False
+        else:  # auto — Plaid: positive = outflow (spending)
+            offset_is_debit = float(row.amount or 0.0) > 0
+        offset_line = {'account': offset_account}
+        bank_line = {'account': bank}
+        if offset_is_debit:
+            offset_line['debit_in_account_currency'] = amt
+            bank_line['credit_in_account_currency'] = amt
+            accounts = [offset_line, bank_line]
+        else:
+            offset_line['credit_in_account_currency'] = amt
+            bank_line['debit_in_account_currency'] = amt
+            accounts = [bank_line, offset_line]
+        party_line = offset_line
     else:
-        party_line['credit_in_account_currency'] = amt
-        bank_line['debit_in_account_currency'] = amt
+        # Deprecated pre-v0.3.1 pair (both accounts on the rule).
+        outflow = float(row.amount or 0.0) >= 0
+        party_line = {'account': rule.debit_account}
+        bank_line = {'account': rule.credit_account}
+        if outflow:
+            party_line['debit_in_account_currency'] = amt
+            bank_line['credit_in_account_currency'] = amt
+        else:
+            party_line['credit_in_account_currency'] = amt
+            bank_line['debit_in_account_currency'] = amt
+        accounts = [party_line, bank_line]
 
     party = rule.party_name or supplier_name
     if rule.party_type and party:
@@ -196,7 +253,7 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
         party_line['party'] = party
 
     if row.erpnext_bank_transaction_id:
-        for ln in (party_line, bank_line):
+        for ln in accounts:
             ln['reference_type'] = 'Bank Transaction'
             ln['reference_name'] = row.erpnext_bank_transaction_id
 
@@ -205,7 +262,7 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
         'voucher_type': 'Journal Entry',
         'company': company,
         'user_remark': remark,
-        'accounts': [party_line, bank_line],
+        'accounts': accounts,
     }
     if row.date:
         doc['posting_date'] = row.date.isoformat()

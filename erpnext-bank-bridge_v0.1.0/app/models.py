@@ -234,10 +234,26 @@ class CategorizationRule(db.Model):
     the FIRST active rule that matches generates the JE — see
     app/categorization.py.
 
-    `match_type` + `match_value` describe the predicate; `debit_account` /
-    `credit_account` are ERPNext Account docnames (the credit is usually the
-    Bank Account). `party_type` / `party_name` optionally link a Supplier /
-    Customer on the expense line (party_name blank → the auto-created Supplier
+    `match_type` + `match_value` describe the predicate.
+
+    v0.3.1 · bank-account-agnostic rules: a rule only names the OFFSET side —
+    `offset_account` (the expense/income/party GL account it categorizes to).
+    The BANK side is taken from the transaction's own linked Plaid account
+    (PlaidAccount.erpnext_gl_account_name), so one rule works across every
+    account. `offset_direction` decides which side the offset lands on:
+      * 'auto'          — infer from the Plaid amount sign (withdrawal → offset
+                          is debited; deposit/refund → offset is credited);
+      * 'always_debit'  — force the offset to the debit side (rare: reversals);
+      * 'always_credit' — force the offset to the credit side (rare).
+
+    `debit_account` / `credit_account` are the DEPRECATED pre-v0.3.1 pair (both
+    accounts named on the rule). They're kept for one release cycle for
+    backwards compatibility: a rule with no `offset_account` still generates a JE
+    from the old pair (see app/categorization.py). The boot migration backfills
+    `offset_account` from them (app/migrations.py).
+
+    `party_type` / `party_name` optionally link a Supplier /
+    Customer on the offset line (party_name blank → the auto-created Supplier
     for the transaction's merchant is used). `description_template` is a Jinja
     string rendered into the JE's user_remark. Deliberately un-constrained on
     match_type so a new predicate never needs a migration."""
@@ -251,6 +267,11 @@ class CategorizationRule(db.Model):
     match_type = db.Column(db.String(40), nullable=False, default='merchant_contains')
     # Pattern / exact match, or a JSON array '[min, max]' for amount_range.
     match_value = db.Column(db.Text, default='')
+    # v0.3.1 · the categorized (non-bank) side; the bank side comes from the txn.
+    offset_account = db.Column(db.String(255), default='')
+    # auto | always_debit | always_credit
+    offset_direction = db.Column(db.String(20), default='auto')
+    # DEPRECATED (pre-v0.3.1) — kept one release for backwards compat.
     debit_account = db.Column(db.String(255), default='')
     credit_account = db.Column(db.String(255), default='')
     party_type = db.Column(db.String(20), nullable=True)    # Supplier | Customer
@@ -271,6 +292,8 @@ class CategorizationRule(db.Model):
             'id': self.id, 'priority': self.priority, 'active': bool(self.active),
             'name': self.name, 'match_type': self.match_type,
             'match_value': self.match_value,
+            'offset_account': self.offset_account or '',
+            'offset_direction': self.offset_direction or 'auto',
             'debit_account': self.debit_account,
             'credit_account': self.credit_account,
             'party_type': self.party_type, 'party_name': self.party_name,

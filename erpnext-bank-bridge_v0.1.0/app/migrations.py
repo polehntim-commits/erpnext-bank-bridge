@@ -124,5 +124,59 @@ def run_migrations() -> None:
                                default_sql='false')
         #   * audit cross-link from the HTTP-level sync log to an AuditEvent subject
         _add_column_if_missing('plaid_sync_log', 'subject_id', 'VARCHAR(120)')
+        # v0.3.1 — bank-account-agnostic rules: a rule names only the offset
+        # (categorized) side; the bank side comes from the transaction's linked
+        # Plaid account. Add the two columns, then backfill offset_account from
+        # the deprecated debit/credit pair on any pre-v0.3.1 rule.
+        _add_column_if_missing('categorization_rules', 'offset_account',
+                               'VARCHAR(255)', default_sql="''")
+        _add_column_if_missing('categorization_rules', 'offset_direction',
+                               'VARCHAR(20)', default_sql="'auto'")
+        _migrate_rule_offset_accounts()
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)
+
+
+def _migrate_rule_offset_accounts() -> None:
+    """One-time backfill (v0.3.1): give every pre-v0.3.1 rule (which named a
+    debit/credit pair) a single `offset_account`. Prefer whichever side is NOT a
+    known bank GL account (the bank side now comes from the transaction); if
+    neither/both look like a bank account, fall back to `debit_account`. Sets
+    `offset_direction='auto'` when unset. Idempotent: only touches rules whose
+    `offset_account` is still blank, so re-running (and a fresh DB, where there
+    are no legacy rules) is a no-op."""
+    insp = inspect(db.engine)
+    if 'categorization_rules' not in insp.get_table_names():
+        return
+    cols = {c['name'] for c in insp.get_columns('categorization_rules')}
+    if not {'offset_account', 'debit_account', 'credit_account'} <= cols:
+        return  # columns not all present yet (shouldn't happen post-ADD)
+    from .models import CategorizationRule, PlaidAccount
+    # The set of GL accounts that ARE bank accounts (so we can pick the other
+    # side as the offset). Empty on a fresh install → we just fall back to debit.
+    bank_gls = {(a.erpnext_gl_account_name or '').strip()
+                for a in PlaidAccount.query.filter(
+                    PlaidAccount.erpnext_gl_account_name.isnot(None)).all()}
+    bank_gls.discard('')
+    rules = CategorizationRule.query.filter(
+        (CategorizationRule.offset_account.is_(None))
+        | (CategorizationRule.offset_account == '')).all()
+    changed = 0
+    for r in rules:
+        debit = (r.debit_account or '').strip()
+        credit = (r.credit_account or '').strip()
+        if not debit and not credit:
+            continue  # nothing to migrate (a v0.3.1-native rule with no offset)
+        if credit in bank_gls and debit and debit not in bank_gls:
+            offset = debit
+        elif debit in bank_gls and credit and credit not in bank_gls:
+            offset = credit
+        else:
+            offset = debit or credit
+        r.offset_account = offset
+        if not (r.offset_direction or '').strip():
+            r.offset_direction = 'auto'
+        changed += 1
+    if changed:
+        db.session.commit()
+        log.info('migration: backfilled offset_account on %d rule(s)', changed)

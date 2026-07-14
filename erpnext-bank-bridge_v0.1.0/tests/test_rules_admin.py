@@ -155,6 +155,62 @@ class TestRuleTestEndpoint(AdminBase):
             'merchant_name': 'Chevron', 'amount': '10'})
         self.assertIn(b'No rule matched', r.data)
 
+    def test_offset_rule_preview_shows_bank_placeholder(self):
+        db.session.add(CategorizationRule(
+            name='Fuel', priority=10, active=True, match_type='merchant_contains',
+            match_value='Chevron', offset_account='Fuel Expense - EC',
+            offset_direction='auto'))
+        db.session.commit()
+        r = self.client.post('/admin/rules/test', data={
+            'merchant_name': 'Chevron', 'amount': '42.50'})
+        self.assertIn(b'Matched rule', r.data)
+        self.assertIn(b'Fuel Expense - EC', r.data)
+        self.assertIn(b"the transaction&#39;s bank account", r.data)
+
+
+class TestOffsetRuleForm(AdminBase):
+    """v0.3.1 · the rule form is a single offset account + direction, not a
+    debit/credit pair."""
+
+    def test_form_renders_offset_not_debit_credit(self):
+        r = self.client.get('/admin/rules')
+        body = r.get_data(as_text=True)
+        self.assertIn('name="offset_account"', body)
+        self.assertIn('name="offset_direction"', body)
+        self.assertNotIn('name="debit_account"', body)
+        self.assertNotIn('name="credit_account"', body)
+        # Tooltip wording present.
+        self.assertIn('automatically determined from the transaction', body)
+
+    def test_create_offset_rule(self):
+        self.client.post('/admin/rules/save', data=dict(
+            name='Fuel', priority='10', active='1',
+            match_type='merchant_contains', match_value='Chevron',
+            offset_account='Fuel Expense - EC', offset_direction='always_debit',
+            party_type='', party_name='', description_template=''),
+            follow_redirects=True)
+        rule = CategorizationRule.query.first()
+        self.assertEqual(rule.offset_account, 'Fuel Expense - EC')
+        self.assertEqual(rule.offset_direction, 'always_debit')
+
+    def test_bad_direction_defaults_auto(self):
+        self.client.post('/admin/rules/save', data=dict(
+            name='Fuel', priority='10', active='1',
+            match_type='merchant_contains', match_value='Chevron',
+            offset_account='Fuel Expense - EC', offset_direction='sideways'),
+            follow_redirects=True)
+        self.assertEqual(CategorizationRule.query.first().offset_direction, 'auto')
+
+    def test_rules_table_shows_offset_column(self):
+        db.session.add(CategorizationRule(
+            name='Fuel', priority=10, active=True, match_type='merchant_contains',
+            match_value='Chevron', offset_account='Fuel Expense - EC',
+            offset_direction='auto'))
+        db.session.commit()
+        body = self.client.get('/admin/rules').get_data(as_text=True)
+        self.assertIn('Offset account', body)
+        self.assertIn('Fuel Expense - EC', body)
+
 
 class TestSuppliersUi(AdminBase):
     def _supplier(self):

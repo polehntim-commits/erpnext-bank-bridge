@@ -324,6 +324,178 @@ class TestJournalEntryBuild(Base):
             self.assertEqual(ln['reference_name'], 'ACC-BTN-0001')
 
 
+# ── v0.3.1 · bank-account-agnostic offset rules ────────────────────────
+
+class TestOffsetJournalEntryBuild(Base):
+    """The rule names only the OFFSET account; the BANK side comes from the
+    transaction's linked Plaid account (erpnext_gl_account_name)."""
+
+    GL = 'WF Checking - 1201 - EC'
+
+    def _linked_account(self):
+        a = PlaidAccount(account_id=ACC, item_id='item-abc', name='WF Checking',
+                         mask='1234', type='depository', subtype='checking',
+                         erpnext_bank_account_name='WF Checking - Ops',
+                         erpnext_gl_account_name=self.GL, sync_enabled=True)
+        db.session.add(a)
+        db.session.commit()
+        return a
+
+    def _offset_rule(self, **kw):
+        defaults = dict(name='fuel', priority=100, active=True,
+                        match_type='merchant_contains', match_value='Chevron',
+                        offset_account='Fuel Expense - EC', offset_direction='auto')
+        defaults.update(kw)
+        rule = CategorizationRule(**defaults)
+        db.session.add(rule)
+        db.session.commit()
+        return rule
+
+    def test_withdrawal_debits_offset_credits_bank(self):
+        # $50 spending (positive) → offset debited, bank credited.
+        self._item(); self._linked_account()
+        rule = self._offset_rule()
+        row = self._row(amount=50.0)
+        doc = categorization.build_journal_entry(rule, row, 'Co')
+        debit, credit = doc['accounts']
+        self.assertEqual(debit['account'], 'Fuel Expense - EC')
+        self.assertEqual(debit['debit_in_account_currency'], 50.0)
+        self.assertEqual(credit['account'], self.GL)
+        self.assertEqual(credit['credit_in_account_currency'], 50.0)
+
+    def test_deposit_debits_bank_credits_offset(self):
+        # $100 refund/income (negative) → bank debited, offset credited.
+        self._item(); self._linked_account()
+        rule = self._offset_rule(offset_account='Refunds - EC')
+        row = self._row(amount=-100.0)
+        doc = categorization.build_journal_entry(rule, row, 'Co')
+        debit, credit = doc['accounts']
+        self.assertEqual(debit['account'], self.GL)
+        self.assertEqual(debit['debit_in_account_currency'], 100.0)
+        self.assertEqual(credit['account'], 'Refunds - EC')
+        self.assertEqual(credit['credit_in_account_currency'], 100.0)
+
+    def test_always_debit_forces_offset_to_debit(self):
+        # always_debit forces offset to the debit side regardless of sign — even
+        # for a deposit (negative amount).
+        self._item(); self._linked_account()
+        rule = self._offset_rule(offset_direction='always_debit')
+        row = self._row(amount=-30.0)   # would be a deposit under 'auto'
+        doc = categorization.build_journal_entry(rule, row, 'Co')
+        debit, credit = doc['accounts']
+        self.assertEqual(debit['account'], 'Fuel Expense - EC')
+        self.assertEqual(debit['debit_in_account_currency'], 30.0)
+        self.assertEqual(credit['account'], self.GL)
+
+    def test_always_credit_forces_offset_to_credit(self):
+        self._item(); self._linked_account()
+        rule = self._offset_rule(offset_direction='always_credit')
+        row = self._row(amount=75.0)    # would be a withdrawal under 'auto'
+        doc = categorization.build_journal_entry(rule, row, 'Co')
+        debit, credit = doc['accounts']
+        self.assertEqual(debit['account'], self.GL)
+        self.assertEqual(credit['account'], 'Fuel Expense - EC')
+        self.assertEqual(credit['credit_in_account_currency'], 75.0)
+
+    def test_party_rides_offset_line(self):
+        self._item(); self._linked_account()
+        rule = self._offset_rule(party_type='Supplier', party_name=None)
+        row = self._row(amount=50.0)
+        doc = categorization.build_journal_entry(rule, row, 'Co',
+                                                 supplier_name='Chevron')
+        offset = next(l for l in doc['accounts']
+                      if l['account'] == 'Fuel Expense - EC')
+        self.assertEqual(offset['party_type'], 'Supplier')
+        self.assertEqual(offset['party'], 'Chevron')
+
+    def test_bank_side_resolved_from_transaction_account(self):
+        # No bank_account arg → resolved from the row's linked Plaid account.
+        self._item(); self._linked_account()
+        self.assertEqual(categorization.bank_gl_account_for(self._row()), self.GL)
+
+    def test_generation_end_to_end_uses_bank_from_txn(self):
+        self._item(); self._linked_account()
+        self._offset_rule()
+        row = self._row(amount=50.0)
+        erp = FakeERPClient()
+        categorization.generate_journal_entry(erp, row)
+        je = erp.created['Journal Entry']
+        self.assertEqual(len(je), 1)
+        accounts = list(je.values())[0]['accounts']
+        names = {a['account'] for a in accounts}
+        self.assertIn(self.GL, names)
+        self.assertIn('Fuel Expense - EC', names)
+
+
+class TestLegacyRuleBackwardCompat(Base):
+    """Pre-v0.3.1 rules that still carry a debit/credit pair (no offset_account)
+    keep generating JEs from the old two-account logic during the transition."""
+
+    def test_legacy_pair_still_builds(self):
+        rule = CategorizationRule(
+            name='legacy', priority=100, active=True,
+            match_type='merchant_contains', match_value='Chevron',
+            debit_account='Fuel Expense - EC', credit_account='Checking - EC')
+        db.session.add(rule); db.session.commit()
+        row = self._row(amount=42.5)
+        doc = categorization.build_journal_entry(rule, row, 'Co')
+        debit, credit = doc['accounts']
+        self.assertEqual(debit['account'], 'Fuel Expense - EC')
+        self.assertEqual(debit['debit_in_account_currency'], 42.5)
+        self.assertEqual(credit['account'], 'Checking - EC')
+        self.assertEqual(credit['credit_in_account_currency'], 42.5)
+
+    def _row(self, amount=42.5, merchant='Chevron', name='CHEVRON', category='GAS',
+             tid='t1'):
+        r = BankTransaction(plaid_transaction_id=tid, account_id=ACC,
+                            amount=amount, merchant_name=merchant, name=name,
+                            category=category, date=date(2026, 7, 10),
+                            erpnext_bank_transaction_id='ACC-BTN-0001')
+        db.session.add(r); db.session.commit()
+        return r
+
+
+class TestOffsetMigration(Base):
+    """v0.3.1 boot backfill: legacy rules (debit/credit pair) get a single
+    offset_account — the side that ISN'T the bank GL account."""
+
+    def _rule(self, **kw):
+        r = CategorizationRule(name='r', priority=100, active=True,
+                               match_type='merchant_contains', match_value='X', **kw)
+        db.session.add(r); db.session.commit()
+        return r
+
+    def test_backfills_non_bank_side_as_offset(self):
+        from app import migrations
+        # Bank GL is the credit side → offset should become the debit (expense).
+        a = PlaidAccount(account_id=ACC, item_id='item-abc', name='WF',
+                         erpnext_gl_account_name='Checking - EC')
+        db.session.add(a); db.session.commit()
+        r = self._rule(debit_account='Fuel Expense - EC',
+                       credit_account='Checking - EC', offset_account='')
+        migrations._migrate_rule_offset_accounts()
+        db.session.refresh(r)
+        self.assertEqual(r.offset_account, 'Fuel Expense - EC')
+        self.assertEqual(r.offset_direction, 'auto')
+
+    def test_backfills_falls_back_to_debit_when_unclear(self):
+        from app import migrations
+        # No known bank GL accounts → fall back to debit_account.
+        r = self._rule(debit_account='Fuel Expense - EC',
+                       credit_account='Some Other - EC', offset_account='')
+        migrations._migrate_rule_offset_accounts()
+        db.session.refresh(r)
+        self.assertEqual(r.offset_account, 'Fuel Expense - EC')
+
+    def test_backfill_idempotent_leaves_set_offset_alone(self):
+        from app import migrations
+        r = self._rule(debit_account='A - EC', credit_account='B - EC',
+                       offset_account='Already Chosen - EC')
+        migrations._migrate_rule_offset_accounts()
+        db.session.refresh(r)
+        self.assertEqual(r.offset_account, 'Already Chosen - EC')
+
+
 # ── JE generation (write path) ─────────────────────────────────────────
 
 class TestGeneration(Base):

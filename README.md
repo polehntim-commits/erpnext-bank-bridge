@@ -33,8 +33,9 @@ ERPNext  ──►  Bank Reconciliation Tool
   created as a Supplier so the transaction is instantly linkable. On by default.
 - **Rules-based Journal Entry generation** (v0.3.0) — user-configured rules
   (`/admin/rules`) match on merchant / description / Plaid category / amount and
-  auto-generate a Journal Entry (debit expense, credit bank), inserted as a
-  Draft for review. **Off by default** — opt in once your rules are trusted.
+  auto-generate a Journal Entry, inserted as a Draft for review. Rules name only
+  the categorized **offset** account; the bank side comes from the transaction's
+  linked account (v0.3.1). **Off by default** — opt in once your rules are trusted.
 - **Handles the full transaction lifecycle** — pending → posted transitions,
   category and merchant-name normalization, Plaid `modified` (re-post) and
   `removed` (cancel) events.
@@ -51,10 +52,12 @@ v0.3.1 — functional pilot. Runs the full Plaid Link → sync → ERPNext push 
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
-Accounts get sequential `account_number`s under their numbered parent group, the
-rule debit/credit dropdowns list every enabled leaf account (Bank included), and
-a fuzzy-match check reuses an existing near-duplicate GL Account instead of
-creating a new one (with an operator confirm on the accounts page). See the
+Accounts get sequential `account_number`s under their numbered parent group; the
+rule account dropdown lists every enabled leaf account (Bank included); a
+fuzzy-match check reuses an existing near-duplicate GL Account instead of
+creating a new one (with an operator confirm on the accounts page); and rules are
+now **bank-account-agnostic** — a rule names only the categorized offset account
+while the bank side is taken from the transaction's linked account. See the
 roadmap at the bottom.
 
 ## How it works
@@ -95,7 +98,7 @@ out of the account → withdrawal; negative = money in → deposit).
 | `plaid_accounts` | accounts within an item; ERPNext Bank Account mapping + sync toggle + import status |
 | `bank_transactions` | local mirror of Plaid transactions + ERPNext docname/state |
 | `suppliers` | merchant → ERPNext Supplier cache (normalized name, tallies) — v0.3.0 |
-| `categorization_rules` | user rules: match predicate → debit/credit accounts + party + template — v0.3.0 |
+| `categorization_rules` | user rules: match predicate → offset account + direction + party + template (bank side from the txn; v0.3.1) — v0.3.0 |
 | `generated_journal_entries` | per-JE state record (state, rule, JE docname) — v0.3.0 |
 | `audit_events` | **permanent, append-only** audit trail of every action (before/after JSON, actor, IP) — v0.3.0 |
 | `plaid_sync_log` | HTTP-level action log (plaid_pull / erpnext_push / erpnext_supplier_auto_create, counts, errors); `subject_id` cross-links to `audit_events` |
@@ -246,12 +249,16 @@ Review / correct the cache at `/admin/suppliers`. Turn it off with
 `ERPNEXT_AUTO_CREATE_SUPPLIERS=false`.
 
 **Categorization rules → Journal Entries** (off by default). Author rules at
-`/admin/rules`; each has a **priority** (lower wins), a **match type**, a
-**debit** + **credit** account, an optional **party**, and a Jinja description
-template. On each newly-posted transaction the engine walks active rules in
-priority order and the **first match** generates a Journal Entry — debit the
-expense account, credit the bank (reversed for a deposit/refund) — inserted as a
-**Draft** for review. Nothing fires until you set
+`/admin/rules`; each has a **priority** (lower wins), a **match type**, a single
+**offset account** (the categorized, non-bank side) + a **direction**, an
+optional **party**, and a Jinja description template. Rules are
+**bank-account-agnostic** (v0.3.1): the bank side of the JE is taken
+automatically from the transaction's own linked Plaid account, so one rule works
+across every account. **Direction** defaults to `auto` (a withdrawal debits the
+offset, a deposit/refund credits it); `always_debit` / `always_credit` force the
+side for the rare reversal case. On each newly-posted transaction the engine
+walks active rules in priority order and the **first match** generates a Journal
+Entry, inserted as a **Draft** for review. Nothing fires until you set
 `ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES=true`; until then you can still author and
 **Test a rule** against a sample transaction. Match types:
 
@@ -261,17 +268,18 @@ expense account, credit the bank (reversed for a deposit/refund) — inserted as
 - `plaid_category_matches` — `match_value` matches the Plaid category label
 - `amount_range` — `min ≤ abs(amount) ≤ max`, with `match_value = [min, max]`
 
-**Sample rules for common categories** (credit account is your Bank Account
-docname; debit accounts are examples — match your Chart of Accounts):
+**Sample rules for common categories** (the offset account is the categorized
+side; the bank side is filled in automatically from the transaction — examples,
+match your Chart of Accounts):
 
-| Priority | Name | Match type | Match value | Debit account | Party |
-|---|---|---|---|---|---|
-| 10 | Fuel | `merchant_contains` | `Chevron` | `Fuel Expenses - EC` | Supplier (auto) |
-| 10 | Fuel (Shell) | `merchant_contains` | `Shell` | `Fuel Expenses - EC` | Supplier (auto) |
-| 20 | Groceries | `plaid_category_matches` | `GROCERIES` | `Groceries - EC` | Supplier (auto) |
-| 20 | Utilities | `plaid_category_matches` | `UTILITIES` | `Utilities - EC` | — |
-| 30 | Rent | `description_regex` | `(?i)\brent\b` | `Rent - EC` | — |
-| 40 | Payroll | `plaid_category_matches` | `PAYROLL` | `Salaries and Wages - EC` | — |
+| Priority | Name | Match type | Match value | Offset account | Direction | Party |
+|---|---|---|---|---|---|---|
+| 10 | Fuel | `merchant_contains` | `Chevron` | `Fuel Expenses - EC` | `auto` | Supplier (auto) |
+| 10 | Fuel (Shell) | `merchant_contains` | `Shell` | `Fuel Expenses - EC` | `auto` | Supplier (auto) |
+| 20 | Groceries | `plaid_category_matches` | `GROCERIES` | `Groceries - EC` | `auto` | Supplier (auto) |
+| 20 | Utilities | `plaid_category_matches` | `UTILITIES` | `Utilities - EC` | `auto` | — |
+| 30 | Rent | `description_regex` | `(?i)\brent\b` | `Rent - EC` | `auto` | — |
+| 40 | Payroll | `plaid_category_matches` | `PAYROLL` | `Salaries and Wages - EC` | `auto` | — |
 
 A rule with an empty **party name** but a **party type** of `Supplier` links the
 auto-created Supplier for that transaction's merchant, so "Fuel → Chevron"

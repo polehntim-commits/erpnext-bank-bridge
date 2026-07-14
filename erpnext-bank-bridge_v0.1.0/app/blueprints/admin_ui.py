@@ -761,13 +761,26 @@ RULES_BODY = """
     </label>
   </div>
   <div style="display:flex;gap:12px;flex-wrap:wrap">
-    <label style="flex:1;min-width:200px">Debit account (expense / party side)
-      <input name="debit_account" list="acctlist" value="{{ form.debit_account or '' }}" placeholder="Fuel Expense - EC">
+    <label style="flex:2;min-width:220px">Offset account
+      <span style="font-weight:400;color:#888">— the categorized (non-bank) side</span>
+      <input name="offset_account" list="acctlist" value="{{ form.offset_account or '' }}"
+             title="The account for the categorized side. The bank side is automatically determined from the transaction's linked Plaid account. Direction defaults to auto (withdrawal → offset is debit; deposit → offset is credit)."
+             placeholder="Fuel Expense - EC">
     </label>
-    <label style="flex:1;min-width:200px">Credit account (usually the Bank Account)
-      <input name="credit_account" list="acctlist" value="{{ form.credit_account or '' }}" placeholder="Checking - EC">
+    <label style="flex:1;min-width:160px">Direction
+      <select name="offset_direction"
+              title="The account for the categorized side. The bank side is automatically determined from the transaction's linked Plaid account. Direction defaults to auto (withdrawal → offset is debit; deposit → offset is credit).">
+        {% for d in offset_directions %}
+        <option value="{{ d }}" {{ 'selected' if d == (form.offset_direction or 'auto') else '' }}>{{ d }}</option>
+        {% endfor %}
+      </select>
     </label>
   </div>
+  <p style="font-size:12px;color:#888;margin:-4px 0 6px">
+    The bank side is set automatically from the transaction's linked Plaid
+    account. <b>auto</b>: withdrawal → offset is debited; deposit/refund → offset
+    is credited. Use <b>always_debit</b> / <b>always_credit</b> only for reversals.
+  </p>
   <datalist id="acctlist">
     {% for n in account_names %}<option value="{{ n }}">{% endfor %}
   </datalist>
@@ -828,7 +841,7 @@ RULES_BODY = """
   </span>
 </h3>
 <table>
-  <tr><th class="num">#</th><th class="num">Prio</th><th>Name</th><th>Match</th><th>Debit</th><th>Credit</th>
+  <tr><th class="num">#</th><th class="num">Prio</th><th>Name</th><th>Match</th><th>Offset account</th><th>Dir</th>
       <th>Party</th><th>Active</th><th></th></tr>
   {% for r in rules %}
   <tr>
@@ -836,8 +849,8 @@ RULES_BODY = """
     <td class="num">{{ r.priority }}</td>
     <td>{{ r.name }}</td>
     <td style="font-size:12px"><code>{{ r.match_type }}</code><br>{{ (r.match_value or '')[:50] }}</td>
-    <td style="font-size:12px">{{ r.debit_account }}</td>
-    <td style="font-size:12px">{{ r.credit_account }}</td>
+    <td style="font-size:12px">{{ r.offset_account or r.debit_account }}</td>
+    <td style="font-size:12px">{{ r.offset_direction or 'auto' }}</td>
     <td style="font-size:12px">{{ (r.party_type or '') }}{% if r.party_name %}: {{ r.party_name }}{% endif %}</td>
     <td>
       <form method="post" action="/admin/rules/toggle" style="margin:0">
@@ -895,6 +908,7 @@ def _rules_page(flash_msg='', test_result=None, test=None, form=None,
     return _page(RULES_BODY, page='rules', rules=live, archived=archived,
                  show_archived=show_archived,
                  match_types=categorization.MATCH_TYPES,
+                 offset_directions=categorization.OFFSET_DIRECTIONS,
                  account_names=_erpnext_account_names(),
                  form=form or {'active': True, 'priority': 100},
                  test=test or {}, test_result=test_result,
@@ -926,12 +940,20 @@ def _rule_form_values():
     except ValueError:
         priority = 100
     party_type = (request.form.get('party_type') or '').strip() or None
+    direction = (request.form.get('offset_direction') or 'auto').strip()
+    if direction not in categorization.OFFSET_DIRECTIONS:
+        direction = 'auto'
     return {
         'name': (request.form.get('name') or '').strip(),
         'priority': priority,
         'active': bool(request.form.get('active')),
         'match_type': (request.form.get('match_type') or 'merchant_contains').strip(),
         'match_value': (request.form.get('match_value') or '').strip(),
+        # v0.3.1 · bank-agnostic offset side.
+        'offset_account': (request.form.get('offset_account') or '').strip(),
+        'offset_direction': direction,
+        # Deprecated pre-v0.3.1 pair — still accepted for backwards compat so a
+        # legacy form/caller keeps working during the transition.
         'debit_account': (request.form.get('debit_account') or '').strip(),
         'credit_account': (request.form.get('credit_account') or '').strip(),
         'party_type': party_type,
@@ -1030,7 +1052,7 @@ def test_rule():
     }
     sample = SimpleNamespace(
         merchant_name=test['merchant_name'], name=test['description'],
-        category=test['category'], amount=amount, date=None,
+        category=test['category'], amount=amount, date=None, account_id=None,
         plaid_transaction_id='(sample)',
         erpnext_bank_transaction_id='(the Bank Transaction)')
     rule = categorization.find_matching_rule(sample)
@@ -1038,9 +1060,11 @@ def test_rule():
     if rule is not None:
         import json as _json
         remark = categorization.render_description(rule, sample)
+        # The sample isn't a real linked account, so show a placeholder for the
+        # auto-resolved bank side (only used by the v0.3.1 offset path).
         doc = categorization.build_journal_entry(
             rule, sample, erps.load().get('default_company', '(company)'),
-            remark=remark)
+            remark=remark, bank_account="(the transaction's bank account)")
         result['je_preview'] = _json.dumps(doc, indent=2)
     return _rules_page(test=test, test_result=result)
 
