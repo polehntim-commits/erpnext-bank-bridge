@@ -57,7 +57,129 @@ MATCH_TYPES = ('merchant_exact', 'merchant_contains', 'description_regex',
 # sign; the two 'always_*' overrides force the offset side (rare — reversals).
 OFFSET_DIRECTIONS = ('auto', 'always_debit', 'always_credit')
 
+# v0.3.2 · short, human names for the common Plaid categories, used to suggest a
+# rule Name from the transaction's category (e.g. a Chevron txn categorized
+# "Transportation > Gas Stations" suggests the name "Fuel — Chevron"). Keys are
+# the hierarchical Plaid path; matching is lenient (see category_alias) so a raw
+# PFC label like "GAS_STATIONS" resolves to the same alias.
+CATEGORY_ALIASES = {
+    'Transportation > Gas Stations': 'Fuel',
+    'Food and Drink > Restaurants > Coffee Shop': 'Coffee',
+    'Food and Drink > Restaurants': 'Meals',
+    'Food and Drink > Groceries': 'Groceries',
+    'Food and Drink': 'Meals',
+    'Rent and Utilities > Rent': 'Rent',
+    'Rent and Utilities > Utilities': 'Utilities',
+    'General Merchandise': 'Supplies',
+    'Travel > Airlines': 'Travel',
+    'Transportation': 'Transportation',
+    'Entertainment': 'Entertainment',
+    'Loan Payments': 'Loan Payment',
+    'Bank Fees': 'Bank Fees',
+    'Interest': 'Interest Income',
+    'Payroll': 'Payroll',
+    'Transfer': 'Transfer',
+}
+
 _jinja = SandboxedEnvironment(autoescape=False)
+
+
+def _norm_category(s: str) -> str:
+    """Collapse a category label/segment to a comparison key: lowercased, with
+    every non-alphanumeric character (spaces, '>', ',', '_') stripped. So
+    "Gas Stations", "gas_stations" and "GAS_STATIONS" all key the same."""
+    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+
+# Built lazily: normalized-key → alias. Both the full path and each key's last
+# segment are indexed (full path wins) so a stored PFC label matches by leaf.
+_ALIAS_INDEX = None
+
+
+def _alias_index() -> dict:
+    global _ALIAS_INDEX
+    if _ALIAS_INDEX is None:
+        idx = {}
+        for path, alias in CATEGORY_ALIASES.items():
+            segs = [p.strip() for p in re.split(r'[>,]', path) if p.strip()]
+            if segs:                      # last segment first (weaker key)
+                idx.setdefault(_norm_category(segs[-1]), alias)
+        for path, alias in CATEGORY_ALIASES.items():
+            idx[_norm_category(path)] = alias   # full path wins
+        _ALIAS_INDEX = idx
+    return _ALIAS_INDEX
+
+
+def category_alias(category: str) -> str:
+    """Short human name for a Plaid category, or '' if we have no alias. Tries the
+    full path, then each segment (leaf first), so both "Transportation > Gas
+    Stations" and a raw "GAS_STATIONS" resolve to "Fuel"."""
+    cat = (category or '').strip()
+    if not cat:
+        return ''
+    idx = _alias_index()
+    hit = idx.get(_norm_category(cat))
+    if hit:
+        return hit
+    parts = [p.strip() for p in re.split(r'[>,]', cat) if p.strip()]
+    for p in reversed(parts):
+        hit = idx.get(_norm_category(p))
+        if hit:
+            return hit
+    return ''
+
+
+def suggest_rule_name(match_value: str, category: str = '') -> str:
+    """Suggest a rule Name from the match value + the merchant's category:
+    "<alias> — <match>" (e.g. "Fuel — Chevron"). Falls back to just the match
+    value when no alias is known, or the alias alone when there's no match."""
+    alias = category_alias(category)
+    mv = (match_value or '').strip()
+    if alias and mv:
+        return f'{alias} — {mv}'
+    return mv or alias
+
+
+def _overlap_facets(match_type: str, match_value: str) -> dict:
+    """A representative transaction (as rule_matches kwargs) that the given
+    predicate is meant to catch — used to detect whether OTHER rules also fire on
+    the same input (conflict detection)."""
+    mv = (match_value or '').strip()
+    facets = {'merchant_name': '', 'description': '', 'category': '', 'amount': 0.0}
+    if match_type in ('merchant_exact', 'merchant_contains'):
+        facets['merchant_name'] = mv
+    elif match_type == 'plaid_category_matches':
+        facets['category'] = mv
+    elif match_type == 'description_regex':
+        facets['description'] = mv
+    elif match_type == 'amount_range':
+        rng = _amount_range(match_value)
+        facets['amount'] = (rng[0] + rng[1]) / 2.0 if rng else 0.0
+    return facets
+
+
+def conflicting_rules(match_type: str, match_value: str, priority: int,
+                      exclude_id=None) -> list:
+    """ACTIVE, non-archived rules at the SAME or HIGHER priority (lower number)
+    that already match the same input a new rule targets. Because the engine is
+    first-match-wins in priority order, any such rule would shadow the new one.
+    Returned in priority order (the winner first) so the caller can warn."""
+    facets = _overlap_facets(match_type, match_value)
+    if not any((facets['merchant_name'], facets['description'],
+                facets['category'])) and match_type != 'amount_range':
+        return []
+    rules = (CategorizationRule.query
+             .filter(CategorizationRule.active.is_(True),
+                     CategorizationRule.archived.is_(False))
+             .order_by(CategorizationRule.priority.asc(),
+                       CategorizationRule.id.asc()).all())
+    out = []
+    for r in rules:
+        if exclude_id is not None and r.id == exclude_id:
+            continue
+        if (r.priority or 0) <= priority and rule_matches(r, **facets):
+            out.append(r)
+    return out
 
 
 def _now() -> datetime:

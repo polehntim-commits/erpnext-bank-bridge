@@ -13,8 +13,8 @@ Pages:
 """
 from urllib.parse import quote_plus
 
-from flask import (Blueprint, current_app, redirect, render_template_string,
-                   request, url_for)
+from flask import (Blueprint, current_app, jsonify, redirect,
+                   render_template_string, request, url_for)
 
 from .. import audit
 from .. import categorization
@@ -708,6 +708,53 @@ def rerun_rules():
 
 # ── Categorization rules ─────────────────────────────────────────
 
+def _merchant_has_rule(name: str, merchant_rules: list) -> bool:
+    """True when an active merchant rule already matches `name` — exact rules by
+    equality, contains rules by substring (both case-insensitive)."""
+    low = (name or '').strip().lower()
+    if not low:
+        return False
+    for r in merchant_rules:
+        mv = (r['match_value'] or '').strip().lower()
+        if not mv:
+            continue
+        if r['match_type'] == 'merchant_exact' and low == mv:
+            return True
+        if r['match_type'] == 'merchant_contains' and mv in low:
+            return True
+    return False
+
+
+@bp.get('/api/rules/known_merchants')
+def known_merchants_api():
+    """Autocomplete feed for the merchant match-value field: every merchant seen
+    in the local transaction mirror, most-frequent first, tagged with whether a
+    rule already covers it and a suggested rule Name from its category."""
+    merchant_rules = CategorizationRule.merchants_with_rules()
+    out = []
+    for m in BankTransaction.known_merchants(limit=200):
+        out.append({
+            'name': m['name'], 'count': m['count'],
+            'total_amount': m['total_amount'], 'category': m['category'],
+            'has_rule': _merchant_has_rule(m['name'], merchant_rules),
+            'suggested_name': categorization.suggest_rule_name(
+                m['name'], m['category']),
+        })
+    return jsonify({'merchants': out})
+
+
+@bp.get('/api/rules/known_categories')
+def known_categories_api():
+    """Autocomplete feed for the plaid_category_matches field: distinct Plaid
+    categories seen locally (full hierarchy preserved), most-frequent first,
+    each with a suggested short alias."""
+    out = []
+    for c in BankTransaction.known_categories(limit=200):
+        out.append({'path': c['path'], 'count': c['count'],
+                    'alias': categorization.category_alias(c['path'])})
+    return jsonify({'categories': out})
+
+
 def _erpnext_account_names() -> list:
     """ERPNext GL Account docnames for the rule debit/credit datalists.
     Best-effort — an empty list (ERPNext down / unconfigured) just means the
@@ -738,7 +785,8 @@ RULES_BODY = """
   <input type="hidden" name="id" value="{{ form.id or '' }}">
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:2;min-width:180px">Name
-      <input name="name" value="{{ form.name or '' }}" placeholder="Fuel — Chevron">
+      <input name="name" id="rule-name" value="{{ form.name or '' }}" placeholder="Fuel — Chevron">
+      <span id="name-hint" style="display:none;font-weight:400;font-size:12px;color:#0a7;margin-top:3px"></span>
     </label>
     <label style="flex:1;min-width:90px">Priority
       <input name="priority" type="number" value="{{ form.priority if form.priority is not none else 100 }}">
@@ -747,17 +795,30 @@ RULES_BODY = """
       <input type="checkbox" name="active" value="1" {{ 'checked' if form.active else '' }} style="width:auto"> active
     </label>
   </div>
-  <div style="display:flex;gap:12px;flex-wrap:wrap">
+  <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start">
     <label style="flex:1;min-width:180px">Match type
-      <select name="match_type">
+      <select name="match_type" id="mt">
         {% for mt in match_types %}
         <option value="{{ mt }}" {{ 'selected' if mt == form.match_type else '' }}>{{ mt }}</option>
         {% endfor %}
       </select>
     </label>
-    <label style="flex:2;min-width:200px">Match value
-      <input name="match_value" value="{{ form.match_value or '' }}"
+    <label style="flex:2;min-width:200px;position:relative">Match value
+      <span id="mv-refresh-wrap" style="float:right;font-weight:400">
+        <a href="#" id="ac-refresh" style="font-size:11px" title="Re-fetch merchants + categories from your local transactions">↻ refresh</a>
+      </span>
+      <input name="match_value" id="mv" autocomplete="off" value="{{ form.match_value or '' }}"
              placeholder="Chevron   ·   ^UBER   ·   [10, 500] for amount_range">
+      <!-- custom merchant autocomplete (shown for merchant_* types) -->
+      <div id="mv-dd" style="display:none;position:absolute;left:0;right:0;z-index:20;background:#fff;border:1px solid #ccc;border-top:none;border-radius:0 0 4px 4px;max-height:240px;overflow:auto;box-shadow:0 4px 12px rgba(0,0,0,.12)"></div>
+      <!-- category picker (shown for plaid_category_matches) -->
+      <select id="mv-cat" style="display:none;margin-top:6px;width:100%"></select>
+      <!-- regex tester (shown for description_regex) -->
+      <div id="mv-regex" style="display:none;margin-top:6px">
+        <input id="regex-sample" autocomplete="off" placeholder="Paste a sample description to test…" style="width:100%">
+        <span id="regex-result" style="font-size:12px"></span>
+      </div>
+      <span id="mv-hint" style="display:block;font-weight:400;font-size:11px;color:#888;margin-top:3px"></span>
     </label>
   </div>
   <div style="display:flex;gap:12px;flex-wrap:wrap">
@@ -891,6 +952,176 @@ RULES_BODY = """
   {% if not archived %}<tr><td colspan="6" style="color:#888">No archived rules.</td></tr>{% endif %}
 </table>
 {% endif %}
+{% raw %}
+<script>
+// v0.3.2 · rule-builder autocomplete. Context-aware match-value widget +
+// name suggestion, fed by /api/rules/known_merchants|known_categories. Vanilla
+// JS, no dependencies; data cached in sessionStorage for the session.
+(function () {
+  var mt = document.getElementById('mt');
+  if (!mt) return;                       // not on the rules page
+  var mv = document.getElementById('mv');
+  var dd = document.getElementById('mv-dd');
+  var cat = document.getElementById('mv-cat');
+  var regexBox = document.getElementById('mv-regex');
+  var regexSample = document.getElementById('regex-sample');
+  var regexResult = document.getElementById('regex-result');
+  var hint = document.getElementById('mv-hint');
+  var refresh = document.getElementById('ac-refresh');
+  var nameEl = document.getElementById('rule-name');
+  var nameHint = document.getElementById('name-hint');
+  var CK = 'bb_known_merchants', CC = 'bb_known_categories';
+  var merchants = [], categories = [];
+
+  function money(n) { return '$' + Math.round(n || 0).toLocaleString(); }
+  function esc(s) {
+    return (s == null ? '' : String(s)).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; });
+  }
+
+  function load(force) {
+    var haveM = !force && sessionStorage.getItem(CK);
+    var haveC = !force && sessionStorage.getItem(CC);
+    if (haveM && haveC) {
+      try { merchants = JSON.parse(haveM); categories = JSON.parse(haveC); }
+      catch (e) { merchants = []; categories = []; }
+      onData(); return;
+    }
+    Promise.all([
+      fetch('/api/rules/known_merchants').then(function (r) { return r.json(); }),
+      fetch('/api/rules/known_categories').then(function (r) { return r.json(); })
+    ]).then(function (res) {
+      merchants = (res[0] && res[0].merchants) || [];
+      categories = (res[1] && res[1].categories) || [];
+      try {
+        sessionStorage.setItem(CK, JSON.stringify(merchants));
+        sessionStorage.setItem(CC, JSON.stringify(categories));
+      } catch (e) {}
+      onData();
+    }).catch(function () { onData(); });
+  }
+
+  function onData() { populateCategories(); applyMode(); }
+
+  function populateCategories() {
+    if (!cat) return;
+    var cur = mv.value;
+    cat.innerHTML = '<option value="">— pick a category seen locally —</option>' +
+      categories.map(function (c) {
+        var lbl = c.path + '  ·  ' + c.count + ' txn' + (c.count === 1 ? '' : 's') +
+                  (c.alias ? '  → ' + c.alias : '');
+        return '<option value="' + esc(c.path) + '"' +
+               (c.path === cur ? ' selected' : '') + '>' + esc(lbl) + '</option>';
+      }).join('');
+  }
+
+  function applyMode() {
+    var m = mt.value;
+    var isMerchant = (m === 'merchant_exact' || m === 'merchant_contains');
+    var isCat = (m === 'plaid_category_matches');
+    var isRegex = (m === 'description_regex');
+    dd.style.display = 'none';
+    cat.style.display = isCat ? 'block' : 'none';
+    regexBox.style.display = isRegex ? 'block' : 'none';
+    if (isMerchant) {
+      hint.textContent = merchants.length
+        ? 'Type to search ' + merchants.length + ' merchant(s) seen locally, or enter a new one.'
+        : 'No local merchants yet — type any merchant name.';
+    } else if (isCat) {
+      hint.textContent = 'Pick a Plaid category seen locally (full hierarchy shown).';
+    } else if (isRegex) {
+      hint.textContent = 'A Python regex tested against the transaction description.';
+    } else {
+      hint.textContent = 'Amount range as JSON: [min, max] — e.g. [10, 500].';
+    }
+    updateNameSuggestion();
+    if (isRegex) runRegex();
+  }
+
+  function renderDD() {
+    if (mt.value !== 'merchant_exact' && mt.value !== 'merchant_contains') return;
+    var q = mv.value.trim().toLowerCase();
+    var rows = merchants.filter(function (x) {
+      return !q || x.name.toLowerCase().indexOf(q) !== -1; }).slice(0, 50);
+    if (!rows.length) { dd.style.display = 'none'; return; }
+    dd.innerHTML = rows.map(function (x, i) {
+      var badge = x.has_rule
+        ? '<span style="background:#fde68a;color:#7a5b00;border-radius:3px;padding:0 5px;font-size:10px;margin-left:6px">already has rule</span>'
+        : '';
+      return '<div class="mv-opt" data-i="' + i + '" data-name="' + esc(x.name) +
+        '" style="padding:6px 9px;cursor:pointer;border-bottom:1px solid #f0f0f0">' +
+        '<b>' + esc(x.name) + '</b>' + badge +
+        '<span style="color:#888;font-size:12px;float:right">' + x.count +
+        ' txns · ' + money(x.total_amount) + '</span></div>';
+    }).join('');
+    Array.prototype.forEach.call(dd.querySelectorAll('.mv-opt'), function (el) {
+      el.addEventListener('mousedown', function (ev) {
+        ev.preventDefault();
+        mv.value = el.getAttribute('data-name');
+        dd.style.display = 'none';
+        updateNameSuggestion();
+      });
+      el.addEventListener('mouseenter', function () { el.style.background = '#f5f7ff'; });
+      el.addEventListener('mouseleave', function () { el.style.background = '#fff'; });
+    });
+    dd.style.display = 'block';
+  }
+
+  function merchantFor(name) {
+    var low = (name || '').trim().toLowerCase();
+    for (var i = 0; i < merchants.length; i++)
+      if (merchants[i].name.toLowerCase() === low) return merchants[i];
+    return null;
+  }
+
+  function updateNameSuggestion() {
+    var suggestion = '';
+    var m = merchantFor(mv.value);
+    if (m && m.suggested_name) suggestion = m.suggested_name;
+    else if (mt.value === 'plaid_category_matches') {
+      var c = categories.filter(function (x) { return x.path === mv.value; })[0];
+      if (c && c.alias) suggestion = c.alias;
+    }
+    if (suggestion && suggestion !== nameEl.value) {
+      nameHint.style.display = 'block';
+      nameHint.innerHTML = 'Suggested: <b>' + esc(suggestion) +
+        '</b> · <a href="#" id="use-name">use</a>';
+      var u = document.getElementById('use-name');
+      u.addEventListener('click', function (e) {
+        e.preventDefault(); nameEl.value = suggestion; nameHint.style.display = 'none';
+      });
+    } else {
+      nameHint.style.display = 'none';
+    }
+  }
+
+  function runRegex() {
+    if (!regexSample) return;
+    var pat = mv.value, s = regexSample.value;
+    if (!pat) { regexResult.textContent = ''; return; }
+    var re;
+    try { re = new RegExp(pat, 'i'); }
+    catch (e) { regexResult.innerHTML = '<span style="color:#c00">✗ invalid regex</span>'; return; }
+    regexResult.innerHTML = re.test(s)
+      ? '<span style="color:#0a7">✓ matches</span>'
+      : '<span style="color:#a00">✗ no match</span>';
+  }
+
+  mt.addEventListener('change', applyMode);
+  mv.addEventListener('input', function () { renderDD(); updateNameSuggestion(); runRegex(); });
+  mv.addEventListener('focus', renderDD);
+  mv.addEventListener('blur', function () { setTimeout(function () { dd.style.display = 'none'; }, 150); });
+  if (cat) cat.addEventListener('change', function () {
+    mv.value = cat.value; updateNameSuggestion(); });
+  if (regexSample) regexSample.addEventListener('input', runRegex);
+  if (refresh) refresh.addEventListener('click', function (e) {
+    e.preventDefault(); refresh.textContent = '↻ …'; load(true);
+    setTimeout(function () { refresh.textContent = '↻ refresh'; }, 600); });
+
+  load(false);
+})();
+</script>
+{% endraw %}
 """
 
 
@@ -998,6 +1229,19 @@ def save_rule():
         audit.record('rule_created', subject_type='CategorizationRule',
                      subject_id=new_rule.id, after=new_rule.to_dict())
         msg = f'Added rule “{vals["name"]}”'
+    # Conflict detection (v0.3.2): warn — never block — if a higher-or-equal
+    # priority active rule already matches the same value and would shadow this
+    # one. The old (now-archived) version is excluded via new_rule.id.
+    conflicts = categorization.conflicting_rules(
+        new_rule.match_type, new_rule.match_value, new_rule.priority or 0,
+        exclude_id=new_rule.id)
+    if conflicts:
+        c = conflicts[0]
+        msg += (f'  ⚠ Heads up: rule “{c.name or ("#" + str(c.id))}” at priority '
+                f'{c.priority} already matches “{new_rule.match_value}”. This new '
+                f'rule at priority {new_rule.priority} won’t fire for those '
+                f'transactions unless you raise its priority (lower number) or '
+                f'disable the older rule.')
     return redirect('/admin/rules?flash=' + quote_plus(msg))
 
 

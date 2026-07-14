@@ -155,6 +155,64 @@ class BankTransaction(db.Model):
             'removed': bool(self.removed), 'sync_error': self.sync_error,
         }
 
+    # ── v0.3.2 · autocomplete feeds for the rule builder ──────────────
+    # These aggregate the local transaction mirror so the /admin/rules form can
+    # offer merchants + categories the operator has actually seen, instead of
+    # asking them to type merchant names from memory.
+
+    @classmethod
+    def known_merchants(cls, limit: int = 200) -> list:
+        """Distinct merchants seen locally, most-frequent first:
+        [{'name', 'count', 'total_amount', 'category'}]. `total_amount` is the
+        summed absolute spend (Plaid amounts are positive = outflow) so the UI
+        can show a real dollar figure; `category` is the merchant's most common
+        Plaid category (for the Name suggestion). Non-removed rows only."""
+        from sqlalchemy import func
+        rows = (db.session.query(
+                    cls.merchant_name,
+                    func.count(cls.id),
+                    func.coalesce(func.sum(func.abs(cls.amount)), 0.0))
+                .filter(cls.merchant_name.isnot(None),
+                        cls.merchant_name != '',
+                        cls.removed.is_(False))
+                .group_by(cls.merchant_name)
+                .order_by(func.count(cls.id).desc(), cls.merchant_name.asc())
+                .limit(limit).all())
+        merchants = [{'name': name, 'count': int(count or 0),
+                      'total_amount': round(float(total or 0.0), 2),
+                      'category': ''} for name, count, total in rows]
+        if not merchants:
+            return merchants
+        # Dominant category per merchant (one extra grouped pass), then attach.
+        names = {m['name'] for m in merchants}
+        cat_rows = (db.session.query(
+                        cls.merchant_name, cls.category, func.count(cls.id))
+                    .filter(cls.merchant_name.in_(names),
+                            cls.category.isnot(None), cls.category != '',
+                            cls.removed.is_(False))
+                    .group_by(cls.merchant_name, cls.category)
+                    .order_by(func.count(cls.id).desc()).all())
+        dominant = {}
+        for name, cat, _cnt in cat_rows:
+            dominant.setdefault(name, cat)     # first seen = highest count
+        for m in merchants:
+            m['category'] = dominant.get(m['name'], '')
+        return merchants
+
+    @classmethod
+    def known_categories(cls, limit: int = 200) -> list:
+        """Distinct Plaid categories seen locally, most-frequent first:
+        [{'path', 'count'}]. The stored string (a 'A > B > C' path or a raw PFC
+        label) is preserved verbatim — the UI shows the full hierarchy."""
+        from sqlalchemy import func
+        rows = (db.session.query(cls.category, func.count(cls.id))
+                .filter(cls.category.isnot(None), cls.category != '',
+                        cls.removed.is_(False))
+                .group_by(cls.category)
+                .order_by(func.count(cls.id).desc(), cls.category.asc())
+                .limit(limit).all())
+        return [{'path': path, 'count': int(count or 0)} for path, count in rows]
+
 
 class PlaidSyncLog(db.Model):
     """One row per logical sync ACTION (a plaid pull, or an erpnext push batch)
@@ -286,6 +344,19 @@ class CategorizationRule(db.Model):
     archived = db.Column(db.Boolean, default=False, index=True)
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    @classmethod
+    def merchants_with_rules(cls) -> list:
+        """The (match_type, match_value) of every ACTIVE, non-archived merchant
+        rule — feeds the "already has a rule" badge on the merchant autocomplete
+        (v0.3.2). Returns [{'match_type', 'match_value'}]; the caller decides
+        overlap (exact vs contains) against each known merchant."""
+        rows = (cls.query
+                .filter(cls.active.is_(True), cls.archived.is_(False),
+                        cls.match_type.in_(('merchant_exact', 'merchant_contains')))
+                .all())
+        return [{'match_type': r.match_type,
+                 'match_value': (r.match_value or '')} for r in rows]
 
     def to_dict(self):
         return {

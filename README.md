@@ -48,7 +48,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.3.1 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.3.2 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -57,8 +57,12 @@ rule account dropdown lists every enabled leaf account (Bank included); a
 fuzzy-match check reuses an existing near-duplicate GL Account instead of
 creating a new one (with an operator confirm on the accounts page); and rules are
 now **bank-account-agnostic** — a rule names only the categorized offset account
-while the bank side is taken from the transaction's linked account. See the
-roadmap at the bottom.
+while the bank side is taken from the transaction's linked account. v0.3.2 makes
+rule building easier: the match-value field autocompletes from merchants and
+Plaid categories already seen locally (with per-merchant txn counts, dollar
+totals and an "already has rule" badge), the Name field suggests a short name
+from the merchant's category (`Fuel — Chevron`), and saving a rule warns when a
+higher-priority active rule already shadows it. See the roadmap at the bottom.
 
 ## How it works
 
@@ -418,10 +422,13 @@ a vulnerability.
   one-click "reconcile" from `/admin/generated_entries`).
 - Fuzzy merchant → Supplier matching (beyond exact-name find-or-create).
 - Rule-authoring conveniences: clone a rule, import/export a rule set.
+- Multi-select of Plaid categories on a single rule (currently one category per
+  rule; the picker is single-select).
 
 **Done:** ~~Merchant → ERPNext Supplier auto-create + rules-based transaction
 categorization~~ + ~~full append-only audit trail with non-destructive rule
-history~~ (v0.3.0).
+history~~ (v0.3.0). ~~Rule-builder autocomplete (merchants + Plaid categories),
+category-based Name suggestions, and shadow-conflict warnings~~ (v0.3.2).
 
 ## License
 

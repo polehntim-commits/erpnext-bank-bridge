@@ -11,9 +11,12 @@ import unittest
 
 os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 
+from datetime import date  # noqa: E402
+
 from app import create_app, db, crypto  # noqa: E402
-from app.models import (CategorizationRule, GeneratedJournalEntry,  # noqa: E402
-                        Supplier)
+from app import categorization  # noqa: E402
+from app.models import (BankTransaction, CategorizationRule,  # noqa: E402
+                        GeneratedJournalEntry, Supplier)
 
 
 class AdminBase(unittest.TestCase):
@@ -287,6 +290,133 @@ class TestGeneratedEntriesUi(AdminBase):
         # ERPNext not configured → cannot submit → stays pending.
         self.assertEqual(g.state, 'pending_review')
         self.assertIn(b'Could not submit', r.data)
+
+
+class TestRuleBuilderAutocomplete(AdminBase):
+    """v0.3.2 · autocomplete feeds + name suggestion + conflict detection."""
+
+    _txn_seq = 0
+
+    def _txn(self, merchant, amount=10.0, category='', removed=False):
+        TestRuleBuilderAutocomplete._txn_seq += 1
+        n = TestRuleBuilderAutocomplete._txn_seq
+        db.session.add(BankTransaction(
+            plaid_transaction_id=f't{n}', account_id='acc1',
+            merchant_name=merchant, amount=amount, category=category,
+            date=date(2026, 1, 1), removed=removed))
+
+    def test_known_merchants_endpoint_sorted_by_count(self):
+        # Chevron seen 3×, Costco 2×, Shell 1×.
+        for _ in range(3):
+            self._txn('Chevron', amount=40.0, category='Transportation > Gas Stations')
+        for _ in range(2):
+            self._txn('Costco', amount=120.0, category='Food and Drink > Groceries')
+        self._txn('Shell', amount=35.0)
+        db.session.commit()
+        r = self.client.get('/api/rules/known_merchants')
+        self.assertEqual(r.status_code, 200)
+        merchants = r.get_json()['merchants']
+        names = [m['name'] for m in merchants]
+        self.assertEqual(names, ['Chevron', 'Costco', 'Shell'])   # count desc
+        chevron = merchants[0]
+        self.assertEqual(chevron['count'], 3)
+        self.assertEqual(chevron['total_amount'], 120.0)          # 3 × $40
+        # Category attached → name suggestion derives "Fuel — Chevron".
+        self.assertEqual(chevron['suggested_name'], 'Fuel — Chevron')
+
+    def test_known_merchants_excludes_removed_and_blank(self):
+        self._txn('Chevron', category='Transportation > Gas Stations')
+        self._txn('', amount=5.0)                 # blank merchant → excluded
+        self._txn('Ghost', removed=True)          # removed → excluded
+        db.session.commit()
+        names = [m['name'] for m in
+                 self.client.get('/api/rules/known_merchants').get_json()['merchants']]
+        self.assertEqual(names, ['Chevron'])
+
+    def test_known_categories_endpoint_hierarchy_preserved(self):
+        deep = 'Food and Drink > Restaurants > Coffee Shop'
+        for _ in range(2):
+            self._txn('Starbucks', category=deep)
+        self._txn('Costco', category='Food and Drink > Groceries')
+        db.session.commit()
+        r = self.client.get('/api/rules/known_categories')
+        self.assertEqual(r.status_code, 200)
+        cats = r.get_json()['categories']
+        paths = [c['path'] for c in cats]
+        self.assertEqual(paths[0], deep)          # count desc → coffee first
+        self.assertIn('Food and Drink > Groceries', paths)
+        # Full hierarchy preserved verbatim (not truncated to a leaf).
+        self.assertEqual(cats[0]['count'], 2)
+        self.assertEqual(cats[0]['alias'], 'Coffee')
+
+    def test_name_suggestion_uses_category_alias(self):
+        self.assertEqual(
+            categorization.suggest_rule_name('Chevron', 'Transportation > Gas Stations'),
+            'Fuel — Chevron')
+        # Raw PFC leaf label resolves to the same alias.
+        self.assertEqual(categorization.category_alias('GAS_STATIONS'), 'Fuel')
+        # Unknown category → no alias, falls back to the bare match value.
+        self.assertEqual(categorization.suggest_rule_name('Acme', 'Nonsense > Zzz'), 'Acme')
+
+    def test_dropdown_shows_has_rule_badge_for_covered_merchants(self):
+        self._txn('Chevron', category='Transportation > Gas Stations')
+        self._txn('Costco', category='Food and Drink > Groceries')
+        db.session.commit()
+        db.session.add(CategorizationRule(
+            name='Fuel', priority=100, active=True,
+            match_type='merchant_contains', match_value='Chevron',
+            offset_account='Fuel - EC', offset_direction='auto'))
+        db.session.commit()
+        merchants = self.client.get(
+            '/api/rules/known_merchants').get_json()['merchants']
+        by_name = {m['name']: m for m in merchants}
+        self.assertTrue(by_name['Chevron']['has_rule'])
+        self.assertFalse(by_name['Costco']['has_rule'])
+        # And the badge string renders in the served page's JS payload.
+        self.assertIn('already has rule',
+                      self.client.get('/admin/rules').get_data(as_text=True))
+
+    def test_conflict_detection_warns_on_lower_priority(self):
+        # Existing higher-priority (lower number) rule already matches Chevron.
+        db.session.add(CategorizationRule(
+            name='Old Fuel Rule', priority=100, active=True,
+            match_type='merchant_contains', match_value='Chevron',
+            offset_account='Fuel - EC', offset_direction='auto'))
+        db.session.commit()
+        r = self.client.post('/admin/rules/save', data=dict(
+            name='New Fuel', priority='200', active='1',
+            match_type='merchant_exact', match_value='Chevron',
+            offset_account='Fuel Expense - EC', offset_direction='auto'),
+            follow_redirects=True)
+        body = r.get_data(as_text=True)
+        self.assertIn('already matches', body)
+        self.assertIn('Old Fuel Rule', body)
+        # Non-blocking: the new rule was still saved.
+        self.assertEqual(
+            CategorizationRule.query.filter_by(name='New Fuel').count(), 1)
+
+    def test_conflict_detection_silent_when_new_rule_wins(self):
+        # New rule at HIGHER priority (lower number) than the existing one →
+        # it fires first, so no shadow warning.
+        db.session.add(CategorizationRule(
+            name='Old Fuel Rule', priority=200, active=True,
+            match_type='merchant_contains', match_value='Chevron',
+            offset_account='Fuel - EC', offset_direction='auto'))
+        db.session.commit()
+        r = self.client.post('/admin/rules/save', data=dict(
+            name='New Fuel', priority='50', active='1',
+            match_type='merchant_exact', match_value='Chevron',
+            offset_account='Fuel Expense - EC', offset_direction='auto'),
+            follow_redirects=True)
+        self.assertNotIn('already matches', r.get_data(as_text=True))
+
+    def test_rule_form_has_autocomplete_widgets(self):
+        body = self.client.get('/admin/rules').get_data(as_text=True)
+        self.assertIn('id="mv-dd"', body)         # merchant dropdown
+        self.assertIn('id="mv-cat"', body)        # category picker
+        self.assertIn('id="mv-regex"', body)      # regex tester
+        self.assertIn('/api/rules/known_merchants', body)
+        self.assertIn('id="name-hint"', body)     # name suggestion slot
 
 
 if __name__ == '__main__':
