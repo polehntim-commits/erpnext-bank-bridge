@@ -48,7 +48,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.3.2 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.3.3 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -62,7 +62,11 @@ rule building easier: the match-value field autocompletes from merchants and
 Plaid categories already seen locally (with per-merchant txn counts, dollar
 totals and an "already has rule" badge), the Name field suggests a short name
 from the merchant's category (`Fuel — Chevron`), and saving a rule warns when a
-higher-priority active rule already shadows it. See the roadmap at the bottom.
+higher-priority active rule already shadows it. v0.3.3 fixes the merchant picker:
+the custom dropdown now stays open and live-filters (case-insensitive substring)
+as you type instead of collapsing, shows a "use as new" row when nothing matches,
+and supports arrow-key navigation — its filter logic moved into a small tested
+static JS module (`app/static/rule_dropdown.js`). See the roadmap at the bottom.
 
 ## How it works
 

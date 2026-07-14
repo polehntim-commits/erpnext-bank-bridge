@@ -952,9 +952,10 @@ RULES_BODY = """
   {% if not archived %}<tr><td colspan="6" style="color:#888">No archived rules.</td></tr>{% endif %}
 </table>
 {% endif %}
+<script src="/static/rule_dropdown.js?v=0.3.3"></script>
 {% raw %}
 <script>
-// v0.3.2 · rule-builder autocomplete. Context-aware match-value widget +
+// v0.3.3 · rule-builder autocomplete. Context-aware match-value widget +
 // name suggestion, fed by /api/rules/known_merchants|known_categories. Vanilla
 // JS, no dependencies; data cached in sessionStorage for the session.
 (function () {
@@ -1038,34 +1039,36 @@ RULES_BODY = """
     if (isRegex) runRegex();
   }
 
-  function renderDD() {
-    if (mt.value !== 'merchant_exact' && mt.value !== 'merchant_contains') return;
-    var q = mv.value.trim().toLowerCase();
-    var rows = merchants.filter(function (x) {
-      return !q || x.name.toLowerCase().indexOf(q) !== -1; }).slice(0, 50);
-    if (!rows.length) { dd.style.display = 'none'; return; }
-    dd.innerHTML = rows.map(function (x, i) {
+  function isMerchantMode() {
+    return mt.value === 'merchant_exact' || mt.value === 'merchant_contains';
+  }
+
+  // The merchant picker is the one custom (non-native) dropdown in this form —
+  // the category picker is a <select> and the offset account is a <datalist>,
+  // both native and unaffected by the v0.3.2 collapse-on-empty bug. Its
+  // filter/open/keyboard behavior lives in the shared, tested module.
+  var mvDD = BankBridgeDropdown.createDropdown({
+    input: mv,
+    menu: dd,
+    enabled: isMerchantMode,
+    getOptions: function () { return merchants; },
+    getLabel: function (x) { return x.name; },
+    onInput: function () { updateNameSuggestion(); runRegex(); },
+    onSelect: function () { updateNameSuggestion(); },
+    emptyRow: function (q) {
+      var t = (q || '').trim();
+      if (!t) return null;
+      return 'No matches — press <b>Enter</b> to use “' + esc(t) + '” as new';
+    },
+    renderRow: function (x) {
       var badge = x.has_rule
         ? '<span style="background:#fde68a;color:#7a5b00;border-radius:3px;padding:0 5px;font-size:10px;margin-left:6px">already has rule</span>'
         : '';
-      return '<div class="mv-opt" data-i="' + i + '" data-name="' + esc(x.name) +
-        '" style="padding:6px 9px;cursor:pointer;border-bottom:1px solid #f0f0f0">' +
-        '<b>' + esc(x.name) + '</b>' + badge +
+      return '<b>' + esc(x.name) + '</b>' + badge +
         '<span style="color:#888;font-size:12px;float:right">' + x.count +
-        ' txns · ' + money(x.total_amount) + '</span></div>';
-    }).join('');
-    Array.prototype.forEach.call(dd.querySelectorAll('.mv-opt'), function (el) {
-      el.addEventListener('mousedown', function (ev) {
-        ev.preventDefault();
-        mv.value = el.getAttribute('data-name');
-        dd.style.display = 'none';
-        updateNameSuggestion();
-      });
-      el.addEventListener('mouseenter', function () { el.style.background = '#f5f7ff'; });
-      el.addEventListener('mouseleave', function () { el.style.background = '#fff'; });
-    });
-    dd.style.display = 'block';
-  }
+        ' txns · ' + money(x.total_amount) + '</span>';
+    }
+  });
 
   function merchantFor(name) {
     var low = (name || '').trim().toLowerCase();
@@ -1107,10 +1110,9 @@ RULES_BODY = """
       : '<span style="color:#a00">✗ no match</span>';
   }
 
-  mt.addEventListener('change', applyMode);
-  mv.addEventListener('input', function () { renderDD(); updateNameSuggestion(); runRegex(); });
-  mv.addEventListener('focus', renderDD);
-  mv.addEventListener('blur', function () { setTimeout(function () { dd.style.display = 'none'; }, 150); });
+  // Focus / input / keyboard / outside-click for the merchant picker are owned
+  // by the shared dropdown module (mvDD). Only the mode switch stays here.
+  mt.addEventListener('change', function () { applyMode(); mvDD.close(); });
   if (cat) cat.addEventListener('change', function () {
     mv.value = cat.value; updateNameSuggestion(); });
   if (regexSample) regexSample.addEventListener('input', runRegex);
