@@ -168,20 +168,37 @@ class Config:
     # value — no wipe, no manual step (see app/db_recovery.py).
     #   * master switch — set False to disable the self-heal entirely.
     AUTO_RECOVER_DB_AUTH = _bool('AUTO_RECOVER_DB_AUTH', True)
-    #   * the superuser role used to rotate the app role's password. Defaults to
-    #     the postgres superuser. NOTE: the stock compose runs the db with
-    #     POSTGRES_USER=bankbridge, so the only superuser is `bankbridge` itself
-    #     — for the self-heal to have a reachable superuser, either run the db
-    #     with a distinct superuser role, set POSTGRES_HOST_AUTH_METHOD=trust on
-    #     the isolated db network, or pin POSTGRES_PASSWORD so it never drifts.
-    DB_SUPERUSER = os.environ.get('DB_SUPERUSER', 'postgres').strip() or 'postgres'
+    #   * an OPTIONAL explicitly-provisioned superuser, tried first. The stock
+    #     compose runs the db with POSTGRES_USER=bankbridge, which makes
+    #     `bankbridge` the SOLE superuser — there is no stock `postgres` role
+    #     (psql -U postgres → "role does not exist"). So this usually can't
+    #     connect; the deterministic rescue user below is the real recovery path.
+    #     Leave DB_SUPERUSER blank to skip this attempt, or set it if you
+    #     provisioned a distinct superuser yourself.
+    DB_SUPERUSER = os.environ.get('DB_SUPERUSER', '').strip()
     #   * password for DB_SUPERUSER. Falls back to POSTGRES_PASSWORD, then to
-    #     SECRET_KEY (our app-side alias for APP_SEED, which in Umbrel is the
-    #     same value POSTGRES_PASSWORD is derived from).
+    #     SECRET_KEY (our app-side alias for APP_SEED).
     DB_SUPERUSER_PASSWORD = (
         os.environ.get('DB_SUPERUSER_PASSWORD', '').strip()
         or os.environ.get('POSTGRES_PASSWORD', '').strip()
         or SECRET_KEY)
+    #   * the deterministic RESCUE superuser. Fresh installs create this second
+    #     superuser at init (scripts/initdb.d/10-create-rescue-superuser.sh) with
+    #     a password derived as HMAC-SHA256(key=APP_SEED, msg=DB_RESCUE_SALT).
+    #     Because the same APP_SEED + salt reproduce the same password every
+    #     boot, the app re-derives it to log in and reset a drifted `bankbridge`
+    #     password. Existing installs predate this user and must run
+    #     scripts/rotate_db_password.sh once (which creates it).
+    DB_RESCUE_USER = os.environ.get('DB_RESCUE_USER', 'bridgeadmin').strip() \
+        or 'bridgeadmin'
+    DB_RESCUE_SALT = os.environ.get('DB_RESCUE_SALT', 'bankbridge-rescue-v1').strip() \
+        or 'bankbridge-rescue-v1'
+    #   * the APP_SEED the rescue password is derived from — must match what the
+    #     db container used at init. Falls back to POSTGRES_PASSWORD (which the
+    #     compose sets to APP_SEED), then SECRET_KEY (also APP_SEED).
+    DB_RESCUE_SEED = (os.environ.get('DB_RESCUE_SEED', '').strip()
+                      or os.environ.get('POSTGRES_PASSWORD', '').strip()
+                      or SECRET_KEY)
 
     # Poll cadence (hours) for the background transactions/sync loop.
     SYNC_INTERVAL_HOURS = int(os.environ.get('SYNC_INTERVAL_HOURS', '6'))

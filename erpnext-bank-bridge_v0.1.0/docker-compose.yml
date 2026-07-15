@@ -8,15 +8,20 @@ services:
       POSTGRES_USER: bankbridge
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev-postgres-password}
       POSTGRES_DB: bankbridge
-      # NOTE: POSTGRES_USER=bankbridge makes `bankbridge` the ONLY superuser, so
-      # the v0.3.5 boot self-heal (app/db_recovery.py) has no *separate*
-      # superuser to rotate through if bankbridge's own password drifts. Pin
-      # POSTGRES_PASSWORD (above) so it never drifts, or uncomment the line below
-      # to allow passwordless superuser logins on this isolated db network so the
-      # self-heal can always reconnect and repair the drift:
-      # POSTGRES_HOST_AUTH_METHOD: trust
+      # v0.3.5 — POSTGRES_USER=bankbridge makes `bankbridge` the ONLY superuser,
+      # so if its password ever drifts nothing can log in to reset it. The init
+      # script mounted below creates a deterministic RESCUE superuser
+      # (`bridgeadmin`, password = HMAC(APP_SEED, salt)) on FIRST init so the
+      # app's boot self-heal (app/db_recovery.py) can always reconnect and repair
+      # the drift. These feed that script + the app-side derivation; keep them in
+      # sync with the server's DB_RESCUE_* below.
+      DB_RESCUE_USER: ${DB_RESCUE_USER:-bridgeadmin}
+      DB_RESCUE_SALT: ${DB_RESCUE_SALT:-bankbridge-rescue-v1}
+      DB_RESCUE_SEED: ${POSTGRES_PASSWORD:-dev-postgres-password}
     volumes:
       - bankbridge_pgdata:/var/lib/postgresql/data
+      # Runs ONCE on a fresh volume — creates the bridgeadmin rescue superuser.
+      - ./scripts/initdb.d:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bankbridge -d bankbridge"]
       interval: 5s
@@ -50,6 +55,15 @@ services:
       # to {DATA_DIR}/fernet.key. Set to pin/rotate a known key.
       FERNET_KEY: ${FERNET_KEY:-}
       SYNC_INTERVAL_HOURS: ${SYNC_INTERVAL_HOURS:-6}
+      # v0.3.5 — boot self-heal of app-role password drift. The rescue user +
+      # salt + seed must match the db service above so the app re-derives the
+      # same bridgeadmin password. DB_RESCUE_SEED defaults (in config.py) to
+      # POSTGRES_PASSWORD then SECRET_KEY — both APP_SEED — so it's set here
+      # implicitly; pass it explicitly only if you override the seed.
+      AUTO_RECOVER_DB_AUTH: ${AUTO_RECOVER_DB_AUTH:-true}
+      DB_RESCUE_USER: ${DB_RESCUE_USER:-bridgeadmin}
+      DB_RESCUE_SALT: ${DB_RESCUE_SALT:-bankbridge-rescue-v1}
+      DB_RESCUE_SEED: ${POSTGRES_PASSWORD:-dev-postgres-password}
     volumes:
       # /data holds the Fernet key + plaid/erpnext settings JSON + scheduler
       # lock. Postgres data lives on its own named volume above.

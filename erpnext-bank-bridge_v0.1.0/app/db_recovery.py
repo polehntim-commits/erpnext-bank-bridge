@@ -6,33 +6,49 @@ The problem this fixes
 Postgres persists the `bankbridge` login role's password from the FIRST time
 its data volume was initialized. If a later deploy hands the app a *different*
 password than that first-init value — e.g. an earlier init happened while
-`APP_SEED` was blank because compose was run by hand over SSH, or a stop/start
-cycle propagated env differently — then every connection the app makes fails
-with:
+`APP_SEED` was blank because compose was run by hand over SSH — then every
+connection the app makes fails with:
 
     psycopg2.OperationalError: password authentication failed for user "bankbridge"
 
 The historical workaround was to wipe the postgres volume and reinstall, which
 throws away Plaid tokens and local history.
 
-The fix
-───────
-At boot we probe the DB with a `SELECT 1`. If (and only if) that fails with a
-*password authentication* error, we open a short-lived **superuser** connection
-(using credentials the operator DOES control — `DB_SUPERUSER` /
-`DB_SUPERUSER_PASSWORD`, which default to the postgres superuser + `APP_SEED`)
-and `ALTER USER` the app role's password to match exactly what the app is
-already trying to authenticate with (the password embedded in `DATABASE_URL`).
-Then we re-probe. If it now succeeds the drift is healed transparently — no
-volume wipe, no manual intervention.
+Why we can't just use the `postgres` superuser
+───────────────────────────────────────────────
+The compose runs the db with `POSTGRES_USER=bankbridge`, so postgres init makes
+`bankbridge` the SOLE superuser — there is no separate `postgres` role to fall
+back to (`psql -U postgres` → `role "postgres" does not exist`). And when
+`bankbridge`'s own password has drifted, we can't authenticate as it either.
+
+The fix — a deterministic rescue superuser
+───────────────────────────────────────────
+Fresh installs create a SECOND superuser, `bridgeadmin` (see
+scripts/initdb.d/10-create-rescue-superuser.sh), whose password is derived
+deterministically as HMAC-SHA256(key=APP_SEED, msg=salt). Because the same
+APP_SEED + salt reproduce the same password on every boot, the app can always
+re-derive it (rescue_password below) and log in as `bridgeadmin` to reset the
+drifted `bankbridge` password — no volume wipe, no manual step.
+
+At boot we probe with `SELECT 1`. Only on a *password authentication* failure we
+try, in order, each configured superuser candidate — the optional `DB_SUPERUSER`
+then the `bridgeadmin` rescue user — opening a short-lived connection and
+`ALTER USER`-ing the app role's password to match what the app is already
+authenticating with (the password embedded in `DATABASE_URL`). Then we re-probe.
+
+Existing installs predate the rescue user (their volume only has `bankbridge`),
+so auto-recovery has no superuser to reach and fails safe with a clear pointer
+to the one-time manual repair: scripts/rotate_db_password.sh (which ALSO creates
+`bridgeadmin`, so subsequent drifts self-heal).
 
 Design guarantees:
   * **Idempotent / transparent** — on a healthy DB the probe succeeds and this
-    is a no-op costing one `SELECT 1`. Recovery only ever fires on the specific
-    password-auth failure.
-  * **Fail-safe** — if the superuser is *also* unreachable we log a loud warning
-    and return; we never crash the app or mask a non-auth error.
-  * **Secret-safe** — the actual `APP_SEED` / password value is never written to
+    is a no-op costing one `SELECT 1`. Recovery only fires on the password-auth
+    failure.
+  * **Fail-safe** — if no superuser candidate is reachable we log a loud warning
+    (pointing at the manual script) and return; we never crash the app or mask a
+    non-auth error.
+  * **Secret-safe** — the actual APP_SEED / password values are never written to
     the logs; messages only ever say the password was "rotated".
 
 Uses only psycopg2 (already a dependency) for the superuser side channel, kept
@@ -40,6 +56,8 @@ deliberately separate from the SQLAlchemy engine/pool the rest of the app uses.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 from dataclasses import dataclass
 
@@ -47,7 +65,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
 
-# psycopg2 is imported lazily inside _rotate_superuser_password so that merely
+# psycopg2 is imported lazily inside _rotate_with_superuser so that merely
 # importing this module (which happens on every boot) never requires the driver
 # — only the actual superuser rotation path does.
 
@@ -56,6 +74,9 @@ log = logging.getLogger('bankbridge.db_recovery')
 # Substring that marks the exact failure mode we self-heal. Postgres emits
 # `FATAL:  password authentication failed for user "…"` for a wrong password.
 _PW_AUTH_MARKER = 'password authentication failed'
+
+# Path shown to the operator when auto-recovery can't reach any superuser.
+_MANUAL_SCRIPT = 'scripts/rotate_db_password.sh'
 
 
 @dataclass(frozen=True)
@@ -71,10 +92,23 @@ class RecoveryResult:
     """
     status: str
     recovered: bool = False
+    via: str | None = None  # which superuser role performed a successful rotation
+
+
+def rescue_password(seed: str, salt: str) -> str:
+    """Deterministically derive the rescue superuser's password from APP_SEED.
+
+    HMAC-SHA256(key=seed, msg=salt) as lowercase hex. MUST stay byte-for-byte
+    identical to the server-side derivation in
+    scripts/initdb.d/10-create-rescue-superuser.sh, which computes it via
+    pgcrypto as `encode(hmac(salt, seed, 'sha256'), 'hex')` — note pgcrypto's
+    hmac(data, key, …) takes the message first and the key second, so there
+    data=salt and key=seed, matching (key=seed, msg=salt) here."""
+    return hmac.new(seed.encode(), salt.encode(), hashlib.sha256).hexdigest()
 
 
 def _looks_like_password_auth_failure(exc: BaseException) -> bool:
-    """True when `exc` (a SQLAlchemy or raw psycopg2 error) is a Postgres
+    """True when `exc` (a SQLAlchemy or raw driver error) is a Postgres
     password-authentication failure — the one drift symptom we self-heal."""
     parts = [str(exc)]
     orig = getattr(exc, 'orig', None)
@@ -99,14 +133,31 @@ def _probe(engine) -> None:
         conn.execute(text('SELECT 1'))
 
 
-def _rotate_superuser_password(db_url: str, superuser: str,
-                               superuser_password: str, target_user: str,
-                               target_password: str) -> None:
-    """Open a superuser psycopg2 connection and `ALTER USER <target_user>` to
-    `target_password`. Raises the last connection error if no superuser
-    connection candidate succeeds.
+def _candidate_superusers(app, url):
+    """Ordered list of (role, password) pairs to try for the rescue rotation.
 
-    Tries the configured superuser password first, then a passwordless connect
+    Preference order: an explicitly-configured DB_SUPERUSER first (in case an
+    operator provisioned a real one), then the deterministic `bridgeadmin`
+    rescue user derived from APP_SEED."""
+    candidates = []
+    su = (app.config.get('DB_SUPERUSER') or '').strip()
+    if su:
+        candidates.append((su, app.config.get('DB_SUPERUSER_PASSWORD') or ''))
+    rescue_user = (app.config.get('DB_RESCUE_USER') or '').strip()
+    seed = app.config.get('DB_RESCUE_SEED') or ''
+    salt = app.config.get('DB_RESCUE_SALT') or ''
+    if rescue_user and seed and salt:
+        candidates.append((rescue_user, rescue_password(seed, salt)))
+    return candidates
+
+
+def _rotate_with_superuser(db_url: str, superuser: str, superuser_password: str,
+                           target_user: str, target_password: str) -> None:
+    """Open a superuser psycopg2 connection and `ALTER USER <target_user>` to
+    `target_password`. Raises the last connection error if the superuser can't
+    connect.
+
+    Tries the given superuser password first, then a passwordless connect
     (covers a db configured with POSTGRES_HOST_AUTH_METHOD=trust). The role name
     is quoted via psycopg2.sql.Identifier and the password is bound as a
     parameter (psycopg2 does client-side literal substitution, so this is safe
@@ -146,7 +197,7 @@ def _rotate_superuser_password(db_url: str, superuser: str,
     raise last_exc or RuntimeError('no superuser connection candidate available')
 
 
-def _record_recovery_event(target_user: str) -> None:
+def _record_recovery_event(target_user: str, via: str) -> None:
     """Write the post-recovery AuditEvent. Best-effort (audit.record never
     raises), and only reached after a successful re-probe, by which point the
     audit_events table is guaranteed present (drift only happens on an already-
@@ -155,8 +206,9 @@ def _record_recovery_event(target_user: str) -> None:
     audit.record(
         'db_auth_recovered',
         actor='system',
-        notes=(f'Rotated {target_user} password to match current APP_SEED. '
-               'Cause: postgres init drift from prior deploy.'))
+        notes=(f'Rotated {target_user} password to match current APP_SEED via '
+               f'the "{via}" superuser. Cause: postgres init drift from prior '
+               'deploy.'))
 
 
 def ensure_db_auth(app, engine) -> RecoveryResult:
@@ -183,28 +235,40 @@ def ensure_db_auth(app, engine) -> RecoveryResult:
     # 2 · gate
     if not app.config.get('AUTO_RECOVER_DB_AUTH', True):
         log.warning('AUTO_RECOVER_DB_AUTH is disabled; skipping self-heal. '
-                    'Manual intervention required to reset the app role '
-                    'password.')
+                    'Manual intervention required (%s).', _MANUAL_SCRIPT)
         return RecoveryResult('disabled')
 
-    # 3 · rotate via superuser
+    # 3 · rotate via the first reachable superuser candidate
     db_url = app.config['SQLALCHEMY_DATABASE_URI']
-    superuser = app.config.get('DB_SUPERUSER', 'postgres') or 'postgres'
-    superuser_password = app.config.get('DB_SUPERUSER_PASSWORD') or ''
     url = make_url(db_url)
     target_user = url.username or 'bankbridge'
     # Set the role password to exactly what the app authenticates with — the
     # password already embedded in DATABASE_URL (which IS the current APP_SEED).
     target_password = url.password or ''
-    secrets = (superuser_password, target_password)
 
-    try:
-        _rotate_superuser_password(db_url, superuser, superuser_password,
-                                   target_user, target_password)
-    except Exception as exc:  # noqa: BLE001 - fail-safe, never crash boot
-        log.error('DB auth recovery failed — could not rotate the app role '
-                  'password via the "%s" superuser: %s. Manual intervention '
-                  'required.', superuser, _redact(exc, secrets))
+    candidates = _candidate_superusers(app, url)
+    secrets = tuple({p for _, p in candidates} | {target_password,
+                                                  app.config.get('DB_RESCUE_SEED') or ''})
+    used = None
+    last_exc: BaseException | None = None
+    for su_user, su_pw in candidates:
+        try:
+            _rotate_with_superuser(db_url, su_user, su_pw, target_user,
+                                   target_password)
+            used = su_user
+            break
+        except Exception as exc:  # noqa: BLE001 - try the next candidate
+            last_exc = exc
+            log.warning('DB auth recovery: superuser "%s" could not reset the '
+                        'app role: %s', su_user, _redact(exc, secrets))
+
+    if used is None:
+        tried = ', '.join(u for u, _ in candidates) or '(none configured)'
+        log.error('DB auth recovery failed — no superuser candidate (%s) could '
+                  'reset the "%s" role. This install likely predates the rescue '
+                  'superuser; run %s once to repair it (that also creates the '
+                  'rescue user so future drift self-heals). Last error: %s',
+                  tried, target_user, _MANUAL_SCRIPT, _redact(last_exc, secrets))
         return RecoveryResult('recovery_failed')
 
     # 4 · re-probe with the app credentials (dispose first to drop any
@@ -213,12 +277,13 @@ def ensure_db_auth(app, engine) -> RecoveryResult:
         engine.dispose()
         _probe(engine)
     except OperationalError as exc:
-        log.error('DB auth recovery rotated the password but the app role is '
-                  'still unreachable: %s. Manual intervention required.',
-                  _redact(exc, secrets))
-        return RecoveryResult('recovery_failed')
+        log.error('DB auth recovery rotated the password via "%s" but the app '
+                  'role is still unreachable: %s. Manual intervention required '
+                  '(%s).', used, _redact(exc, secrets), _MANUAL_SCRIPT)
+        return RecoveryResult('recovery_failed', via=used)
 
     log.warning('auto-recovered DB auth drift: rotated the app role password to '
-                'match the current APP_SEED. Continuing boot.')
-    _record_recovery_event(target_user)
-    return RecoveryResult('recovered', recovered=True)
+                'match the current APP_SEED via the "%s" superuser. Continuing '
+                'boot.', used)
+    _record_recovery_event(target_user, used)
+    return RecoveryResult('recovered', recovered=True, via=used)

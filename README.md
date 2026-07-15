@@ -68,10 +68,11 @@ as you type instead of collapsing, shows a "use as new" row when nothing matches
 and supports arrow-key navigation — its filter logic moved into a small tested
 static JS module (`app/static/rule_dropdown.js`). v0.3.5 makes the app
 **self-heal postgres app-role password drift** at boot: the recurring "password
-authentication failed for user 'bankbridge'" failure that used to force a
-volume wipe is now detected and auto-repaired via a superuser password rotation,
-logged as a `db_auth_recovered` audit event (see *Self-healing DB auth* below).
-See the roadmap at the bottom.
+authentication failed for user 'bankbridge'" failure that used to force a volume
+wipe is now detected and auto-repaired via a deterministic **rescue superuser**
+(`bridgeadmin`, created at init with an APP_SEED-derived password), logged as a
+`db_auth_recovered` audit event; existing installs get a one-time manual rescue
+script (see *Self-healing DB auth* below). See the roadmap at the bottom.
 
 ## How it works
 
@@ -374,8 +375,11 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `SYNC_INTERVAL_HOURS` | `6` | background poll cadence |
 | `SCHEDULER_ENABLED` | `true` | set false to drive syncs by external cron |
 | `AUTO_RECOVER_DB_AUTH` | `true` | v0.3.5 · self-heal postgres app-role password drift on boot (see below); set `false` to disable |
-| `DB_SUPERUSER` | `postgres` | v0.3.5 · superuser role used to rotate the app-role password during self-heal |
-| `DB_SUPERUSER_PASSWORD` | `POSTGRES_PASSWORD` → `SECRET_KEY` | v0.3.5 · password for `DB_SUPERUSER` (falls back to `POSTGRES_PASSWORD`, then `SECRET_KEY`) |
+| `DB_RESCUE_USER` | `bridgeadmin` | v0.3.5 · deterministic rescue superuser created at init; used to reset a drifted app-role password |
+| `DB_RESCUE_SALT` | `bankbridge-rescue-v1` | v0.3.5 · HMAC salt for the rescue password (`HMAC-SHA256(key=APP_SEED, msg=salt)`); don't change post-init |
+| `DB_RESCUE_SEED` | `POSTGRES_PASSWORD` → `SECRET_KEY` | v0.3.5 · the APP_SEED the rescue password derives from (override only to pin it) |
+| `DB_SUPERUSER` | "" | v0.3.5 · OPTIONAL extra superuser tried first (the stock db has none; rescue user is the real path) |
+| `DB_SUPERUSER_PASSWORD` | `POSTGRES_PASSWORD` → `SECRET_KEY` | v0.3.5 · password for `DB_SUPERUSER` |
 | `DATA_DIR` | `/data` | Fernet key + settings JSON + scheduler lock |
 
 > ⚠️ **Back up `{DATA_DIR}/fernet.key`.** It decrypts every stored Plaid
@@ -394,31 +398,50 @@ psycopg2.OperationalError: password authentication failed for user "bankbridge"
 ```
 
 Previously the only fix was to wipe the postgres volume and reinstall, losing
-Plaid tokens and local history. As of v0.3.5 the app self-heals this at boot:
+Plaid tokens and local history. And because the compose runs the db with
+`POSTGRES_USER=bankbridge`, `bankbridge` is the **sole** superuser — there is no
+stock `postgres` account to fall back to (`psql -U postgres` →
+`role "postgres" does not exist`), and when *its* password has drifted you can't
+log in as it either. So v0.3.5 introduces a deterministic **rescue superuser**.
 
-1. It probes the DB with `SELECT 1`.
+**Fresh installs** create a second superuser, `bridgeadmin`, at first volume init
+(`scripts/initdb.d/10-create-rescue-superuser.sh`, mounted into the db in
+`docker-compose.yml`). Its password is derived deterministically as
+`HMAC-SHA256(key=APP_SEED, msg=DB_RESCUE_SALT)` — so the same APP_SEED reproduces
+the same password on every boot, and the app can always re-derive it. At boot:
+
+1. The app probes the DB with `SELECT 1`.
 2. On success → normal boot (the common path; one cheap query).
 3. On a **password authentication** failure specifically, it opens a superuser
-   connection (`DB_SUPERUSER` / `DB_SUPERUSER_PASSWORD`) and `ALTER USER`s the
-   app role's password to match the value the app is already authenticating with
-   (the password in `DATABASE_URL`), then re-probes. Success → it logs
+   connection — trying an optional `DB_SUPERUSER` first, then re-deriving the
+   `bridgeadmin` password from APP_SEED — and `ALTER USER`s the app role's
+   password to match the value the app is already authenticating with (the
+   password in `DATABASE_URL`), then re-probes. Success → it logs
    `auto-recovered DB auth drift` and continues; the fix is transparent.
-4. If the superuser is *also* unreachable it logs a loud warning and continues
-   without crashing — you then reset the role password manually.
+4. If no superuser candidate is reachable it logs a loud warning pointing at the
+   manual script (below) and continues without crashing.
 
 Every successful recovery writes a `db_auth_recovered` **audit event** (actor
-`system`) so the heal is visible at `/admin/audit`. The actual `APP_SEED` /
-password value is never written to the logs.
+`system`, noting which superuser was used) so the heal is visible at
+`/admin/audit`. The actual `APP_SEED` / password values are never logged.
 
-> **Reachable-superuser caveat.** The self-heal needs a superuser it can log in
-> as. The stock `docker-compose.yml` runs the db with `POSTGRES_USER=bankbridge`,
-> which makes `bankbridge` itself the *only* superuser — and its password is the
-> drifted one, so there is no separate superuser to rotate through. For the
-> self-heal to actually connect in that setup, do one of: run the db with a
-> distinct superuser role, set `POSTGRES_HOST_AUTH_METHOD=trust` on the isolated
-> db network (the app reaches Postgres only over Umbrel's private Docker
-> network), or simply **pin `POSTGRES_PASSWORD`** so it never drifts in the first
-> place. Set `AUTO_RECOVER_DB_AUTH=false` to opt out of the behavior entirely.
+**Existing installs** predate `bridgeadmin` (their volume only has the drifted
+`bankbridge`), so boot recovery has no superuser to reach. Run the one-time
+manual rescue on the Umbrel host:
+
+```bash
+cd erpnext-bank-bridge_v0.1.0
+./scripts/rotate_db_password.sh        # auto-detects the db + server containers
+```
+
+It temporarily enables trust auth on the db container's own loopback, resets the
+`bankbridge` password to the current APP_SEED, **creates `bridgeadmin`** (so
+future drift self-heals), restores the original `pg_hba.conf`, and restarts the
+server. No volume wipe; Plaid tokens and history are preserved.
+
+> Set `AUTO_RECOVER_DB_AUTH=false` to opt out of the boot self-heal entirely.
+> Changing `DB_RESCUE_SALT` after init makes the derived password stop matching —
+> don't, unless you also re-run the rescue script.
 
 ## Local development
 

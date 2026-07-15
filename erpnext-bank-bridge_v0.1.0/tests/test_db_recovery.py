@@ -2,17 +2,22 @@
 """Boot-time self-heal of postgres app-role password drift (v0.3.5).
 
   * a healthy DB probes clean → recovery never fires (transparent no-op)
-  * a "password authentication failed" probe → rotate app-role password via the
-    superuser → re-probe succeeds → boot continues
-  * both app AND superuser auth failing → loud warning, NO crash
+  * a "password authentication failed" probe → rotate the app-role password via
+    the first reachable superuser candidate → re-probe succeeds → boot continues
+  * candidates are tried in order: optional DB_SUPERUSER, then the deterministic
+    `bridgeadmin` rescue user (HMAC(APP_SEED, salt))
+  * every candidate failing → loud warning pointing at the manual rescue script,
+    NO crash
   * a successful recovery writes a `db_auth_recovered` AuditEvent
   * AUTO_RECOVER_DB_AUTH=False → self-heal is skipped entirely
   * a non-auth probe error is left to the normal boot retry (not "recovered")
-  * secrets (APP_SEED / passwords) never leak into a log/redacted string
+  * the rescue password derivation is deterministic + secrets never leak
 
     cd erpnext-bank-bridge_v0.1.0
     python3 -m unittest discover -s tests -v
 """
+import hashlib
+import hmac
 import os
 import tempfile
 import unittest
@@ -68,7 +73,7 @@ class Base(unittest.TestCase):
 class TestEnsureDbAuth(Base):
     def test_auto_recovery_does_not_fire_on_healthy_db(self):
         # The real sqlite probe succeeds → no rotation attempt at all.
-        with mock.patch('app.db_recovery._rotate_superuser_password') as rot:
+        with mock.patch('app.db_recovery._rotate_with_superuser') as rot:
             res = db_recovery.ensure_db_auth(self.app, db.engine)
         self.assertEqual(res.status, 'healthy')
         self.assertFalse(res.recovered)
@@ -84,29 +89,60 @@ class TestEnsureDbAuth(Base):
             return None                      # re-probe after rotation: healthy
 
         with mock.patch('app.db_recovery._probe', side_effect=fake_probe), \
-             mock.patch('app.db_recovery._rotate_superuser_password') as rot:
+             mock.patch('app.db_recovery._rotate_with_superuser') as rot:
             res = db_recovery.ensure_db_auth(self.app, db.engine)
 
         self.assertEqual(res.status, 'recovered')
         self.assertTrue(res.recovered)
+        # Default DB_SUPERUSER is blank, so the only candidate is the rescue user.
+        self.assertEqual(res.via, 'bridgeadmin')
         rot.assert_called_once()
-        # The role password is set to the value the app itself authenticates
-        # with (the DATABASE_URL password), NOT re-derived elsewhere. The test
-        # URI is sqlite (no embedded user), so target_user falls back to the
-        # default role name.
-        _url, _su, _supw, target_user, _target_pw = rot.call_args.args
+        # The role password is set to the value the app authenticates with (the
+        # DATABASE_URL password); the sqlite test URI has no user so target_user
+        # falls back to the default role name.
+        _url, su_user, _su_pw, target_user, _target_pw = rot.call_args.args
+        self.assertEqual(su_user, 'bridgeadmin')
         self.assertEqual(target_user, 'bankbridge')
 
-    def test_auto_recovery_fails_gracefully_when_superuser_also_unauth(self):
+    def test_candidates_tried_in_order_superuser_then_rescue(self):
+        # With an explicit DB_SUPERUSER configured, it is tried first; when it
+        # fails the rescue user is tried next and succeeds.
+        self.app.config['DB_SUPERUSER'] = 'pgadmin'
+        self.app.config['DB_SUPERUSER_PASSWORD'] = 'sekret'
+        seen = []
+
+        def rot(db_url, su_user, su_pw, target_user, target_pw):
+            seen.append(su_user)
+            if su_user == 'pgadmin':
+                raise _FakePgError('password authentication failed for user "pgadmin"')
+            return None
+
+        calls = {'n': 0}
+
+        def fake_probe(engine):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise _auth_error()
+            return None
+
+        with mock.patch('app.db_recovery._probe', side_effect=fake_probe), \
+             mock.patch('app.db_recovery._rotate_with_superuser', side_effect=rot):
+            res = db_recovery.ensure_db_auth(self.app, db.engine)
+
+        self.assertEqual(seen, ['pgadmin', 'bridgeadmin'])   # order preserved
+        self.assertEqual(res.status, 'recovered')
+        self.assertEqual(res.via, 'bridgeadmin')
+
+    def test_auto_recovery_fails_gracefully_when_all_superusers_unauth(self):
         def always_auth_fail(engine):
             raise _auth_error()
 
         def rot_fail(*a, **k):
             raise _FakePgError(
-                'FATAL:  password authentication failed for user "postgres"\n')
+                'FATAL:  password authentication failed for user "bridgeadmin"\n')
 
         with mock.patch('app.db_recovery._probe', side_effect=always_auth_fail), \
-             mock.patch('app.db_recovery._rotate_superuser_password',
+             mock.patch('app.db_recovery._rotate_with_superuser',
                         side_effect=rot_fail):
             res = db_recovery.ensure_db_auth(self.app, db.engine)  # must not raise
 
@@ -119,7 +155,7 @@ class TestEnsureDbAuth(Base):
             raise _auth_error()
 
         with mock.patch('app.db_recovery._probe', side_effect=always_auth_fail), \
-             mock.patch('app.db_recovery._rotate_superuser_password'):
+             mock.patch('app.db_recovery._rotate_with_superuser'):
             res = db_recovery.ensure_db_auth(self.app, db.engine)
         self.assertEqual(res.status, 'recovery_failed')
 
@@ -133,12 +169,13 @@ class TestEnsureDbAuth(Base):
             return None
 
         with mock.patch('app.db_recovery._probe', side_effect=fake_probe), \
-             mock.patch('app.db_recovery._rotate_superuser_password'):
+             mock.patch('app.db_recovery._rotate_with_superuser'):
             db_recovery.ensure_db_auth(self.app, db.engine)
 
         ev = AuditEvent.query.filter_by(event_type='db_auth_recovered').one()
         self.assertEqual(ev.actor, 'system')
         self.assertIn('APP_SEED', ev.notes)
+        self.assertIn('bridgeadmin', ev.notes)     # records which superuser
         self.assertIn('db_auth_recovered', db_recovery_event_types())
 
     def test_non_auth_error_does_not_recover(self):
@@ -148,7 +185,7 @@ class TestEnsureDbAuth(Base):
                 _FakePgError('could not connect to server'))
 
         with mock.patch('app.db_recovery._probe', side_effect=conn_refused), \
-             mock.patch('app.db_recovery._rotate_superuser_password') as rot:
+             mock.patch('app.db_recovery._rotate_with_superuser') as rot:
             res = db_recovery.ensure_db_auth(self.app, db.engine)
         self.assertEqual(res.status, 'probe_failed_other')
         rot.assert_not_called()
@@ -162,11 +199,25 @@ class TestConfigDisable(Base):
             raise _auth_error()
 
         with mock.patch('app.db_recovery._probe', side_effect=always_auth_fail), \
-             mock.patch('app.db_recovery._rotate_superuser_password') as rot:
+             mock.patch('app.db_recovery._rotate_with_superuser') as rot:
             res = db_recovery.ensure_db_auth(self.app, db.engine)
         self.assertEqual(res.status, 'disabled')
         self.assertFalse(res.recovered)
         rot.assert_not_called()
+
+
+class TestRescueCredentials(unittest.TestCase):
+    def test_rescue_password_is_deterministic_hmac(self):
+        seed, salt = 'app-seed-value', 'bankbridge-rescue-v1'
+        got = db_recovery.rescue_password(seed, salt)
+        # Deterministic: same inputs → same output on every call.
+        self.assertEqual(got, db_recovery.rescue_password(seed, salt))
+        # And it IS HMAC-SHA256(key=seed, msg=salt) hex — the exact contract the
+        # pgcrypto side script must reproduce (hmac(msg=salt, key=seed)).
+        self.assertEqual(
+            got,
+            hmac.new(seed.encode(), salt.encode(), hashlib.sha256).hexdigest())
+        self.assertEqual(len(got), 64)         # sha256 hex
 
 
 class TestHelpers(unittest.TestCase):
