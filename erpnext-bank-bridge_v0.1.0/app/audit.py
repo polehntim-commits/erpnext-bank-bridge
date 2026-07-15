@@ -51,6 +51,8 @@ EVENT_TYPES = (
     'gl_account_number_assigned',
     'fuzzy_match_found',
     'fuzzy_match_rejected_by_user',
+    # v0.3.5 — boot-time self-heal of postgres app-role password drift
+    'db_auth_recovered',
 )
 
 SUBJECT_TYPES = ('Supplier', 'CategorizationRule', 'GeneratedJournalEntry',

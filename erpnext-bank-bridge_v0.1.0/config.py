@@ -158,6 +158,31 @@ class Config:
     # app/crypto.py). Set explicitly to rotate / share a known key.
     FERNET_KEY = os.environ.get('FERNET_KEY', '').strip()
 
+    # ── v0.3.5 · self-healing DB auth ─────────────────────────────────────
+    # Postgres bakes the `bankbridge` role's password in at first volume init.
+    # If a later deploy hands the app a different password (e.g. an earlier init
+    # ran while APP_SEED was blank), every connection fails with "password
+    # authentication failed for user 'bankbridge'" and the old workaround was to
+    # wipe the volume. Instead, at boot we detect that specific failure and use
+    # a superuser connection to ALTER the role's password to match the current
+    # value — no wipe, no manual step (see app/db_recovery.py).
+    #   * master switch — set False to disable the self-heal entirely.
+    AUTO_RECOVER_DB_AUTH = _bool('AUTO_RECOVER_DB_AUTH', True)
+    #   * the superuser role used to rotate the app role's password. Defaults to
+    #     the postgres superuser. NOTE: the stock compose runs the db with
+    #     POSTGRES_USER=bankbridge, so the only superuser is `bankbridge` itself
+    #     — for the self-heal to have a reachable superuser, either run the db
+    #     with a distinct superuser role, set POSTGRES_HOST_AUTH_METHOD=trust on
+    #     the isolated db network, or pin POSTGRES_PASSWORD so it never drifts.
+    DB_SUPERUSER = os.environ.get('DB_SUPERUSER', 'postgres').strip() or 'postgres'
+    #   * password for DB_SUPERUSER. Falls back to POSTGRES_PASSWORD, then to
+    #     SECRET_KEY (our app-side alias for APP_SEED, which in Umbrel is the
+    #     same value POSTGRES_PASSWORD is derived from).
+    DB_SUPERUSER_PASSWORD = (
+        os.environ.get('DB_SUPERUSER_PASSWORD', '').strip()
+        or os.environ.get('POSTGRES_PASSWORD', '').strip()
+        or SECRET_KEY)
+
     # Poll cadence (hours) for the background transactions/sync loop.
     SYNC_INTERVAL_HOURS = int(os.environ.get('SYNC_INTERVAL_HOURS', '6'))
     # Set false to disable the in-process scheduler (e.g. drive syncs by cron

@@ -8,6 +8,13 @@ services:
       POSTGRES_USER: bankbridge
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev-postgres-password}
       POSTGRES_DB: bankbridge
+      # NOTE: POSTGRES_USER=bankbridge makes `bankbridge` the ONLY superuser, so
+      # the v0.3.5 boot self-heal (app/db_recovery.py) has no *separate*
+      # superuser to rotate through if bankbridge's own password drifts. Pin
+      # POSTGRES_PASSWORD (above) so it never drifts, or uncomment the line below
+      # to allow passwordless superuser logins on this isolated db network so the
+      # self-heal can always reconnect and repair the drift:
+      # POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - bankbridge_pgdata:/var/lib/postgresql/data
     healthcheck:

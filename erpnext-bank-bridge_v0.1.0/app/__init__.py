@@ -13,7 +13,7 @@ from flask_sqlalchemy import SQLAlchemy
 
 from config import Config
 
-__version__ = '0.3.4'
+__version__ = '0.3.5'
 db = SQLAlchemy()
 
 
@@ -54,6 +54,13 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.register_blueprint(api.bp)
 
     with app.app_context():
+        # v0.3.5 — before touching the schema, self-heal the one recurring
+        # failure mode: the app role's password drifting from the value baked
+        # into the postgres volume at first init. On a healthy DB this is one
+        # `SELECT 1`; on the drift case it rotates the role password via the
+        # superuser so we never have to wipe the volume. Fail-safe: never raises.
+        from .db_recovery import ensure_db_auth
+        ensure_db_auth(app, db.engine)
         db.create_all()
         # create_all() adds missing tables but never new columns on an existing
         # one — apply idempotent additive column migrations here.
