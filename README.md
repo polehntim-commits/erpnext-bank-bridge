@@ -50,7 +50,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.3.7 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.3.8 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -85,8 +85,15 @@ per-account daily call brake. v0.3.7 trims Plaid cost further by **throttling th
 balance refresh** (`/accounts/get`) to at most once per Item per day
 (`ACCOUNT_REFRESH_INTERVAL_HOURS`, default `24`) — those balances feed the
 dashboard only, so on a sub-daily poll that's ~40% fewer Plaid calls/month; it
-also documents Plaid **webhooks** as a way to drop polling cost to zero. See the
-roadmap at the bottom.
+also documents Plaid **webhooks** as a way to drop polling cost to zero. v0.3.8
+fixes the **Bank Account Subtype** bootstrap: the doctype `Bank Account
+.account_subtype` links to is named `Bank Account Subtype` in ERPNext v15, but
+Bank Bridge was probing `Account Subtype` (which doesn't exist — ERPNext answers
+with an ImportError), so it wrongly marked the doctype unavailable, dropped the
+`account_subtype` field from every imported Bank Account, and showed a persistent
+*bootstrap partially failed* warning. Pointing the bootstrap at the real doctype
+name provisions the subtype masters and populates the field. See the roadmap at
+the bottom.
 
 ## How it works
 
@@ -177,7 +184,7 @@ There is **no prebuilt public image assumed** — the supported path is to build
 from source, which always works from a clone of this repo:
 
 ```bash
-docker build -t bank-bridge:0.3.7 app
+docker build -t bank-bridge:0.3.8 app
 ```
 
 (`app/` is the build context; the `Dockerfile` lives inside it. The stock
@@ -481,9 +488,14 @@ set up. Prefer to skip the company path entirely? Set
 from the start (no GL account is created).
 
 **No prerequisites on a stock ERPNext.** The bootstrap also creates the
-`Current` and `Credit` **Bank Account Type** records if they're missing (stock
-ERPNext ships without them), so the very first import can't fail on a missing
-link target. Bank Account Types are provisioned on Test Connection, by the
+`Current` and `Credit` **Bank Account Type** records and the **Bank Account
+Subtype** records (Checking, Savings, Current, Other, …) if they're missing, so
+the very first import can't fail on a missing link target. (`Bank Account
+.account_subtype` is a `Link → Bank Account Subtype` in ERPNext v15; v0.3.8
+fixed a bug where Bank Bridge probed the wrong doctype name — `Account Subtype`
+— which ERPNext answers with an ImportError, so the subtype was silently dropped
+from every import and the settings footer showed *Bank Account Subtypes:
+unavailable ⚠*.) These masters are provisioned on Test Connection, by the
 **Ensure Bank Account fields & types** button on the ERPNext settings page, and
 as the first step of every import — always idempotent.
 

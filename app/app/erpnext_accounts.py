@@ -51,17 +51,24 @@ log = logging.getLogger('bankbridge.erpnext.accounts')
 BANK_DT = 'Bank'
 BANK_ACCOUNT_DT = 'Bank Account'
 BANK_ACCOUNT_TYPE_DT = 'Bank Account Type'
-ACCOUNT_SUBTYPE_DT = 'Account Subtype'
+# The doctype `Bank Account.account_subtype` links to. In ERPNext v15 this is
+# named "Bank Account Subtype" (module Accounts, autoname field:account_subtype);
+# earlier Bank Bridge builds probed the non-existent name "Account Subtype",
+# which Frappe answers with an ImportError ("Module import failed for Account
+# Subtype") — mis-read as an unavailable doctype, so the subtype was dropped from
+# every import. Using the real name lets bootstrap provision the records and the
+# Link on Bank Account resolve. (Fixed in v0.3.8.)
+ACCOUNT_SUBTYPE_DT = 'Bank Account Subtype'
 CUSTOM_FIELD_DT = 'Custom Field'
 # The Chart-of-Accounts doctype the GL auto-create (v0.2.0) walks and creates in.
 ACCOUNT_DT = 'Account'
 
 # ── unavailable-doctype registry ────────────────────────────────────────────
 #
-# Some ERPNext / Frappe instances don't ship (or have a broken) `Account
-# Subtype` — Tim's returns HTTP 500 "No module named
-# 'frappe.core.doctype.account_subtype'" for the existence probe. Bootstrap must
-# not crash on that; instead it records the doctype as *unavailable* and the
+# Some ERPNext / Frappe instances genuinely don't ship (or have a broken) linked
+# doctype — the probe then returns HTTP 500 with an ImportError / "No module
+# named …". Bootstrap must not crash on that; instead it records the doctype as
+# *unavailable* and the
 # send-side drops the fields that link to it. The registry is a per-app set so
 # it's process-local and resets on restart (bootstrap then re-discovers), and so
 # tests — each of which builds a fresh app — start clean. When there's no app
@@ -101,8 +108,8 @@ def unavailable_doctypes() -> set:
 def _is_missing_doctype_error(e: ERPNextAPIError) -> bool:
     """True when a Frappe error means the *doctype itself* isn't installed in
     this ERPNext (its Python module is missing) rather than a normal
-    missing-document / permission error. Tim's instance returns HTTP 500 with
-    'No module named …' / ImportError for the Account Subtype probe."""
+    missing-document / permission error. A truly-absent doctype answers the
+    probe with HTTP 500 and 'No module named …' / ImportError."""
     blob = ((e.response_body or '') + ' ' + str(e)).lower()
     return e.status_code == 500 and ('no module named' in blob
                                      or 'importerror' in blob)
@@ -112,11 +119,12 @@ def _is_missing_doctype_error(e: ERPNextAPIError) -> bool:
 # one — we provision them as part of the idempotent bootstrap.
 DEFAULT_BANK_ACCOUNT_TYPES = ('Current', 'Credit')
 
-# The Account Subtype records `Bank Account.account_subtype` links to. On Tim's
-# instance that field is a Link (not a Select), so a Bank Account create fails
-# with a LinkValidationError ("Could not find Account Subtype: savings") unless
-# the target record exists. Same remedy as Bank Account Type: provision them in
-# the idempotent bootstrap. Docnames are Title Case (Frappe convention), and the
+# The Bank Account Subtype records `Bank Account.account_subtype` links to. That
+# field is a Link (ERPNext v15: options "Bank Account Subtype"), so a Bank Account
+# create fails with a LinkValidationError ("Could not find Account Subtype:
+# savings" — the error names the field label, not the doctype) unless the target
+# record exists. Same remedy as Bank Account Type: provision them in the
+# idempotent bootstrap. Docnames are Title Case (Frappe convention), and the
 # send-side (erpnext_account_subtype) matches — see build_bank_account_doc.
 DEFAULT_ACCOUNT_SUBTYPES = (
     'Checking', 'Savings', 'Current', 'Other',
@@ -274,23 +282,23 @@ def ensure_bank_account_types(client: ERPNextClient) -> bool:
 
 
 def ensure_account_subtypes(client: ERPNextClient) -> bool:
-    """Ensure ERPNext has the Account Subtype records the import flow links from
+    """Ensure ERPNext has the Bank Account Subtype records the import flow links from
     `Bank Account.account_subtype` (Checking, Savings, Current, …). Where that
     field is a Link, an out-of-box instance has no matching target and rejects
     the Bank Account create with a LinkValidationError. Idempotent: a record is
     only created when the GET returns 404. Docnames are Title Case, matching the
     values erpnext_account_subtype sends.
 
-    Returns True if available, False if this ERPNext lacks the Account Subtype
-    doctype entirely (Tim's instance returns HTTP 500 'No module named …'). In
-    that case we log-warn, mark it unavailable, and skip — the send-side then
-    drops `account_subtype` so the import still succeeds."""
+    Returns True if available, False if this ERPNext lacks the Bank Account
+    Subtype doctype entirely (a truly-absent doctype answers HTTP 500 'No module
+    named …'). In that case we log-warn, mark it unavailable, and skip — the
+    send-side then drops `account_subtype` so the import still succeeds."""
     for name in DEFAULT_ACCOUNT_SUBTYPES:
         try:
             existing = client.get_doc(ACCOUNT_SUBTYPE_DT, name)
         except ERPNextAPIError as e:
             if _is_missing_doctype_error(e):
-                log.warning('Account Subtype doctype unavailable in this '
+                log.warning('Bank Account Subtype doctype unavailable in this '
                             'ERPNext; skipping provisioning (%s)', str(e)[:200])
                 _mark_doctype_unavailable(ACCOUNT_SUBTYPE_DT)
                 return False
@@ -300,7 +308,7 @@ def ensure_account_subtypes(client: ERPNextClient) -> bool:
         # Mirror Bank Account Type: the master autonames from its titling field,
         # so the created record's docname is exactly `name`.
         client.create_doc(ACCOUNT_SUBTYPE_DT, {'account_subtype': name})
-        log.info("created Account Subtype '%s'", name)
+        log.info("created Bank Account Subtype '%s'", name)
     _mark_doctype_available(ACCOUNT_SUBTYPE_DT)
     return True
 
@@ -340,7 +348,7 @@ def ensure_custom_fields(client: ERPNextClient) -> bool:
 
 def bootstrap(client: ERPNextClient) -> dict:
     """Provision everything the import flow depends on, idempotently: the
-    Current/Credit Bank Account Type records, the Account Subtype records, and
+    Current/Credit Bank Account Type records, the Bank Account Subtype records, and
     the Bank Account custom fields. The link-target masters come first so a Bank
     Account create can't fail on a missing link target.
 
@@ -348,7 +356,7 @@ def bootstrap(client: ERPNextClient) -> dict:
     doctype is logged, recorded in the unavailable registry, and skipped — never
     raised — so one broken doctype can't sink the whole bootstrap (or poison the
     request that triggered it). Returns a per-doctype availability dict, e.g.
-    {'Bank Account Type': True, 'Account Subtype': False, 'Custom Field': True,
+    {'Bank Account Type': True, 'Bank Account Subtype': False, 'Custom Field': True,
     'partial': True}."""
     status = {
         BANK_ACCOUNT_TYPE_DT: ensure_bank_account_types(client),
@@ -908,7 +916,7 @@ def build_bank_account_doc(account: PlaidAccount, bank_name: str,
     if gl_account and doc.get('is_company_account'):
         doc['account'] = gl_account
     # Drop any field whose linked doctype bootstrap found unavailable in this
-    # ERPNext (e.g. account_subtype when Tim's instance has no Account Subtype).
+    # ERPNext (e.g. account_subtype if this instance lacks Bank Account Subtype).
     return _prune_unavailable_fields(doc)
 
 
@@ -1085,7 +1093,7 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
     linked items. Already-mapped rows are silently skipped; unsupported rows are
     marked and counted. Returns aggregate stats plus a human summary."""
     client = client or get_client()
-    # Bank Account Types + Account Subtypes + custom fields, once for the batch.
+    # Bank Account Types + Bank Account Subtypes + custom fields, once for the batch.
     # Missing doctypes are marked unavailable inside bootstrap (not raised); any
     # other bootstrap error is logged and the batch proceeds on the create-side
     # defensive path rather than failing every account.

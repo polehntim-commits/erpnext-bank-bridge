@@ -257,13 +257,14 @@ class TestBankAccountTypes(ImportBase):
 
 
 class TestAccountSubtypes(ImportBase):
-    """Bug 3 — `Bank Account.account_subtype` is a Link on Tim's instance, so the
-    subtype values we send must exist as Account Subtype records. Bootstrap
-    provisions them idempotently, in Title Case."""
+    """Bug 3 — `Bank Account.account_subtype` is a Link (ERPNext v15 options
+    "Bank Account Subtype"), so the subtype values we send must exist as Bank
+    Account Subtype records. Bootstrap provisions them idempotently, in Title
+    Case."""
 
     def _created_subtypes(self, erp):
         return [c for c in erp.calls
-                if c[0] == 'create_doc' and c[1] == 'Account Subtype']
+                if c[0] == 'create_doc' and c[1] == 'Bank Account Subtype']
 
     def test_account_subtypes_created_when_missing(self):
         erp = FakeERPClient()   # none exist (GET → 404)
@@ -271,7 +272,7 @@ class TestAccountSubtypes(ImportBase):
         created = self._created_subtypes(erp)
         self.assertEqual(len(created),
                          len(erpnext_accounts.DEFAULT_ACCOUNT_SUBTYPES))
-        names = set(erp.created['Account Subtype'].keys())
+        names = set(erp.created['Bank Account Subtype'].keys())
         self.assertEqual(names, set(erpnext_accounts.DEFAULT_ACCOUNT_SUBTYPES))
         # Title Case, per Frappe docname convention.
         self.assertIn('Checking', names)
@@ -289,8 +290,8 @@ class TestAccountSubtypes(ImportBase):
         self._account('acct-1', subtype='checking')
         erp = FakeERPClient()
         erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
-        self.assertIn('Checking', erp.created['Account Subtype'])
-        self.assertIn('Savings', erp.created['Account Subtype'])
+        self.assertIn('Checking', erp.created['Bank Account Subtype'])
+        self.assertIn('Savings', erp.created['Bank Account Subtype'])
         # And the send-side value matches the provisioned docname (Title Case).
         ba_doc = erp.creates_of('Bank Account')[0][2]
         self.assertEqual(ba_doc['account_subtype'], 'Checking')
@@ -551,28 +552,28 @@ class TestDefensiveFieldDrop(ImportBase):
 
 
 class TestMissingLinkedDoctypes(ImportBase):
-    """Fix 4 — some ERPNext instances don't have (or have a broken) linked
-    doctype. Tim's returns HTTP 500 'No module named …' for the Account Subtype
-    probe. Bootstrap must survive it (log-warn, mark unavailable, don't raise),
-    and the send-side must drop the dependent field so the import still runs."""
+    """Fix 4 — some ERPNext instances genuinely don't have (or have a broken)
+    linked doctype; the probe then returns HTTP 500 'No module named …'.
+    Bootstrap must survive it (log-warn, mark unavailable, don't raise), and the
+    send-side must drop the dependent field so the import still runs."""
 
     def test_bootstrap_survives_missing_account_subtype_doctype(self):
-        erp = FakeERPClient(missing_doctypes={'Account Subtype'})
+        erp = FakeERPClient(missing_doctypes={'Bank Account Subtype'})
         with self.assertLogs('bankbridge.erpnext.accounts', level='WARNING') as cm:
             status = erpnext_accounts.bootstrap(erp)   # must NOT raise
         self.assertFalse(status[erpnext_accounts.ACCOUNT_SUBTYPE_DT])
         self.assertTrue(status[erpnext_accounts.BANK_ACCOUNT_TYPE_DT])
         self.assertTrue(status['partial'])
-        self.assertTrue(erpnext_accounts.is_doctype_unavailable('Account Subtype'))
+        self.assertTrue(erpnext_accounts.is_doctype_unavailable('Bank Account Subtype'))
         # Nothing provisioned for the missing doctype.
-        self.assertEqual(len(erp.created['Account Subtype']), 0)
-        self.assertTrue(any('Account Subtype doctype unavailable' in m
+        self.assertEqual(len(erp.created['Bank Account Subtype']), 0)
+        self.assertTrue(any('Bank Account Subtype doctype unavailable' in m
                             for m in cm.output))
 
     def test_send_side_drops_account_subtype_when_unavailable(self):
         self._item(institution='Wells Fargo')
         self._account('acct-1', subtype='checking', mask='0000')
-        erp = FakeERPClient(missing_doctypes={'Account Subtype'})
+        erp = FakeERPClient(missing_doctypes={'Bank Account Subtype'})
         result = erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
 
         self.assertEqual(result['status'], 'imported')
@@ -613,8 +614,8 @@ class TestMissingLinkedDoctypes(ImportBase):
         bootstrap step failed — with the partial-bootstrap banner."""
         self._item()
         self._account('acct-1', subtype='checking')
-        erp = FakeERPClient(missing_doctypes={'Account Subtype'})
-        # An import triggers the partial bootstrap (marks Account Subtype
+        erp = FakeERPClient(missing_doctypes={'Bank Account Subtype'})
+        # An import triggers the partial bootstrap (marks Bank Account Subtype
         # unavailable) but must not poison the session or raise.
         erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
         client = self.app.test_client()
@@ -625,18 +626,18 @@ class TestMissingLinkedDoctypes(ImportBase):
         self.assertEqual(r.status_code, 200)
         body = r.get_data(as_text=True)
         self.assertIn('ERPNext bootstrap partially failed', body)
-        self.assertIn('Account Subtype', body)
+        self.assertIn('Bank Account Subtype', body)
 
     def test_test_connection_reports_per_doctype_status(self):
         erpnext_settings.save('http://erp.test', 'K', 'SECRET', 'Example Company LLC')
-        erp = FakeERPClient(missing_doctypes={'Account Subtype'})
+        erp = FakeERPClient(missing_doctypes={'Bank Account Subtype'})
         client = self.app.test_client()
         with mock.patch('app.erpnext_bank.get_client', return_value=erp):
             r = client.post('/admin/erpnext_settings/test')
         self.assertEqual(r.status_code, 200)
         body = r.get_data(as_text=True)
         self.assertIn('Bank Account Types: ready', body)
-        self.assertIn('Account Subtypes: unavailable', body)
+        self.assertIn('Bank Account Subtypes: unavailable', body)
         self.assertIn('Custom fields: ready', body)
 
 

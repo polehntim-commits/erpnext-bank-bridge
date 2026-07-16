@@ -101,7 +101,7 @@ class FakeERPClient:
         self.bank_account_error = bank_account_error
         # Doctypes this ERPNext doesn't have installed at all — the existence
         # probe (get_doc / list_docs) raises the exact 500 ImportError Frappe
-        # returns for a missing module, e.g. Tim's broken Account Subtype:
+        # returns for a genuinely-missing module, e.g.:
         #   {"exception":"Error: No module named
         #    'frappe.core.doctype.account_subtype'","exc_type":"ImportError"}
         self.missing_doctypes = set(missing_doctypes or ())
@@ -112,7 +112,7 @@ class FakeERPClient:
         self.company_account_mandatory = company_account_mandatory
         # Bank Account Type records that already exist in ERPNext (get_doc hits).
         self.existing_types = set(existing_types or ())
-        # Account Subtype records that already exist in ERPNext (get_doc hits).
+        # Bank Account Subtype records that already exist in ERPNext (get_doc hits).
         self.existing_subtypes = set(existing_subtypes or ())
         # Company abbreviation Frappe appends when autonaming an Account
         # ('<account_name> - <abbr>'). Also the abbr for preset chart names.
@@ -143,7 +143,7 @@ class FakeERPClient:
         self.fail_je_create = fail_je_create
         # Records created by the one-click account import, keyed by doctype.
         self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {},
-                        'Bank Account Type': {}, 'Account Subtype': {},
+                        'Bank Account Type': {}, 'Bank Account Subtype': {},
                         'Account': {}, 'Supplier': {}, 'Journal Entry': {}}
 
     def get_logged_user(self):
@@ -169,8 +169,8 @@ class FakeERPClient:
             if name in self.existing_types or name in self.created['Bank Account Type']:
                 return {'name': name}
             return None
-        if doctype == 'Account Subtype':
-            if name in self.existing_subtypes or name in self.created['Account Subtype']:
+        if doctype == 'Bank Account Subtype':
+            if name in self.existing_subtypes or name in self.created['Bank Account Subtype']:
                 return {'name': name}
             return None
         if doctype == 'Account':
@@ -313,9 +313,9 @@ class FakeERPClient:
             name = doc.get('account_type')   # autonames on account_type
             self.created['Bank Account Type'][name] = dict(doc)
             return {'name': name}
-        if doctype == 'Account Subtype':
+        if doctype == 'Bank Account Subtype':
             name = doc.get('account_subtype')  # autonames on account_subtype
-            self.created['Account Subtype'][name] = dict(doc)
+            self.created['Bank Account Subtype'][name] = dict(doc)
             return {'name': name}
         if doctype == 'Supplier':
             if self.fail_supplier_create:

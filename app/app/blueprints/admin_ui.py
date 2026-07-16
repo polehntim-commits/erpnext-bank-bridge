@@ -2107,7 +2107,7 @@ def _doctype_status_line(status: dict) -> str:
         return 'ready ✓' if ok else 'unavailable ⚠'
     parts = [
         f"Bank Account Types: {mark(status.get(erpnext_accounts.BANK_ACCOUNT_TYPE_DT))}",
-        f"Account Subtypes: {mark(status.get(erpnext_accounts.ACCOUNT_SUBTYPE_DT))}",
+        f"Bank Account Subtypes: {mark(status.get(erpnext_accounts.ACCOUNT_SUBTYPE_DT))}",
         f"Custom fields: {mark(status.get(erpnext_accounts.CUSTOM_FIELD_DT))}",
     ]
     return ' · ' + ' · '.join(parts)
@@ -2137,7 +2137,7 @@ def test_erpnext_connection():
 @bp.post('/admin/erpnext_settings/ensure_fields')
 def ensure_erpnext_fields():
     """Idempotently provision the Bank Account Type records (Current/Credit), the
-    Account Subtype link targets, and the custom fields (plaid_account_id,
+    Bank Account Subtype link targets, and the custom fields (plaid_account_id,
     last_4) the import flow depends on."""
     if not erps.is_configured():
         return _erpnext_settings_page(
@@ -2148,7 +2148,7 @@ def ensure_erpnext_fields():
     except (ERPNextConfigError, ERPNextError) as e:
         return _erpnext_settings_page(probe={'ok': False, 'detail': str(e)})
     detail = ('Provisioned the Bank Account Type records (Current, Credit), '
-              'Account Subtype records, and custom fields (plaid_account_id, '
+              'Bank Account Subtype records, and custom fields (plaid_account_id, '
               'last_4) where this ERPNext supports them.'
               + _doctype_status_line(status))
     return _erpnext_settings_page(probe={'ok': not status['partial'],
