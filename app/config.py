@@ -236,6 +236,18 @@ class Config:
             0, int(os.environ.get('PLAID_MAX_CALLS_PER_DAY', '0')))
     except ValueError:
         PLAID_MAX_CALLS_PER_DAY = 0
+    # How often the sync engine spends a billable Plaid /accounts/get to refresh
+    # cached balances. Those balances feed the dashboard only — ERPNext
+    # reconciles on transaction amounts, not balances — so refreshing them every
+    # poll pays for data no logic consumes. Default 24 (at most one balance
+    # refresh per Item per day, plus always on an Item's first sync). Set to 0 to
+    # refresh every poll if balance freshness matters more than call cost. See
+    # app/sync_engine.py:_should_refresh_accounts.
+    try:
+        ACCOUNT_REFRESH_INTERVAL_HOURS = max(
+            0, int(os.environ.get('ACCOUNT_REFRESH_INTERVAL_HOURS', '24')))
+    except ValueError:
+        ACCOUNT_REFRESH_INTERVAL_HOURS = 24
     # Indicative price per Plaid /transactions/sync call — used ONLY to render
     # the cost estimate next to the admin sync-frequency picker. Not billing,
     # just a planning aid; override if your Plaid contract differs.

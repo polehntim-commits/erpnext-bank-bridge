@@ -7,7 +7,9 @@ Two phases per Item, each independently logged to PlaidSyncLog:
      Loop /transactions/sync while has_more, applying Plaid's added / modified /
      removed lists to the local BankTransaction table and advancing the Item's
      cursor. Cursor-based, so each poll only pulls the delta. Also refreshes the
-     Item's accounts (balances) so the dashboard stays current.
+     Item's accounts (balances) so the dashboard stays current — but only at most
+     once per ACCOUNT_REFRESH_INTERVAL_HOURS, since that billable /accounts/get
+     powers the dashboard only (ERPNext reconciles on amounts, not balances).
 
   2. PUSH  (direction='erpnext_push')
      Post every settled local row to ERPNext (see app/erpnext_bank.py).
@@ -132,6 +134,32 @@ def get_erp_client_or_none():
 
 # ── account refresh ────────────────────────────────────────────────────
 
+def _as_utc(dt: datetime) -> datetime:
+    """PlaidAccount.updated_at round-trips through the DB as naive UTC while
+    _now() is tz-aware; coerce a naive value to UTC so the two can be
+    subtracted without raising TypeError."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _should_refresh_accounts(item: PlaidItem) -> bool:
+    """Balances are dashboard-only, so skip the billable /accounts/get on most
+    polls. Refresh at most once per ACCOUNT_REFRESH_INTERVAL_HOURS (default 24),
+    and always when the Item has no cached accounts yet (first sync / new acct).
+    Set the interval to 0 to opt back into every-poll refresh."""
+    try:
+        interval = max(0, int(
+            current_app.config.get('ACCOUNT_REFRESH_INTERVAL_HOURS', 24) or 0))
+    except (TypeError, ValueError):
+        interval = 24
+    if interval == 0:
+        return True
+    newest = (db.session.query(db.func.max(PlaidAccount.updated_at))
+              .filter(PlaidAccount.item_id == item.item_id).scalar())
+    if newest is None:
+        return True
+    return (_now() - _as_utc(newest)).total_seconds() / 3600.0 >= interval
+
+
 def refresh_accounts(item: PlaidItem, plaid_client: PlaidClient,
                      access_token: str) -> int:
     """Upsert the Item's accounts (idempotent on account_id); refresh cached
@@ -215,10 +243,11 @@ def pull_item(item: PlaidItem, plaid_client: PlaidClient) -> dict:
     advancing the cursor. Returns a stats dict. Logs one plaid_pull row."""
     access_token = crypto.decrypt(item.access_token_encrypted)
     stats = {'added': 0, 'modified': 0, 'removed': 0, 'accounts': 0}
-    try:
-        stats['accounts'] = refresh_accounts(item, plaid_client, access_token)
-    except PlaidError as e:
-        log.warning('account refresh failed for %s: %s', item.item_id, e)
+    if _should_refresh_accounts(item):
+        try:
+            stats['accounts'] = refresh_accounts(item, plaid_client, access_token)
+        except PlaidError as e:
+            log.warning('account refresh failed for %s: %s', item.item_id, e)
 
     cursor = item.cursor or None
     try:

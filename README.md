@@ -50,7 +50,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.3.6 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.3.7 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -81,7 +81,12 @@ HTTPS (Tailscale Funnel / Cloudflare Tunnel / nginx + Let's Encrypt); an
 default) for public-facing installs; and a **user-configurable sync frequency**
 with cost-aware presets (hourly → monthly, or manual only) — the default drops
 from 6-hourly to **daily** (~4× cheaper on Plaid calls) with an optional
-per-account daily call brake. See the roadmap at the bottom.
+per-account daily call brake. v0.3.7 trims Plaid cost further by **throttling the
+balance refresh** (`/accounts/get`) to at most once per Item per day
+(`ACCOUNT_REFRESH_INTERVAL_HOURS`, default `24`) — those balances feed the
+dashboard only, so on a sub-daily poll that's ~40% fewer Plaid calls/month; it
+also documents Plaid **webhooks** as a way to drop polling cost to zero. See the
+roadmap at the bottom.
 
 ## How it works
 
@@ -172,7 +177,7 @@ There is **no prebuilt public image assumed** — the supported path is to build
 from source, which always works from a clone of this repo:
 
 ```bash
-docker build -t bank-bridge:0.3.6 app
+docker build -t bank-bridge:0.3.7 app
 ```
 
 (`app/` is the build context; the `Dockerfile` lives inside it. The stock
@@ -400,6 +405,30 @@ transactions refresh only when you click **Sync now** on the dashboard (which
 also shows a "last synced" reminder in that mode). For belt-and-suspenders cost
 protection, set `PLAID_MAX_CALLS_PER_DAY` to cap pulls per account per day.
 
+Each poll historically spent **two** billable Plaid calls per Item:
+`/transactions/sync` (the transaction delta ERPNext actually reconciles on) and
+`/accounts/get` (cached balances that feed the dashboard only). Since v0.3.7 the
+balance call is throttled by `ACCOUNT_REFRESH_INTERVAL_HOURS` (default `24`) — it
+fires at most once per Item per day, plus always on an Item's first sync, so a
+sub-daily schedule stops paying for balance data no logic consumes. On the
+6-hourly cadence that's ~8 → ~5 calls/day per Item (**~40% fewer Plaid calls per
+month**); hourly saves closer to half. Set `ACCOUNT_REFRESH_INTERVAL_HOURS=0` to
+restore an every-poll balance refresh if dashboard freshness matters more than
+call cost. Daily/weekly/monthly cadences are unaffected (their polls are already
+spaced past the refresh interval).
+
+**Eliminate polling entirely with webhooks (optional).** Instead of polling on a
+timer, you can set `PLAID_WEBHOOK_URL` to a public HTTPS endpoint on this app;
+Plaid then *pushes* a notification the moment new transactions are available and
+the bridge pulls the delta in near-real-time. With webhooks wired up you can set
+the sync frequency to **Manual only** and drop the recurring poll cost to zero —
+you keep only the on-demand `/transactions/sync` calls triggered by actual bank
+activity. The trade-off is that webhooks require a public HTTPS URL Plaid can
+reach (the same Tailscale Funnel / Cloudflare Tunnel / nginx setup documented in
+[Production Deployment](#production-deployment-https-for-plaid-oauth) — just
+register the app's webhook path as `PLAID_WEBHOOK_URL`), whereas timer-based
+polling works fine on a purely LAN-only install.
+
 ### 2. ERPNext (`/admin/erpnext_settings`)
 
 - In ERPNext, open a System-Manager user → Settings → API Access → **Generate
@@ -606,6 +635,7 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `SYNC_INTERVAL_HOURS` | `24` | v0.3.6 · background poll cadence in hours (**daily by default**). `0` or negative = **manual only** (no auto-poll; use "Sync now"). Editable in the admin UI, which persists a value that wins over this seed |
 | `PLAID_MAX_CALLS_PER_DAY` | `0` | v0.3.6 · optional per-Item safety brake — max Plaid pull calls per Item per UTC day (`0` = no limit). A pull that would exceed it is skipped with a logged warning |
 | `PLAID_PRICE_PER_CALL` | `0.30` | v0.3.6 · indicative $/Plaid call used only to render the admin cost estimate — not billing |
+| `ACCOUNT_REFRESH_INTERVAL_HOURS` | `24` | v0.3.7 · min hours between billable `/accounts/get` balance refreshes (dashboard-only data). Refreshes at most once per Item per day, plus always on first sync — ~40% fewer Plaid calls/month on sub-daily schedules. `0` = refresh every poll |
 | `SCHEDULER_ENABLED` | `true` | set false to disable the in-process scheduler entirely (drive syncs by external cron instead) |
 | `AUTO_RECOVER_DB_AUTH` | `true` | v0.3.5 · self-heal postgres app-role password drift on boot (see below); set `false` to disable |
 | `DB_RESCUE_USER` | `bridgeadmin` | v0.3.5 · deterministic rescue superuser created at init; used to reset a drifted app-role password |

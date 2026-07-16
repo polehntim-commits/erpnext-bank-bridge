@@ -15,7 +15,7 @@
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 
@@ -246,6 +246,77 @@ class TestLogging(SyncBase):
         sync_engine.sync_item(item, plaid, FakeERPClient())
         self.assertEqual(PlaidSyncLog.query.filter_by(direction='plaid_pull').count(), 1)
         self.assertEqual(PlaidSyncLog.query.filter_by(direction='erpnext_push').count(), 1)
+
+
+class TestAccountRefreshThrottle(SyncBase):
+    """v0.3.7 — /accounts/get (balances) is dashboard-only, so it is throttled to
+    at most once per ACCOUNT_REFRESH_INTERVAL_HOURS (default 24) rather than
+    fired on every poll. Balances never feed ERPNext (it reconciles on transaction
+    amounts), so skipping them costs no correctness and trims Plaid calls."""
+
+    def _get_accounts_calls(self, plaid):
+        return [c for c in plaid.calls if c[0] == 'get_accounts']
+
+    def _cached_account(self, hours_ago, naive=True, mapped=True, enabled=True):
+        """A cached PlaidAccount whose updated_at is `hours_ago` in the past.
+        naive=True mirrors how the DateTime column round-trips (naive UTC)."""
+        a = self._account(mapped=mapped, enabled=enabled)
+        stamp = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        a.updated_at = stamp.replace(tzinfo=None) if naive else stamp
+        db.session.commit()
+        return a
+
+    def test_accounts_refresh_skipped_when_within_interval(self):
+        item = self._item()
+        self._cached_account(hours_ago=2)          # 2h < 24h → still fresh
+        plaid = FakePlaidClient(accounts=self._plaid_accounts(),
+                                pages=[page(added=[txn('t1', ACC, 10.0)])])
+        stats = sync_engine.sync_item(item, plaid, FakeERPClient())
+        self.assertEqual(self._get_accounts_calls(plaid), [])   # no /accounts/get
+        self.assertEqual(stats['pull']['accounts'], 0)
+        # The delta pull still ran and mirrored the transaction.
+        self.assertEqual(BankTransaction.query.count(), 1)
+
+    def test_accounts_refresh_fires_when_interval_elapsed(self):
+        item = self._item()
+        self._cached_account(hours_ago=26)         # 26h >= 24h → stale
+        plaid = FakePlaidClient(accounts=self._plaid_accounts(),
+                                pages=[page(added=[txn('t1', ACC, 10.0)])])
+        stats = sync_engine.sync_item(item, plaid, FakeERPClient())
+        self.assertEqual(len(self._get_accounts_calls(plaid)), 1)
+        self.assertEqual(stats['pull']['accounts'], 1)
+
+    def test_accounts_refresh_fires_on_first_sync(self):
+        item = self._item()                        # no cached accounts yet
+        plaid = FakePlaidClient(accounts=self._plaid_accounts(),
+                                pages=[page(added=[txn('t1', ACC, 10.0)])])
+        stats = sync_engine.sync_item(item, plaid, FakeERPClient())
+        self.assertEqual(len(self._get_accounts_calls(plaid)), 1)
+        self.assertEqual(stats['pull']['accounts'], 1)
+        self.assertEqual(PlaidAccount.query.count(), 1)   # refresh populated it
+
+    def test_accounts_refresh_config_zero_always_refreshes(self):
+        self.app.config['ACCOUNT_REFRESH_INTERVAL_HOURS'] = 0
+        item = self._item()
+        self._cached_account(hours_ago=0)          # brand-new cache
+        plaid = FakePlaidClient(accounts=self._plaid_accounts(),
+                                pages=[page(added=[txn('t1', ACC, 10.0)])])
+        stats = sync_engine.sync_item(item, plaid, FakeERPClient())
+        self.assertEqual(len(self._get_accounts_calls(plaid)), 1)
+        self.assertEqual(stats['pull']['accounts'], 1)
+
+    def test_accounts_refresh_naive_tz_handling(self):
+        # updated_at is naive UTC (as the DB round-trips it) while _now() is
+        # tz-aware — the interval subtraction must not raise TypeError.
+        item = self._item()
+        self._cached_account(hours_ago=2, naive=True)
+        self.assertFalse(sync_engine._should_refresh_accounts(item))  # no raise
+        # The full sync path is clean too (belt and suspenders).
+        plaid = FakePlaidClient(accounts=self._plaid_accounts(),
+                                pages=[page(added=[txn('t1', ACC, 10.0)])])
+        stats = sync_engine.sync_item(item, plaid, FakeERPClient())
+        self.assertEqual(self._get_accounts_calls(plaid), [])
+        self.assertEqual(stats['pull']['accounts'], 0)
 
 
 class TestMapping(SyncBase):
