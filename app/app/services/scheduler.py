@@ -22,6 +22,16 @@ _lock = threading.Lock()
 _scheduler_lock_fd: int | None = None
 
 
+def poll_interval_or_none(interval_hours) -> int | None:
+    """The cadence (hours) to schedule the auto-poll at, or None for MANUAL
+    ONLY. The scheduler's single source of truth for whether to add a job —
+    pure, so the manual-only decision is testable without APScheduler."""
+    from .. import sync_config
+    if not sync_config.is_auto_sync_enabled(interval_hours):
+        return None
+    return max(1, sync_config.normalize_interval(interval_hours))
+
+
 def _run_sync(app) -> None:
     from ..sync_engine import sync_all
     from ..plaid_client import PlaidError, PlaidConfigError
@@ -44,8 +54,10 @@ def _run_sync(app) -> None:
 
 def ensure_scheduler_started(app):
     """Elect one scheduler across the container's workers and start it. No-op
-    (returns None) for a non-winning worker. Runs the sync every
-    SYNC_INTERVAL_HOURS, plus once ~30s after boot."""
+    (returns None) for a non-winning worker. Runs the sync every effective
+    interval (persisted setting > SYNC_INTERVAL_HOURS env), plus once ~30s after
+    boot — unless the interval is manual-only (<= 0), in which case no poll job
+    is added and syncs run only from the dashboard "Sync now" button."""
     global _scheduler_lock_fd
     if app.config.get('TESTING'):
         return None
@@ -66,12 +78,24 @@ def ensure_scheduler_started(app):
         from datetime import datetime, timedelta
         from apscheduler.schedulers.background import BackgroundScheduler
 
-        hours = max(1, int(app.config.get('SYNC_INTERVAL_HOURS', 6)))
+        from .. import plaid_settings
+        # The persisted admin setting wins over the SYNC_INTERVAL_HOURS env seed.
+        with app.app_context():
+            interval = plaid_settings.sync_interval_hours()
+        hours = poll_interval_or_none(interval)
+
         sched = BackgroundScheduler(daemon=True, timezone='UTC')
-        sched.add_job(lambda: _run_sync(app), 'interval', hours=hours,
-                      id='plaid_sync', max_instances=1, coalesce=True,
-                      next_run_time=datetime.utcnow() + timedelta(seconds=30))
         sched.start()
-        log.info('[scheduler] pid=%d elected — polling every %dh', os.getpid(), hours)
+        if hours is None:
+            # MANUAL ONLY — start the scheduler with no poll job so the
+            # container lifecycle is consistent; syncs run from "Sync now".
+            log.info('[scheduler] pid=%d elected — MANUAL-ONLY (no auto-poll '
+                     'job); use the dashboard "Sync now" button', os.getpid())
+        else:
+            sched.add_job(lambda: _run_sync(app), 'interval', hours=hours,
+                          id='plaid_sync', max_instances=1, coalesce=True,
+                          next_run_time=datetime.utcnow() + timedelta(seconds=30))
+            log.info('[scheduler] pid=%d elected — polling every %dh',
+                     os.getpid(), hours)
         _schedulers[id(app)] = sched
         return sched

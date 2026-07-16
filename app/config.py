@@ -213,8 +213,37 @@ class Config:
                       or os.environ.get('POSTGRES_PASSWORD', '').strip()
                       or SECRET_KEY)
 
-    # Poll cadence (hours) for the background transactions/sync loop.
-    SYNC_INTERVAL_HOURS = int(os.environ.get('SYNC_INTERVAL_HOURS', '6'))
-    # Set false to disable the in-process scheduler (e.g. drive syncs by cron
-    # hitting /api/sync/plaid_now instead).
+    # ── Sync cadence + cost guardrails ────────────────────────────────────
+    # Poll cadence (hours) for the background transactions/sync loop. Default
+    # DAILY (24): most reconciliation workflows don't need fresher-than-daily
+    # bank data, and daily is ~4× cheaper on Plaid /transactions/sync calls than
+    # the old 6h default. Extended semantics: 0 or negative = MANUAL ONLY — the
+    # scheduler adds no auto-poll job and syncs run only from the dashboard
+    # "Sync now" button. Editable per-install at /admin/plaid_settings (which
+    # persists a value that WINS over this seed); the admin picker exposes it as
+    # cost-aware presets (see app/sync_config.py).
+    try:
+        SYNC_INTERVAL_HOURS = int(os.environ.get('SYNC_INTERVAL_HOURS', '24'))
+    except ValueError:
+        SYNC_INTERVAL_HOURS = 24
+    # Optional per-Item safety brake: the max number of Plaid pull calls allowed
+    # per Item per UTC day. 0 (default) = no limit. When set, a pull that would
+    # exceed it is skipped with a logged warning + a `plaid_pull`/`skipped`
+    # sync-log row — a backstop against a misconfigured short interval or a
+    # retry loop running up the Plaid bill (see app/sync_engine.py).
+    try:
+        PLAID_MAX_CALLS_PER_DAY = max(
+            0, int(os.environ.get('PLAID_MAX_CALLS_PER_DAY', '0')))
+    except ValueError:
+        PLAID_MAX_CALLS_PER_DAY = 0
+    # Indicative price per Plaid /transactions/sync call — used ONLY to render
+    # the cost estimate next to the admin sync-frequency picker. Not billing,
+    # just a planning aid; override if your Plaid contract differs.
+    try:
+        PLAID_PRICE_PER_CALL = float(os.environ.get('PLAID_PRICE_PER_CALL', '0.30'))
+    except ValueError:
+        PLAID_PRICE_PER_CALL = 0.30
+    # Set false to disable the in-process scheduler entirely (e.g. drive syncs by
+    # cron hitting /api/sync/plaid_now instead). Distinct from MANUAL-ONLY above:
+    # this stops the scheduler process; MANUAL-ONLY runs it with no poll job.
     SCHEDULER_ENABLED = _bool('SCHEDULER_ENABLED', True)

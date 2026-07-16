@@ -15,9 +15,14 @@ import os
 
 from flask import current_app
 
+from . import sync_config
+
 _FILENAME = 'plaid_settings.json'
+# `sync_interval_hours` rides along in this same JSON blob (the sync-frequency
+# picker lives on the Plaid settings page). It's the background poll cadence in
+# hours; 0 = manual only. See app/sync_config.py.
 _FIELDS = ('client_id', 'sandbox_secret', 'production_secret',
-           'environment', 'redirect_uri', 'webhook_url')
+           'environment', 'redirect_uri', 'webhook_url', 'sync_interval_hours')
 
 
 def _path() -> str:
@@ -37,6 +42,8 @@ def _defaults() -> dict:
         'environment': env if env in ('sandbox', 'production') else 'sandbox',
         'redirect_uri': (c.get('PLAID_REDIRECT_URI') or '').strip(),
         'webhook_url': (c.get('PLAID_WEBHOOK_URL') or '').strip(),
+        'sync_interval_hours': sync_config.normalize_interval(
+            c.get('SYNC_INTERVAL_HOURS', 24)),
     }
 
 
@@ -55,14 +62,18 @@ def load() -> dict:
         pass
     if d.get('environment') not in ('sandbox', 'production'):
         d['environment'] = 'sandbox'
+    d['sync_interval_hours'] = sync_config.normalize_interval(
+        d.get('sync_interval_hours'))
     return d
 
 
 def save(client_id: str, environment: str, redirect_uri: str = '',
-         webhook_url: str = '', sandbox_secret=None, production_secret=None) -> dict:
+         webhook_url: str = '', sandbox_secret=None, production_secret=None,
+         sync_interval_hours=None) -> dict:
     """Persist settings. Each secret is only overwritten when a non-None value
     is passed, so an admin can re-save the client id / environment without
-    re-typing a secret (the form submits None to keep the existing one)."""
+    re-typing a secret (the form submits None to keep the existing one). The
+    sync interval is likewise only touched when a value is passed."""
     d = load()
     d['client_id'] = (client_id or '').strip()
     env = (environment or 'sandbox').strip().lower()
@@ -73,10 +84,19 @@ def save(client_id: str, environment: str, redirect_uri: str = '',
         d['sandbox_secret'] = (sandbox_secret or '').strip()
     if production_secret is not None:
         d['production_secret'] = (production_secret or '').strip()
+    if sync_interval_hours is not None:
+        d['sync_interval_hours'] = sync_config.normalize_interval(
+            sync_interval_hours)
     os.makedirs(current_app.config['DATA_DIR'], exist_ok=True)
     with open(_path(), 'w', encoding='utf-8') as f:
         json.dump({k: d[k] for k in _FIELDS}, f)
     return d
+
+
+def sync_interval_hours() -> int:
+    """Effective background poll cadence in hours (0 = manual only). Persisted
+    value wins over the SYNC_INTERVAL_HOURS env seed."""
+    return sync_config.normalize_interval(load().get('sync_interval_hours'))
 
 
 def active_secret() -> str:

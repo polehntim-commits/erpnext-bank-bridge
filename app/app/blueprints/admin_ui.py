@@ -4,7 +4,8 @@ Unauthenticated + LAN-only (the Umbrel trust boundary).
 
 Pages:
   /  and  /admin        — dashboard (health, counts, recent sync log)
-  /admin/plaid_settings — Plaid Client ID / secrets / environment / webhook
+  /admin/plaid_settings — Plaid Client ID / secrets / environment / webhook +
+                          sync frequency (cost-aware presets)
   /admin/link_bank      — Plaid Link entry point
   /admin/accounts       — map each Plaid account → ERPNext Bank Account
   /admin/transactions   — filterable transaction list + per-row retry
@@ -12,6 +13,7 @@ Pages:
   /admin/sync_log       — recent PlaidSyncLog rows
 """
 import hmac
+from datetime import datetime, timezone
 from urllib.parse import quote_plus
 
 from flask import (Blueprint, Response, current_app, jsonify, redirect,
@@ -25,6 +27,7 @@ from .. import erpnext_accounts
 from .. import erpnext_bank
 from .. import erpnext_settings as erps
 from .. import plaid_settings as ps
+from .. import sync_config
 from .. import sync_engine
 from ..erpnext_client import ERPNextConfigError, ERPNextError
 from ..models import (AuditEvent, BankTransaction, CategorizationRule,
@@ -176,6 +179,15 @@ DASHBOARD_BODY = """
   and map accounts.
 </div>
 {% endif %}
+{% if manual_only and counts.items %}
+<div class="banner-warn">
+  <h3>Auto-sync is off (manual only)</h3>
+  Transactions refresh only when you click <b>Sync now</b> below.
+  Last synced: <b>{{ last_synced_human }}</b>.
+  Change the cadence on the <a href="/admin/plaid_settings">Plaid settings</a>
+  page.
+</div>
+{% endif %}
 
 <div class="kpis">
   <div class="kpi"><b>{{ counts.items }}</b><br>linked banks</div>
@@ -248,16 +260,42 @@ def _counts() -> dict:
     }
 
 
+def _ago(dt) -> str:
+    """Compact 'time since' label for the manual-only 'last synced' reminder."""
+    if dt is None:
+        return 'never'
+    now = datetime.now(timezone.utc)
+    # Stored timestamps are naive UTC (SQLite/Postgres); compare in UTC.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    secs = max(0, int((now - dt).total_seconds()))
+    if secs < 90:
+        return 'just now'
+    mins = secs // 60
+    if mins < 90:
+        return f'{mins} minute{"s" if mins != 1 else ""} ago'
+    hours = mins // 60
+    if hours < 48:
+        return f'{hours} hour{"s" if hours != 1 else ""} ago'
+    days = hours // 24
+    return f'{days} day{"s" if days != 1 else ""} ago'
+
+
 @bp.get('/')
 @bp.get('/admin')
 def dashboard():
     items = PlaidItem.query.order_by(PlaidItem.created_at.desc()).all()
     recent_log = (PlaidSyncLog.query
                   .order_by(PlaidSyncLog.at.desc()).limit(15).all())
+    last_synced = db.session.query(
+        db.func.max(PlaidItem.last_synced_at)).scalar()
     return _page(DASHBOARD_BODY, page='dashboard', counts=_counts(),
                  items=items, recent_log=recent_log,
                  plaid_ok=ps.is_configured(),
                  erpnext_ok=erps.is_configured(),
+                 manual_only=not sync_config.is_auto_sync_enabled(
+                     ps.sync_interval_hours()),
+                 last_synced_human=_ago(last_synced),
                  flash_msg=request.args.get('flash', ''))
 
 
@@ -1912,8 +1950,44 @@ PLAID_SETTINGS_BODY = """
   <label>Webhook URL <span style="font-weight:400;color:#888">(optional — leave blank for polling)</span>
     <input name="webhook_url" value="{{ s.webhook_url }}" placeholder="http://umbrel.local:5202/api/plaid/webhook">
   </label>
+  <label>Sync frequency <span style="font-weight:400;color:#888">(how often we pull transactions from Plaid)</span>
+    <select name="sync_interval_hours" id="syncFreq">
+      {% for p in sync_presets %}
+      <option value="{{ p.value }}" {{ 'selected' if p.value == s.sync_interval_hours else '' }}>{{ p.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <p id="costEst" style="font-size:13px;color:#555;margin:4px 0 0"
+     data-accounts="{{ account_count }}" data-price="{{ price_per_call }}"></p>
+  <p style="font-size:12px;color:#888;margin:4px 0 0">Fewer syncs = lower Plaid
+    cost. Daily is plenty for most reconciliation; you can always click
+    <b>Sync now</b> on the dashboard for an on-demand refresh.</p>
   <button type="submit">Save Plaid settings</button>
 </form>
+<script>
+(function () {
+  var sel = document.getElementById('syncFreq');
+  var out = document.getElementById('costEst');
+  if (!sel || !out) return;
+  var accounts = parseInt(out.getAttribute('data-accounts'), 10) || 1;
+  var price = parseFloat(out.getAttribute('data-price')) || 0.30;
+  function update() {
+    var h = parseInt(sel.value, 10) || 0;
+    if (h <= 0) {
+      out.textContent = 'Manual only — no automatic Plaid calls (use “Sync now”).';
+      return;
+    }
+    var callsPerMonthPerAcct = (24 / h) * 30;
+    var total = callsPerMonthPerAcct * accounts * price;
+    out.textContent = '≈ ' + Math.round(callsPerMonthPerAcct) +
+      ' Plaid calls/month per account · est. $' + total.toFixed(2) +
+      '/month for ' + accounts + ' linked account' + (accounts === 1 ? '' : 's') +
+      ' (at $' + price.toFixed(2) + '/call).';
+  }
+  sel.addEventListener('change', update);
+  update();
+})();
+</script>
 <p style="font-size:13px">Status:
   {% if configured %}<span class="pill pill-ok">configured ({{ s.environment }})</span>
   {% else %}<span class="pill pill-err">not configured</span>{% endif %}
@@ -1925,6 +1999,10 @@ PLAID_SETTINGS_BODY = """
 def plaid_settings_page():
     return _page(PLAID_SETTINGS_BODY, page='plaid_settings', s=ps.load(),
                  masked=ps.masked(), configured=ps.is_configured(),
+                 sync_presets=sync_config.PRESETS,
+                 account_count=(PlaidAccount.query.count() or 1),
+                 price_per_call=current_app.config.get(
+                     'PLAID_PRICE_PER_CALL', sync_config.DEFAULT_PRICE_PER_CALL),
                  flash_msg=request.args.get('flash', ''))
 
 
@@ -1938,8 +2016,12 @@ def save_plaid_settings():
     raw_prod = request.form.get('production_secret')
     sandbox_secret = raw_sandbox if (raw_sandbox or '').strip() else None
     production_secret = raw_prod if (raw_prod or '').strip() else None
+    # Only touch the interval when the picker submitted a value.
+    raw_interval = request.form.get('sync_interval_hours')
+    sync_interval = raw_interval if raw_interval not in (None, '') else None
     ps.save(client_id, environment, redirect_uri, webhook_url,
-            sandbox_secret=sandbox_secret, production_secret=production_secret)
+            sandbox_secret=sandbox_secret, production_secret=production_secret,
+            sync_interval_hours=sync_interval)
     return redirect('/admin/plaid_settings?flash=Saved')
 
 

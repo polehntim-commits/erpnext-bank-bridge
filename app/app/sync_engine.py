@@ -62,6 +62,42 @@ def _parse_date(s):
         return None
 
 
+def _plaid_calls_today(item_id: str) -> int:
+    """Count today's (UTC) real Plaid pull actions logged for one Item — the
+    basis for the optional per-Item daily call brake. `skipped` markers (rows
+    the brake itself wrote) are excluded so they never inflate the count."""
+    # Naive UTC midnight — PlaidSyncLog.at is stored naive-UTC on both SQLite
+    # and Postgres, so compare against a matching naive value.
+    today0 = datetime.now(timezone.utc).replace(
+        tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
+    return (PlaidSyncLog.query
+            .filter(PlaidSyncLog.direction == 'plaid_pull',
+                    PlaidSyncLog.item_id == item_id,
+                    PlaidSyncLog.status != 'skipped',
+                    PlaidSyncLog.at >= today0)
+            .count())
+
+
+def _daily_call_brake_hit(item_id: str) -> bool:
+    """True when PLAID_MAX_CALLS_PER_DAY is set and this Item has reached it
+    today. Off (always False) when the limit is 0/unset. Logs + records a
+    `skipped` sync-log row on the transition so the operator sees why a poll was
+    held back."""
+    try:
+        limit = int(current_app.config.get('PLAID_MAX_CALLS_PER_DAY', 0) or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        return False
+    if _plaid_calls_today(item_id) < limit:
+        return False
+    log.warning('[brake] item %s reached PLAID_MAX_CALLS_PER_DAY=%d — '
+                'skipping this pull', item_id, limit)
+    _log(item_id, 'plaid_pull', 0, 'skipped',
+         f'daily Plaid call brake hit (limit={limit})')
+    return True
+
+
 def _log(item_id: str, direction: str, count: int, status: str,
          error_message: str = '') -> None:
     """Persist one PlaidSyncLog row. Best-effort — never masks the real outcome."""
@@ -347,7 +383,12 @@ def retry_row(row_id: int) -> tuple[bool, str]:
 def sync_item(item: PlaidItem, plaid_client: PlaidClient = None,
               erp_client=None) -> dict:
     """Pull + push one Item. Pull failures propagate; push failures are logged
-    per-row and don't abort the pull's local mirror."""
+    per-row and don't abort the pull's local mirror. The optional per-Item daily
+    call brake (PLAID_MAX_CALLS_PER_DAY) short-circuits the pull before any Plaid
+    call when the Item has hit its limit for the day."""
+    if _daily_call_brake_hit(item.item_id):
+        return {'item_id': item.item_id, 'skipped': 'max_calls_per_day',
+                'pull': {}, 'push': {}}
     plaid_client = plaid_client or get_plaid_client()
     pull_stats = pull_item(item, plaid_client)
     if erp_client is None:
