@@ -8,7 +8,7 @@
   * JE generation: amount-sign direction, party fallback to auto-Supplier,
     draft-vs-submit, idempotency (one JE per txn), non-destructive on failure
 
-    cd erpnext-bank-bridge_v0.1.0
+    cd app
     python3 -m unittest discover -s tests -v
 """
 import os

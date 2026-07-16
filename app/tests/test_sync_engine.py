@@ -9,7 +9,7 @@
   * unmapped account → mirrored locally but not pushed (stays pending)
   * failed push → sync_error recorded, row stays pending, retry re-posts
 
-    cd erpnext-bank-bridge_v0.1.0
+    cd app
     python3 -m unittest discover -s tests -v
 """
 import os

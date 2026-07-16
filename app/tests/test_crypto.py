@@ -4,7 +4,7 @@
   * ciphertext is not the plaintext
   * a key is generated + persisted on first use and reused thereafter
 
-    cd erpnext-bank-bridge_v0.1.0
+    cd app
     python3 -m unittest discover -s tests -v
 """
 import os

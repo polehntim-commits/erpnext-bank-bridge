@@ -48,7 +48,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.3.5 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.3.6 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -72,7 +72,11 @@ authentication failed for user 'bankbridge'" failure that used to force a volume
 wipe is now detected and auto-repaired via a deterministic **rescue superuser**
 (`bridgeadmin`, created at init with an APP_SEED-derived password), logged as a
 `db_auth_recovered` audit event; existing installs get a one-time manual rescue
-script (see *Self-healing DB auth* below). See the roadmap at the bottom.
+script (see *Self-healing DB auth* below). v0.3.6 is a docs + hardening polish:
+a **Production Deployment** guide for serving the Plaid OAuth callback over
+HTTPS (Tailscale Funnel / Cloudflare Tunnel / nginx + Let's Encrypt) and an
+**optional HTTP Basic Auth** layer for `/admin` (`ADMIN_BASIC_AUTH_*`, off by
+default) for public-facing installs. See the roadmap at the bottom.
 
 ## How it works
 
@@ -118,10 +122,14 @@ out of the account → withdrawal; negative = money in → deposit).
 | `plaid_sync_log` | HTTP-level action log (plaid_pull / erpnext_push / erpnext_supplier_auto_create, counts, errors); `subject_id` cross-links to `audit_events` |
 | `plaid_link_state` | short-lived link-token bookkeeping for the OAuth handoff |
 
-## Admin UI (LAN-only, unauthenticated)
+## Admin UI (LAN-only by default)
 
-The admin UI carries no login — it is intended to run behind Umbrel on a
-trusted LAN, never exposed to the Internet.
+The admin UI carries no login by default — it is intended to run behind Umbrel
+on a trusted LAN, never exposed to the Internet. If you expose the app publicly
+to serve the Plaid OAuth callback, keep `/admin` on the LAN and optionally turn
+on an HTTP Basic Auth layer (`ADMIN_BASIC_AUTH_*`) — see
+[Deployment models](#deployment-models) and
+[Production Deployment](#production-deployment-https-for-plaid-oauth).
 
 - `/admin` — dashboard: linked banks, health, counts, recent sync log
 - `/admin/link_bank` — Plaid Link entry point
@@ -151,11 +159,202 @@ trusted LAN, never exposed to the Internet.
    Postgres sidecar.
 3. Open the app; you'll land on `/admin`.
 
-Build the Docker image yourself:
+### Docker image
+
+There is **no prebuilt public image assumed** — the supported path is to build
+from source, which always works from a clone of this repo:
 
 ```bash
-docker build -t polehntim/bank-bridge:0.3.5 erpnext-bank-bridge_v0.1.0
+docker build -t bank-bridge:0.3.6 app
 ```
+
+(`app/` is the build context; the `Dockerfile` lives inside it. The stock
+`docker-compose.yml` in `app/` already does this via `build: .`, so
+`docker compose up --build` needs no separate `docker build`.)
+
+If a prebuilt image has been published to Docker Hub you can pull it instead of
+building:
+
+```bash
+docker pull polehntim/bank-bridge:0.3.6   # only if the tag exists on Docker Hub
+```
+
+Availability is not guaranteed by this README — if the pull 404s, build from
+source with the command above.
+
+## Deployment models
+
+Bank Bridge supports two deployment postures. Pick one before you configure
+Plaid, because it determines your redirect URI.
+
+**1. LAN-only (default, simplest).** The whole app — admin UI *and* the Plaid
+callback — is reachable only on your trusted LAN behind Umbrel's app proxy.
+Works out of the box with a `http://umbrel.local:5202/...` redirect URI. This is
+fine for **Plaid sandbox** and for production banks that don't use OAuth. No
+extra setup, no auth needed.
+
+**2. Public HTTPS callback (required for production OAuth banks).** Production
+OAuth institutions (Wells Fargo, Chase, etc.) require an **`https://`** redirect
+URI that Plaid can reach from the public Internet. You expose **only** the
+callback paths — `/plaid/*` and `/api/plaid/*` — over HTTPS, while `/admin` and
+everything else stay on the LAN. See
+[Production Deployment](#production-deployment-https-for-plaid-oauth) for three
+ways to do this.
+
+> **When you expose the app publicly, enable admin auth.** Set
+> `ADMIN_BASIC_AUTH_USER` and `ADMIN_BASIC_AUTH_PASS` as a belt-and-suspenders
+> layer so that even if a proxy misconfiguration leaks `/admin`, it still
+> requires credentials. Setting **both** turns it on; leaving **either** blank
+> keeps the stock unauthenticated LAN behavior. Generate a strong password with:
+>
+> ```bash
+> python3 -c "import secrets; print(secrets.token_urlsafe(24))"
+> ```
+>
+> The password may be stored as plaintext or as a `werkzeug` hash
+> (`generate_password_hash`). The Plaid callback and JSON API are **never** gated
+> by this — only `/admin` is.
+
+## Production Deployment (HTTPS for Plaid OAuth)
+
+Production OAuth banks require an `https://` redirect URI reachable from the
+public Internet. The goal of every pattern below is the same: **terminate TLS
+and forward only `/plaid/*` and `/api/plaid/*` to port 5202**, keeping the admin
+UI on the LAN. After setting one up, register the resulting HTTPS URL as the
+redirect URI in **both** the Plaid dashboard (Developers → API → Allowed
+redirect URIs) **and** the `PLAID_REDIRECT_URI` env var / `/admin/plaid_settings`.
+
+Placeholders below use `<your-host>`, `<your-umbrel>`, `<your-tailnet>`, and
+`<your-domain>` — substitute your own.
+
+### Option A — Tailscale Funnel (recommended for Umbrel / self-hosters)
+
+Free HTTPS on a `*.ts.net` name with no port forwarding, no DNS, and no
+certificate management (Tailscale provisions the cert). Funnel can be
+**path-restricted** so only the Plaid callback is public.
+
+**Prerequisites**
+- A [Tailscale](https://tailscale.com) account with the Umbrel host on your
+  tailnet (Umbrel ships a Tailscale app; or install the daemon on the host).
+- Funnel enabled for your tailnet (Tailscale admin console → *Access controls*;
+  Funnel node attribute must be granted).
+
+**Setup**
+```bash
+# Expose ONLY the two callback path prefixes over HTTPS → local port 5202.
+tailscale funnel --set-path /plaid       http://localhost:5202/plaid
+tailscale funnel --set-path /api/plaid   http://localhost:5202/api/plaid
+tailscale funnel status          # shows the public https://<your-umbrel>.<your-tailnet>.ts.net URL
+```
+Your redirect URI is then
+`https://<your-umbrel>.<your-tailnet>.ts.net/plaid/oauth_return`.
+
+**Verify**
+```bash
+curl -sI https://<your-umbrel>.<your-tailnet>.ts.net/plaid/oauth_return
+# Expect: HTTP/2 200 (the OAuth return page renders).
+curl -sI https://<your-umbrel>.<your-tailnet>.ts.net/admin
+# Expect: 404 — /admin is NOT funneled, so it stays LAN-only.
+```
+
+**Security note.** Only `/plaid/*` and `/api/plaid/*` are on the public
+`ts.net` hostname; `/admin` is unreachable through Funnel and stays on the LAN.
+Even so, set `ADMIN_BASIC_AUTH_*` as defense-in-depth.
+
+### Option B — Cloudflare Tunnel
+
+Free HTTPS via a Cloudflare-managed hostname, again with no port forwarding.
+Good if you already use Cloudflare for DNS.
+
+**Prerequisites**
+- A Cloudflare account with a domain on Cloudflare DNS (`<your-domain>`).
+- [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+  installed on the Umbrel host.
+
+**Setup**
+```bash
+cloudflared tunnel login
+cloudflared tunnel create bank-bridge
+# Route a subdomain to the tunnel:
+cloudflared tunnel route dns bank-bridge bank-bridge.<your-domain>
+```
+Create `~/.cloudflared/config.yml` that forwards only the callback paths and
+returns 404 for everything else:
+```yaml
+tunnel: bank-bridge
+credentials-file: /root/.cloudflared/bank-bridge.json
+ingress:
+  - hostname: bank-bridge.<your-domain>
+    path: ^/plaid/.*
+    service: http://localhost:5202
+  - hostname: bank-bridge.<your-domain>
+    path: ^/api/plaid/.*
+    service: http://localhost:5202
+  - service: http_status:404          # /admin and all else → 404 (not exposed)
+```
+Then run it (or install as a service):
+```bash
+cloudflared tunnel run bank-bridge
+```
+Your redirect URI is `https://bank-bridge.<your-domain>/plaid/oauth_return`.
+
+**Verify**
+```bash
+curl -sI https://bank-bridge.<your-domain>/plaid/oauth_return   # Expect 200
+curl -sI https://bank-bridge.<your-domain>/admin                # Expect 404
+```
+
+**Security note.** The `ingress` rules publish only the two callback prefixes;
+the catch-all `http_status:404` keeps `/admin` off the public hostname. Enable
+`ADMIN_BASIC_AUTH_*` as an extra layer.
+
+### Option C — Nginx reverse proxy + Let's Encrypt
+
+The classic self-hosted setup if you have your own domain and a host with ports
+80/443 reachable. You manage DNS and a certificate (via Certbot).
+
+**Prerequisites**
+- A domain `<your-domain>` with an `A`/`AAAA` record pointing at your host.
+- Ports 80 and 443 open to the host; `nginx` and `certbot` installed.
+
+**Setup** — an nginx server block that proxies **only** the callback paths and
+`444`s everything else:
+```nginx
+server {
+    listen 443 ssl;
+    server_name <your-domain>;
+
+    ssl_certificate     /etc/letsencrypt/live/<your-domain>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/<your-domain>/privkey.pem;
+
+    location /plaid/ {
+        proxy_pass http://127.0.0.1:5202;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location /api/plaid/ {
+        proxy_pass http://127.0.0.1:5202;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location / { return 444; }        # drop everything else, incl. /admin
+}
+```
+Provision the certificate:
+```bash
+sudo certbot --nginx -d <your-domain>
+```
+Your redirect URI is `https://<your-domain>/plaid/oauth_return`.
+
+**Verify**
+```bash
+curl -sI https://<your-domain>/plaid/oauth_return   # Expect 200
+curl -sI https://<your-domain>/admin                # Expect connection closed (444)
+```
+
+**Security note.** Only `/plaid/` and `/api/plaid/` are proxied; `location /`
+returns `444` so `/admin` is never served publicly. Because a reverse proxy is
+the easiest place to accidentally widen scope, set `ADMIN_BASIC_AUTH_*` too.
 
 ## Configuration
 
@@ -173,14 +372,14 @@ Create an app at [dashboard.plaid.com](https://dashboard.plaid.com):
   Plaid app is approved for the institutions you need.
 
 **Production OAuth needs HTTPS.** Plaid accepts a plain `http://…` redirect URI
-in sandbox, but **production OAuth banks require an `https://` redirect URI**. The
-admin UI stays LAN-only — you only need to reach the two callback paths from the
-public Internet, not `/admin`. Put a reverse proxy (Caddy, nginx) or a
-**Tailscale Funnel** in front of the app that terminates TLS and forwards **only**
-`/plaid/*` and `/api/plaid/*` to port 5202, then register that HTTPS URL (e.g.
+in sandbox, but **production OAuth banks require an `https://` redirect URI**
+reachable from the public Internet. You only need to expose the two callback
+paths (`/plaid/*` and `/api/plaid/*`), not `/admin`. See
+[Production Deployment](#production-deployment-https-for-plaid-oauth) for three
+ready-to-use patterns (Tailscale Funnel, Cloudflare Tunnel, or nginx +
+Let's Encrypt), then register the resulting HTTPS URL (e.g.
 `https://<your-host>/plaid/oauth_return`) as the redirect URI in both the Plaid
-dashboard and `PLAID_REDIRECT_URI`. Everything else — including the whole admin
-UI — remains reachable only on the trusted LAN.
+dashboard and `PLAID_REDIRECT_URI`.
 
 ### 2. ERPNext (`/admin/erpnext_settings`)
 
@@ -364,6 +563,8 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 |-----|---------|-------|
 | `DATABASE_URL` | — (required) | Postgres only, no SQLite fallback |
 | `SECRET_KEY` | `dev-not-for-production` | Flask secret |
+| `ADMIN_BASIC_AUTH_USER` | "" | v0.3.6 · optional Basic Auth username for `/admin`; set together with the password to enable |
+| `ADMIN_BASIC_AUTH_PASS` | "" | v0.3.6 · optional Basic Auth password for `/admin` (plaintext or a `werkzeug` hash). **Both** vars set → auth on; **either** blank → off (LAN mode). Never gates `/plaid/*` or `/api/plaid/*` |
 | `PLAID_CLIENT_ID` / `PLAID_SECRET` | "" | seed; editable in the UI |
 | `PLAID_ENV` | `sandbox` | `sandbox` \| `production` |
 | `PLAID_REDIRECT_URI` | `http://umbrel.local:5202/plaid/oauth_return` | must match the Plaid dashboard |
@@ -441,7 +642,7 @@ Every successful recovery writes a `db_auth_recovered` **audit event** (actor
 manual rescue on the Umbrel host:
 
 ```bash
-cd erpnext-bank-bridge_v0.1.0
+cd app
 ./scripts/rotate_db_password.sh        # auto-detects the db + server containers
 ```
 
@@ -457,7 +658,7 @@ server. No volume wipe; Plaid tokens and history are preserved.
 ## Local development
 
 ```bash
-cd erpnext-bank-bridge_v0.1.0
+cd app
 cp .env.example .env          # fill in POSTGRES_PASSWORD etc.
 docker compose up --build     # admin UI at http://localhost:5202/admin
 ```
@@ -465,11 +666,11 @@ docker compose up --build     # admin UI at http://localhost:5202/admin
 ## Tests
 
 ```bash
-cd erpnext-bank-bridge_v0.1.0
+cd app
 python3 -m unittest discover -s tests -v
 ```
 
-227 tests cover Fernet encryption round-trip + key persistence, Plaid response
+239 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
 push → error + retry, one-click account import, merchant-name normalization,
@@ -477,9 +678,12 @@ auto-Supplier cache hit/miss/config-disabled, the rules engine (every match
 type, priority ordering, JE sign handling, one-JE-per-transaction idempotency,
 non-destructive failure), the rules admin CRUD + test endpoint, the audit trail
 (every state change writes an event, count grows monotonically, rule
-supersede-vs-delete preserves history, CSV export, subject filtering), and every
-admin page rendering. The Plaid SDK and ERPNext are mocked (`tests/fakes.py`), so
-no network access or extra wheels are needed.
+supersede-vs-delete preserves history, CSV export, subject filtering), every
+admin page rendering, and the optional admin Basic Auth gate (enforced only when
+both env vars are set, correct vs wrong credentials, plaintext + hashed
+passwords, and the Plaid callback / JSON API staying ungated). The Plaid SDK and
+ERPNext are mocked (`tests/fakes.py`), so no network access or extra wheels are
+needed.
 
 ## Security notes
 

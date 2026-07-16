@@ -19,6 +19,19 @@ class Config:
     # Flask
     SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-not-for-production')
 
+    # ── Optional admin HTTP Basic Auth ────────────────────────────────────
+    # The admin UI is unauthenticated by design — it assumes Umbrel's app_proxy
+    # (LAN trust boundary) sits in front. When you expose the OAuth callback
+    # over public HTTPS (see the README "Production Deployment" section), set
+    # BOTH of these to add a belt-and-suspenders Basic Auth prompt on every
+    # /admin route. If EITHER is blank, no auth is enforced (backward-compatible
+    # — stock LAN deployments keep working untouched). The password may be a
+    # plaintext value or a werkzeug password hash (`pbkdf2:…`/`scrypt:…` from
+    # `generate_password_hash`) — a hash is verified as one, so you never have to
+    # store the cleartext. See app/blueprints/admin_ui.py.
+    ADMIN_BASIC_AUTH_USER = os.environ.get('ADMIN_BASIC_AUTH_USER', '').strip()
+    ADMIN_BASIC_AUTH_PASS = os.environ.get('ADMIN_BASIC_AUTH_PASS', '')
+
     # Persistent data dir — Fernet key file, plaid_settings.json,
     # erpnext_settings.json, scheduler lock all live here.
     DATA_DIR = os.environ.get('APP_DATA_DIR_INNER') or \

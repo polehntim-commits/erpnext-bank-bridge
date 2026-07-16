@@ -7,7 +7,7 @@ Two layers:
     shipped behavior. Skips cleanly if `node` isn't on PATH.
   * Server-side: the static module is served and the rules page wires it in.
 
-    cd erpnext-bank-bridge_v0.1.0
+    cd app
     python3 -m unittest discover -s tests -v
 """
 import json

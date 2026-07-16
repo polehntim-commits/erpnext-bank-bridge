@@ -7,7 +7,7 @@
   * plaid_client response-normalization helpers shape added/removed/category
   * exchange_token stores the access_token ENCRYPTED (never plaintext)
 
-    cd erpnext-bank-bridge_v0.1.0
+    cd app
     python3 -m unittest discover -s tests -v
 """
 import os

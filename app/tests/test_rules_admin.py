@@ -2,7 +2,7 @@
 """Admin UI for v0.3.0: rules CRUD + test endpoint, suppliers list/edit,
 generated-entries audit + approve/reject.
 
-    cd erpnext-bank-bridge_v0.1.0
+    cd app
     python3 -m unittest discover -s tests -v
 """
 import os

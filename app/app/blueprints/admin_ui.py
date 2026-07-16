@@ -11,10 +11,12 @@ Pages:
   /admin/erpnext_settings — ERPNext connection (URL + API key/secret)
   /admin/sync_log       — recent PlaidSyncLog rows
 """
+import hmac
 from urllib.parse import quote_plus
 
-from flask import (Blueprint, current_app, jsonify, redirect,
+from flask import (Blueprint, Response, current_app, jsonify, redirect,
                    render_template_string, request, url_for)
+from werkzeug.security import check_password_hash
 
 from .. import audit
 from .. import categorization
@@ -30,6 +32,45 @@ from ..models import (AuditEvent, BankTransaction, CategorizationRule,
                       PlaidSyncLog, Supplier)
 
 bp = Blueprint('admin_ui', __name__)
+
+
+def _password_ok(configured: str, provided: str) -> bool:
+    """Verify the provided password against the configured value.
+
+    A configured value that looks like a werkzeug password hash
+    (`pbkdf2:…` / `scrypt:…`) is verified as one; anything else is treated as a
+    plaintext secret and compared in constant time. Either way the comparison is
+    timing-safe."""
+    if configured.startswith(('pbkdf2:', 'scrypt:')):
+        return check_password_hash(configured, provided)
+    return hmac.compare_digest(configured, provided)
+
+
+@bp.before_request
+def _require_admin_auth():
+    """OPTIONAL HTTP Basic Auth gate for the whole admin UI.
+
+    Off by default: the admin UI assumes Umbrel's app_proxy provides the LAN
+    trust boundary. If BOTH ADMIN_BASIC_AUTH_USER and ADMIN_BASIC_AUTH_PASS are
+    configured, every /admin route requires those credentials — a
+    belt-and-suspenders layer for operators who expose the app over public
+    HTTPS. If either is blank, this is a no-op (backward compatible). The
+    unauthenticated Plaid callback + JSON API live on a separate blueprint and
+    are never affected."""
+    user = current_app.config.get('ADMIN_BASIC_AUTH_USER', '')
+    pw = current_app.config.get('ADMIN_BASIC_AUTH_PASS', '')
+    if not user or not pw:
+        return None  # auth disabled — stock LAN mode
+    auth = request.authorization
+    # Compare both fields even when the username is wrong so the response time
+    # doesn't reveal which half failed.
+    user_ok = bool(auth) and hmac.compare_digest(auth.username or '', user)
+    pass_ok = bool(auth) and _password_ok(pw, auth.password or '')
+    if user_ok and pass_ok:
+        return None
+    return Response(
+        'Authentication required.', 401,
+        {'WWW-Authenticate': 'Basic realm="Bank Bridge admin"'})
 
 
 @bp.before_request

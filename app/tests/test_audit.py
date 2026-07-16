@@ -8,7 +8,7 @@
   * CSV export includes all fields
   * the audit UI is filterable down to an individual subject
 
-    cd erpnext-bank-bridge_v0.1.0
+    cd app
     python3 -m unittest discover -s tests -v
 """
 import csv

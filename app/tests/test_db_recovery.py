@@ -13,7 +13,7 @@
   * a non-auth probe error is left to the normal boot retry (not "recovered")
   * the rescue password derivation is deterministic + secrets never leak
 
-    cd erpnext-bank-bridge_v0.1.0
+    cd app
     python3 -m unittest discover -s tests -v
 """
 import hashlib

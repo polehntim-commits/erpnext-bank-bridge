@@ -15,7 +15,7 @@ release a fix before any public disclosure.
 
 ## Supported versions
 
-This project is at an early (v0.3.5) stage. Security fixes are applied to the
+This project is at an early (v0.3.6) stage. Security fixes are applied to the
 latest release on `main`.
 
 ## Security posture
@@ -48,6 +48,12 @@ not on the public Internet.
 - The admin UI is **unauthenticated by design** and intended to be reachable
   only on a trusted LAN behind Umbrel's app proxy. **Do not expose it to the
   Internet.**
+- If you must reach the app over public HTTPS (e.g. to serve the Plaid OAuth
+  callback), expose **only** the `/plaid/*` and `/api/plaid/*` paths and keep
+  `/admin` on the LAN. As defense-in-depth you can additionally enable an
+  optional HTTP Basic Auth layer on `/admin` by setting `ADMIN_BASIC_AUTH_USER`
+  and `ADMIN_BASIC_AUTH_PASS` (see the README "Deployment models" section). The
+  Plaid callback and JSON API are never gated by it.
 
 **Secrets in source control**
 - `.env`, `fernet.key`, `plaid_settings.json`, and `erpnext_settings.json` are

@@ -11,7 +11,7 @@
   * custom-field bootstrap (plaid_account_id, last_4) is idempotent
   * the admin endpoints wire it all together
 
-    cd erpnext-bank-bridge_v0.1.0
+    cd app
     python3 -m unittest discover -s tests -v
 """
 import os

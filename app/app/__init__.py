@@ -13,7 +13,7 @@ from flask_sqlalchemy import SQLAlchemy
 
 from config import Config
 
-__version__ = '0.3.5'
+__version__ = '0.3.6'
 db = SQLAlchemy()
 
 
