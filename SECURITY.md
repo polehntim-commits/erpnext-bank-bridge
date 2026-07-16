@@ -15,7 +15,7 @@ release a fix before any public disclosure.
 
 ## Supported versions
 
-This project is at an early (v0.1.0) stage. Security fixes are applied to the
+This project is at an early (v0.3.5) stage. Security fixes are applied to the
 latest release on `main`.
 
 ## Security posture

@@ -144,16 +144,17 @@ trusted LAN, never exposed to the Internet.
 ## Installation (Umbrel Community Store)
 
 1. Add a Community Store that ships this app's manifest (Umbrel → App Store →
-   ⋯ → Community App Stores). A ready-to-use `docker-compose.yml` +
-   `umbrel-app.yml` are provided for packaging.
+   ⋯ → Community App Stores). A ready-to-use `docker-compose.yml` is included;
+   pair it with an `umbrel-app.yml` manifest in your Community Store to package
+   the app.
 2. Install **Bank Bridge**. It launches a Flask server (port 5202) plus a
    Postgres sidecar.
 3. Open the app; you'll land on `/admin`.
 
-Docker image: `polehntim/bank-bridge:0.1.1`. To build it yourself:
+Build the Docker image yourself:
 
 ```bash
-docker build -t polehntim/bank-bridge:0.1.1 erpnext-bank-bridge_v0.1.0
+docker build -t polehntim/bank-bridge:0.3.5 erpnext-bank-bridge_v0.1.0
 ```
 
 ## Configuration
@@ -170,6 +171,16 @@ Create an app at [dashboard.plaid.com](https://dashboard.plaid.com):
   (Developers → API → Allowed redirect URIs) — required for OAuth banks.
 - Start in **sandbox** to rehearse the flow; switch to **production** once your
   Plaid app is approved for the institutions you need.
+
+**Production OAuth needs HTTPS.** Plaid accepts a plain `http://…` redirect URI
+in sandbox, but **production OAuth banks require an `https://` redirect URI**. The
+admin UI stays LAN-only — you only need to reach the two callback paths from the
+public Internet, not `/admin`. Put a reverse proxy (Caddy, nginx) or a
+**Tailscale Funnel** in front of the app that terminates TLS and forwards **only**
+`/plaid/*` and `/api/plaid/*` to port 5202, then register that HTTPS URL (e.g.
+`https://<your-host>/plaid/oauth_return`) as the redirect URI in both the Plaid
+dashboard and `PLAID_REDIRECT_URI`. Everything else — including the whole admin
+UI — remains reachable only on the trusted LAN.
 
 ### 2. ERPNext (`/admin/erpnext_settings`)
 
@@ -458,7 +469,7 @@ cd erpnext-bank-bridge_v0.1.0
 python3 -m unittest discover -s tests -v
 ```
 
-154 tests cover Fernet encryption round-trip + key persistence, Plaid response
+227 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
 push → error + retry, one-click account import, merchant-name normalization,
