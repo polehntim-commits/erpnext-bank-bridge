@@ -27,7 +27,11 @@ ERPNext  ──►  Bank Reconciliation Tool
 - **One-click account import** — create the matching ERPNext **Bank** +
   **Bank Account** records straight from the linked Plaid accounts (per row or
   all at once), deduped and auto-mapped, so there's no manual setup before
-  transactions can post.
+  transactions can post. Auto-created GL accounts are placed on the correct side
+  of the chart by Plaid `type` — depository under **Bank Accounts** (Assets),
+  credit cards under **Credit Cards** (Current Liabilities), loans under
+  **Loans** — with precise subtypes and account numbers matching your chart's
+  scheme (v0.3.9).
 - **Creates ERPNext Bank Transaction records** ready for the built-in Bank
   Reconciliation Tool (deposit/withdrawal split from Plaid's amount sign).
 - **Auto-creates ERPNext Suppliers** from merchant names (v0.3.0) — a never-seen
@@ -50,7 +54,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.3.8 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.3.9 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -92,8 +96,23 @@ Bank Bridge was probing `Account Subtype` (which doesn't exist — ERPNext answe
 with an ImportError), so it wrongly marked the doctype unavailable, dropped the
 `account_subtype` field from every imported Bank Account, and showed a persistent
 *bootstrap partially failed* warning. Pointing the bootstrap at the real doctype
-name provisions the subtype masters and populates the field. See the roadmap at
-the bottom.
+name provisions the subtype masters and populates the field. v0.3.9 corrects the
+**Chart-of-Accounts placement** of imported accounts: a credit card is a
+liability, not an asset, so credit-card GL accounts now land under **Current
+Liabilities → Credit Cards** (auto-created) instead of the Assets-side *Bank
+Accounts* group — the leaf stays `account_type = Bank` so Bank Reconciliation
+still works on it; loans map to a **Loans** group on the Liabilities side, and
+depository accounts are unchanged. The GL parent is chosen by Plaid `type`. Bank
+Account **subtypes** are now mapped 1:1 onto the ten provisioned masters
+(Checking / Savings / Cd / Money Market / Cash Management / Paypal / Credit Card
+/ Line Of Credit / Current / Other) instead of the old coarse *Current / Other*
+buckets. **Account numbering** is applied to auto-created groups and leaves,
+matching the chart's existing scheme (siblings' max + step, groups on hundreds,
+leaves consecutive; range-numbered parents like `2100-2400` handled), and skipped
+silently when a chart doesn't use numbers. Three idempotent one-shot bench
+scripts under `app/scripts/` bring an existing install in line:
+`migrate_credit_cards_to_liabilities.py`, `backfill_account_subtypes.py`, and
+`backfill_account_numbers.py`. See the roadmap at the bottom.
 
 ## How it works
 
@@ -184,7 +203,7 @@ There is **no prebuilt public image assumed** — the supported path is to build
 from source, which always works from a clone of this repo:
 
 ```bash
-docker build -t bank-bridge:0.3.8 app
+docker build -t bank-bridge:0.3.9 app
 ```
 
 (`app/` is the build context; the `Dockerfile` lives inside it. The stock

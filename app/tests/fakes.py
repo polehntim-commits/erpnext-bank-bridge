@@ -362,3 +362,141 @@ class FakeERPClient:
     def creates_of(self, doctype='Bank Transaction'):
         return [c for c in self.calls
                 if c[0] == 'create_doc' and c[1] == doctype]
+
+
+# ── FakeFrappe: a tiny stand-in for the `frappe` module used by the one-shot
+# bench migration scripts (scripts/*.py), so their idempotency can be unit-tested
+# without a live ERPNext. Backs Account + Bank Account by dicts and mimics the
+# handful of frappe / frappe.db calls the scripts make.
+
+class _FakeDoc:
+    """A minimal frappe document: attribute get/set, .flags, .insert(), .save()."""
+
+    def __init__(self, frappe, fields, existing_name=None):
+        object.__setattr__(self, '_frappe', frappe)
+        object.__setattr__(self, '_fields', dict(fields))
+
+        class _Flags:
+            pass
+        object.__setattr__(self, 'flags', _Flags())
+        object.__setattr__(self, 'name', existing_name)
+
+    def __getattr__(self, k):
+        return object.__getattribute__(self, '_fields').get(k)
+
+    def __setattr__(self, k, v):
+        if k in ('_frappe', '_fields', 'flags', 'name'):
+            object.__setattr__(self, k, v)
+        else:
+            self._fields[k] = v
+
+    def insert(self, ignore_permissions=False):
+        name = f"{self._fields['account_name']} - {self._frappe.abbr}"
+        object.__setattr__(self, 'name', name)
+        self._fields['name'] = name
+        self._frappe.accounts[name] = dict(self._fields)
+        return self
+
+    def save(self, ignore_permissions=False):
+        self._frappe.accounts[self.name].update(self._fields)
+        return self
+
+
+class _FakeDB:
+    def __init__(self, frappe):
+        self._f = frappe
+
+    def get_value(self, doctype, name_or_filters, field, as_dict=False):
+        pool = self._f.accounts if doctype == 'Account' else {}
+        row = None
+        if isinstance(name_or_filters, dict):
+            for a in pool.values():
+                if self._f._match(a, name_or_filters):
+                    row = a
+                    break
+        else:
+            row = pool.get(name_or_filters)
+        if row is None:
+            return None
+        if isinstance(field, (list, tuple)):
+            if as_dict:
+                return {f: row.get(f) for f in field}
+            return [row.get(f) for f in field]
+        return row.get(field)
+
+    def set_value(self, doctype, name, field, value):
+        if doctype == 'Account':
+            self._f.accounts[name][field] = value
+
+    def exists(self, doctype, name):
+        if doctype == 'Account':
+            return name in self._f.accounts
+        return name in self._f.other_exists.get(doctype, set())
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+class FakeFrappe:
+    """Stand-in for the `frappe` module. `accounts` maps docname → Account dict;
+    `bank_accounts` is a list of Bank Account dicts. `abbr` is the company suffix
+    Frappe appends when autonaming a created Account."""
+
+    def __init__(self, accounts=None, bank_accounts=None, companies=None,
+                 abbr='TEST', other_exists=None):
+        self.accounts = {n: {**dict(d), 'name': n}
+                         for n, d in (accounts or {}).items()}
+        self.bank_accounts = [dict(b) for b in (bank_accounts or [])]
+        self.abbr = abbr
+        self.other_exists = other_exists or {}
+        if companies is not None:
+            self._companies = list(companies)
+        else:
+            seen = []
+            for a in self.accounts.values():
+                c = a.get('company')
+                if c and c not in seen:
+                    seen.append(c)
+            self._companies = seen or ['Testing']
+        self.db = _FakeDB(self)
+
+    @staticmethod
+    def _match(row, filters):
+        for k, v in (filters or {}).items():
+            actual = row.get(k)
+            if k == 'is_group':
+                actual = 1 if actual else 0
+                v = 1 if v else 0
+            if isinstance(v, (list, tuple)) and v and v[0] == 'in':
+                if actual not in v[1]:
+                    return False
+            elif str(actual if actual is not None else '') != str(v):
+                return False
+        return True
+
+    def get_all(self, doctype, filters=None, fields=None, order_by=None):
+        if doctype == 'Company':
+            rows = [{'name': c} for c in self._companies]
+            return rows
+        if doctype == 'Bank Account':
+            rows = [b for b in self.bank_accounts if self._match(b, filters)]
+        elif doctype == 'Account':
+            rows = [a for a in self.accounts.values() if self._match(a, filters)]
+        else:
+            rows = []
+        if order_by:
+            key = order_by.split()[0]
+            rows = sorted(rows, key=lambda r: str(r.get(key) or ''))
+        flds = fields or ['name']
+        return [{f: r.get(f) for f in flds} for r in rows]
+
+    def get_doc(self, arg, name=None):
+        if isinstance(arg, dict):
+            return _FakeDoc(self, arg)
+        return _FakeDoc(self, dict(self.accounts[name]), existing_name=name)
+
+    def destroy(self):
+        pass

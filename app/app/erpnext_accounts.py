@@ -185,17 +185,34 @@ def erpnext_account_type(account: PlaidAccount) -> str:
     return 'Current'
 
 
+# Plaid subtype → precise ERPNext Bank Account Subtype docname (Title Case, to
+# match the Bank Account Subtype link targets provisioned in bootstrap). v0.3.9
+# replaces the old coarse buckets (cd/money market/… → 'Current', credit card →
+# 'Other') with a 1:1 mapping onto the 10 provisioned masters. Anything unmapped
+# still falls back to 'Other'.
+_SUBTYPE_MAP = {
+    'checking': 'Checking',
+    'savings': 'Savings',
+    'cd': 'Cd',
+    'money market': 'Money Market',
+    'cash management': 'Cash Management',
+    'paypal': 'Paypal',
+    'credit card': 'Credit Card',
+    'line of credit': 'Line Of Credit',
+}
+
+
 def erpnext_account_subtype(account: PlaidAccount) -> str:
-    """Normalized `account_subtype` for the Bank Account (Checking / Savings /
-    Current / Other) — a coarser bucket than Plaid's subtype. Title Case, to
-    match the Account Subtype link-target docnames provisioned in bootstrap."""
+    """Precise `account_subtype` docname for the Bank Account, mapped 1:1 from
+    the Plaid subtype (v0.3.9). Title Case, to match the Bank Account Subtype
+    link-target docnames provisioned in bootstrap. A `credit`-type account with
+    no recognized subtype still reads as 'Credit Card'; everything else unmapped
+    falls back to 'Other'."""
     s = (account.subtype or '').strip().lower()
-    if s == 'checking':
-        return 'Checking'
-    if s == 'savings':
-        return 'Savings'
-    if s in _CURRENT_SUBTYPES:
-        return 'Current'
+    if s in _SUBTYPE_MAP:
+        return _SUBTYPE_MAP[s]
+    if (account.type or '').strip().lower() == 'credit':
+        return 'Credit Card'
     return 'Other'
 
 
@@ -220,10 +237,57 @@ def _default_is_company_account() -> int:
 
 
 def _bank_account_group_name() -> str:
-    """The Chart-of-Accounts group the per-account GL Accounts are created under
-    (ERPNEXT_BANK_ACCOUNT_GROUP_NAME, default 'Bank Accounts')."""
+    """The Chart-of-Accounts group the per-account depository GL Accounts are
+    created under (ERPNEXT_BANK_ACCOUNT_GROUP_NAME, default 'Bank Accounts')."""
     return (current_app.config.get('ERPNEXT_BANK_ACCOUNT_GROUP_NAME')
             or 'Bank Accounts').strip() or 'Bank Accounts'
+
+
+def _credit_card_group_name() -> str:
+    """The Chart-of-Accounts group credit-card GL Accounts are created under, on
+    the Liabilities side (ERPNEXT_CREDIT_CARD_GROUP_NAME, default 'Credit
+    Cards')."""
+    return (current_app.config.get('ERPNEXT_CREDIT_CARD_GROUP_NAME')
+            or 'Credit Cards').strip() or 'Credit Cards'
+
+
+def _loan_group_name() -> str:
+    """The Chart-of-Accounts group loan GL Accounts are created under, on the
+    Liabilities side (ERPNEXT_LOAN_GROUP_NAME, default 'Loans')."""
+    return (current_app.config.get('ERPNEXT_LOAN_GROUP_NAME')
+            or 'Loans').strip() or 'Loans'
+
+
+def _current_liabilities_group_name() -> str:
+    """The parent group credit-card / current-loan groups anchor under
+    (ERPNEXT_CURRENT_LIABILITIES_GROUP_NAME, default 'Current Liabilities')."""
+    return (current_app.config.get('ERPNEXT_CURRENT_LIABILITIES_GROUP_NAME')
+            or 'Current Liabilities').strip() or 'Current Liabilities'
+
+
+def _longterm_liabilities_group_name() -> str:
+    """The parent group long-term loans anchor under
+    (ERPNEXT_LONGTERM_LIABILITIES_GROUP_NAME, default 'Long-term Liabilities').
+    Stock ERPNext charts don't always ship this — the loan resolver falls back to
+    Current Liabilities when it's absent."""
+    return (current_app.config.get('ERPNEXT_LONGTERM_LIABILITIES_GROUP_NAME')
+            or 'Long-term Liabilities').strip() or 'Long-term Liabilities'
+
+
+def _gl_side(account: PlaidAccount) -> str:
+    """Which side of the Chart of Accounts this Plaid account's GL leaf belongs
+    on: 'credit' (cards / lines of credit → Current Liabilities), 'loan' (→
+    Loans, on the Liabilities side), or 'depository' (checking / savings / … →
+    Assets, the existing Bank Accounts group). Drives the GL parent choice
+    (v0.3.9); the leaf's own account_type stays 'Bank' regardless, so ERPNext's
+    Bank Reconciliation Tool still operates on it."""
+    t = (account.type or '').strip().lower()
+    s = (account.subtype or '').strip().lower()
+    if t == 'credit' or s in _CREDIT_SUBTYPES:
+        return 'credit'
+    if t == 'loan':
+        return 'loan'
+    return 'depository'
 
 
 def _account_currency(account: PlaidAccount) -> str:
@@ -443,15 +507,24 @@ def _create_group_account(client: ERPNextClient, account_name: str,
                           parent_account: str, company: str, *,
                           account_type: str | None = None) -> str:
     """Create an is_group=1 Account under `parent_account`; return its docname.
-    root_type is inherited from the parent by ERPNext, so we don't set it."""
+    root_type is inherited from the parent by ERPNext, so we don't set it.
+
+    v0.3.9: when the parent group uses account numbering, the new group also gets
+    an account_number in the parent's range (e.g. Current Liabilities siblings
+    2100/2200/2300/2400 → new group 2500). Skipped silently when the chart
+    doesn't number its accounts."""
     doc = {'account_name': account_name, 'parent_account': parent_account,
            'company': company, 'is_group': 1}
     if account_type:
         doc['account_type'] = account_type
+    number = _next_account_number(client, company, parent_account, is_group=True)
+    if number:
+        doc['account_number'] = number
     created = client.create_doc(ACCOUNT_DT, doc)
     name = created.get('name')
-    log.info("created Chart-of-Accounts group '%s' under '%s'", name or account_name,
-             parent_account)
+    log.info("created Chart-of-Accounts group '%s' under '%s'%s",
+             name or account_name, parent_account,
+             f' as #{number}' if number else '')
     return name or account_name
 
 
@@ -502,6 +575,114 @@ def ensure_bank_account_group(client: ERPNextClient, company: str) -> str | None
     log.info('no Chart of Accounts anchor (Bank group / Current Assets / Asset '
              'root) found for company %r; skipping GL auto-create', company)
     return None
+
+
+# ── v0.3.9: liability-side groups (credit cards, loans) ─────────────────────
+#
+# Credit cards and loans are NOT assets — a credit card is a current liability,
+# a loan a (usually long-term) liability. Before v0.3.9 every imported account,
+# cards included, was created as a Bank leaf under the Assets-side "Bank
+# Accounts" group, overstating assets and understating liabilities. Now the GL
+# parent is chosen by Plaid `type` (see _gl_side): depository stays on Assets,
+# credit lands under Current Liabilities → Credit Cards, loan under Loans. The
+# leaf's account_type is still 'Bank' so Bank Reconciliation keeps working.
+
+
+def _liability_root(client: ERPNextClient, company: str) -> str | None:
+    """The company's root Liability group (top of the Liabilities branch).
+    Prefers a root_type=Liability group with no parent_account; falls back to the
+    first Liability-rooted group. None if the company has no Chart of Accounts."""
+    groups = _find_accounts(client, company, is_group=1, root_type='Liability')
+    if not groups:
+        return None
+    for g in groups:
+        if not (g.get('parent_account') or ''):
+            return g['name']
+    return groups[0]['name']
+
+
+def _ensure_current_liabilities(client: ERPNextClient, company: str) -> str | None:
+    """Find (or create) the 'Current Liabilities' group for `company`; return its
+    docname. Falls back to creating it under the Liability root when the chart
+    doesn't ship it. None when there's no Liability branch to anchor to."""
+    name = _current_liabilities_group_name()
+    existing = _find_accounts(client, company, account_name=name, is_group=1)
+    if existing:
+        return existing[0]['name']
+    root = _liability_root(client, company)
+    if root:
+        return _create_group_account(client, name, root, company)
+    return None
+
+
+def ensure_credit_card_group(client: ERPNextClient, company: str) -> str | None:
+    """Find (or create) the group credit-card GL Accounts live under, for
+    `company`; return its docname. The conventional path is Liabilities →
+    Current Liabilities → Credit Cards.
+
+    Walks down, creating only what's missing:
+      1. the configured group name (default 'Credit Cards', is_group) — reuse if
+         present;
+      2. else find/create 'Current Liabilities' and create the group under it.
+    Returns None when the company has no Liability branch to anchor to — the
+    caller then degrades to the personal-account path (same as the Assets side)."""
+    group_name = _credit_card_group_name()
+    existing = _find_accounts(client, company, account_name=group_name, is_group=1)
+    if existing:
+        return existing[0]['name']
+    current_liabilities = _ensure_current_liabilities(client, company)
+    if current_liabilities:
+        return _create_group_account(client, group_name, current_liabilities,
+                                     company)
+    log.info('no Current Liabilities anchor for company %r; skipping credit-card '
+             'GL group', company)
+    return None
+
+
+def ensure_loan_group(client: ERPNextClient, company: str) -> str | None:
+    """Find (or create) the group loan GL Accounts live under, for `company`;
+    return its docname. Prefers Long-term Liabilities → Loans, falling back to
+    Current Liabilities → Loans when the chart has no long-term branch (stock
+    ERPNext charts often don't).
+
+    Walks down, creating only what's missing:
+      1. an existing 'Loans' (or stock 'Loans (Liabilities)') group — reuse;
+      2. else create 'Loans' under Long-term Liabilities if that group exists;
+      3. else create 'Loans' under Current Liabilities;
+      4. else create it directly under the Liability root.
+    Returns None when the company has no Liability branch at all."""
+    group_name = _loan_group_name()
+    for candidate in (group_name, 'Loans (Liabilities)'):
+        existing = _find_accounts(client, company, account_name=candidate,
+                                  is_group=1)
+        if existing:
+            return existing[0]['name']
+    for parent_name in (_longterm_liabilities_group_name(),
+                        _current_liabilities_group_name()):
+        parent = _find_accounts(client, company, account_name=parent_name,
+                                is_group=1)
+        if parent:
+            return _create_group_account(client, group_name, parent[0]['name'],
+                                         company)
+    root = _liability_root(client, company)
+    if root:
+        return _create_group_account(client, group_name, root, company)
+    log.info('no Liability anchor for company %r; skipping loan GL group', company)
+    return None
+
+
+def resolve_gl_parent(client: ERPNextClient, account: PlaidAccount,
+                      company: str) -> str | None:
+    """The Chart-of-Accounts group a Plaid account's GL leaf belongs under,
+    chosen by _gl_side (v0.3.9): credit → Credit Cards (Current Liabilities),
+    loan → Loans, depository → Bank Accounts (Assets). Returns the group docname
+    or None when the relevant branch can't be found/created."""
+    side = _gl_side(account)
+    if side == 'credit':
+        return ensure_credit_card_group(client, company)
+    if side == 'loan':
+        return ensure_loan_group(client, company)
+    return ensure_bank_account_group(client, company)
 
 
 # ── v0.3.1: child account numbering + fuzzy dedup ──────────────────────────
@@ -587,37 +768,94 @@ def _fuzzy_match_gl_account(client: ERPNextClient, company: str,
     return best
 
 
-def _next_account_number(client: ERPNextClient, company: str,
-                         parent_group: str) -> str | None:
-    """Sequential account_number for a new leaf under `parent_group`, from the
-    parent's own number: parent '1200' → first child '1201', then max existing
-    child number + 1 (monotonic; gaps are not backfilled). Returns None when the
-    parent has no numeric account_number, or on any read error, so the create
-    simply omits the field (no worse than before v0.3.1)."""
+_LEADING_INT_RE = re.compile(r'^(\d+)')
+
+
+def _leading_int(value) -> int | None:
+    """The leading integer of an account_number string, tolerating the range
+    form some group numbers take ('2100-2400' → 2100, '1200' → 1200). None when
+    there's no leading digit ('' , 'Test' → None)."""
+    m = _LEADING_INT_RE.match(str(value or '').strip())
+    return int(m.group(1)) if m else None
+
+
+def _company_account_numbers(client: ERPNextClient, company: str) -> set[int]:
+    """Every integer account_number in use across `company` (leading-int of the
+    range form counts). Used to guarantee a freshly-assigned number is unique —
+    ERPNext rejects a duplicate account_number in a company. Best-effort: any
+    read error yields an empty set (the caller then skips the uniqueness bump)."""
     try:
-        parent_rows = client.list_docs(
-            ACCOUNT_DT, filters=[['name', '=', parent_group]],
-            fields=['name', 'account_number'], limit_page_length=1)
+        rows = client.list_docs(
+            ACCOUNT_DT, filters=[['company', '=', company]],
+            fields=['account_number'], limit_page_length=0)
     except (ERPNextAPIError, ERPNextError):
-        return None
-    parent_num = str((parent_rows[0].get('account_number') if parent_rows else '')
-                     or '').strip()
-    if not parent_num.isdigit():
-        log.info("parent group %r has no numeric account_number; skipping child "
-                 "auto-numbering", parent_group)
-        return None
-    base = int(parent_num)
+        return set()
+    out = set()
+    for r in (rows or []):
+        n = _leading_int(r.get('account_number'))
+        if n is not None:
+            out.add(n)
+    return out
+
+
+def _next_account_number(client: ERPNextClient, company: str, parent_group: str,
+                         *, is_group: bool = False) -> str | None:
+    """Next account_number for a new child under `parent_group`, matching the
+    chart's existing numbering convention (v0.3.9). None — so the create omits the
+    field — when the chart doesn't number its accounts (parent unnumbered AND no
+    numbered siblings) or on any read error.
+
+    Scheme, discovered by inspecting siblings of the same kind (group vs leaf):
+      * with numbered siblings → max sibling number + step, where step is 1 for a
+        leaf and the siblings' spacing (default 100) for a group. So consecutive
+        leaves 1201/1202 → 1203, and hundred-spaced groups 2100/2200/2300/2400 →
+        2500;
+      * no numbered siblings yet → the parent's own (leading) number + step, e.g.
+        parent '1200' → first leaf '1201'.
+    The result is zero-padded to the siblings' width and bumped past any number
+    already used in the company, so it can't collide. Monotonic — gaps are never
+    backfilled."""
     try:
-        children = client.list_docs(
+        siblings = client.list_docs(
             ACCOUNT_DT,
             filters=[['parent_account', '=', parent_group],
-                     ['company', '=', company]],
+                     ['company', '=', company],
+                     ['is_group', '=', 1 if is_group else 0]],
             fields=['name', 'account_number'], limit_page_length=0)
     except (ERPNextAPIError, ERPNextError):
-        children = []
-    nums = [int(str(c.get('account_number')).strip()) for c in (children or [])
-            if str(c.get('account_number') or '').strip().isdigit()]
-    return str(max(nums + [base]) + 1)
+        return None
+    sib_strs = [str(c.get('account_number') or '').strip() for c in (siblings or [])]
+    nums = sorted(int(s) for s in sib_strs if s.isdigit())
+    width = max((len(s) for s in sib_strs if s.isdigit()), default=0)
+
+    if nums:
+        if is_group:
+            gaps = [b - a for a, b in zip(nums, nums[1:]) if b - a > 0]
+            step = min(gaps) if gaps else 100
+        else:
+            step = 1
+        candidate = nums[-1] + step
+    else:
+        try:
+            parent_rows = client.list_docs(
+                ACCOUNT_DT, filters=[['name', '=', parent_group]],
+                fields=['name', 'account_number'], limit_page_length=1)
+        except (ERPNextAPIError, ERPNextError):
+            return None
+        base = _leading_int(parent_rows[0].get('account_number')) if parent_rows else None
+        if base is None:
+            log.info("parent group %r has no numeric account_number and no "
+                     "numbered siblings; skipping auto-numbering", parent_group)
+            return None
+        step = 100 if is_group else 1
+        candidate = base + step
+        width = width or len(str(base))
+
+    used = _company_account_numbers(client, company)
+    bump = step if step else 1
+    while candidate in used:
+        candidate += bump
+    return str(candidate).zfill(width)
 
 
 def find_or_create_gl_account_for(client: ERPNextClient, account: PlaidAccount,
@@ -689,7 +927,9 @@ def _resolve_gl_account(client: ERPNextClient, account: PlaidAccount,
     if not company:
         return None
     try:
-        group = ensure_bank_account_group(client, company)
+        # v0.3.9: parent chosen by Plaid type — depository → Assets/Bank
+        # Accounts, credit → Current Liabilities/Credit Cards, loan → Loans.
+        group = resolve_gl_parent(client, account, company)
         if not group:
             return None
         return find_or_create_gl_account_for(client, account, group, company,

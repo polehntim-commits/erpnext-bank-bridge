@@ -26,7 +26,7 @@ from app import erpnext_accounts, erpnext_bank, erpnext_settings  # noqa: E402
 from app.erpnext_client import ERPNextError  # noqa: E402
 from app.models import PlaidAccount, PlaidItem, PlaidSyncLog  # noqa: E402
 
-from tests.fakes import FakeERPClient  # noqa: E402
+from tests.fakes import FakeERPClient, FakeFrappe  # noqa: E402
 
 
 class ImportBase(unittest.TestCase):
@@ -1109,6 +1109,288 @@ class TestFuzzyProbeAndModal(ImportBase):
         self.assertEqual(len(leaves), 0)   # reused, nothing created
         a = PlaidAccount.query.filter_by(account_id='acct-1').first()
         self.assertEqual(a.erpnext_gl_account_name, 'Wells Fargo Checking - EC')
+
+
+class TestGLParentByType(ImportBase):
+    """v0.3.9 · the GL leaf's parent group is chosen by Plaid type — depository
+    stays on the Assets side (Bank Accounts), credit lands under Current
+    Liabilities → Credit Cards, loan under Loans. The leaf's account_type is
+    always 'Bank' so Bank Reconciliation still works on it."""
+
+    COMPANY = 'Example Company LLC'
+
+    def _leaf_creates(self, erp):
+        return [c for c in erp.creates_of('Account') if c[2].get('is_group') == 0]
+
+    def _group_create(self, erp, account_name):
+        return next((c[2] for c in erp.creates_of('Account')
+                     if c[2].get('is_group') == 1
+                     and c[2]['account_name'] == account_name), None)
+
+    def test_depository_lands_under_bank_accounts(self):
+        self._item(institution='Wells Fargo')
+        self._account('acct-chk', subtype='checking', mask='0000')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1,
+             'account_type': 'Bank', 'root_type': 'Asset'}])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-chk', client=erp)
+        leaf = self._leaf_creates(erp)[0][2]
+        self.assertEqual(leaf['parent_account'], 'Bank Accounts - EC')
+        self.assertEqual(leaf['account_type'], 'Bank')
+
+    def test_credit_card_lands_under_credit_cards_liability(self):
+        self._item(institution='Red Plaidypus Bank')
+        self._account('acct-cc', subtype='credit card', type_='credit', mask='9999')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1,
+             'account_type': 'Bank', 'root_type': 'Asset'},
+            {'account_name': 'Current Liabilities', 'is_group': 1,
+             'root_type': 'Liability'}])
+        result = erpnext_accounts.import_plaid_account_to_erpnext('acct-cc', client=erp)
+        self.assertEqual(result['status'], 'imported')
+        # A Credit Cards group was auto-created under Current Liabilities …
+        grp = self._group_create(erp, 'Credit Cards')
+        self.assertIsNotNone(grp)
+        self.assertEqual(grp['parent_account'], 'Current Liabilities - EC')
+        # … and the card leaf lives under it, still account_type Bank.
+        leaf = self._leaf_creates(erp)[0][2]
+        self.assertEqual(leaf['parent_account'], 'Credit Cards - EC')
+        self.assertEqual(leaf['account_type'], 'Bank')
+        # The Bank Account links the liability-side leaf and stays a company acct.
+        ba_doc = erp.creates_of('Bank Account')[0][2]
+        self.assertEqual(ba_doc['account'], leaf['account_name'] + ' - EC')
+        self.assertEqual(ba_doc['is_company_account'], 1)
+
+    def test_credit_card_reuses_existing_credit_cards_group(self):
+        self._item(institution='Red Plaidypus Bank')
+        self._account('acct-cc', subtype='credit card', type_='credit', mask='9999')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Current Liabilities', 'is_group': 1,
+             'root_type': 'Liability'},
+            {'account_name': 'Credit Cards', 'is_group': 1, 'root_type': 'Liability',
+             'parent_account': 'Current Liabilities - EC'}])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-cc', client=erp)
+        # No new group created — the existing Credit Cards group is reused.
+        self.assertIsNone(self._group_create(erp, 'Credit Cards'))
+        leaf = self._leaf_creates(erp)[0][2]
+        self.assertEqual(leaf['parent_account'], 'Credit Cards - EC')
+
+    def test_resolve_gl_parent_loan_lands_under_longterm_liabilities(self):
+        # Loans are gated out by is_supported in the real flow, but the parent
+        # resolver still maps them correctly: loan → Loans under Long-term
+        # Liabilities when that branch exists.
+        self._item()
+        a = self._account('acct-loan', subtype='', type_='loan')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Current Liabilities', 'is_group': 1,
+             'root_type': 'Liability'},
+            {'account_name': 'Long-term Liabilities', 'is_group': 1,
+             'root_type': 'Liability'}])
+        parent = erpnext_accounts.resolve_gl_parent(erp, a, self.COMPANY)
+        self.assertEqual(parent, 'Loans - EC')
+        grp = self._group_create(erp, 'Loans')
+        self.assertEqual(grp['parent_account'], 'Long-term Liabilities - EC')
+
+    def test_resolve_gl_parent_loan_falls_back_to_current_liabilities(self):
+        self._item()
+        a = self._account('acct-loan', subtype='', type_='loan')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Current Liabilities', 'is_group': 1,
+             'root_type': 'Liability'}])   # no Long-term branch
+        parent = erpnext_accounts.resolve_gl_parent(erp, a, self.COMPANY)
+        self.assertEqual(parent, 'Loans - EC')
+        grp = self._group_create(erp, 'Loans')
+        self.assertEqual(grp['parent_account'], 'Current Liabilities - EC')
+
+    def test_resolve_gl_parent_reuses_stock_loans_liabilities_group(self):
+        self._item()
+        a = self._account('acct-loan', subtype='', type_='loan')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Loans (Liabilities)', 'is_group': 1,
+             'root_type': 'Liability'}])
+        parent = erpnext_accounts.resolve_gl_parent(erp, a, self.COMPANY)
+        self.assertEqual(parent, 'Loans (Liabilities) - EC')
+        self.assertIsNone(self._group_create(erp, 'Loans'))   # reused, not created
+
+    def test_gl_side_classification(self):
+        self._item()
+        dep = self._account('d', subtype='savings')
+        cc = self._account('c', subtype='credit card', type_='credit')
+        loc = self._account('l', subtype='line of credit', type_='credit')
+        ln = self._account('n', subtype='', type_='loan')
+        self.assertEqual(erpnext_accounts._gl_side(dep), 'depository')
+        self.assertEqual(erpnext_accounts._gl_side(cc), 'credit')
+        self.assertEqual(erpnext_accounts._gl_side(loc), 'credit')
+        self.assertEqual(erpnext_accounts._gl_side(ln), 'loan')
+
+
+class TestPreciseSubtype(ImportBase):
+    """v0.3.9 · account_subtype maps 1:1 onto the 10 provisioned Bank Account
+    Subtype masters, replacing the coarse Current/Other buckets."""
+
+    def test_precise_subtype_mapping(self):
+        self._item()
+        cases = {
+            ('checking', 'depository'): 'Checking',
+            ('savings', 'depository'): 'Savings',
+            ('cd', 'depository'): 'Cd',
+            ('money market', 'depository'): 'Money Market',
+            ('cash management', 'depository'): 'Cash Management',
+            ('paypal', 'depository'): 'Paypal',
+            ('credit card', 'credit'): 'Credit Card',
+            ('line of credit', 'credit'): 'Line Of Credit',
+        }
+        for i, ((st, ty), expected) in enumerate(cases.items()):
+            a = self._account(f'ps-{i}', subtype=st, type_=ty)
+            self.assertEqual(erpnext_accounts.erpnext_account_subtype(a), expected,
+                             f'{ty}/{st}')
+
+    def test_credit_type_without_subtype_reads_credit_card(self):
+        self._item()
+        a = self._account('cc-x', subtype='', type_='credit')
+        self.assertEqual(erpnext_accounts.erpnext_account_subtype(a), 'Credit Card')
+
+    def test_unmapped_subtype_falls_back_to_other(self):
+        self._item()
+        a = self._account('u-x', subtype='prepaid', type_='depository')
+        self.assertEqual(erpnext_accounts.erpnext_account_subtype(a), 'Other')
+
+    def test_import_sends_precise_subtype(self):
+        self._item(institution='Red Plaidypus Bank')
+        self._account('acct-cc', subtype='credit card', type_='credit', mask='9999')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Current Liabilities', 'is_group': 1,
+             'root_type': 'Liability'}])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-cc', client=erp)
+        ba_doc = erp.creates_of('Bank Account')[0][2]
+        self.assertEqual(ba_doc['account_subtype'], 'Credit Card')
+
+
+class TestGroupAccountNumbering(ImportBase):
+    """v0.3.9 · auto-created GROUP accounts get an account_number in the parent's
+    range, and the leaf numbering handles range-numbered parents (e.g. Current
+    Liabilities '2100-2400')."""
+
+    COMPANY = 'Example Company LLC'
+
+    def _group_create(self, erp, account_name):
+        return next((c[2] for c in erp.creates_of('Account')
+                     if c[2].get('is_group') == 1
+                     and c[2]['account_name'] == account_name), None)
+
+    def test_group_number_from_hundred_spaced_siblings(self):
+        # Current Liabilities children 2100/2200/2300/2400 → new group 2500.
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Current Liabilities', 'is_group': 1,
+             'root_type': 'Liability', 'account_number': '2100-2400'},
+            {'account_name': 'Accounts Payable', 'is_group': 1,
+             'account_number': '2100', 'parent_account': 'Current Liabilities - EC'},
+            {'account_name': 'Duties and Taxes', 'is_group': 1,
+             'account_number': '2300', 'parent_account': 'Current Liabilities - EC'},
+            {'account_name': 'Loans (Liabilities)', 'is_group': 1,
+             'account_number': '2400', 'parent_account': 'Current Liabilities - EC'}])
+        erpnext_accounts.ensure_credit_card_group(erp, self.COMPANY)
+        grp = self._group_create(erp, 'Credit Cards')
+        self.assertEqual(grp['account_number'], '2500')
+
+    def test_group_number_skipped_when_chart_unnumbered(self):
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Current Liabilities', 'is_group': 1,
+             'root_type': 'Liability'}])   # no numbers anywhere
+        erpnext_accounts.ensure_credit_card_group(erp, self.COMPANY)
+        grp = self._group_create(erp, 'Credit Cards')
+        self.assertNotIn('account_number', grp)
+
+    def test_credit_card_leaf_numbered_from_range_parent(self):
+        # Card leaf under the newly-numbered Credit Cards group (2500) → 2501.
+        self._item(institution='Red Plaidypus Bank')
+        self._account('acct-cc', subtype='credit card', type_='credit', mask='9999')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Current Liabilities', 'is_group': 1,
+             'root_type': 'Liability', 'account_number': '2100-2400'},
+            {'account_name': 'Loans (Liabilities)', 'is_group': 1,
+             'account_number': '2400', 'parent_account': 'Current Liabilities - EC'}])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-cc', client=erp)
+        leaf = next(c[2] for c in erp.creates_of('Account')
+                    if c[2].get('is_group') == 0)
+        self.assertEqual(leaf['account_number'], '2501')
+
+
+class TestCreditCardMigrationScript(unittest.TestCase):
+    """v0.3.9 · the retroactive migration (scripts/migrate_credit_cards_to_
+    liabilities.py) moves credit-card GL accounts to Current Liabilities → Credit
+    Cards and is idempotent (a second run changes nothing)."""
+
+    def setUp(self):
+        import importlib.util
+        here = os.path.dirname(__file__)
+        path = os.path.join(here, '..', 'scripts',
+                            'migrate_credit_cards_to_liabilities.py')
+        spec = importlib.util.spec_from_file_location('_mig_cc', path)
+        self.mig = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mig)
+
+    def _fake(self):
+        return FakeFrappe(
+            accounts={
+                'Source of Funds (Liabilities) - TEST': dict(
+                    account_name='Source of Funds (Liabilities)', parent_account='',
+                    company='Testing', is_group=1, root_type='Liability',
+                    account_number='2000'),
+                '2100-2400 - Current Liabilities - TEST': dict(
+                    account_name='Current Liabilities',
+                    parent_account='Source of Funds (Liabilities) - TEST',
+                    company='Testing', is_group=1, root_type='Liability',
+                    account_number='2100-2400'),
+                '1200 - Bank Accounts - TEST': dict(
+                    account_name='Bank Accounts',
+                    parent_account='Current Assets - TEST', company='Testing',
+                    is_group=1, root_type='Asset', account_type='Bank',
+                    account_number='1200'),
+                'RP Credit Card - 3333 - TEST': dict(
+                    account_name='RP Credit Card - 3333',
+                    parent_account='1200 - Bank Accounts - TEST', company='Testing',
+                    is_group=0, root_type='Asset', account_type='Bank'),
+                'RP Credit Card - 9999 - TEST': dict(
+                    account_name='RP Credit Card - 9999',
+                    parent_account='2100-2400 - Current Liabilities - TEST',
+                    company='Testing', is_group=0, root_type='Liability',
+                    account_type='Current Liability'),
+            },
+            bank_accounts=[
+                {'name': 'RP Credit Card - 3333 - RP',
+                 'account': 'RP Credit Card - 3333 - TEST', 'account_type': 'Credit'},
+                {'name': 'RP Credit Card - 9999 - RP',
+                 'account': 'RP Credit Card - 9999 - TEST', 'account_type': 'Credit'},
+                {'name': 'RP Checking - 0000 - RP',
+                 'account': 'RP Checking - 0000 - TEST', 'account_type': 'Current'},
+            ])
+
+    def test_moves_both_cards_and_fixes_type(self):
+        fake = self._fake()
+        moved = self.mig.run(fake)
+        self.assertEqual(set(moved),
+                         {'RP Credit Card - 3333 - TEST',
+                          'RP Credit Card - 9999 - TEST'})
+        # The Credit Cards group was created under Current Liabilities.
+        grp = fake.accounts.get('Credit Cards - TEST')
+        self.assertIsNotNone(grp)
+        self.assertEqual(grp['parent_account'],
+                         '2100-2400 - Current Liabilities - TEST')
+        # Both cards now sit under it, account_type forced back to Bank.
+        for gl in ('RP Credit Card - 3333 - TEST', 'RP Credit Card - 9999 - TEST'):
+            self.assertEqual(fake.accounts[gl]['parent_account'], 'Credit Cards - TEST')
+            self.assertEqual(fake.accounts[gl]['account_type'], 'Bank')
+
+    def test_second_run_is_idempotent(self):
+        fake = self._fake()
+        self.mig.run(fake)
+        moved2 = self.mig.run(fake)
+        self.assertEqual(moved2, [])
+        # And no duplicate Credit Cards group was created.
+        groups = [n for n, a in fake.accounts.items()
+                  if a.get('account_name') == 'Credit Cards']
+        self.assertEqual(len(groups), 1)
 
 
 if __name__ == '__main__':
