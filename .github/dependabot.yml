@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: MIT
+# Dependabot configuration for ERPNext Bank Bridge.
+# Reference: https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+#
+# Weekly updates, grouped where sensible, all targeting `main` and labelled
+# `dependencies`. Covers the two dependency surfaces this repo actually ships:
+# the Python requirements (app/requirements.txt) and the container base image
+# (app/Dockerfile). A github-actions entry is intentionally omitted — there are
+# no workflows under .github/workflows/ yet; add one here when the first lands.
+version: 2
+updates:
+  # Python dependencies (Flask, SQLAlchemy, plaid-python, …).
+  - package-ecosystem: "pip"
+    directory: "/app"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+    labels:
+      - "dependencies"
+      - "python"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+
+  # Container base image (python:3.11-slim) + any pinned apt/pip layers.
+  - package-ecosystem: "docker"
+    directory: "/app"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+    labels:
+      - "dependencies"
+      - "docker"
