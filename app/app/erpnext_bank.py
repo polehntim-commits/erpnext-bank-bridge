@@ -116,7 +116,14 @@ def list_companies(client: ERPNextClient | None = None) -> list[str]:
     return [r['name'] for r in rows if r.get('name')]
 
 
-def list_accounts(client: ERPNextClient | None = None) -> list[dict]:
+# Sentinel for list_accounts(company=…): distinguishes "caller didn't specify a
+# company" (→ back-compat default-Company scoping) from "caller explicitly wants
+# ALL Companies" (company=None/'' → no company filter).
+_COMPANY_UNSET = object()
+
+
+def list_accounts(client: ERPNextClient | None = None, *,
+                  company=_COMPANY_UNSET) -> list[dict]:
     """Non-group ERPNext GL Accounts (Chart of Accounts leaves) for the rule
     offset-account dropdown. Ordered by name so the picker is tidy.
 
@@ -124,18 +131,29 @@ def list_accounts(client: ERPNextClient | None = None) -> list[dict]:
     `is_group=0` (leaves, not the parent groups the auto-CoA import creates) and
     `disabled=0` — but deliberately NOT by account_type/root_type, so every leaf
     (Bank, Cash, Expense, Income, …), including the auto-created Bank Accounts
-    under the '1200' group, is offered. Scoped to the configured default company
-    when one is set so a multi-company instance doesn't cross-list. `limit_page_
-    length=0` returns every match (no 20-row default cap that would hide
-    accounts)."""
+    under the '1200' group, is offered. `limit_page_length=0` returns every match
+    (no 20-row default cap that would hide accounts).
+
+    v0.4.0.2 — Company scoping is now explicit, to fix cross-Company posting:
+      * `company` omitted  → back-compat: scope to the configured default
+        Company (unchanged callers keep their old behaviour);
+      * `company='Acme'`   → scope to that Company's chart only;
+      * `company=None`/`''` → NO company filter — every Company's leaves, so the
+        caller can render them all with their Company suffix and force a
+        conscious choice.
+    The `company` field is returned on every row so callers can group / label by
+    owning Company and validate a chosen account against a target Company."""
     client = client or get_client()
     filters = [['is_group', '=', 0], ['disabled', '=', 0]]
-    company = (erpnext_settings.load().get('default_company') or '').strip()
+    if company is _COMPANY_UNSET:
+        company = (erpnext_settings.load().get('default_company') or '').strip()
+    else:
+        company = (company or '').strip()
     if company:
         filters.append(['company', '=', company])
     return client.list_docs(
         'Account', filters=filters,
-        fields=['name', 'account_type', 'root_type'],
+        fields=['name', 'account_name', 'company', 'account_type', 'root_type'],
         order_by='name asc', limit_page_length=0)
 
 

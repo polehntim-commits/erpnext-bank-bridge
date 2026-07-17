@@ -42,6 +42,9 @@ EVENT_TYPES = (
     'journal_entry_edited',
     'journal_entry_submitted_to_erpnext',
     'journal_entry_failed',
+    # v0.4.0.2 — push-time cross-Company guard refused a JE whose account(s)
+    # belong to a different Company than the target Bank Account.
+    'journal_entry_blocked_cross_company',
     'bank_transaction_synced',
     'bank_transaction_reconciled',
     'sync_run_started',

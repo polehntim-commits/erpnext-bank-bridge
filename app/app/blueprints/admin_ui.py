@@ -233,6 +233,9 @@ def set_company_scope():
     blank `company` clears the scope back to 'all Companies'. Redirects to the
     caller's `next` path (local-only, to avoid an open redirect)."""
     session['scope_company'] = (request.args.get('company') or '').strip()
+    # The offset-account feed is cached per Company; a scope change must not let
+    # the dropdown keep serving the previous Company's accounts (v0.4.0.2).
+    _invalidate_accounts_cache()
     nxt = request.args.get('next') or '/admin'
     if not nxt.startswith('/') or nxt.startswith('//'):
         nxt = '/admin'
@@ -1107,29 +1110,105 @@ def known_categories_api():
     return jsonify({'categories': out})
 
 
-def _erpnext_account_names() -> list:
-    """ERPNext GL Account docnames for the rule offset-account dropdown.
-    Best-effort — an empty list (ERPNext down / unconfigured) just means the
-    field is free-text, which still works."""
+# ── offset-account dropdown: Company-scoped feed (v0.4.0.2) ────────────────
+#
+# The Offset Account picker must only offer GL Accounts from the Company that
+# owns the rule — otherwise a rule authored while scoped to Company X could pick
+# Company Y's expense account and post a cross-Company Journal Entry. The
+# effective Company is resolved per-request (see _offset_account_company) and the
+# ERPNext result is cached per Company for the session lifetime, so paging around
+# the admin UI doesn't re-hit ERPNext for the same list. `set_company` clears the
+# cache so a scope change is reflected immediately.
+_ACCOUNTS_CACHE_KEY = 'bankbridge_offset_account_cache'
+# Cache-key marker for the explicit all-Companies feed (company='' means "no
+# filter" to list_accounts, so we key it distinctly from the None default).
+_ALL_COMPANIES_KEY = '\x00ALL'
+
+
+def _accounts_cache() -> dict | None:
+    """The per-app {company_key: [account dicts]} cache, or None without an app
+    context. Process-local (single-operator bridge) and reset on restart."""
+    try:
+        return current_app.extensions.setdefault(_ACCOUNTS_CACHE_KEY, {})
+    except RuntimeError:  # pragma: no cover - no app context (defensive)
+        return None
+
+
+def _invalidate_accounts_cache() -> None:
+    """Drop every cached offset-account list — called when the session Company
+    scope changes so the dropdown can't serve another Company's accounts."""
+    cache = _accounts_cache()
+    if cache is not None:
+        cache.clear()
+
+
+def _offset_account_company(rule_company: str | None) -> str | None:
+    """The effective Company whose GL Accounts the Offset Account dropdown should
+    offer, resolved in priority order (v0.4.0.2):
+
+      1. the rule's own `applies_to_company` (`rule_company`) when set — a rule
+         scoped to Company X must draw its offset from X's chart;
+      2. else the active session scope (the navbar switcher) when set;
+      3. else None — no scope anywhere, so offer EVERY Company's accounts (each
+         carries its Company suffix in the docname) and force a conscious pick.
+
+    Returns the Company name for cases 1-2, or None for case 3."""
+    rc = (rule_company or '').strip()
+    if rc:
+        return rc
+    scope = _current_company()
+    if scope:
+        return scope
+    return None
+
+
+def _erpnext_account_names(rule_company: str | None = None) -> list:
+    """ERPNext GL Account docnames for the rule offset-account dropdown, scoped to
+    the effective Company (rule scope → session scope → all). Cached per Company
+    for the session lifetime. Best-effort — an empty list (ERPNext down /
+    unconfigured) just means the field is free-text, which still works.
+
+    When the effective Company is None (case 3: no scope at all), every Company's
+    leaves are returned; the docname already ends in ` - <company_abbr>`, so the
+    operator sees which Company each account belongs to and picks deliberately."""
     if not erps.is_configured():
         return []
+    company = _offset_account_company(rule_company)
+    cache = _accounts_cache()
+    key = company if company else _ALL_COMPANIES_KEY
+    if cache is not None and key in cache:
+        return cache[key]
     try:
-        return [a['name'] for a in erpnext_bank.list_accounts()]
+        # company=None → list_accounts(company=None) → NO filter (all Companies);
+        # a real name → that Company only.
+        rows = erpnext_bank.list_accounts(company=company)
+        names = [a['name'] for a in rows]
     except (ERPNextConfigError, ERPNextError):
         return []
+    if cache is not None:
+        cache[key] = names
+    return names
 
 
 @bp.get('/api/rules/known_accounts')
 def known_accounts_api():
     """Autocomplete feed for the offset_account field: ERPNext GL Account
-    docnames (Chart-of-Accounts leaves). The docname is already the
-    `<account_number> - <account_name> - <company_abbr>` display string, so the
-    dropdown matches + renders it directly. Best-effort — an empty list
-    (ERPNext down / unconfigured) just leaves the field as free-text.
+    docnames (Chart-of-Accounts leaves) for the effective Company. The docname is
+    already the `<account_number> - <account_name> - <company_abbr>` display
+    string, so the dropdown matches + renders it directly. Best-effort — an empty
+    list (ERPNext down / unconfigured) just leaves the field as free-text.
+
+    v0.4.0.2 — the caller passes `?company=` with the rule's Applies-to-Company
+    select value so the feed follows the rule's scope; an empty/absent value
+    falls back to the session scope, and only a fully-unscoped context lists every
+    Company's accounts. This is what stops a rule from silently drawing its offset
+    from the ERPNext default Company's chart.
 
     Fed to the shared BankBridgeDropdown (v0.3.4) that replaced the native
     <datalist>, which Safari collapsed mid-type."""
-    return jsonify({'accounts': _erpnext_account_names()})
+    rule_company = (request.args.get('company') or '').strip()
+    return jsonify({'accounts': _erpnext_account_names(rule_company),
+                    'company': _offset_account_company(rule_company) or ''})
 
 
 RULES_BODY = """
@@ -1379,6 +1458,7 @@ RULES_BODY = """
   var nameHint = document.getElementById('name-hint');
   var oa = document.getElementById('offset-account');
   var oaDD = document.getElementById('oa-dd');
+  var companySel = document.querySelector('select[name=applies_to_company]');
   var CK = 'bb_known_merchants', CC = 'bb_known_categories',
       CA = 'bb_known_accounts';
   var merchants = [], categories = [], accounts = [];
@@ -1389,29 +1469,51 @@ RULES_BODY = """
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; });
   }
 
+  // The offset-account feed is Company-scoped (v0.4.0.2): the rule's
+  // Applies-to-Company select drives which chart's accounts are offered, so the
+  // sessionStorage cache is keyed per Company and re-fetched whenever the scope
+  // changes. Merchants + categories are Company-agnostic and stay globally cached.
+  function accountCompany() {
+    return companySel ? (companySel.value || '') : '';
+  }
+  function accountsCacheKey() { return CA + '::' + accountCompany(); }
+
+  function loadAccounts(force) {
+    var ck = accountsCacheKey();
+    var have = !force && sessionStorage.getItem(ck);
+    if (have) {
+      try { accounts = JSON.parse(have); } catch (e) { accounts = []; }
+      onData(); return;
+    }
+    fetch('/api/rules/known_accounts?company=' +
+          encodeURIComponent(accountCompany()))
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        accounts = (res && res.accounts) || [];
+        try { sessionStorage.setItem(ck, JSON.stringify(accounts)); } catch (e) {}
+        onData();
+      }).catch(function () { onData(); });
+  }
+
   function load(force) {
+    loadAccounts(force);
     var haveM = !force && sessionStorage.getItem(CK);
     var haveC = !force && sessionStorage.getItem(CC);
-    var haveA = !force && sessionStorage.getItem(CA);
-    if (haveM && haveC && haveA) {
+    if (haveM && haveC) {
       try {
         merchants = JSON.parse(haveM); categories = JSON.parse(haveC);
-        accounts = JSON.parse(haveA);
-      } catch (e) { merchants = []; categories = []; accounts = []; }
+      } catch (e) { merchants = []; categories = []; }
       onData(); return;
     }
     Promise.all([
       fetch('/api/rules/known_merchants').then(function (r) { return r.json(); }),
-      fetch('/api/rules/known_categories').then(function (r) { return r.json(); }),
-      fetch('/api/rules/known_accounts').then(function (r) { return r.json(); })
+      fetch('/api/rules/known_categories').then(function (r) { return r.json(); })
     ]).then(function (res) {
       merchants = (res[0] && res[0].merchants) || [];
       categories = (res[1] && res[1].categories) || [];
-      accounts = (res[2] && res[2].accounts) || [];
       try {
         sessionStorage.setItem(CK, JSON.stringify(merchants));
         sessionStorage.setItem(CC, JSON.stringify(categories));
-        sessionStorage.setItem(CA, JSON.stringify(accounts));
       } catch (e) {}
       onData();
     }).catch(function () { onData(); });
@@ -1556,6 +1658,11 @@ RULES_BODY = """
   if (refresh) refresh.addEventListener('click', function (e) {
     e.preventDefault(); refresh.textContent = '↻ …'; load(true);
     setTimeout(function () { refresh.textContent = '↻ refresh'; }, 600); });
+  // Re-scope the offset-account feed when the rule's Company changes, so the
+  // picker never offers another Company's chart (v0.4.0.2).
+  if (companySel) companySel.addEventListener('change', function () {
+    accounts = []; loadAccounts(false);
+  });
 
   load(false);
 })();

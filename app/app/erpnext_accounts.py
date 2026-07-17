@@ -373,6 +373,57 @@ def company_drift(client: ERPNextClient, account: PlaidAccount) -> tuple | None:
     return None
 
 
+def account_company(client: ERPNextClient, account_name: str,
+                    cache: dict | None = None) -> str:
+    """The `company` field of an ERPNext GL Account (Chart-of-Accounts leaf), or
+    '' if it can't be read (missing doc / connection error). Best-effort: never
+    raises. `cache` (an optional {account_name: company} dict) memoizes lookups
+    across a push batch so the same account isn't re-fetched per Journal Entry."""
+    name = (account_name or '').strip()
+    if not name:
+        return ''
+    if cache is not None and name in cache:
+        return cache[name]
+    company = ''
+    try:
+        doc = client.get_doc(ACCOUNT_DT, name)
+    except (ERPNextAPIError, ERPNextError):
+        doc = None
+    if doc:
+        company = (doc.get('company') or '').strip()
+    if cache is not None:
+        cache[name] = company
+    return company
+
+
+def je_company_mismatches(client: ERPNextClient, doc: dict,
+                          cache: dict | None = None) -> list[dict]:
+    """Cross-Company guard (v0.4.0.2): every GL account referenced by a Journal
+    Entry payload must belong to the JE's own `company`. Returns a list of
+    mismatch dicts ({account, account_company, expected}) — empty when every line
+    is aligned (the safe case) or when the target company / an account's company
+    can't be determined (best-effort: an unreadable account is not treated as a
+    mismatch, so a transient ERPNext read error never blocks a legitimate JE).
+
+    This is the belt-and-suspenders behind the scoped Offset Account dropdown:
+    even if a mis-scoped rule slips through the UI, the push refuses to post into
+    another entity's books."""
+    expected = (doc.get('company') or '').strip()
+    if not expected:
+        return []
+    mismatches = []
+    for line in (doc.get('accounts') or []):
+        acct = (line.get('account') or '').strip()
+        if not acct:
+            continue
+        acct_company = account_company(client, acct, cache)
+        if acct_company and acct_company != expected:
+            mismatches.append({'account': acct,
+                               'account_company': acct_company,
+                               'expected': expected})
+    return mismatches
+
+
 def _default_is_company_account() -> int:
     """1 to mark imported Bank Accounts as company accounts, else 0. Driven by
     ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT (default True). When False we send 0 up

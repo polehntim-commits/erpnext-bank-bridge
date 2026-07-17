@@ -472,6 +472,31 @@ def generate_journal_entry(client, row, *, supplier_name=None,
     try:
         doc = build_journal_entry(rule, row, company,
                                   supplier_name=supplier_name, remark=remark)
+        # v0.4.0.2 retroactive guard: refuse to post a JE that references a GL
+        # account from a different Company than the target (belt-and-suspenders
+        # behind the scoped Offset Account dropdown). A mismatch is a blocked,
+        # not a failed, JE — it's a configuration error, not a transient one.
+        mismatches = erpnext_accounts.je_company_mismatches(client, doc)
+        if mismatches:
+            detail = '; '.join(
+                f"{m['account']} belongs to {m['account_company']}, "
+                f"not {m['expected']}" for m in mismatches)
+            msg = ('Blocked: cross-Company account reference — ' + detail
+                   + '. Re-scope the rule (Applies to Company) or pick an '
+                   'Offset Account under the transaction\'s Company.')
+            gje.state = 'blocked'
+            gje.error_message = msg[:2000]
+            gje.updated_at = _now()
+            db.session.commit()
+            log.warning('Journal Entry BLOCKED (cross-Company) for %s: %s',
+                        tid, detail)
+            audit.record('journal_entry_blocked_cross_company',
+                         subject_type='GeneratedJournalEntry', subject_id=gje.id,
+                         after={'plaid_transaction_id': tid, 'rule_id': rule.id,
+                                'rule_name': rule.name, 'company': company,
+                                'mismatches': mismatches},
+                         notes=f'rule “{rule.name}” blocked — {detail}')
+            return gje
         created = client.create_doc(JOURNAL_ENTRY_DT, doc)
         name = created.get('name')
         if not name:

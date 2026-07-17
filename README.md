@@ -165,6 +165,23 @@ filter plus a persistent "Viewing … for {Company}" header. Rules can now be
 company-agnostic, applies everywhere) that the rules engine honours, firing a
 scoped rule only for transactions whose bank account resolves to that Company.
 
+**v0.4.0.2** — fixes a cross-Company posting bug in the Rules editor. The
+**Offset Account** dropdown was scoped to the ERPNext *default* Company
+regardless of the rule's or the operator's scope, so a rule authored while scoped
+to Company X could silently pick Company Y's expense account and post a Journal
+Entry into the wrong entity's books. The dropdown now resolves its Company in
+priority order — the rule's **Applies to Company** first, then the active session
+scope, and only when neither is set does it list **every** Company's accounts
+(each shown with its `- <abbr>` Company suffix so the choice is deliberate). The
+feed re-scopes live when the rule's Company select changes, and is cached per
+Company for the session (invalidated when the navbar scope switches). As a
+belt-and-suspenders backstop, a **push-time guard** now refuses to post any
+Journal Entry whose referenced GL account belongs to a different Company than the
+target — it marks the JE `blocked`, records a
+`journal_entry_blocked_cross_company` audit event, and never touches ERPNext —
+so even a mis-scoped rule that slips through can't corrupt another entity's
+ledger.
+
 ## How it works
 
 1. **Link a bank once** through Plaid Link (`/admin/link_bank`). OAuth-only

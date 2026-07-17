@@ -213,11 +213,13 @@ class TestDropdownAssetWiring(_AppBase):
 
     def test_known_accounts_endpoint_returns_accounts_shape(self):
         # The offset-account dropdown fetches from this endpoint. Unconfigured
-        # ERPNext → an empty list (field stays free-text), never an error.
+        # ERPNext → an empty list (field stays free-text), never an error. v0.4.0.2
+        # also echoes the resolved `company` (empty here — no scope) so the caller
+        # can label the feed; `accounts` stays the load-bearing field.
         r = self.client.get('/api/rules/known_accounts')
         self.assertEqual(r.status_code, 200)
         self.assertIn('json', r.headers.get('Content-Type', ''))
-        self.assertEqual(r.get_json(), {'accounts': []})
+        self.assertEqual(r.get_json(), {'accounts': [], 'company': ''})
 
 
 if __name__ == '__main__':
