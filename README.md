@@ -58,7 +58,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.0 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.0.1 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -139,6 +139,18 @@ Investments* (subdivided into Retirement / Marketable Securities / Digital Asset
 skipped (Plaid returns no investment transactions without the `investments`
 product). **(4)** New **PRIVACY.md** and **TERMS.md** for open-source disclosure.
 Backward-compatible: existing installs upgrade with no manual steps.
+
+**v0.4.0.1** — hotfix for the v0.4.0 upgrade path. The startup migration runner
+adds the new `owning_company` / `balance_only` columns via inspected
+`ALTER TABLE … ADD COLUMN`, but on an existing (v0.3.x) database the v0.3.1 rule
+backfill — which issues `PlaidAccount.query`, a SELECT that lists *every* model
+column — ran **before** those columns were added, raised `UndefinedColumn`, and
+the fail-open handler swallowed the remaining ADDs. The columns never landed and
+every later `PlaidItem` query 500'd (`column plaid_items.owning_company does not
+exist`). Fixed by ordering all additive `ADD COLUMN` steps (now a single
+`SCHEMA_MIGRATIONS` list) ahead of every ORM-based backfill, so the schema is
+fully migrated before any model is queried. Fresh installs are unaffected (a
+silent no-op). Existing v0.3.x → v0.4.0.1 upgrades now migrate cleanly on boot.
 
 ## How it works
 

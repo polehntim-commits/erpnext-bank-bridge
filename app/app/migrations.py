@@ -23,22 +23,60 @@ from . import db
 log = logging.getLogger('bankbridge.migrations')
 
 
-def _add_column_if_missing(table: str, column: str, ddl_type: str,
-                           default_sql: str | None = None) -> None:
-    """ADD COLUMN <column> <ddl_type> [DEFAULT <default_sql>] on <table> when it
-    isn't already there. Portable across Postgres (production) and SQLite
-    (tests): both support the plain `ALTER TABLE … ADD COLUMN` form used here."""
+# Every additive column an upgrade has introduced, oldest first, as
+# (table, column, ddl). `ddl` is the full definition that follows the column
+# name — a type plus any DEFAULT, e.g. 'VARCHAR(140)' or 'BOOLEAN DEFAULT
+# false'. Each is applied by _add_column_if_missing (an inspected, idempotent
+# ADD COLUMN) in run_migrations, BEFORE any data backfill runs.
+#
+# To ship a new additive column: add the db.Column to the model AND append one
+# line here. That's the whole migration — no Alembic, no revision files.
+SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
+    # v0.1.1 — one-click account import: track which Plaid accounts have been
+    # auto-provisioned into ERPNext.
+    ('plaid_accounts', 'import_status', "VARCHAR(20) DEFAULT 'pending'"),
+    # v0.2.0 — the created/linked GL Account docname for an imported company
+    # Bank Account.
+    ('plaid_accounts', 'erpnext_gl_account_name', 'TEXT'),
+    # v0.3.0 — non-destructive rule history (supersede/archive).
+    ('categorization_rules', 'superseded_by', 'INTEGER'),
+    ('categorization_rules', 'archived', 'BOOLEAN DEFAULT false'),
+    # v0.3.0 — audit cross-link from the HTTP-level sync log to an AuditEvent.
+    ('plaid_sync_log', 'subject_id', 'VARCHAR(120)'),
+    # v0.3.1 — bank-account-agnostic rules: a rule names only the offset
+    # (categorized) side; the bank side comes from the transaction's account.
+    ('categorization_rules', 'offset_account', "VARCHAR(255) DEFAULT ''"),
+    ('categorization_rules', 'offset_direction', "VARCHAR(20) DEFAULT 'auto'"),
+    # v0.4.0 — multi-entity L1: the owning ERPNext Company, chosen at Plaid Link
+    # time on the Item and inherited (overridable) per account. Both backfill to
+    # NULL on an existing install, which the push path resolves to the ERPNext
+    # default Company — so v0.3.9 installs keep working with no manual step.
+    ('plaid_items', 'owning_company', 'VARCHAR(140)'),
+    ('plaid_accounts', 'owning_company', 'VARCHAR(140)'),
+    # v0.4.0 — balance-only investment support: flag Plaid investment accounts
+    # so the sync loop skips /transactions/sync for them. Backfills to false;
+    # the flag is re-derived from type/subtype on the next account refresh.
+    ('plaid_accounts', 'balance_only', 'BOOLEAN DEFAULT false'),
+]
+
+
+def _add_column_if_missing(table: str, column: str, ddl: str) -> None:
+    """ADD COLUMN <column> <ddl> on <table> when it isn't already there. <ddl>
+    is the full definition after the column name (type plus any DEFAULT).
+
+    Portable across Postgres (production) and SQLite (tests): both support the
+    plain `ALTER TABLE … ADD COLUMN` form used here. The "already there?" guard
+    is a SQLAlchemy-inspector check rather than a Postgres-only `ADD COLUMN IF
+    NOT EXISTS`, precisely so the same code path is a no-op on SQLite (which has
+    no IF NOT EXISTS on ADD COLUMN)."""
     insp = inspect(db.engine)
     if table not in insp.get_table_names():
         return  # fresh DB — create_all already built the full schema
     cols = {c['name'] for c in insp.get_columns(table)}
     if column in cols:
         return
-    ddl = f'ALTER TABLE {table} ADD COLUMN {column} {ddl_type}'
-    if default_sql is not None:
-        ddl += f' DEFAULT {default_sql}'
     with db.engine.begin() as conn:
-        conn.execute(text(ddl))
+        conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} {ddl}'))
     log.info('migration: added %s.%s', table, column)
 
 
@@ -91,61 +129,42 @@ def _drop_not_null(table: str, column: str) -> None:
 
 def run_migrations() -> None:
     """Apply all pending additive migrations. Call inside an app context, right
-    after db.create_all(). Safe to call on every boot."""
+    after db.create_all(). Safe to call on every boot.
+
+    Ordering is load-bearing and must not be shuffled:
+
+      1. ADD every column in SCHEMA_MIGRATIONS.
+      2. Widen/relax types on existing columns (v0.1.2).
+      3. Run ORM-based data backfills LAST.
+
+    Step 3 is last because a backfill issues ORM queries (e.g.
+    ``PlaidAccount.query``) whose generated SELECT lists *every* column the
+    model declares — including columns added in step 1. Running a backfill
+    before its columns exist raises UndefinedColumn on an upgrading database,
+    and because the whole body is wrapped in a fail-open ``except`` that error
+    would abort the remaining ADDs, leaving the schema half-migrated. (That was
+    the v0.4.0 → v0.4.0.1 regression: the offset backfill ran before the
+    owning_company/balance_only ADDs and swallowed them, so every later
+    ``PlaidItem.query`` 500'd with ``column plaid_items.owning_company does not
+    exist``.) Keep all ADDs ahead of all backfills."""
     try:
-        # v0.1.1 — one-click account import: track which Plaid accounts have
-        # been auto-provisioned into ERPNext.
-        _add_column_if_missing('plaid_accounts', 'import_status',
-                               'VARCHAR(20)', default_sql="'pending'")
-        # v0.1.2 — the account-import audit line logs direction
-        # 'erpnext_account_import' (22 chars), which overflows the original
-        # VARCHAR(20) and made the commit fail on Postgres (the log row silently
-        # never persisted). Widen direction, guarantee error_message is TEXT so
-        # a captured Frappe traceback/body fits, and drop item_id's NOT NULL so
-        # a batch action can log without a single owning item.
+        # 1. Additive columns — idempotent, no-op once present or on a fresh DB.
+        for table, column, ddl in SCHEMA_MIGRATIONS:
+            _add_column_if_missing(table, column, ddl)
+        # 2. In-place type/constraint fixes (v0.1.2): the account-import audit
+        # line logs direction 'erpnext_account_import' (22 chars), which
+        # overflows the original VARCHAR(20) and made the commit fail on
+        # Postgres (the log row silently never persisted). Widen direction,
+        # guarantee error_message is TEXT so a captured Frappe traceback/body
+        # fits, and drop item_id's NOT NULL so a batch action can log without a
+        # single owning item.
         _widen_column('plaid_sync_log', 'direction', 'VARCHAR(64)', 64)
         _widen_column('plaid_sync_log', 'error_message', 'TEXT', 10 ** 9)
         _drop_not_null('plaid_sync_log', 'item_id')
-        # v0.2.0 — auto-create the matching GL Account in ERPNext's Chart of
-        # Accounts so an imported company Bank Account can link a real `account`.
-        # Record the created/linked GL Account docname on the Plaid account.
-        _add_column_if_missing('plaid_accounts', 'erpnext_gl_account_name', 'TEXT')
-        # v0.3.0 — auto-Supplier creation + rules-based Journal Entry generation
-        # add three NEW tables (suppliers, categorization_rules,
-        # generated_journal_entries) + one more (audit_events). New tables are
-        # created by db.create_all() (which runs just before this), so they need
-        # no step here. The additive COLUMNS below are only for a database that
-        # already built categorization_rules / plaid_sync_log under an earlier
-        # v0.3.0 build — on a fresh DB create_all already has them, so each check
-        # short-circuits.
-        #   * non-destructive rule history (supersede/archive)
-        _add_column_if_missing('categorization_rules', 'superseded_by', 'INTEGER')
-        _add_column_if_missing('categorization_rules', 'archived', 'BOOLEAN',
-                               default_sql='false')
-        #   * audit cross-link from the HTTP-level sync log to an AuditEvent subject
-        _add_column_if_missing('plaid_sync_log', 'subject_id', 'VARCHAR(120)')
-        # v0.3.1 — bank-account-agnostic rules: a rule names only the offset
-        # (categorized) side; the bank side comes from the transaction's linked
-        # Plaid account. Add the two columns, then backfill offset_account from
-        # the deprecated debit/credit pair on any pre-v0.3.1 rule.
-        _add_column_if_missing('categorization_rules', 'offset_account',
-                               'VARCHAR(255)', default_sql="''")
-        _add_column_if_missing('categorization_rules', 'offset_direction',
-                               'VARCHAR(20)', default_sql="'auto'")
+        # 3. ORM-based data backfills — MUST run after every ADD above, since
+        # they SELECT models whose columns those ADDs create. v0.3.1: give every
+        # pre-v0.3.1 rule a single offset_account from its debit/credit pair.
         _migrate_rule_offset_accounts()
-        # v0.4.0 — multi-entity L1: the owning ERPNext Company, chosen at Plaid
-        # Link time on the Item and inherited (overridable) per account. Both
-        # backfill to NULL on an existing install, which the push path resolves
-        # to the ERPNext default Company — so v0.3.9 installs keep working with no
-        # manual step.
-        _add_column_if_missing('plaid_items', 'owning_company', 'VARCHAR(140)')
-        _add_column_if_missing('plaid_accounts', 'owning_company', 'VARCHAR(140)')
-        # v0.4.0 — balance-only investment support: flag Plaid investment
-        # accounts so the sync loop skips /transactions/sync for them. Backfills
-        # to false (SQLite/Postgres both accept the literal); the flag is
-        # re-derived from type/subtype on the next account refresh regardless.
-        _add_column_if_missing('plaid_accounts', 'balance_only', 'BOOLEAN',
-                               default_sql='false')
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)
 
