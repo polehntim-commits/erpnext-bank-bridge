@@ -238,12 +238,28 @@ def rule_matches(rule: CategorizationRule, *, merchant_name: str = '',
     return False
 
 
+def _rule_applies_to_company(rule, row_company: str) -> bool:
+    """Whether a company-scoped rule is in scope for this transaction. A rule
+    with a blank `applies_to_company` is company-agnostic and always applies
+    (v0.3.x behavior); a scoped rule applies only when the transaction's linked
+    account resolves to that same Company."""
+    scope = (getattr(rule, 'applies_to_company', None) or '').strip()
+    return not scope or scope == row_company
+
+
 def evaluate_rules(row):
     """Walk the ACTIVE, non-archived rules in priority order and return
     (winner_or_None, trace). `trace` is the ordered list of every rule
     considered — {rule_id, rule_name, priority, matched} — up to and including
     the winner, so the audit log captures exactly what was evaluated and why the
-    winner won. Evaluation stops at the first match (first-match-wins)."""
+    winner won. Evaluation stops at the first match (first-match-wins).
+
+    v0.4.0.1: a rule scoped to an owning Company (`applies_to_company`) is only
+    eligible when the transaction's account resolves to that Company. The row's
+    Company is resolved once (not per rule) to keep this cheap."""
+    from . import erpnext_accounts
+    row_company = erpnext_accounts.owning_company_for_account_id(
+        getattr(row, 'account_id', None))
     rules = (CategorizationRule.query
              .filter(CategorizationRule.active.is_(True),
                      CategorizationRule.archived.is_(False))
@@ -251,10 +267,11 @@ def evaluate_rules(row):
                        CategorizationRule.id.asc()).all())
     trace = []
     for rule in rules:
-        matched = rule_matches(
-            rule, merchant_name=row.merchant_name,
-            description=(row.name or ''), category=(row.category or ''),
-            amount=row.amount)
+        matched = (_rule_applies_to_company(rule, row_company)
+                   and rule_matches(
+                       rule, merchant_name=row.merchant_name,
+                       description=(row.name or ''), category=(row.category or ''),
+                       amount=row.amount))
         trace.append({'rule_id': rule.id, 'rule_name': rule.name,
                       'priority': rule.priority, 'matched': matched})
         if matched:

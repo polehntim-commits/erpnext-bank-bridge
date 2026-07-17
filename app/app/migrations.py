@@ -57,6 +57,10 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # so the sync loop skips /transactions/sync for them. Backfills to false;
     # the flag is re-derived from type/subtype on the next account refresh.
     ('plaid_accounts', 'balance_only', 'BOOLEAN DEFAULT false'),
+    # v0.4.0.1 — multi-entity rule scoping: a rule may be restricted to one
+    # owning Company. NULL = company-agnostic (applies everywhere), so existing
+    # rules are unaffected.
+    ('categorization_rules', 'applies_to_company', 'VARCHAR(140)'),
 ]
 
 

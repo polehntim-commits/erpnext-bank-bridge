@@ -356,6 +356,11 @@ class CategorizationRule(db.Model):
     party_type = db.Column(db.String(20), nullable=True)    # Supplier | Customer
     party_name = db.Column(db.String(255), nullable=True)
     description_template = db.Column(db.Text, default='')
+    # v0.4.0.1 · multi-entity rule scoping: when set, the rule only fires for a
+    # transaction whose linked Plaid account resolves to this ERPNext Company.
+    # NULL/'' = company-agnostic (applies to every Company) — the default, so
+    # pre-multi-entity rules keep matching everywhere with no change.
+    applies_to_company = db.Column(db.String(140), nullable=True, index=True)
     # Non-destructive history (v0.3.0 audit): a rule is never mutated in place or
     # hard-deleted. An EDIT clones the rule and points the old row's
     # `superseded_by` at the new id (both archived=inactive); a DELETE just sets
@@ -390,6 +395,7 @@ class CategorizationRule(db.Model):
             'credit_account': self.credit_account,
             'party_type': self.party_type, 'party_name': self.party_name,
             'description_template': self.description_template,
+            'applies_to_company': self.applies_to_company or None,
             'superseded_by': self.superseded_by,
             'archived': bool(self.archived),
             'created_at': self.created_at.isoformat() if self.created_at else None,

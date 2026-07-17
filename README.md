@@ -152,6 +152,19 @@ exist`). Fixed by ordering all additive `ADD COLUMN` steps (now a single
 fully migrated before any model is queried. Fresh installs are unaffected (a
 silent no-op). Existing v0.3.x → v0.4.0.1 upgrades now migrate cleanly on boot.
 
+v0.4.0.1 also surfaces the owning **Company** across the admin UI so a
+multi-entity operator never loses track of whose books they're looking at: a
+**Current Company** switcher in the navbar (a dropdown when the bridge holds
+accounts under more than one Company, the name alone when there's just one, and
+nothing on a single-entity install) sets a session-wide scope that filters every
+screen. The **Accounts** page shows each linked bank's owning Company with a
+correction-only **[Change]** control (confirmation-gated, since it retroactively
+re-assigns the bank's accounts). **Transactions** and **Rules** gain a Company
+filter plus a persistent "Viewing … for {Company}" header. Rules can now be
+**Company-scoped** — a new nullable `applies_to_company` column (NULL =
+company-agnostic, applies everywhere) that the rules engine honours, firing a
+scoped rule only for transactions whose bank account resolves to that Company.
+
 ## How it works
 
 1. **Link a bank once** through Plaid Link (`/admin/link_bank`). OAuth-only

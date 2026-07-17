@@ -143,11 +143,80 @@ NAV_HTML = """
   <a href="/admin/sync_log" class="{{ 'active' if page == 'sync_log' else '' }}">Sync Log</a>
   <a href="/admin/plaid_settings" class="{{ 'active' if page == 'plaid_settings' else '' }}">Plaid</a>
   <a href="/admin/erpnext_settings" class="{{ 'active' if page == 'erpnext_settings' else '' }}">ERPNext</a>
+  {% if nav_companies %}
+  <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
+    <span style="color:#8fbfa5;font-size:12px">Current Company:</span>
+    {% if nav_companies|length > 1 %}
+    <form method="get" action="/admin/set_company" style="margin:0">
+      <input type="hidden" name="next" value="{{ request.path }}">
+      <select name="company" onchange="this.form.submit()"
+        style="padding:4px 8px;font-size:13px;border-radius:4px;border:1px solid #2b4f3f;background:#0f2a1d;color:#eee">
+        <option value="">All Companies</option>
+        {% for c in nav_companies %}
+        <option value="{{ c }}" {{ 'selected' if c == current_company else '' }}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </form>
+    {% else %}
+    <b style="color:#eee;font-size:13px">{{ nav_companies[0] }}</b>
+    {% endif %}
+  </div>
+  {% endif %}
 </nav>
 """
 
 
+def _current_company() -> str:
+    """The Company the operator has scoped the whole admin UI to, or '' for
+    'all Companies'. Stored in the session by /admin/set_company (the navbar
+    switcher and the per-page Company filters all write here), so it's a single
+    source of truth that every screen reads."""
+    return (session.get('scope_company') or '').strip()
+
+
+def _known_companies() -> list:
+    """The ERPNext Companies this bridge actually holds accounts under: the
+    distinct non-empty owning_company across linked Items and accounts, plus the
+    active session scope (so a currently-selected Company stays visible even if
+    no row references it yet). Derived from LOCAL rows only — no ERPNext
+    round-trip — so the navbar is cheap and works when ERPNext is unreachable.
+    Empty on a pre-multi-entity install, which keeps the navbar unchanged."""
+    vals = set()
+    for (c,) in db.session.query(PlaidItem.owning_company).distinct():
+        if c and c.strip():
+            vals.add(c.strip())
+    for (c,) in db.session.query(PlaidAccount.owning_company).distinct():
+        if c and c.strip():
+            vals.add(c.strip())
+    scope = _current_company()
+    if scope:
+        vals.add(scope)
+    return sorted(vals)
+
+
+def _resolve_account_companies() -> dict:
+    """{account_id: resolved owning Company} for every Plaid account, using the
+    v0.4.0 resolution order (per-account override → Item Company → ERPNext
+    default). The default is read once from local settings (no ERPNext call).
+    Feeds the Company transaction filter."""
+    items = {it.item_id: (it.owning_company or '').strip()
+             for it in PlaidItem.query.all()}
+    default = None
+    out = {}
+    for a in PlaidAccount.query.all():
+        company = (a.owning_company or '').strip() or items.get(a.item_id, '')
+        if not company:
+            if default is None:
+                default = (erps.load().get('default_company') or '').strip()
+            company = default
+        out[a.account_id] = company
+    return out
+
+
 def _page(body_tmpl: str, page: str, **ctx):
+    # Every page renders the navbar Company switcher from local data.
+    ctx.setdefault('nav_companies', _known_companies())
+    ctx.setdefault('current_company', _current_company())
     full = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>ERPNext Bank Bridge</title>
 <style>{BASE_CSS}</style></head><body>
@@ -155,6 +224,19 @@ def _page(body_tmpl: str, page: str, **ctx):
 <main>{body_tmpl}</main>
 </body></html>"""
     return render_template_string(full, page=page, **ctx)
+
+
+@bp.get('/admin/set_company')
+def set_company_scope():
+    """Set (or clear) the session-wide Company scope that filters the admin UI.
+    Driven by the navbar switcher and the per-page Company filter dropdowns. A
+    blank `company` clears the scope back to 'all Companies'. Redirects to the
+    caller's `next` path (local-only, to avoid an open redirect)."""
+    session['scope_company'] = (request.args.get('company') or '').strip()
+    nxt = request.args.get('next') or '/admin'
+    if not nxt.startswith('/') or nxt.startswith('//'):
+        nxt = '/admin'
+    return redirect(nxt)
 
 
 # ── Dashboard ────────────────────────────────────────────────────
@@ -482,8 +564,31 @@ ACCOUNTS_BODY = """
 {% endif %}
 
 {% for grp in groups %}
-<h3>{{ grp.item.institution_name or '(unknown institution)' }}
+<h3 style="margin-bottom:2px">{{ grp.item.institution_name or '(unknown institution)' }}
   <span style="font-weight:400;color:#888;font-size:13px">· {{ grp.item.item_id[:14] }}…</span></h3>
+<div style="margin:0 0 8px;font-size:13px;color:#555">
+  Owning Company: <b>{{ grp.item.owning_company or '(unassigned — uses ERPNext default)' }}</b>
+  {% if companies %}
+  <a href="#" style="font-size:12px;margin-left:6px"
+     onclick="document.getElementById('itemco-{{ loop.index }}').style.display='flex';this.style.display='none';return false">[Change]</a>
+  <form id="itemco-{{ loop.index }}" method="post"
+        action="/admin/items/{{ grp.item.item_id }}/set_company"
+        style="display:none;gap:6px;align-items:center;margin-top:6px"
+        onsubmit="return confirm('Reassign EVERY account under {{ (grp.item.institution_name or 'this bank')|replace(\"'\", '') }} to this Company? This retroactively changes which entity their Bank Accounts and generated Journal Entries book to. (Per-account overrides are kept.)')">
+    <select name="owning_company" style="padding:4px;font-size:12px">
+      <option value="">— unassigned (use ERPNext default) —</option>
+      {% for c in companies %}
+      <option value="{{ c }}" {{ 'selected' if c == grp.item.owning_company else '' }}>{{ c }}</option>
+      {% endfor %}
+      {% if grp.item.owning_company and grp.item.owning_company not in companies %}
+      <option value="{{ grp.item.owning_company }}" selected>{{ grp.item.owning_company }} (current)</option>
+      {% endif %}
+    </select>
+    <button type="submit" class="secondary" style="padding:4px 10px;font-size:12px">Reassign Company</button>
+    <span style="font-size:11px;color:#999">correction only</span>
+  </form>
+  {% endif %}
+</div>
 <table>
   <tr><th>Account</th><th>Mask</th><th>Type</th><th class="num">Balance</th>
       <th>ERPNext Bank Account</th><th>Import</th><th>Company</th></tr>
@@ -742,13 +847,64 @@ def set_account_company(plaid_account_id):
     return redirect('/admin/accounts?flash=' + quote_plus(msg))
 
 
+@bp.post('/admin/items/<item_id>/set_company')
+def set_item_company(item_id):
+    """Correction-only (v0.4.0.1): reassign the owning ERPNext Company for a whole
+    linked Item. This retroactively changes the Company every account under the
+    Item inherits (accounts with an explicit per-account override keep it). The
+    normal path is choosing the Company at Plaid Link time; this is the fix-up for
+    a wrong initial choice. Audited."""
+    it = PlaidItem.query.filter_by(item_id=item_id).first()
+    if it is None:
+        return redirect('/admin/accounts?flash=' + quote_plus('Item not found'))
+    new_company = (request.form.get('owning_company') or '').strip() or None
+    before = it.owning_company
+    it.owning_company = new_company
+    db.session.commit()
+    audit.record('item_owning_company_changed', subject_type='PlaidItem',
+                 subject_id=it.item_id,
+                 before={'owning_company': before},
+                 after={'owning_company': new_company},
+                 notes=f'retroactive Item reassignment: {before!r} → {new_company!r}')
+    label = it.institution_name or it.item_id
+    if new_company:
+        msg = f'{label} accounts now owned by {new_company}'
+    else:
+        msg = f'{label} owning Company cleared (accounts use the ERPNext default)'
+    return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
 # ── Transactions ─────────────────────────────────────────────────
 
 TRANSACTIONS_BODY = """
 <h2>Transactions</h2>
 {% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+{% if nav_companies %}
+<div style="position:sticky;top:0;z-index:10;background:#fafafa;padding:10px 0;
+            margin:0 0 6px;border-bottom:2px solid #2e9e5b">
+  <span style="font-size:18px;font-weight:600">
+    {% if cur_company %}Viewing transactions for:
+      <span style="color:#2e9e5b">{{ cur_company }}</span>
+    {% else %}Viewing transactions across all Companies{% endif %}
+  </span>
+</div>
+{% endif %}
+<div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+{% if nav_companies %}
+<form method="get" action="/admin/set_company" class="card" style="margin:0">
+  <input type="hidden" name="next" value="/admin/transactions">
+  <label style="margin:0">Company
+    <select name="company" onchange="this.form.submit()">
+      <option value="">(all)</option>
+      {% for c in nav_companies %}
+      <option value="{{ c }}" {{ 'selected' if c==cur_company else '' }}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </label>
+</form>
+{% endif %}
 <form method="get" action="/admin/transactions" class="card"
-      style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+      style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin:0">
   <label style="margin:0">Status
     <select name="status">
       <option value="">(any)</option>
@@ -771,6 +927,7 @@ TRANSACTIONS_BODY = """
   </label>
   <button type="submit" class="primary">Filter</button>
 </form>
+</div>
 
 <div style="margin:8px 0">
   <form method="post" action="/admin/transactions/rerun_rules" style="display:inline"
@@ -820,8 +977,14 @@ def transactions_page():
     cur_status = (request.args.get('status') or '').strip()
     cur_account = (request.args.get('account_id') or '').strip()
     cur_q = (request.args.get('q') or '').strip()
+    cur_company = _current_company()
     limit = 300
     q = BankTransaction.query
+    if cur_company:
+        # Only transactions whose linked account resolves to the scoped Company.
+        scoped_ids = [aid for aid, c in _resolve_account_companies().items()
+                      if c == cur_company]
+        q = q.filter(BankTransaction.account_id.in_(scoped_ids))
     if cur_account:
         q = q.filter(BankTransaction.account_id == cur_account)
     if cur_status == 'posted':
@@ -846,6 +1009,7 @@ def transactions_page():
     return _page(TRANSACTIONS_BODY, page='transactions', rows=rows,
                  accounts=accounts, acct_mask=acct_mask, limit=limit,
                  cur_status=cur_status, cur_account=cur_account, cur_q=cur_q,
+                 cur_company=cur_company,
                  flash_msg=request.args.get('flash', ''))
 
 
@@ -971,6 +1135,31 @@ def known_accounts_api():
 RULES_BODY = """
 <h2>Categorization rules</h2>
 {% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+{% if nav_companies %}
+<div style="position:sticky;top:0;z-index:10;background:#fafafa;padding:10px 0;
+            margin:0 0 6px;border-bottom:2px solid #2e9e5b;
+            display:flex;justify-content:space-between;align-items:center;
+            flex-wrap:wrap;gap:10px">
+  <span style="font-size:18px;font-weight:600">
+    {% if cur_company %}Viewing rules for:
+      <span style="color:#2e9e5b">{{ cur_company }}</span>
+      <span style="font-size:12px;font-weight:400;color:#777">
+        (+ company-agnostic rules, which apply everywhere)</span>
+    {% else %}Viewing rules across all Companies{% endif %}
+  </span>
+  <form method="get" action="/admin/set_company" style="margin:0">
+    <input type="hidden" name="next" value="/admin/rules">
+    <label style="margin:0;font-size:13px">Company
+      <select name="company" onchange="this.form.submit()" style="width:auto">
+        <option value="">(all)</option>
+        {% for c in nav_companies %}
+        <option value="{{ c }}" {{ 'selected' if c==cur_company else '' }}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </form>
+</div>
+{% endif %}
 {% if not je_engine_on %}
 <div class="banner-warn">
   <h3>Journal-entry generation is OFF</h3>
@@ -1058,6 +1247,21 @@ RULES_BODY = """
       <input name="party_name" value="{{ form.party_name or '' }}" placeholder="(optional)">
     </label>
   </div>
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <label style="flex:1;min-width:220px">Applies to Company
+      <span style="font-weight:400;color:#888">— multi-entity scope</span>
+      <select name="applies_to_company"
+              title="Restrict this rule to transactions whose bank account belongs to one Company. Leave on 'all Companies' to apply everywhere.">
+        <option value="">— all Companies (company-agnostic) —</option>
+        {% for c in companies %}
+        <option value="{{ c }}" {{ 'selected' if c == form.applies_to_company else '' }}>{{ c }}</option>
+        {% endfor %}
+        {% if form.applies_to_company and form.applies_to_company not in companies %}
+        <option value="{{ form.applies_to_company }}" selected>{{ form.applies_to_company }} (current)</option>
+        {% endif %}
+      </select>
+    </label>
+  </div>
   <label>Description template (Jinja) <span style="font-weight:400;color:#888">— vars: merchant_name, name, date, amount, category, supplier_name</span>
     <input name="description_template" value="{{ form.description_template or '' }}"
            placeholder="Fuel purchase - {{ '{{ merchant_name }}' }} - {{ '{{ date }}' }}">
@@ -1104,7 +1308,7 @@ RULES_BODY = """
 </h3>
 <table>
   <tr><th class="num">#</th><th class="num">Prio</th><th>Name</th><th>Match</th><th>Offset account</th><th>Dir</th>
-      <th>Party</th><th>Active</th><th></th></tr>
+      <th>Company</th><th>Party</th><th>Active</th><th></th></tr>
   {% for r in rules %}
   <tr>
     <td class="num">{{ r.id }}</td>
@@ -1113,6 +1317,7 @@ RULES_BODY = """
     <td style="font-size:12px"><code>{{ r.match_type }}</code><br>{{ (r.match_value or '')[:50] }}</td>
     <td style="font-size:12px">{{ r.offset_account or r.debit_account }}</td>
     <td style="font-size:12px">{{ r.offset_direction or 'auto' }}</td>
+    <td style="font-size:12px">{% if r.applies_to_company %}{{ r.applies_to_company }}{% else %}<span style="color:#999">all</span>{% endif %}</td>
     <td style="font-size:12px">{{ (r.party_type or '') }}{% if r.party_name %}: {{ r.party_name }}{% endif %}</td>
     <td>
       <form method="post" action="/admin/rules/toggle" style="margin:0">
@@ -1132,7 +1337,7 @@ RULES_BODY = """
     </td>
   </tr>
   {% endfor %}
-  {% if not rules %}<tr><td colspan="9" style="color:#888">No live rules — add one above.</td></tr>{% endif %}
+  {% if not rules %}<tr><td colspan="10" style="color:#888">No live rules — add one above.</td></tr>{% endif %}
 </table>
 <p style="font-size:12px;color:#888">Edits never overwrite: editing a rule archives the old version and creates a new one, so past auto-JE decisions stay reconstructable. See the <a href="/admin/audit?subject_type=CategorizationRule">audit trail</a>.</p>
 
@@ -1361,17 +1566,32 @@ RULES_BODY = """
 
 def _rules_page(flash_msg='', test_result=None, test=None, form=None,
                 show_archived=False):
+    cur_company = _current_company()
     live = (CategorizationRule.query
             .filter(CategorizationRule.archived.is_(False))
             .order_by(CategorizationRule.priority.asc(),
                       CategorizationRule.id.asc()).all())
+    if cur_company:
+        # In a Company scope, show rules scoped to it PLUS company-agnostic rules
+        # (which apply everywhere, this Company included).
+        live = [r for r in live
+                if not (r.applies_to_company or '').strip()
+                or (r.applies_to_company or '').strip() == cur_company]
     archived = []
     if show_archived:
         archived = (CategorizationRule.query
                     .filter(CategorizationRule.archived.is_(True))
                     .order_by(CategorizationRule.updated_at.desc()).all())
+    # ERPNext Company list for the scope picker on the rule form (best-effort).
+    companies = []
+    if erps.is_configured():
+        try:
+            companies = erpnext_bank.list_companies()
+        except (ERPNextConfigError, ERPNextError):
+            companies = []
     return _page(RULES_BODY, page='rules', rules=live, archived=archived,
-                 show_archived=show_archived,
+                 show_archived=show_archived, cur_company=cur_company,
+                 companies=companies,
                  match_types=categorization.MATCH_TYPES,
                  offset_directions=categorization.OFFSET_DIRECTIONS,
                  form=form or {'active': True, 'priority': 100},
@@ -1385,7 +1605,10 @@ def _rules_page(flash_msg='', test_result=None, test=None, form=None,
 
 @bp.get('/admin/rules')
 def rules_page():
-    form = {'active': True, 'priority': 100}
+    # New rules default their scope to the active Company (if any), so building
+    # rules while scoped to a Company keeps them in that Company by default.
+    form = {'active': True, 'priority': 100,
+            'applies_to_company': _current_company() or None}
     edit_id = (request.args.get('edit') or '').strip()
     if edit_id.isdigit():
         rule = db.session.get(CategorizationRule, int(edit_id))
@@ -1423,6 +1646,8 @@ def _rule_form_values():
         'party_type': party_type,
         'party_name': (request.form.get('party_name') or '').strip() or None,
         'description_template': (request.form.get('description_template') or '').strip(),
+        # v0.4.0.1 · optional multi-entity scope. Blank → company-agnostic.
+        'applies_to_company': (request.form.get('applies_to_company') or '').strip() or None,
     }
 
 
