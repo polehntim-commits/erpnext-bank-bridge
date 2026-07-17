@@ -798,12 +798,126 @@ def _company_account_numbers(client: ERPNextClient, company: str) -> set[int]:
     return out
 
 
+# ── v0.3.9: liquidity-ordered leaf numbering ───────────────────────────────
+#
+# Standard balance-sheet convention: within a group, the most-liquid account
+# gets the lowest number, the least-liquid the highest. The rank is keyed on
+# Plaid subtype and shared by the Assets (depository) and Liabilities (credit)
+# sides — the two never share a group, so the overlapping rank values (Cash
+# Management and Credit Card are both rank 1) can't collide. Unmapped subtypes
+# fall to the end (rank 99). Rank 5 (Bonds) is reserved for a future
+# investment-side extension — Plaid `investment` accounts stay skipped today, so
+# nothing maps to it yet. Extend the map, not the call sites.
+LIQUIDITY_RANK = {
+    # depository (Assets side), most→least liquid
+    'cash management': 1,   # Cash — daily access, market-rate
+    'paypal': 1,            # cash-equivalent balance
+    'checking': 2,          # immediate access, primary transaction account
+    'savings': 3,           # immediate access, usually held as reserves
+    'money market': 3,      # alongside savings (slots after it by name)
+    'cd': 4,                # least liquid — locked for a term
+    # 5 reserved: Bonds (least liquid cash-equivalent) — not a Plaid Bank type
+    # credit (Liabilities side), most→least current-due
+    'credit card': 1,       # revolving, monthly due
+    'line of credit': 2,
+}
+DEFAULT_LIQUIDITY_RANK = 99
+
+# Finer within-rank ordering, so Money Market sorts *after* Savings even though
+# they share rank 3 and 'Money Market' would otherwise sort first alphabetically.
+_SUBTYPE_ORDER = {'savings': 0, 'money market': 1}
+
+# Numbers reserved per liquidity rank inside a group's range. A group is
+# hundred-spaced (e.g. 1200 → children 1201-1299), so 10 per rank leaves room
+# for up to 10 accounts of each liquidity tier before spilling into the next.
+_LIQUIDITY_BAND_SIZE = 10
+
+
+def liquidity_rank(account: PlaidAccount) -> int:
+    """The liquidity rank (lower = more liquid) for a Plaid account, from its
+    subtype. Unmapped subtypes get DEFAULT_LIQUIDITY_RANK (sorted last)."""
+    return LIQUIDITY_RANK.get((account.subtype or '').strip().lower(),
+                              DEFAULT_LIQUIDITY_RANK)
+
+
+def _liquidity_sort_key(subtype: str, account_name: str) -> tuple:
+    """Sort key placing accounts most-liquid first: (rank, within-rank order,
+    name). Used by the retroactive backfill and mirrored by the band layout."""
+    s = (subtype or '').strip().lower()
+    return (LIQUIDITY_RANK.get(s, DEFAULT_LIQUIDITY_RANK),
+            _SUBTYPE_ORDER.get(s, 0), account_name or '')
+
+
+def _band_slot(rank: int) -> int:
+    """0-based band slot for a liquidity rank within the group's range: rank 1 →
+    slot 0, … capped at 8, with the unmapped tail (rank ≥ 90) in slot 9."""
+    return 9 if rank >= 90 else min(max(rank, 1) - 1, 8)
+
+
+def _band_start(base: int, rank: int) -> int:
+    """First number of a rank's reserved band under a group numbered `base`
+    (e.g. base 1200: rank 1 → 1201, rank 2 → 1211, rank 4 → 1231)."""
+    return base + 1 + _band_slot(rank) * _LIQUIDITY_BAND_SIZE
+
+
+def _next_leaf_account_number(client: ERPNextClient, company: str,
+                              parent_group: str,
+                              account: PlaidAccount) -> str | None:
+    """account_number for a new leaf, slotted into its liquidity band under
+    `parent_group` (v0.3.9): the leaf takes the next free number in its rank's
+    reserved band (rank from the Plaid subtype), so a new checking always lands in
+    the checking band — after existing checkings, before less-liquid accounts —
+    without disturbing any existing account. Falls back to a plain append when the
+    parent group has no number but its leaves do, and returns None (no numbering)
+    when neither the parent nor any sibling is numbered, or on a read error."""
+    try:
+        parent_rows = client.list_docs(
+            ACCOUNT_DT, filters=[['name', '=', parent_group]],
+            fields=['name', 'account_number'], limit_page_length=1)
+    except (ERPNextAPIError, ERPNextError):
+        return None
+    base = _leading_int(parent_rows[0].get('account_number')) if parent_rows else None
+    try:
+        siblings = client.list_docs(
+            ACCOUNT_DT,
+            filters=[['parent_account', '=', parent_group],
+                     ['company', '=', company], ['is_group', '=', 0]],
+            fields=['name', 'account_number'], limit_page_length=0)
+    except (ERPNextAPIError, ERPNextError):
+        siblings = []
+    sib_strs = [str(s.get('account_number') or '').strip() for s in (siblings or [])]
+    sib_nums = [int(s) for s in sib_strs if s.isdigit()]
+    width = max((len(s) for s in sib_strs if s.isdigit()),
+                default=(len(str(base)) if base else 0))
+
+    if base is None:
+        if not sib_nums:
+            log.info("parent group %r has no numeric account_number and no "
+                     "numbered siblings; skipping leaf auto-numbering", parent_group)
+            return None
+        candidate = max(sib_nums) + 1   # can't band without a base → append
+    else:
+        rank = liquidity_rank(account)
+        band_start = _band_start(base, rank)
+        band_end = band_start + _LIQUIDITY_BAND_SIZE - 1
+        in_band = [n for n in sib_nums if band_start <= n <= band_end]
+        candidate = (max(in_band) + 1) if in_band else band_start
+
+    used = _company_account_numbers(client, company)
+    while candidate in used:
+        candidate += 1
+    return str(candidate).zfill(width)
+
+
 def _next_account_number(client: ERPNextClient, company: str, parent_group: str,
                          *, is_group: bool = False) -> str | None:
     """Next account_number for a new child under `parent_group`, matching the
     chart's existing numbering convention (v0.3.9). None — so the create omits the
     field — when the chart doesn't number its accounts (parent unnumbered AND no
     numbered siblings) or on any read error.
+
+    Used for GROUP accounts (is_group=True); leaves are numbered by liquidity via
+    _next_leaf_account_number.
 
     Scheme, discovered by inspecting siblings of the same kind (group vs leaf):
       * with numbered siblings → max sibling number + step, where step is 1 for a
@@ -870,8 +984,9 @@ def find_or_create_gl_account_for(client: ERPNextClient, account: PlaidAccount,
 
     v0.3.1: when no exact leaf exists, a fuzzy-similar one is reused instead of
     creating a near-duplicate (unless `skip_fuzzy`, the UI "create new anyway"
-    path). A freshly-created leaf under a numbered parent gets a sequential
-    account_number. Both are audited."""
+    path). v0.3.9: a freshly-created leaf under a numbered parent gets an
+    account_number slotted into its liquidity band (most-liquid lowest). Both are
+    audited."""
     existing = client.list_docs(
         ACCOUNT_DT,
         filters=[['account_name', '=', account_name], ['company', '=', company],
@@ -900,7 +1015,7 @@ def find_or_create_gl_account_for(client: ERPNextClient, account: PlaidAccount,
         'account_currency': _account_currency(account),
         'is_group': 0,
     }
-    number = _next_account_number(client, company, parent_group)
+    number = _next_leaf_account_number(client, company, parent_group, account)
     if number:
         doc['account_number'] = number
     created = client.create_doc(ACCOUNT_DT, doc)

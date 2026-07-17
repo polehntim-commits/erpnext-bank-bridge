@@ -107,9 +107,14 @@ Account **subtypes** are now mapped 1:1 onto the ten provisioned masters
 (Checking / Savings / Cd / Money Market / Cash Management / Paypal / Credit Card
 / Line Of Credit / Current / Other) instead of the old coarse *Current / Other*
 buckets. **Account numbering** is applied to auto-created groups and leaves,
-matching the chart's existing scheme (siblings' max + step, groups on hundreds,
-leaves consecutive; range-numbered parents like `2100-2400` handled), and skipped
-silently when a chart doesn't use numbers. Three idempotent one-shot bench
+matching the chart's existing scheme (groups on hundreds; range-numbered parents
+like `2100-2400` handled) and skipped silently when a chart doesn't use numbers.
+Leaves are ordered by **liquidity** (standard balance-sheet convention, most
+liquid first): within a group each account slots into a reserved band keyed on
+its Plaid subtype — Cash Management/Paypal → 1201.., Checking → 1211.., Savings/
+Money Market → 1221.., CD → 1231.. under group 1200; Credit Card → 2501.., Line
+of Credit → 2511.. on the Liabilities side. A new account always lands in its
+rank's band without disturbing the others. Three idempotent one-shot bench
 scripts under `app/scripts/` bring an existing install in line:
 `migrate_credit_cards_to_liabilities.py`, `backfill_account_subtypes.py`, and
 `backfill_account_numbers.py`. See the roadmap at the bottom.

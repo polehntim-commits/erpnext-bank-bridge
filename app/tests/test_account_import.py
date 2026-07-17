@@ -885,9 +885,10 @@ class TestRuleDropdownAccountList(ImportBase):
 
 
 class TestChildAccountNumbering(ImportBase):
-    """v0.3.1 · leaves under a numbered parent group get a sequential
-    account_number ('1200' parent → '1201', '1202', …); a number-less parent
-    skips numbering entirely (no worse than before)."""
+    """v0.3.9 · leaves under a numbered parent group get an account_number
+    slotted into their liquidity band (most-liquid lowest): under group 1200,
+    Cash Management → 1201, Checking → 1211, Savings → 1221, CD → 1231. A
+    number-less parent skips numbering entirely (no worse than before)."""
 
     COMPANY = 'Example Company LLC'
 
@@ -901,37 +902,72 @@ class TestChildAccountNumbering(ImportBase):
         return next(c[2] for c in erp.creates_of('Account')
                     if c[2].get('is_group') == 0)
 
-    def test_first_child_takes_parent_plus_one(self):
+    def _leaf_numbers(self, erp):
+        return {c[2]['account_name']: c[2].get('account_number')
+                for c in erp.creates_of('Account') if c[2].get('is_group') == 0}
+
+    def test_checking_takes_its_liquidity_band(self):
+        # Checking is rank 2 → band 1211-1220; a lone checking → 1211 (1201-1210
+        # is reserved for cash-equivalents).
         self._item(institution='Wells Fargo')
         self._account('acct-1', subtype='checking', mask='0000')
         erp = FakeERPClient(chart_accounts=[self._numbered_group('1200')])
         erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
+        self.assertEqual(self._leaf(erp)['account_number'], '1211')
+
+    def test_cash_management_takes_lowest_band(self):
+        self._item(institution='Wells Fargo')
+        self._account('acct-1', subtype='cash management', mask='0000')
+        erp = FakeERPClient(chart_accounts=[self._numbered_group('1200')])
+        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
         self.assertEqual(self._leaf(erp)['account_number'], '1201')
 
-    def test_next_child_increments_past_max(self):
-        # Parent 1200 already has a 1201 child → new leaf is 1202.
+    def test_second_account_in_band_increments_within_band(self):
+        # An existing checking at 1211 → a new checking takes the next slot in the
+        # checking band, 1212 (not appended at the bottom of the group).
         self._item(institution='Wells Fargo')
-        self._account('acct-1', subtype='savings', mask='9999')
+        self._account('acct-1', subtype='checking', mask='9999')
         erp = FakeERPClient(chart_accounts=[
             self._numbered_group('1200'),
             {'account_name': 'Existing Checking', 'is_group': 0,
-             'account_type': 'Bank', 'account_number': '1201',
+             'account_type': 'Bank', 'account_number': '1211',
              'parent_account': 'Bank Accounts - EC'}])
         erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
-        self.assertEqual(self._leaf(erp)['account_number'], '1202')
+        self.assertEqual(self._leaf(erp)['account_number'], '1212')
 
-    def test_gaps_are_not_backfilled_monotonic(self):
-        # Children 1201 and 1203 exist → new leaf is 1204, not the 1202 gap.
+    def test_liquidity_ordering_cash_checking_savings_cd(self):
+        # The headline invariant: Cash Management < Checking < Savings < CD.
         self._item(institution='Wells Fargo')
-        self._account('acct-1', subtype='savings', mask='9999')
-        erp = FakeERPClient(chart_accounts=[
-            self._numbered_group('1200'),
-            {'account_name': 'A', 'is_group': 0, 'account_number': '1201',
-             'parent_account': 'Bank Accounts - EC'},
-            {'account_name': 'B', 'is_group': 0, 'account_number': '1203',
-             'parent_account': 'Bank Accounts - EC'}])
-        erpnext_accounts.import_plaid_account_to_erpnext('acct-1', client=erp)
-        self.assertEqual(self._leaf(erp)['account_number'], '1204')
+        self._account('a-cd', subtype='cd', mask='4000')
+        self._account('a-sav', subtype='savings', mask='3000')
+        self._account('a-cm', subtype='cash management', mask='1000')
+        self._account('a-chk', subtype='checking', mask='2000')
+        erp = FakeERPClient(chart_accounts=[self._numbered_group('1200')])
+        # Import in a deliberately non-liquidity order — placement is by rank.
+        for aid in ('a-cd', 'a-sav', 'a-cm', 'a-chk'):
+            erpnext_accounts.import_plaid_account_to_erpnext(aid, client=erp)
+        nums = self._leaf_numbers(erp)
+        cm = int(nums['Wells Fargo Cash Management - 1000'])
+        chk = int(nums['Wells Fargo Checking - 2000'])
+        sav = int(nums['Wells Fargo Savings - 3000'])
+        cd = int(nums['Wells Fargo Cd - 4000'])
+        self.assertLess(cm, chk)
+        self.assertLess(chk, sav)
+        self.assertLess(sav, cd)
+        self.assertEqual((cm, chk, sav, cd), (1201, 1211, 1221, 1231))
+
+    def test_money_market_sorts_after_savings_same_band(self):
+        # Savings and Money Market share rank 3; Savings takes 1221, Money Market
+        # the next band slot 1222 (after Savings, though it sorts first by name).
+        self._item(institution='Wells Fargo')
+        self._account('a-sav', subtype='savings', mask='3000')
+        self._account('a-mm', subtype='money market', mask='4000')
+        erp = FakeERPClient(chart_accounts=[self._numbered_group('1200')])
+        erpnext_accounts.import_plaid_account_to_erpnext('a-sav', client=erp)
+        erpnext_accounts.import_plaid_account_to_erpnext('a-mm', client=erp)
+        nums = self._leaf_numbers(erp)
+        self.assertEqual(nums['Wells Fargo Savings - 3000'], '1221')
+        self.assertEqual(nums['Wells Fargo Money Market - 4000'], '1222')
 
     def test_unnumbered_parent_skips_numbering(self):
         self._item(institution='Wells Fargo')
@@ -951,7 +987,25 @@ class TestChildAccountNumbering(ImportBase):
         ev = AuditEvent.query.filter_by(
             event_type='gl_account_number_assigned').first()
         self.assertIsNotNone(ev)
-        self.assertIn('1201', ev.notes)
+        self.assertIn('1211', ev.notes)
+
+    def test_liquidity_rank_map(self):
+        self._item()
+        ranks = {
+            'cash management': 1, 'paypal': 1, 'checking': 2, 'savings': 3,
+            'money market': 3, 'cd': 4,
+        }
+        for st, r in ranks.items():
+            a = self._account(f'r-{st}', subtype=st)
+            self.assertEqual(erpnext_accounts.liquidity_rank(a), r, st)
+        # Credit side shares the rank map (disjoint keys, never same group).
+        cc = self._account('r-cc', subtype='credit card', type_='credit')
+        loc = self._account('r-loc', subtype='line of credit', type_='credit')
+        self.assertEqual(erpnext_accounts.liquidity_rank(cc), 1)
+        self.assertEqual(erpnext_accounts.liquidity_rank(loc), 2)
+        # Unmapped → last.
+        u = self._account('r-x', subtype='prepaid')
+        self.assertEqual(erpnext_accounts.liquidity_rank(u), 99)
 
 
 class TestFuzzyMatchReuse(ImportBase):
@@ -1391,6 +1445,78 @@ class TestCreditCardMigrationScript(unittest.TestCase):
         groups = [n for n, a in fake.accounts.items()
                   if a.get('account_name') == 'Credit Cards']
         self.assertEqual(len(groups), 1)
+
+
+class TestNumberBackfillScript(unittest.TestCase):
+    """v0.3.9 · backfill_account_numbers.py re-orders existing managed leaves by
+    liquidity (Cash Management < Checking < Savings < CD), leaves unrecognized
+    accounts alone, and is idempotent."""
+
+    def setUp(self):
+        import importlib.util
+        here = os.path.dirname(__file__)
+        path = os.path.join(here, '..', 'scripts', 'backfill_account_numbers.py')
+        spec = importlib.util.spec_from_file_location('_bf_num', path)
+        self.bf = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.bf)
+
+    def _fake(self):
+        def leaf(subtype_name, cur=None):
+            an = f'RP {subtype_name}'
+            return dict(account_name=an, parent_account='1200 - Bank Accounts - TEST',
+                        company='Testing', is_group=0, root_type='Asset',
+                        account_type='Bank', account_number=cur)
+        return FakeFrappe(accounts={
+            '1100-1600 - Current Assets - TEST': dict(
+                account_name='Current Assets', parent_account='', company='Testing',
+                is_group=1, root_type='Asset', account_number='1100-1600'),
+            '1200 - Bank Accounts - TEST': dict(
+                account_name='Bank Accounts',
+                parent_account='1100-1600 - Current Assets - TEST', company='Testing',
+                is_group=1, root_type='Asset', account_type='Bank',
+                account_number='1200'),
+            # Deliberately mis-ordered / unnumbered leaves.
+            'RP Cd - 2222 - TEST': leaf('Cd - 2222', cur='1202'),
+            'RP Cash Management - 9002 - TEST': leaf('Cash Management - 9002', cur='1201'),
+            'RP Checking - 0000 - TEST': leaf('Checking - 0000', cur='1203'),
+            'RP Savings - 1111 - TEST': leaf('Savings - 1111'),
+            'RP Money Market - 4444 - TEST': leaf('Money Market - 4444'),
+            # Not a recognized subtype → must be left untouched.
+            'Plaid Test - TEST': dict(
+                account_name='Plaid Test', parent_account='1200 - Bank Accounts - TEST',
+                company='Testing', is_group=0, root_type='Asset', account_type='Bank',
+                account_number='Test'),
+        })
+
+    def _num(self, fake, name):
+        return fake.accounts[name]['account_number']
+
+    def test_liquidity_ordering(self):
+        fake = self._fake()
+        self.bf.run(fake)
+        cm = int(self._num(fake, 'RP Cash Management - 9002 - TEST'))
+        chk = int(self._num(fake, 'RP Checking - 0000 - TEST'))
+        sav = int(self._num(fake, 'RP Savings - 1111 - TEST'))
+        cd = int(self._num(fake, 'RP Cd - 2222 - TEST'))
+        # Cash Management < Checking < Savings < CD — the required invariant.
+        self.assertLess(cm, chk)
+        self.assertLess(chk, sav)
+        self.assertLess(sav, cd)
+        # And the concrete banded numbers.
+        self.assertEqual((cm, chk, sav, cd), (1201, 1211, 1221, 1231))
+        # Money Market shares Savings' band, slotted just after it.
+        self.assertEqual(self._num(fake, 'RP Money Market - 4444 - TEST'), '1222')
+
+    def test_unrecognized_leaf_untouched(self):
+        fake = self._fake()
+        self.bf.run(fake)
+        self.assertEqual(self._num(fake, 'Plaid Test - TEST'), 'Test')
+
+    def test_idempotent(self):
+        fake = self._fake()
+        self.bf.run(fake)
+        assigned2 = self.bf.run(fake)
+        self.assertEqual(assigned2, [])
 
 
 if __name__ == '__main__':
