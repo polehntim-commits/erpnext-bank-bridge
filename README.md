@@ -6,6 +6,10 @@ automated accounting reconciliation. Designed for small businesses running
 self-hosted ERP who want their bank feed in ERPNext without a SaaS accounting
 middleman.
 
+> **Self-hosted and private.** Your data stays on your own hardware — see
+> [PRIVACY.md](PRIVACY.md). The software is provided as-is under the MIT
+> License with no warranty — see [TERMS.md](TERMS.md).
+
 ```
 Bank (any Plaid-supported institution)
       │  Plaid Link (once)  +  /transactions/sync (every 6h)
@@ -863,6 +867,22 @@ a vulnerability.
 categorization~~ + ~~full append-only audit trail with non-destructive rule
 history~~ (v0.3.0). ~~Rule-builder autocomplete (merchants + Plaid categories),
 category-based Name suggestions, and shadow-conflict warnings~~ (v0.3.2).
+
+## Compliance and disclosure
+
+This is self-hosted, open-source software with no hosted service behind it. Two
+short documents spell out how it treats your data and the terms of use:
+
+- **[PRIVACY.md](PRIVACY.md)** — what data is collected (Plaid transactions,
+  account metadata, balances), where it lives (encrypted at rest on your own
+  hardware, no telemetry), the only third party involved (Plaid), retention
+  (permanent until you delete it), and how to remove everything.
+- **[TERMS.md](TERMS.md)** — as-is, no-warranty MIT terms; that you are
+  responsible for your own Plaid costs, backups, and the legal/tax correctness of
+  your bookkeeping; and the disclaimer of liability for accounting errors.
+
+For the security posture and vulnerability reporting, see
+[SECURITY.md](SECURITY.md).
 
 ## License
 
