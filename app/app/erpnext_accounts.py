@@ -25,10 +25,13 @@ Bank Account. The HTTP mechanics live in erpnext_client; this module owns the
 doctype field mapping, the Plaid-subtype → ERPNext-type inference, the custom
 field bootstrap, and the PlaidSyncLog audit line.
 
-Supported vs unsupported: only account subtypes that map cleanly onto an
-ERPNext Bank Account are offered a button. Loans, investments, brokerage,
-retirement (401k/IRA/…), mortgages, HSAs etc. are NOT Bank Accounts in
-ERPNext's model, so they're marked `unsupported` and skipped.
+Supported vs unsupported: depository / credit subtypes map cleanly onto an
+ERPNext Bank Account and are offered a button for full transaction sync.
+Investment accounts (401k/IRA/brokerage/crypto/…) are supported BALANCE-ONLY
+(v0.4.0): they get a Bank Account + GL leaf under Non-current Assets →
+Investments and their balance is mirrored, but no transactions are synced (Plaid
+returns none without the `investments` product). Loans and the catch-all 'other'
+remain unsupported and are skipped.
 """
 from __future__ import annotations
 
@@ -143,13 +146,70 @@ _CREDIT_SUBTYPES = {'credit card', 'line of credit'}
 SUPPORTED_SUBTYPES = _CURRENT_SUBTYPES | _CREDIT_SUBTYPES
 
 # Types / subtypes we explicitly never offer a button for — not Bank Accounts
-# in ERPNext's model. (The subtype set is broader than strictly necessary given
-# SUPPORTED_SUBTYPES already gates inclusion, but it documents intent and keeps
-# the "not supported" note honest even if Plaid adds a new depository subtype.)
-_UNSUPPORTED_TYPES = {'loan', 'investment', 'brokerage', 'other'}
-_UNSUPPORTED_SUBTYPES = {
-    'mortgage', 'student', 'auto', '401k', 'ira', 'roth', 'brokerage', 'hsa',
+# in ERPNext's model. Loans (and the catch-all 'other') stay out. Investment /
+# brokerage / retirement accounts USED to be here too, but v0.4.0 brings them in
+# as *balance-only* accounts (see the investment section below), so they're no
+# longer unsupported — is_investment() short-circuits is_supported() before this.
+_UNSUPPORTED_TYPES = {'loan', 'other'}
+_UNSUPPORTED_SUBTYPES = {'mortgage', 'student', 'auto'}
+
+# ── v0.4.0: balance-only investment support ─────────────────────────────────
+#
+# Plaid `investment` accounts (401k, IRA, brokerage, crypto, …) don't return
+# transactions without Plaid's separate `investments` product, so Bank Bridge
+# supports them BALANCE-ONLY: it still creates a Bank Account + GL leaf (under
+# Non-current Assets → Investments) and reflects the current balance on each
+# refresh, but never attempts a /transactions/sync for them (see
+# PlaidAccount.balance_only + the sync engine). A crypto account can also surface
+# from a non-investment institution, so the subtype signal alone qualifies it.
+_INVESTMENT_TYPES = {'investment', 'brokerage'}
+
+# Plaid investment subtype → the Investments subgroup it books under. Keys are
+# normalized (lowercased, underscores→spaces) so 'crypto_exchange' and
+# 'crypto exchange' both resolve.
+_INVESTMENT_SUBGROUP = {
+    '401k': 'Retirement', 'ira': 'Retirement', 'roth': 'Retirement',
+    'retirement': 'Retirement', 'hsa': 'Retirement',
+    'brokerage': 'Marketable Securities', 'mutual fund': 'Marketable Securities',
+    'stock': 'Marketable Securities', 'bond': 'Marketable Securities',
+    'crypto exchange': 'Digital Assets',
 }
+INVESTMENT_SUBGROUPS = ('Retirement', 'Marketable Securities',
+                        'Digital Assets', 'Other')
+
+
+def _norm_subtype(subtype: str) -> str:
+    return (subtype or '').strip().lower().replace('_', ' ')
+
+
+def is_investment_type(type_str: str, subtype: str) -> bool:
+    """True when a (type, subtype) pair is a balance-only investment account:
+    an investment/brokerage type, a known investment subtype, or anything whose
+    subtype names crypto (so a crypto account from a bank institution counts)."""
+    t = (type_str or '').strip().lower()
+    s = _norm_subtype(subtype)
+    if t in _INVESTMENT_TYPES:
+        return True
+    if s in _INVESTMENT_SUBGROUP:
+        return True
+    return 'crypto' in s
+
+
+def is_investment(account: PlaidAccount) -> bool:
+    """`is_investment_type` for a PlaidAccount."""
+    return is_investment_type(account.type, account.subtype)
+
+
+def investment_subgroup(account: PlaidAccount) -> str:
+    """The Investments subgroup for an investment account: Retirement /
+    Marketable Securities / Digital Assets, else Other. A crypto subtype always
+    lands in Digital Assets even without an explicit map entry."""
+    s = _norm_subtype(account.subtype)
+    if s in _INVESTMENT_SUBGROUP:
+        return _INVESTMENT_SUBGROUP[s]
+    if 'crypto' in s:
+        return 'Digital Assets'
+    return 'Other'
 
 # The auto-provisioned custom fields on the Bank Account doctype. Idempotent:
 # `plaid_account_id` is the dedup key (unique); `last_4` mirrors the mask.
@@ -159,12 +219,21 @@ _CUSTOM_FIELDS = (
      'insert_after': 'bank_account_no'},
     {'fieldname': 'last_4', 'label': 'Last 4', 'fieldtype': 'Data',
      'read_only': 1, 'insert_after': 'plaid_account_id'},
+    # v0.4.0 balance-only investments: the last Plaid current balance, refreshed
+    # on each /accounts/get. ERPNext's Bank Account has no native balance field,
+    # so this Custom Field holds it (informational; not a reconciled figure).
+    {'fieldname': 'plaid_balance', 'label': 'Plaid Balance',
+     'fieldtype': 'Currency', 'read_only': 1, 'insert_after': 'last_4'},
 )
 
 
 def is_supported(account: PlaidAccount) -> bool:
     """True when this Plaid account maps onto an ERPNext Bank Account (and so
-    gets a 'Create in ERPNext' button)."""
+    gets a 'Create in ERPNext' button). Depository/credit subtypes are supported
+    for full transaction sync; investment accounts are supported balance-only
+    (v0.4.0). Loans and the catch-all 'other' remain unsupported."""
+    if is_investment(account):
+        return True
     t = (account.type or '').strip().lower()
     s = (account.subtype or '').strip().lower()
     if t in _UNSUPPORTED_TYPES or s in _UNSUPPORTED_SUBTYPES:
@@ -350,6 +419,22 @@ def _longterm_liabilities_group_name() -> str:
             or 'Long-term Liabilities').strip() or 'Long-term Liabilities'
 
 
+def _noncurrent_assets_group_name() -> str:
+    """The parent group the Investments group anchors under, on the Assets side
+    (ERPNEXT_NONCURRENT_ASSETS_GROUP_NAME, default 'Non-current Assets'). Stock
+    ERPNext charts don't always ship it — the resolver falls back to creating it
+    under the Asset root."""
+    return (current_app.config.get('ERPNEXT_NONCURRENT_ASSETS_GROUP_NAME')
+            or 'Non-current Assets').strip() or 'Non-current Assets'
+
+
+def _investments_group_name() -> str:
+    """The Chart-of-Accounts group balance-only investment GL Accounts live under
+    (ERPNEXT_INVESTMENTS_GROUP_NAME, default 'Investments')."""
+    return (current_app.config.get('ERPNEXT_INVESTMENTS_GROUP_NAME')
+            or 'Investments').strip() or 'Investments'
+
+
 def _gl_side(account: PlaidAccount) -> str:
     """Which side of the Chart of Accounts this Plaid account's GL leaf belongs
     on: 'credit' (cards / lines of credit → Current Liabilities), 'loan' (→
@@ -361,6 +446,8 @@ def _gl_side(account: PlaidAccount) -> str:
     s = (account.subtype or '').strip().lower()
     if t == 'credit' or s in _CREDIT_SUBTYPES:
         return 'credit'
+    if is_investment(account):
+        return 'investment'
     if t == 'loan':
         return 'loan'
     return 'depository'
@@ -581,19 +668,26 @@ def _find_accounts(client: ERPNextClient, company: str, *, account_name=None,
 
 def _create_group_account(client: ERPNextClient, account_name: str,
                           parent_account: str, company: str, *,
-                          account_type: str | None = None) -> str:
+                          account_type: str | None = None,
+                          account_number: str | int | None = None) -> str:
     """Create an is_group=1 Account under `parent_account`; return its docname.
     root_type is inherited from the parent by ERPNext, so we don't set it.
 
     v0.3.9: when the parent group uses account numbering, the new group also gets
     an account_number in the parent's range (e.g. Current Liabilities siblings
     2100/2200/2300/2400 → new group 2500). Skipped silently when the chart
-    doesn't number its accounts."""
+    doesn't number its accounts. v0.4.0: pass `account_number` to force a reserved
+    number (the investment groups at 1300/1310/…); it's still only applied when
+    the chart numbers its accounts, and bumped past any collision."""
     doc = {'account_name': account_name, 'parent_account': parent_account,
            'company': company, 'is_group': 1}
     if account_type:
         doc['account_type'] = account_type
-    number = _next_account_number(client, company, parent_account, is_group=True)
+    if account_number is not None:
+        number = _reserved_group_number(client, company, int(account_number))
+    else:
+        number = _next_account_number(client, company, parent_account,
+                                      is_group=True)
     if number:
         doc['account_number'] = number
     created = client.create_doc(ACCOUNT_DT, doc)
@@ -602,6 +696,22 @@ def _create_group_account(client: ERPNextClient, account_name: str,
              name or account_name, parent_account,
              f' as #{number}' if number else '')
     return name or account_name
+
+
+def _reserved_group_number(client: ERPNextClient, company: str,
+                           preferred: int) -> str | None:
+    """A reserved account_number (e.g. the investment groups' 1300/1310/…),
+    honored only when the chart already numbers its accounts — otherwise None so
+    the create omits the field, exactly like the sibling-derived numbering. The
+    preferred value is bumped past any number already used in the company so it
+    can't collide."""
+    used = _company_account_numbers(client, company)
+    if not used:
+        return None  # chart doesn't number its accounts — stay number-less
+    n = preferred
+    while n in used:
+        n += 1
+    return str(n)
 
 
 def _asset_root(client: ERPNextClient, company: str) -> str | None:
@@ -747,15 +857,90 @@ def ensure_loan_group(client: ERPNextClient, company: str) -> str | None:
     return None
 
 
+# ── v0.4.0: investment groups (balance-only) ────────────────────────────────
+#
+# Investment accounts book under Assets → Non-current Assets → Investments,
+# subdivided by Plaid subtype into Retirement / Marketable Securities / Digital
+# Assets / Other. The group numbers are reserved (Investments 1300, Retirement
+# 1310, Marketable 1320, Digital 1330, Other 1390) so the branch reads tidily in
+# a numbered chart; on an un-numbered chart they're created number-less like
+# everything else.
+
+# Investments subgroup → its reserved account_number (applied only on a numbered
+# chart; see _reserved_group_number).
+_INVESTMENT_SUBGROUP_NUMBER = {
+    'Retirement': 1310, 'Marketable Securities': 1320,
+    'Digital Assets': 1330, 'Other': 1390,
+}
+_INVESTMENTS_GROUP_NUMBER = 1300
+
+
+def _ensure_noncurrent_assets(client: ERPNextClient, company: str) -> str | None:
+    """Find (or create) the 'Non-current Assets' group for `company`; return its
+    docname. Tolerates the common 'Non Current Assets' spelling stock charts use.
+    Falls back to creating it under the Asset root. None when there's no Asset
+    branch to anchor to."""
+    for candidate in (_noncurrent_assets_group_name(), 'Non Current Assets',
+                      'Non-Current Assets'):
+        existing = _find_accounts(client, company, account_name=candidate,
+                                  is_group=1)
+        if existing:
+            return existing[0]['name']
+    root = _asset_root(client, company)
+    if root:
+        return _create_group_account(client, _noncurrent_assets_group_name(),
+                                     root, company)
+    return None
+
+
+def ensure_investment_group(client: ERPNextClient, company: str) -> str | None:
+    """Find (or create) the 'Investments' group for `company`, under Non-current
+    Assets; return its docname. Reuses an existing group; otherwise anchors under
+    Non-current Assets (created if missing). None when the company has no Asset
+    branch — the caller then degrades to the personal-account path."""
+    group_name = _investments_group_name()
+    existing = _find_accounts(client, company, account_name=group_name, is_group=1)
+    if existing:
+        return existing[0]['name']
+    parent = _ensure_noncurrent_assets(client, company)
+    if parent:
+        return _create_group_account(client, group_name, parent, company,
+                                     account_number=_INVESTMENTS_GROUP_NUMBER)
+    log.info('no Non-current Assets / Asset anchor for company %r; skipping '
+             'investment GL group', company)
+    return None
+
+
+def ensure_investment_subgroup(client: ERPNextClient, account: PlaidAccount,
+                               company: str) -> str | None:
+    """Find (or create) the subgroup a balance-only investment account books
+    under (Investments → Retirement / Marketable Securities / Digital Assets /
+    Other); return its docname. None when the Investments group can't be
+    found/created."""
+    parent = ensure_investment_group(client, company)
+    if not parent:
+        return None
+    subgroup = investment_subgroup(account)
+    existing = _find_accounts(client, company, account_name=subgroup, is_group=1)
+    if existing:
+        return existing[0]['name']
+    return _create_group_account(
+        client, subgroup, parent, company,
+        account_number=_INVESTMENT_SUBGROUP_NUMBER.get(subgroup))
+
+
 def resolve_gl_parent(client: ERPNextClient, account: PlaidAccount,
                       company: str) -> str | None:
     """The Chart-of-Accounts group a Plaid account's GL leaf belongs under,
-    chosen by _gl_side (v0.3.9): credit → Credit Cards (Current Liabilities),
-    loan → Loans, depository → Bank Accounts (Assets). Returns the group docname
-    or None when the relevant branch can't be found/created."""
+    chosen by _gl_side: credit → Credit Cards (Current Liabilities), investment →
+    Investments subgroup (Non-current Assets, v0.4.0), loan → Loans, depository →
+    Bank Accounts (Assets). Returns the group docname or None when the relevant
+    branch can't be found/created."""
     side = _gl_side(account)
     if side == 'credit':
         return ensure_credit_card_group(client, company)
+    if side == 'investment':
+        return ensure_investment_subgroup(client, account, company)
     if side == 'loan':
         return ensure_loan_group(client, company)
     return ensure_bank_account_group(client, company)
@@ -892,10 +1077,15 @@ LIQUIDITY_RANK = {
     'savings': 3,           # immediate access, usually held as reserves
     'money market': 3,      # alongside savings (slots after it by name)
     'cd': 4,                # least liquid — locked for a term
-    # 5 reserved: Bonds (least liquid cash-equivalent) — not a Plaid Bank type
     # credit (Liabilities side), most→least current-due
     'credit card': 1,       # revolving, monthly due
     'line of credit': 2,
+    # investment (Assets side, balance-only) — most→least liquid: marketable
+    # securities (rank 5) sell same-day, retirement (rank 6) is locked to
+    # age/plan rules, crypto/digital (rank 7) sits furthest out.
+    'brokerage': 5, 'mutual fund': 5, 'stock': 5, 'bond': 5,
+    '401k': 6, 'ira': 6, 'roth': 6, 'retirement': 6, 'hsa': 6,
+    'crypto exchange': 7,
 }
 DEFAULT_LIQUIDITY_RANK = 99
 
@@ -912,7 +1102,7 @@ _LIQUIDITY_BAND_SIZE = 10
 def liquidity_rank(account: PlaidAccount) -> int:
     """The liquidity rank (lower = more liquid) for a Plaid account, from its
     subtype. Unmapped subtypes get DEFAULT_LIQUIDITY_RANK (sorted last)."""
-    return LIQUIDITY_RANK.get((account.subtype or '').strip().lower(),
+    return LIQUIDITY_RANK.get(_norm_subtype(account.subtype),
                               DEFAULT_LIQUIDITY_RANK)
 
 
@@ -1587,3 +1777,43 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
     _log('', stats['created'], 'failed' if stats['failed'] and not stats['created']
          else 'success', summary_msg)
     return stats
+
+
+# ── v0.4.0: balance-only balance refresh ────────────────────────────────────
+
+def update_bank_account_balance(client: ERPNextClient,
+                                account: PlaidAccount) -> bool:
+    """Write a balance-only account's current Plaid balance onto its mapped
+    ERPNext Bank Account (`plaid_balance` custom field). Best-effort: returns
+    True only when an update was actually pushed. No-op when the account isn't
+    mapped, has no cached balance, or the Custom Field doctype is unavailable
+    (nothing to write to). Never reconciles — this is an informational mirror."""
+    name = (account.erpnext_bank_account_name or '').strip()
+    if not name or account.balance_current is None:
+        return False
+    if is_doctype_unavailable(CUSTOM_FIELD_DT):
+        return False
+    try:
+        client.update_doc(BANK_ACCOUNT_DT, name,
+                          {'plaid_balance': account.balance_current})
+    except (ERPNextAPIError, ERPNextError):
+        log.warning('balance refresh failed for %s → %s', account.account_id,
+                    name, exc_info=True)
+        return False
+    return True
+
+
+def refresh_investment_balances(client: ERPNextClient) -> int:
+    """Push the latest cached balance for every mapped balance-only account onto
+    its ERPNext Bank Account. Returns the count updated. Best-effort per account —
+    one failure doesn't stop the rest."""
+    if client is None:
+        return 0
+    count = 0
+    accounts = (PlaidAccount.query
+                .filter(PlaidAccount.balance_only.is_(True),
+                        PlaidAccount.erpnext_bank_account_name.isnot(None)).all())
+    for account in accounts:
+        if update_bank_account_balance(client, account):
+            count += 1
+    return count

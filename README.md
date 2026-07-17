@@ -525,12 +525,40 @@ as the first step of every import — always idempotent.
 
 **Supported** subtypes (get a button): `checking`, `savings`, `cd`,
 `money market`, `cash management`, `paypal` → account type **Current**;
-`credit card`, `line of credit` → account type **Credit**. Loans, investments,
-brokerage, and retirement accounts (mortgage, student, auto, 401k, IRA, Roth,
-HSA, brokerage) are **not** Bank Accounts in ERPNext's model and are skipped
-with a "not supported" note. Set `ERPNEXT_DEFAULT_BANK_ACCOUNT_TYPE` to force a
-single account type for every import if your Chart of Accounts names them
-differently.
+`credit card`, `line of credit` → account type **Credit**. Investment accounts
+(401k, IRA, brokerage, crypto, …) are supported **balance-only** (see below).
+Loans (mortgage, student, auto) and the catch-all `other` are **not** Bank
+Accounts in ERPNext's model and are skipped with a "not supported" note. Set
+`ERPNEXT_DEFAULT_BANK_ACCOUNT_TYPE` to force a single account type for every
+import if your Chart of Accounts names them differently.
+
+**Investment accounts (balance-only, v0.4.0).** Plaid `investment` accounts
+(401k, IRA, HSA, brokerage, crypto, …) don't return transactions without Plaid's
+separate, pricier **investments** product, so Bank Bridge supports them
+**balance-only**: it still creates a **Bank Account** + GL leaf for each, but
+**does not sync transactions** — it only mirrors the current balance. On the
+Accounts page these rows carry a *"balance-only, no transactions"* badge.
+
+The GL leaves are placed under **Assets → Non-current Assets → Investments**,
+auto-subdivided by Plaid subtype:
+
+| Plaid subtype | Investments subgroup | Group # |
+|---|---|---|
+| `401k`, `ira`, `roth`, `retirement`, `hsa` | **Retirement** | 1310 |
+| `brokerage`, `mutual fund`, `stock`, `bond` | **Marketable Securities** | 1320 |
+| `crypto exchange` | **Digital Assets** | 1330 |
+| anything else | **Other** | 1390 |
+
+(The **Investments** parent group is 1300; a `crypto`-subtype account lands under
+Digital Assets even if it comes from a non-investment institution. Reserved
+numbers are only applied when your chart already numbers its accounts.) The
+current balance is written to a `plaid_balance` **Custom Field** on the Bank
+Account each time `/accounts/get` refreshes (daily by default) — it's
+**informational**, never reconciled. This is the roadmap's **tier-2** investment
+support (balances in the books); full **tier-3** support (holdings + investment
+transactions, which needs Plaid's investments product) is not implemented.
+Configure the group names with `ERPNEXT_INVESTMENTS_GROUP_NAME` /
+`ERPNEXT_NONCURRENT_ASSETS_GROUP_NAME`.
 
 **Multi-entity: which Company owns the accounts (v0.4.0).** If you keep books
 for more than one entity in the same ERPNext, you can choose the **owning

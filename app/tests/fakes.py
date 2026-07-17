@@ -358,6 +358,21 @@ class FakeERPClient:
         name = f'DOC-{self._counter:04d}'
         return {'name': name}
 
+    def update_doc(self, doctype, name, doc):
+        """Merge fields into an existing doc (used by the v0.4.0 balance-only
+        refresh, which PUTs `plaid_balance` onto a Bank Account)."""
+        self.calls.append(('update_doc', doctype, name, doc))
+        pool = self.created.get(doctype)
+        if pool is not None and name in pool:
+            pool[name].update(doc)
+        elif name in self.docs:
+            self.docs[name].update(doc)
+        else:
+            # Track the update even if we never saw the create (tests may map an
+            # account to a Bank Account name without a prior create).
+            self.created.setdefault(doctype, {})[name] = dict(doc)
+        return {'name': name, **doc}
+
     def call_method(self, method, params=None, http_method='GET', json_body=None):
         self.calls.append(('call_method', method, json_body))
         if method == 'frappe.client.submit':

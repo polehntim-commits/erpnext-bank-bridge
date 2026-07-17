@@ -190,6 +190,10 @@ def refresh_accounts(item: PlaidItem, plaid_client: PlaidClient,
         cur = a.get('iso_currency_code', 'USD') or 'USD'
         acct.iso_currency_code = cur
         acct.currency = cur
+        # v0.4.0: re-derive balance-only (investment) each refresh from the live
+        # type/subtype, so a reclassification flips the flag either way.
+        acct.balance_only = erpnext_accounts.is_investment_type(
+            acct.type, acct.subtype)
         acct.updated_at = _now()
     db.session.commit()
     return len(accounts)
@@ -244,6 +248,14 @@ def _mark_removed(tid: str) -> None:
     row.updated_at = _now()
 
 
+def _item_all_balance_only(item: PlaidItem) -> bool:
+    """True when the Item has at least one account and every one is balance-only
+    (an investment). Such an Item has no transactions to pull, so the sync loop
+    skips /transactions/sync for it and just refreshes balances."""
+    accts = PlaidAccount.query.filter_by(item_id=item.item_id).all()
+    return bool(accts) and all(a.balance_only for a in accts)
+
+
 def pull_item(item: PlaidItem, plaid_client: PlaidClient) -> dict:
     """Pull the delta for one Item, applying added/modified/removed locally and
     advancing the cursor. Returns a stats dict. Logs one plaid_pull row."""
@@ -254,6 +266,20 @@ def pull_item(item: PlaidItem, plaid_client: PlaidClient) -> dict:
             stats['accounts'] = refresh_accounts(item, plaid_client, access_token)
         except PlaidError as e:
             log.warning('account refresh failed for %s: %s', item.item_id, e)
+
+    # v0.4.0: an Item whose every account is balance-only (e.g. a 401k-only
+    # institution) has no transactions to fetch — Plaid returns none without the
+    # `investments` product — so skip the billable /transactions/sync entirely.
+    if _item_all_balance_only(item):
+        item.status = 'active'
+        item.last_synced_at = _now()
+        item.last_error = None
+        item.updated_at = _now()
+        db.session.commit()
+        _log(item.item_id, 'plaid_pull', 0, 'success',
+             f"balance-only item — skipped /transactions/sync "
+             f"(accounts={stats['accounts']})")
+        return stats
 
     cursor = item.cursor or None
     try:
@@ -479,6 +505,14 @@ def sync_item(item: PlaidItem, plaid_client: PlaidClient = None,
     if erp_client is None:
         erp_client = get_erp_client_or_none()
     push_stats = push_pending(erp_client, item.item_id) if erp_client else {}
+    # v0.4.0: mirror refreshed balances onto balance-only investment accounts'
+    # ERPNext Bank Accounts. Best-effort — never fails the sync.
+    if erp_client is not None:
+        try:
+            erpnext_accounts.refresh_investment_balances(erp_client)
+        except (ERPNextAPIError, ERPNextError):
+            log.warning('investment balance refresh failed for %s',
+                        item.item_id, exc_info=True)
     return {'item_id': item.item_id, 'pull': pull_stats, 'push': push_stats}
 
 

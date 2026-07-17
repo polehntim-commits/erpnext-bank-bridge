@@ -97,6 +97,13 @@ class PlaidAccount(db.Model):
     # page). NULL falls back to the Item's owning_company, then the ERPNext
     # default Company — so pre-v0.4.0 accounts keep their current behavior.
     owning_company = db.Column(db.String(140), nullable=True)
+    # v0.4.0 · balance-only investment support. True for Plaid investment
+    # accounts (401k, IRA, brokerage, crypto, …): Bank Bridge creates a Bank
+    # Account + GL leaf and mirrors the current balance, but skips
+    # /transactions/sync (Plaid returns no transactions without the `investments`
+    # product). Re-derived from type/subtype on every account refresh, so it
+    # flips off if an account is ever reclassified to a depository type.
+    balance_only = db.Column(db.Boolean, default=False, index=True)
     sync_enabled = db.Column(db.Boolean, default=True)
     # One-click-import lifecycle (see app/erpnext_accounts.py):
     #   pending     — never auto-imported (the default / freshly linked)
@@ -120,6 +127,7 @@ class PlaidAccount(db.Model):
             'erpnext_bank_account_name': self.erpnext_bank_account_name,
             'erpnext_gl_account_name': self.erpnext_gl_account_name,
             'owning_company': self.owning_company,
+            'balance_only': bool(self.balance_only),
             'sync_enabled': bool(self.sync_enabled),
             'import_status': self.import_status or 'pending',
         }

@@ -4,7 +4,8 @@
   * per-account "Create in ERPNext": Bank + Bank Account created, mapped,
     sync_enabled, import_status stamped
   * Plaid subtype → ERPNext account_type inference (Current / Credit) + override
-  * skip filter: loan / investment / 401k / mortgage etc. are unsupported
+  * skip filter: loan / mortgage / student / auto / other are unsupported
+    (investment accounts are supported balance-only — see test_investments.py)
   * dedup: importing the same account twice makes no duplicate Bank Account,
     and two accounts at one institution share a single Bank
   * bulk import: 5 supported + 3 unsupported → 5 created, 3 skipped
@@ -86,15 +87,14 @@ class TestSupportFilter(ImportBase):
             self.assertTrue(erpnext_accounts.is_supported(a), st)
 
     def test_unsupported_types_and_subtypes(self):
+        # Loans + the catch-all 'other' stay unsupported. (Investment accounts
+        # are now supported balance-only — see TestInvestmentSupport in
+        # test_investments.py.)
         self._item()
         cases = [
             ('mortgage', 'loan'),
             ('student', 'loan'),
-            ('401k', 'investment'),
-            ('ira', 'investment'),
-            ('roth', 'investment'),
-            ('hsa', 'depository'),
-            ('brokerage', 'brokerage'),
+            ('auto', 'loan'),
             ('', 'other'),
         ]
         for i, (st, ty) in enumerate(cases):
@@ -216,11 +216,11 @@ class TestCustomFieldBootstrap(ImportBase):
         erpnext_accounts.ensure_custom_fields(erp)   # second call: no-op
         created = [c for c in erp.calls
                    if c[0] == 'create_doc' and c[1] == 'Custom Field']
-        # Exactly the two fields, created once each despite two calls.
-        self.assertEqual(len(created), 2)
+        # Exactly the three fields, created once each despite two calls.
+        self.assertEqual(len(created), 3)
         names = {erp.created['Custom Field'][n]['fieldname']
                  for n in erp.created['Custom Field']}
-        self.assertEqual(names, {'plaid_account_id', 'last_4'})
+        self.assertEqual(names, {'plaid_account_id', 'last_4', 'plaid_balance'})
 
 
 class TestBankAccountTypes(ImportBase):
@@ -302,9 +302,11 @@ class TestBulkImport(ImportBase):
         self._item()
         for i in range(5):
             self._account(f'sup-{i}', subtype='checking', mask=f'{i}{i}{i}{i}')
+        # 3 genuinely-unsupported accounts (loans + other). Investment accounts
+        # are supported balance-only now, so they no longer belong here.
         self._account('un-0', subtype='mortgage', type_='loan')
-        self._account('un-1', subtype='401k', type_='investment')
-        self._account('un-2', subtype='brokerage', type_='brokerage')
+        self._account('un-1', subtype='student', type_='loan')
+        self._account('un-2', subtype='', type_='other')
         erp = FakeERPClient()
         stats = erpnext_accounts.import_all_supported_accounts(client=erp)
         self.assertEqual(stats['created'], 5)

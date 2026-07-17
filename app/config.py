@@ -118,6 +118,15 @@ class Config:
     #     doesn't report an iso_currency_code.
     ERPNEXT_BANK_ACCOUNT_CURRENCY = os.environ.get(
         'ERPNEXT_BANK_ACCOUNT_CURRENCY', 'USD').strip() or 'USD'
+    #   * v0.4.0 balance-only investments — the Assets-side groups their GL
+    #     leaves are created under (Non-current Assets → Investments →
+    #     Retirement / Marketable Securities / Digital Assets / Other). Set these
+    #     to match your Chart of Accounts if it names them differently.
+    ERPNEXT_INVESTMENTS_GROUP_NAME = os.environ.get(
+        'ERPNEXT_INVESTMENTS_GROUP_NAME', 'Investments').strip() or 'Investments'
+    ERPNEXT_NONCURRENT_ASSETS_GROUP_NAME = os.environ.get(
+        'ERPNEXT_NONCURRENT_ASSETS_GROUP_NAME',
+        'Non-current Assets').strip() or 'Non-current Assets'
     # ── v0.3.1 · fuzzy dedup of auto-created GL Accounts ───────────────────
     # Before auto-creating a Bank GL Account, the importer fuzzy-matches its
     # intended account_name against the company's existing leaf Accounts

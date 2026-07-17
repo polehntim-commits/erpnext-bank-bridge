@@ -140,6 +140,12 @@ def run_migrations() -> None:
         # manual step.
         _add_column_if_missing('plaid_items', 'owning_company', 'VARCHAR(140)')
         _add_column_if_missing('plaid_accounts', 'owning_company', 'VARCHAR(140)')
+        # v0.4.0 — balance-only investment support: flag Plaid investment
+        # accounts so the sync loop skips /transactions/sync for them. Backfills
+        # to false (SQLite/Postgres both accept the literal); the flag is
+        # re-derived from type/subtype on the next account refresh regardless.
+        _add_column_if_missing('plaid_accounts', 'balance_only', 'BOOLEAN',
+                               default_sql='false')
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)
 

@@ -491,7 +491,9 @@ ACCOUNTS_BODY = """
   <tr>
     <td>{{ a.name or a.official_name or '(unnamed)' }}</td>
     <td><code>••{{ a.mask or '??' }}</code></td>
-    <td>{{ a.type }}{% if a.subtype %} / {{ a.subtype }}{% endif %}</td>
+    <td>{{ a.type }}{% if a.subtype %} / {{ a.subtype }}{% endif %}
+      {% if a.balance_only %}<br><span class="pill pill-muted"
+        title="Plaid doesn't return investment transactions without the investments product — only the balance is mirrored">balance-only, no transactions</span>{% endif %}</td>
     <td class="num">{{ '%.2f'|format(a.balance_current) if a.balance_current is not none else '—' }} {{ a.iso_currency_code }}</td>
     <td>
       <form method="post" action="/admin/accounts/map" style="display:flex;gap:8px;align-items:center;margin:0">
