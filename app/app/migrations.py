@@ -133,6 +133,13 @@ def run_migrations() -> None:
         _add_column_if_missing('categorization_rules', 'offset_direction',
                                'VARCHAR(20)', default_sql="'auto'")
         _migrate_rule_offset_accounts()
+        # v0.4.0 — multi-entity L1: the owning ERPNext Company, chosen at Plaid
+        # Link time on the Item and inherited (overridable) per account. Both
+        # backfill to NULL on an existing install, which the push path resolves
+        # to the ERPNext default Company — so v0.3.9 installs keep working with no
+        # manual step.
+        _add_column_if_missing('plaid_items', 'owning_company', 'VARCHAR(140)')
+        _add_column_if_missing('plaid_accounts', 'owning_company', 'VARCHAR(140)')
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)
 

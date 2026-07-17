@@ -77,7 +77,8 @@ class FakeERPClient:
                  missing_doctypes=None, company_account_mandatory=False,
                  chart_accounts=None, fail_account_create=False,
                  company_abbr='EC', existing_suppliers=None,
-                 fail_supplier_create=False, fail_je_create=False):
+                 fail_supplier_create=False, fail_je_create=False,
+                 companies=None):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -141,6 +142,8 @@ class FakeERPClient:
         # When True, every Journal Entry create fails — exercises the
         # non-destructive `error` GeneratedJournalEntry path.
         self.fail_je_create = fail_je_create
+        # ERPNext Company docnames for list_companies() (v0.4.0 multi-entity).
+        self.companies = list(companies) if companies is not None else []
         # Records created by the one-click account import, keyed by doctype.
         self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {},
                         'Bank Account Type': {}, 'Bank Account Subtype': {},
@@ -175,6 +178,10 @@ class FakeERPClient:
             return None
         if doctype == 'Account':
             return ({**self.chart_accounts, **self.created['Account']}).get(name)
+        if doctype == 'Bank Account':
+            # v0.4.0 drift check reads a Bank Account's `company`; created
+            # accounts live in self.created, keyed by '<account_name> - <bank>'.
+            return self.created['Bank Account'].get(name)
         return self.docs.get(name)
 
     @staticmethod
@@ -209,6 +216,11 @@ class FakeERPClient:
                   limit_page_length=0, order_by=None):
         self.calls.append(('list_docs', doctype, filters))
         self._maybe_missing(doctype)
+        if doctype == 'Company':
+            rows = [{'name': c} for c in self.companies]
+            if order_by:
+                rows = sorted(rows, key=lambda r: r['name'])
+            return rows
         if doctype == 'Bank Transaction' and filters:
             for f in filters:
                 if f[0] == 'reference_number' and f[1] == '=':

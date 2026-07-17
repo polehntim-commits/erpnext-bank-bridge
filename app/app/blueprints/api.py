@@ -13,7 +13,7 @@ secret."""
 import logging
 
 from flask import (Blueprint, current_app, jsonify, render_template_string,
-                   request)
+                   request, session)
 
 from .. import db
 from .. import crypto
@@ -56,6 +56,23 @@ def create_link_token():
     return jsonify({'link_token': link_token})
 
 
+SESSION_OWNING_COMPANY_KEY = 'link_owning_company'
+
+
+@bp.post('/api/plaid/set_link_company')
+def set_link_company():
+    """Remember the owning ERPNext Company the operator picked on the Link page
+    (v0.4.0 multi-entity L1), stashed in the Flask session until the exchange
+    reads it. Empty clears it (→ resolves to the ERPNext default Company)."""
+    data = request.get_json(silent=True) or request.form
+    company = (data.get('company') or '').strip()
+    if company:
+        session[SESSION_OWNING_COMPANY_KEY] = company
+    else:
+        session.pop(SESSION_OWNING_COMPANY_KEY, None)
+    return jsonify({'ok': True, 'owning_company': company})
+
+
 @bp.post('/api/plaid/exchange_token')
 def exchange_token():
     """Exchange a Link public_token for a durable access_token, store the Item
@@ -77,6 +94,13 @@ def exchange_token():
     item.access_token_encrypted = crypto.encrypt(access_token)
     item.status = 'active'
     item.last_error = None
+    # v0.4.0: stamp the owning Company chosen on the Link page (session-carried).
+    # A blank/absent choice leaves it NULL → resolves to the ERPNext default at
+    # push time (unchanged single-company behavior). Only set on a fresh link so
+    # re-linking an existing Item doesn't silently move its accounts' entity.
+    chosen_company = (session.get(SESSION_OWNING_COMPANY_KEY) or '').strip()
+    if chosen_company and not item.owning_company:
+        item.owning_company = chosen_company
     # Resolve institution (best-effort).
     try:
         meta = client.get_item(access_token)

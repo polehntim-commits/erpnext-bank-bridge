@@ -104,6 +104,18 @@ def list_bank_accounts(client: ERPNextClient | None = None) -> list[dict]:
         limit_page_length=0)
 
 
+def list_companies(client: ERPNextClient | None = None) -> list[str]:
+    """Every ERPNext Company docname, for the multi-entity owning-Company
+    dropdowns (v0.4.0 L1). The REST equivalent of `frappe.get_all("Company")` —
+    a plain list of names, ordered so the picker is tidy. Raises the usual
+    ERPNext errors if the connection isn't configured / reachable; callers that
+    render a dropdown swallow those and fall back to just the default Company."""
+    client = client or get_client()
+    rows = client.list_docs('Company', fields=['name'],
+                            order_by='name asc', limit_page_length=0)
+    return [r['name'] for r in rows if r.get('name')]
+
+
 def list_accounts(client: ERPNextClient | None = None) -> list[dict]:
     """Non-group ERPNext GL Accounts (Chart of Accounts leaves) for the rule
     offset-account dropdown. Ordered by name so the picker is tidy.

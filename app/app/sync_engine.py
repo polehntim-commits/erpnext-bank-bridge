@@ -38,6 +38,7 @@ from flask import current_app
 from . import audit
 from . import db
 from . import categorization
+from . import erpnext_accounts
 from . import erpnext_bank
 from . import erpnext_settings
 from . import plaid_settings
@@ -174,6 +175,11 @@ def refresh_accounts(item: PlaidItem, plaid_client: PlaidClient,
         if acct is None:
             acct = PlaidAccount(account_id=acct_id, item_id=item.item_id)
             db.session.add(acct)
+            # v0.4.0: a newly-seen account inherits its Item's owning Company at
+            # link time. Existing accounts keep any per-account override across
+            # refreshes (we never clobber a correction).
+            if item.owning_company and not acct.owning_company:
+                acct.owning_company = item.owning_company
         acct.name = a.get('name', '') or ''
         acct.official_name = a.get('official_name', '') or ''
         acct.mask = a.get('mask', '') or ''
@@ -329,16 +335,26 @@ def push_pending(erp_client, item_id: str = '') -> dict:
     """Post every pending local row (posted_at IS NULL) whose account is mapped
     + enabled. Rows for unmapped accounts are left pending (no error). Logs one
     erpnext_push row. `item_id` scopes the log line (optional)."""
-    stats = {'posted': 0, 'cancelled': 0, 'failed': 0, 'skipped': 0}
+    stats = {'posted': 0, 'cancelled': 0, 'failed': 0, 'skipped': 0, 'drift': 0}
     if erp_client is None:
         return stats
     eligible = _eligible_account_map()
     q = BankTransaction.query.filter(BankTransaction.posted_at.is_(None))
     pending = q.order_by(BankTransaction.date.asc()).all()
+    # v0.4.0 multi-entity drift guard: only for accounts with an explicit owning
+    # Company. Probed once per account per run (cached), and refused rows never
+    # touch ERPNext, so a mis-set Company can't post into the wrong entity.
+    drift_cache: dict = {}
+    drift_audited: set = set()
     for row in pending:
         account = eligible.get(row.account_id)
         if account is None:
             stats['skipped'] += 1
+            continue
+        drift = _company_drift(erp_client, account, drift_cache)
+        if drift is not None:
+            _refuse_on_drift(row, account, drift, drift_audited)
+            stats['drift'] += 1
             continue
         try:
             was_removed = row.removed
@@ -373,8 +389,48 @@ def push_pending(erp_client, item_id: str = '') -> dict:
     status = 'failed' if stats['failed'] and not handled else 'success'
     _log(item_id, 'erpnext_push', handled, status,
          f"posted={stats['posted']} cancelled={stats['cancelled']} "
-         f"failed={stats['failed']} skipped={stats['skipped']}")
+         f"failed={stats['failed']} skipped={stats['skipped']} "
+         f"drift={stats['drift']}")
     return stats
+
+
+def _company_drift(erp_client, account: PlaidAccount, cache: dict):
+    """(expected, actual) owning-Company mismatch for a mapped account, or None.
+    Caches the ERPNext-side probe per Bank Account name so a push run costs at
+    most one extra GET per drifted-or-multi-entity account, and zero for an
+    install that never chose an owning Company (explicit_owning_company == '')."""
+    if not erpnext_accounts.explicit_owning_company(account):
+        return None
+    name = account.erpnext_bank_account_name or ''
+    if name not in cache:
+        cache[name] = erpnext_accounts.company_drift(erp_client, account)
+    return cache[name]
+
+
+def _refuse_on_drift(row: BankTransaction, account: PlaidAccount, drift: tuple,
+                     audited: set) -> None:
+    """Refuse to post one transaction whose Bank Account's ERPNext Company
+    disagrees with the chosen owning Company. Stamps the row's sync_error (but
+    leaves posted_at NULL so it retries once the drift is corrected) and records
+    a company_drift_detected AuditEvent — once per drifted account per run."""
+    expected, actual = drift
+    row.sync_error = (f'company drift: owning Company is {expected!r} but ERPNext '
+                      f'Bank Account {account.erpnext_bank_account_name!r} is under '
+                      f'{actual!r}; refusing to post until corrected')[:2000]
+    row.updated_at = _now()
+    db.session.commit()
+    key = account.account_id
+    if key not in audited:
+        audited.add(key)
+        audit.record('company_drift_detected', subject_type='PlaidAccount',
+                     subject_id=account.account_id,
+                     after={'account_id': account.account_id,
+                            'erpnext_bank_account': account.erpnext_bank_account_name,
+                            'expected_company': expected, 'erpnext_company': actual},
+                     notes=(f'refusing to push — owning Company {expected!r} ≠ '
+                            f'ERPNext Company {actual!r}'))
+    log.warning('company drift for %s: expected %r, ERPNext has %r — refusing push',
+                account.account_id, expected, actual)
 
 
 def retry_row(row_id: int) -> tuple[bool, str]:

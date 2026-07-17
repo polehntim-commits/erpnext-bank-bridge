@@ -228,6 +228,82 @@ def _default_company() -> str:
     return (erpnext_settings.load().get('default_company') or '').strip()
 
 
+# ── v0.4.0: multi-entity L1 — owning Company resolution ─────────────────────
+#
+# Every Plaid account resolves to the ERPNext Company that owns it, in order:
+#   1. the account's own `owning_company` (a correction-only per-account override),
+#   2. its parent Item's `owning_company` (set at Plaid Link time),
+#   3. the ERPNext default Company (unchanged pre-v0.4.0 behavior).
+# `explicit_owning_company` returns only steps 1-2 (empty when the operator never
+# chose one) — the drift check uses it so an install that never picked a Company
+# pays no extra ERPNext round-trip.
+
+
+def explicit_owning_company(account: PlaidAccount | None) -> str:
+    """The Company explicitly chosen for this account or its Item (steps 1-2
+    only), or '' when none was ever set. '' means 'inherit the default' — no
+    multi-entity intent, so the caller can skip the drift probe entirely."""
+    if account is None:
+        return ''
+    own = (getattr(account, 'owning_company', None) or '').strip()
+    if own:
+        return own
+    item = PlaidItem.query.filter_by(item_id=account.item_id).first()
+    if item and (item.owning_company or '').strip():
+        return item.owning_company.strip()
+    return ''
+
+
+def owning_company_for(account: PlaidAccount | None) -> str:
+    """The ERPNext Company that owns this Plaid account (v0.4.0 L1): the explicit
+    account/Item choice, else the ERPNext default Company. Used as the `company`
+    field on the Bank Account, its GL leaf, and any generated Journal Entry."""
+    return explicit_owning_company(account) or _default_company()
+
+
+def owning_company_for_account_id(account_id: str | None) -> str:
+    """`owning_company_for` keyed by Plaid account_id (for callers that hold a
+    transaction row, not the PlaidAccount)."""
+    if not account_id:
+        return _default_company()
+    acct = PlaidAccount.query.filter_by(account_id=account_id).first()
+    return owning_company_for(acct)
+
+
+def erpnext_bank_account_company(client: ERPNextClient, bank_account_name: str) -> str:
+    """The `company` field of an ERPNext Bank Account, or '' if it can't be read
+    (missing doc / connection error). Feeds the v0.4.0 drift check — comparing
+    what ERPNext believes owns the account against `plaid_account.owning_company`.
+    Best-effort: never raises."""
+    if not bank_account_name:
+        return ''
+    try:
+        doc = client.get_doc(BANK_ACCOUNT_DT, bank_account_name)
+    except (ERPNextAPIError, ERPNextError):
+        return ''
+    if not doc:
+        return ''
+    return (doc.get('company') or '').strip()
+
+
+def company_drift(client: ERPNextClient, account: PlaidAccount) -> tuple | None:
+    """(expected, actual) when the ERPNext Bank Account's Company disagrees with
+    the account's explicitly-chosen owning Company, else None (aligned, or no
+    explicit choice / no mapped Bank Account to check). The push path refuses a
+    transaction whose account drifted and records an AuditEvent, rather than
+    posting into the wrong entity's books."""
+    expected = explicit_owning_company(account)
+    if not expected:
+        return None  # no multi-entity intent — nothing to reconcile
+    bank_account = (account.erpnext_bank_account_name or '').strip()
+    if not bank_account:
+        return None
+    actual = erpnext_bank_account_company(client, bank_account)
+    if actual and actual != expected:
+        return (expected, actual)
+    return None
+
+
 def _default_is_company_account() -> int:
     """1 to mark imported Bank Accounts as company accounts, else 0. Driven by
     ERPNEXT_DEFAULT_IS_COMPANY_ACCOUNT (default True). When False we send 0 up
@@ -1243,7 +1319,8 @@ def _bank_account_name(account: PlaidAccount, institution: str) -> str:
 
 def build_bank_account_doc(account: PlaidAccount, bank_name: str,
                            institution: str, *, account_name: str | None = None,
-                           gl_account: str | None = None) -> dict:
+                           gl_account: str | None = None,
+                           company: str | None = None) -> dict:
     """Assemble the ERPNext Bank Account payload. account_name follows
     '<Institution> <TitleCasedSubtype> - <mask>' (e.g. 'Wells Fargo Checking -
     0000'). iban / bank_account_no are left blank (Plaid doesn't expose them).
@@ -1263,7 +1340,10 @@ def build_bank_account_doc(account: PlaidAccount, bank_name: str,
         'plaid_account_id': account.account_id,
         'last_4': account.mask or '',
     }
-    company = _default_company()
+    # v0.4.0: the owning Company (per-account/Item choice → default). An explicit
+    # `company` from the caller (find_or_create_bank_account already resolved it)
+    # wins; otherwise resolve it here so direct callers stay correct.
+    company = (company or '').strip() or owning_company_for(account)
     if company:
         doc['company'] = company
     # Link the auto-created GL Account only for a company account — the `account`
@@ -1301,7 +1381,8 @@ def find_or_create_bank_account(client: ERPNextClient, account: PlaidAccount,
         gl_account = _resolve_gl_account(client, account, company, account_name,
                                          skip_fuzzy=skip_fuzzy)
     doc = build_bank_account_doc(account, bank_name, institution,
-                                 account_name=account_name, gl_account=gl_account)
+                                 account_name=account_name, gl_account=gl_account,
+                                 company=company)
     created, retried = _create_bank_account_defensive(
         client, doc, item_id=account.item_id)
     name = created.get('name')
@@ -1374,9 +1455,10 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
     # Bank Account (find-or-create, deduped on plaid_account_id). The company
     # drives the v0.2.0 GL Account auto-create (best-effort; falls back to the
     # v0.1.5 personal path if the Chart of Accounts can't be walked/created).
+    # v0.4.0: the owning Company is the per-account/Item choice, else the default.
     docname, created_account, retried, gl_account = find_or_create_bank_account(
-        client, account, bank_name, institution, company=_default_company(),
-        skip_fuzzy=skip_fuzzy)
+        client, account, bank_name, institution,
+        company=owning_company_for(account), skip_fuzzy=skip_fuzzy)
 
     account.erpnext_bank_account_name = docname
     if gl_account:
@@ -1417,7 +1499,7 @@ def probe_fuzzy_gl_match(plaid_account_id: str, *,
         return None
     if not is_supported(account):
         return None
-    company = _default_company()
+    company = owning_company_for(account)
     if not company or not _default_is_company_account():
         return None
     try:

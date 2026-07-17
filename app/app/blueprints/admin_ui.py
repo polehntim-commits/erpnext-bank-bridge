@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote_plus
 
 from flask import (Blueprint, Response, current_app, jsonify, redirect,
-                   render_template_string, request, url_for)
+                   render_template_string, request, session, url_for)
 from werkzeug.security import check_password_hash
 
 from .. import audit
@@ -327,6 +327,29 @@ Set your Client ID + secret on the <a href="/admin/plaid_settings">Plaid setting
   <a href="/admin/accounts">Accounts</a> page.
 </p>
 <p>Environment: <span class="pill {{ 'pill-ok' if env == 'production' else 'pill-muted' }}">{{ env }}</span></p>
+
+{% if companies %}
+<div class="card" style="max-width:520px">
+  <label for="owningCompany" style="display:block;font-size:14px;font-weight:600;margin-bottom:4px">
+    Owning Company
+  </label>
+  <select id="owningCompany" style="width:100%;padding:6px;font-size:14px;box-sizing:border-box">
+    {% for c in companies %}
+    <option value="{{ c }}" {{ 'selected' if c == selected_company else '' }}>{{ c }}</option>
+    {% endfor %}
+  </select>
+  <p style="font-size:12px;color:#777;margin:6px 0 0">
+    The ERPNext Company that will own every account from this bank. Entities own
+    the accounts — Bank Bridge just provides the pipeline. You can correct an
+    individual account later on the <a href="/admin/accounts">Accounts</a> page.
+  </p>
+</div>
+{% elif erpnext_ok %}
+<p style="font-size:13px;color:#a04000">Couldn't load your ERPNext Companies — new
+  accounts will fall back to the default Company. You can set each account's
+  Company on the <a href="/admin/accounts">Accounts</a> page after linking.</p>
+{% endif %}
+
 <button id="linkBtn" class="primary" disabled>Loading Plaid Link…</button>
 <p id="linkStatus" style="font-size:13px;color:#555;margin-top:12px"></p>
 {% endif %}
@@ -341,6 +364,19 @@ Set your Client ID + secret on the <a href="/admin/plaid_settings">Plaid setting
 
   function setStatus(t) { statusEl.textContent = t; }
 
+  // v0.4.0 multi-entity: persist the chosen owning Company to the session so
+  // the exchange can stamp it on the new Item.
+  var companyEl = document.getElementById('owningCompany');
+  function saveCompany() {
+    if (!companyEl) return Promise.resolve();
+    return fetch('/api/plaid/set_link_company', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ company: companyEl.value })
+    }).catch(function () {});
+  }
+  if (companyEl) { companyEl.addEventListener('change', saveCompany); }
+
   fetch('/api/plaid/create_link_token', { method: 'POST' })
     .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
     .then(function (res) {
@@ -349,10 +385,12 @@ Set your Client ID + secret on the <a href="/admin/plaid_settings">Plaid setting
         token: res.j.link_token,
         onSuccess: function (public_token) {
           setStatus('Linked! Saving accounts…');
-          fetch('/api/plaid/exchange_token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ public_token: public_token })
+          saveCompany().then(function () {
+            return fetch('/api/plaid/exchange_token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ public_token: public_token })
+            });
           }).then(function (r) { return r.json(); })
             .then(function (j) {
               if (j.error) { setStatus('Exchange failed: ' + j.error); return; }
@@ -378,8 +416,27 @@ Set your Client ID + secret on the <a href="/admin/plaid_settings">Plaid setting
 @bp.get('/admin/link_bank')
 def link_bank_page():
     s = ps.load()
+    # v0.4.0 multi-entity: offer the owning-Company picker (best-effort). Default
+    # to the ERPNext default Company and seed the session so an unchanged pick
+    # still reaches the exchange.
+    companies, selected_company = [], (erps.load().get('default_company') or '').strip()
+    if erps.is_configured():
+        try:
+            companies = erpnext_bank.list_companies()
+        except (ERPNextConfigError, ERPNextError):
+            companies = []
+    if selected_company and selected_company not in companies:
+        # Keep the configured default visible even if the list call came back
+        # empty or didn't include it.
+        companies = [selected_company] + companies
+    if not selected_company and companies:
+        selected_company = companies[0]
+    if selected_company:
+        session['link_owning_company'] = selected_company
     return _page(LINK_BANK_BODY, page='link_bank', plaid_ok=ps.is_configured(),
-                 env=s['environment'], redirect_uri=s['redirect_uri'])
+                 env=s['environment'], redirect_uri=s['redirect_uri'],
+                 companies=companies, selected_company=selected_company,
+                 erpnext_ok=erps.is_configured())
 
 
 # ── Accounts (ERPNext Bank Account mapping) ──────────────────────
@@ -429,7 +486,7 @@ ACCOUNTS_BODY = """
   <span style="font-weight:400;color:#888;font-size:13px">· {{ grp.item.item_id[:14] }}…</span></h3>
 <table>
   <tr><th>Account</th><th>Mask</th><th>Type</th><th class="num">Balance</th>
-      <th>ERPNext Bank Account</th><th>Import</th></tr>
+      <th>ERPNext Bank Account</th><th>Import</th><th>Company</th></tr>
   {% for a in grp.accounts %}
   <tr>
     <td>{{ a.name or a.official_name or '(unnamed)' }}</td>
@@ -471,6 +528,26 @@ ACCOUNTS_BODY = """
         <span class="pill pill-muted" title="Not a Bank Account in ERPNext's model">not supported</span>
       {% endif %}
     </td>
+    <td>
+      {% if companies %}
+      <form method="post" action="/api/accounts/{{ a.account_id }}/set_company"
+            style="display:flex;gap:6px;align-items:center;margin:0"
+            title="Override owning Company (correction only)">
+        <select name="owning_company" style="flex:1;padding:4px;font-size:12px">
+          <option value="">— inherit ({{ grp.item.owning_company or 'default' }}) —</option>
+          {% for c in companies %}
+          <option value="{{ c }}" {{ 'selected' if c == a.owning_company else '' }}>{{ c }}</option>
+          {% endfor %}
+          {% if a.owning_company and a.owning_company not in companies %}
+          <option value="{{ a.owning_company }}" selected>{{ a.owning_company }} (current)</option>
+          {% endif %}
+        </select>
+        <button type="submit" class="secondary" style="padding:4px 8px;font-size:12px">Set</button>
+      </form>
+      {% else %}
+        <span style="font-size:12px;color:#999">{{ a.owning_company or grp.item.owning_company or '—' }}</span>
+      {% endif %}
+    </td>
   </tr>
   {% endfor %}
 </table>
@@ -494,16 +571,21 @@ def accounts_page():
                 any_imported = True
         groups.append({'item': it, 'accounts': accts})
     bank_accounts, erp_error = [], ''
+    companies = []
     if erps.is_configured():
         try:
             bank_accounts = erpnext_bank.list_bank_accounts()
         except (ERPNextConfigError, ERPNextError) as e:
             erp_error = str(e)
+        try:
+            companies = erpnext_bank.list_companies()
+        except (ERPNextConfigError, ERPNextError):
+            companies = []
     bank_account_names = {ba['name'] for ba in bank_accounts}
     return _page(ACCOUNTS_BODY, page='accounts', groups=groups,
                  bank_accounts=bank_accounts, bank_account_names=bank_account_names,
                  supported_map=supported_map, any_imported=any_imported,
-                 erpnext_ok=erps.is_configured(),
+                 erpnext_ok=erps.is_configured(), companies=companies,
                  bootstrap_unavailable=sorted(
                      erpnext_accounts.unavailable_doctypes()),
                  erp_error=erp_error, flash_msg=request.args.get('flash', ''))
@@ -630,6 +712,31 @@ def map_account():
     acct.sync_enabled = sync_enabled
     db.session.commit()
     msg = f'Mapped {acct.name or acct.mask} → {erp_name}' if erp_name else 'Unmapped account'
+    return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
+@bp.post('/api/accounts/<plaid_account_id>/set_company')
+def set_account_company(plaid_account_id):
+    """Correction-only (v0.4.0 L1): override the owning ERPNext Company for one
+    account. Normally an account inherits its Item's Company from Plaid Link; this
+    is the escape hatch for fixing a mis-assignment. Blank clears the override so
+    the account falls back to inheriting the Item's Company. Audited."""
+    acct = PlaidAccount.query.filter_by(account_id=plaid_account_id).first()
+    if acct is None:
+        return redirect('/admin/accounts?flash=' + quote_plus('Account not found'))
+    new_company = (request.form.get('owning_company') or '').strip() or None
+    before = acct.owning_company
+    acct.owning_company = new_company
+    db.session.commit()
+    audit.record('owning_company_override', subject_type='PlaidAccount',
+                 subject_id=acct.account_id,
+                 before={'owning_company': before},
+                 after={'owning_company': new_company},
+                 notes=f'correction: {before!r} → {new_company!r}')
+    if new_company:
+        msg = f'{acct.name or acct.mask} now owned by {new_company}'
+    else:
+        msg = f'{acct.name or acct.mask} reverted to inherit its bank’s Company'
     return redirect('/admin/accounts?flash=' + quote_plus(msg))
 
 

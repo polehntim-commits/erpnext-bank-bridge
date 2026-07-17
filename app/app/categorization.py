@@ -434,7 +434,11 @@ def generate_journal_entry(client, row, *, supplier_name=None,
     if rule is None:
         return None  # no rule matched → leave for manual reconciliation
 
-    company = _default_company()
+    # v0.4.0 multi-entity: the JE books to the Company that owns the
+    # transaction's Bank Account (per-account/Item choice → default).
+    from . import erpnext_accounts
+    company = erpnext_accounts.owning_company_for_account_id(
+        getattr(row, 'account_id', None))
     remark = render_description(rule, row, supplier_name=supplier_name)
 
     if gje is None:

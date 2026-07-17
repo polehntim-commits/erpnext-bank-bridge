@@ -532,6 +532,34 @@ with a "not supported" note. Set `ERPNEXT_DEFAULT_BANK_ACCOUNT_TYPE` to force a
 single account type for every import if your Chart of Accounts names them
 differently.
 
+**Multi-entity: which Company owns the accounts (v0.4.0).** If you keep books
+for more than one entity in the same ERPNext, you can choose the **owning
+Company** for each linked bank at Plaid Link time. The *Link a bank* page shows a
+**Owning Company** dropdown (populated from your ERPNext Companies) above the
+link button; whatever you pick is stamped on the new Item and inherited by every
+account it fans out to. From then on, that Company is used as the `company` on
+the Bank Account, its auto-created GL leaf, and any Journal Entry the rules
+engine generates — so each entity's transactions land in its own books.
+
+The guiding principle from the roadmap: **entities own the accounts; Bank Bridge
+just provides the pipeline.** Bank Bridge never invents Companies or moves money
+between them — it only routes each account's data to the Company you chose.
+
+If an account ends up under the wrong entity, the Accounts page has a
+per-account **Company** dropdown framed as *"Override owning Company (correction
+only)"*. This is a correction escape-hatch, **not** a normal-flow feature: the
+normal flow is to pick the Company once at link time. Clearing the override lets
+the account fall back to inheriting its bank's Company.
+
+**Drift protection.** Before posting a transaction, Bank Bridge checks that the
+target Bank Account's `company` in ERPNext still matches the account's chosen
+owning Company. If someone changed the Company on the ERPNext side, the mismatch
+is logged as a `company_drift_detected` **AuditEvent** and the transaction is
+**refused** (left pending, never posted into the wrong entity's books) until the
+drift is corrected. Installs that never pick an owning Company skip this check
+entirely and behave exactly as they did before v0.4.0 — the column simply
+resolves to the ERPNext **Default Company**, so upgrading needs no manual step.
+
 ### 4. Auto-Supplier + categorization rules (`/admin/rules`, v0.3.0)
 
 Once transactions are posting, two layers automate the reconciliation that used

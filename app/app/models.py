@@ -32,6 +32,11 @@ class PlaidItem(db.Model):
     cursor = db.Column(db.Text, nullable=True)
     # active | error | revoked
     status = db.Column(db.String(20), default='active', index=True)
+    # v0.4.0 · multi-entity L1: the ERPNext Company that owns this Item's
+    # accounts, chosen at Plaid Link time. NULL on a pre-v0.4.0 Item (and when
+    # the operator didn't pick one) — the push path then resolves it to the
+    # ERPNext default Company, so existing single-company installs are unchanged.
+    owning_company = db.Column(db.String(140), nullable=True)
     created_at = db.Column(db.DateTime, default=_now)
     last_synced_at = db.Column(db.DateTime, nullable=True)
     last_error = db.Column(db.Text, nullable=True)
@@ -49,6 +54,7 @@ class PlaidItem(db.Model):
             'institution_name': self.institution_name,
             'has_cursor': bool(self.cursor),
             'status': self.status,
+            'owning_company': self.owning_company,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'last_synced_at': self.last_synced_at.isoformat() if self.last_synced_at else None,
             'last_error': self.last_error,
@@ -85,6 +91,12 @@ class PlaidAccount(db.Model):
     # import creates/links one — or stays NULL when the GL auto-create failed and
     # the import fell back to a personal account.
     erpnext_gl_account_name = db.Column(db.Text, nullable=True)
+    # v0.4.0 · multi-entity L1: the ERPNext Company that owns THIS account.
+    # Inherits from the parent Item at link time (set in refresh_accounts); the
+    # per-account override is a correction-only escape hatch (see the Accounts
+    # page). NULL falls back to the Item's owning_company, then the ERPNext
+    # default Company — so pre-v0.4.0 accounts keep their current behavior.
+    owning_company = db.Column(db.String(140), nullable=True)
     sync_enabled = db.Column(db.Boolean, default=True)
     # One-click-import lifecycle (see app/erpnext_accounts.py):
     #   pending     — never auto-imported (the default / freshly linked)
@@ -107,6 +119,7 @@ class PlaidAccount(db.Model):
             'currency': self.currency, 'iso_currency_code': self.iso_currency_code,
             'erpnext_bank_account_name': self.erpnext_bank_account_name,
             'erpnext_gl_account_name': self.erpnext_gl_account_name,
+            'owning_company': self.owning_company,
             'sync_enabled': bool(self.sync_enabled),
             'import_status': self.import_status or 'pending',
         }
