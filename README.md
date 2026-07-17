@@ -58,7 +58,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.3.9 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.0 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -122,6 +122,23 @@ rank's band without disturbing the others. Three idempotent one-shot bench
 scripts under `app/scripts/` bring an existing install in line:
 `migrate_credit_cards_to_liabilities.py`, `backfill_account_subtypes.py`, and
 `backfill_account_numbers.py`. See the roadmap at the bottom.
+
+**v0.4.0** bundles four changes. **(1) Dependabot** is enabled (`pip` + `docker`,
+weekly, grouped). **(2) Multi-entity (Level 1):** you can choose the **owning
+ERPNext Company** for each linked bank at Plaid Link time — the choice is stamped
+on the Item and inherited by its accounts, and it drives the `company` on the
+Bank Account, its GL leaf, and generated Journal Entries. A correction-only
+per-account override lives on the Accounts page, and a drift guard refuses to
+post a transaction whose ERPNext Bank Account Company no longer matches (logged
+as a `company_drift_detected` audit event). Installs that never pick a Company
+resolve to the Default Company and behave exactly as before. **(3) Balance-only
+investments:** Plaid `investment` accounts (401k, IRA, brokerage, crypto, …) are
+now supported balance-only — a Bank Account + GL leaf under *Non-current Assets →
+Investments* (subdivided into Retirement / Marketable Securities / Digital Assets
+/ Other), with the balance mirrored on each refresh and `/transactions/sync`
+skipped (Plaid returns no investment transactions without the `investments`
+product). **(4)** New **PRIVACY.md** and **TERMS.md** for open-source disclosure.
+Backward-compatible: existing installs upgrade with no manual steps.
 
 ## How it works
 
@@ -817,7 +834,7 @@ cd app
 python3 -m unittest discover -s tests -v
 ```
 
-247 tests cover Fernet encryption round-trip + key persistence, Plaid response
+301 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
 push → error + retry, one-click account import, merchant-name normalization,
@@ -830,9 +847,11 @@ admin page rendering, the optional admin Basic Auth gate (enforced only when
 both env vars are set, correct vs wrong credentials, plaintext + hashed
 passwords, and the Plaid callback / JSON API staying ungated), and the
 configurable sync frequency (preset cost math, manual-only disabling the
-scheduler, interval persistence, and the per-Item daily call brake). The Plaid
-SDK and ERPNext are mocked (`tests/fakes.py`), so no network access or extra
-wheels are needed.
+scheduler, interval persistence, and the per-Item daily call brake), the
+multi-entity owning-Company resolution + inheritance + drift refusal (v0.4.0),
+and balance-only investment placement + the `balance_only` flag + the
+transactions-sync skip. The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
+so no network access or extra wheels are needed.
 
 ## Security notes
 
