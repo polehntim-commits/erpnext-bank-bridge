@@ -487,6 +487,16 @@ class CategorizationRule(db.Model):
     # a past auto-JE decision can always be reconstructed from the archived row.
     superseded_by = db.Column(db.Integer, nullable=True, index=True)
     archived = db.Column(db.Boolean, default=False, index=True)
+    # v0.4.6 · cached count of the transactions this rule has actually matched,
+    # refreshed by the daily rollup (app/rule_stats.rollup_match_counts) rather
+    # than recomputed per page load. A zero here is the signal the Rules list is
+    # built around: the rule is either dead or scoped too narrowly to ever fire.
+    #
+    # The rollup credits an ARCHIVED version's matches to the live rule that
+    # superseded it (it walks `superseded_by` forward). Without that, every edit
+    # — which clones the rule by design — would reset the column to 0 and make a
+    # working rule look dead, which is the exact opposite of what it's for.
+    match_count = db.Column(db.Integer, default=0, index=True)
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -519,6 +529,7 @@ class CategorizationRule(db.Model):
             'applies_to_company': self.applies_to_company or None,
             'superseded_by': self.superseded_by,
             'archived': bool(self.archived),
+            'match_count': int(self.match_count or 0),
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }

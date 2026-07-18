@@ -58,6 +58,12 @@ ERPNext  ──►  Bank Reconciliation Tool
   **Counterparty** overlay that pairs them, giving one net position, one
   combined ledger, and a **1099-eligible list that can't include your bank**.
   See [Counterparty overlay](#counterparty-overlay-v045).
+- **Guided rule authoring** (v0.4.6) — filter the Transactions tab down to what
+  **no rule caught**, see it grouped by merchant, and open the Rules editor
+  pre-filled from a whole group in one click. The Rules list shows a **Matches**
+  count so dead rules stand out, and a Company scope mistake is caught **when you
+  save the rule** rather than silently blocking every Journal Entry it generates.
+  See [Rule authoring](#rule-authoring-v046).
 - **Books opening balances** (v0.4.4) — every real bank account already holds
   something on the day you link it. Bank Bridge books that against an
   auto-created **Opening Balance Equity** account, so the balance sheet shows
@@ -78,7 +84,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.5 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.6 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -287,6 +293,20 @@ Company-agnostic logical-name list too) and reports how many accounts came back.
 Create an account in ERPNext, reload the Rules editor, and it's selectable — no
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
+
+**v0.4.6** — **guided rule authoring**. The first sync used to end in
+guess-and-check: hundreds of raw transactions, no Journal Entries, and no way to
+tell which merchants still needed a rule short of reading the list. The
+Transactions tab now has a **Rule state** filter (Unmatched / Rule matched / JE
+error / JE cancelled), the unmatched view **groups by merchant** so one rule
+clears a whole group, and both a group and a single row can open the Rules editor
+**pre-filled**. The Rules list gains a **Matches** column so a dead rule is
+obvious, and a scope mismatch between the Offset Account's Company and the
+rule's is now caught **when you save the rule** instead of silently blocking
+every Journal Entry it later generates. See
+[Rule authoring](#rule-authoring-v046). Additive: the only schema change is a
+`match_count` column that backfills to 0, and existing rules and transactions
+behave exactly as before.
 
 **v0.4.5** — **one identity per counterparty**. ERPNext models the buy side and
 the sell side as unrelated doctypes. A party that trades with you in both
@@ -604,6 +624,93 @@ Idempotency is enforced two ways: a unique local row per Plaid transaction id,
 and an ERPNext find-or-create keyed on `reference_number` (the Plaid id). The
 deposit/withdrawal split follows Plaid's convention (positive amount = money
 out of the account → withdrawal; negative = money in → deposit).
+
+## Rule authoring (v0.4.6)
+
+Writing the first set of categorization rules is the one genuinely hard part of
+setting Bank Bridge up, and until v0.4.6 the UI gave no help with it. You synced,
+got several hundred Bank Transactions and no Journal Entries, and had to work out
+from the raw list which merchants repeated often enough to be worth a rule —
+then write each one from memory, hit **Rerun rules**, and scroll back through the
+list to see what stuck.
+
+v0.4.6 turns that into a loop you can actually follow.
+
+**1 · Find what no rule caught.** `/admin/transactions` gains a **Rule state**
+filter, separate from the existing **Status** filter (that one is about the
+Plaid → ERPNext push; this one is about what the rules engine did afterwards):
+
+| Filter | Means |
+| --- | --- |
+| **Unmatched** | No rule matched, so no Journal Entry was generated. The list to write rules from. |
+| **Rule matched** | A rule fired and a live Journal Entry exists (`pending_review` or `approved`). |
+| **JE error** | A rule matched but the JE couldn't be created — `error`, `blocked` (cross-Company), or `skipped_missing_account`. |
+| **JE cancelled** | A rule matched and its JE was rejected or reversed. |
+
+All four consider only transactions the engine has actually seen — posted to
+ERPNext and not removed — which is the same set **Rerun rules** operates on. A
+row still pending has never been offered to the engine, so calling it
+"unmatched" would send you off writing rules that can't fire yet.
+
+**2 · Group the work.** Under **Unmatched**, transactions are grouped by
+merchant:
+
+```
+▸ 12 unmatched from Uber Eats   · 284.40 total     [Create rule from this group]
+▸  4 unmatched from Chevron     · 246.80 total     [Create rule from this group]
+▸  2 unmatched from SQ BLUE BOTTLE  (by description)  · 14.00 total
+```
+
+Transactions Plaid gives no merchant name for are grouped by a **description
+signature** — the first few alphabetic words, with card and store numbers
+stripped — so `SQ *BLUE BOTTLE 4471 SEATTLE WA` and `SQ *BLUE BOTTLE 8890
+PORTLAND OR` land together. Anything seen only once falls to a **One-offs**
+section rather than being buried in a group of one.
+
+**3 · Open the editor pre-filled.** "Create rule from this group" opens
+`/admin/rules` with a **`merchant_contains`** rule already filled in — broad
+enough to clear the whole group you just expanded. The **+ Rule** button on an
+individual unmatched row uses **`merchant_exact`** instead (or a description
+regex where there's no merchant): the narrowest rule that certainly covers the
+row in front of you. Both set **Applies to Company** from the transaction's own
+bank account, leave **Party type** on `Auto` (v0.4.0.9) and leave the
+**Description Template** empty so the v0.4.0.4 auto-fill takes over once you pick
+an Offset Account. Nothing is saved — it's a starting point you still edit.
+
+**4 · See which rules are actually working.** The Rules list gains a sortable
+**Matches** column: how many transactions each rule has fired on. A `0` is the
+signal — the rule is dead, or scoped too narrowly to reach anything (usually a
+Company scope no bank account belongs to, or a higher-priority rule shadowing
+it). The count is served from a cached column refreshed by a daily rollup, not
+recomputed per page load; it also refreshes inline right after **Rerun rules**,
+and **↻ refresh match counts** on the Rules page forces it. Because an edit
+clones the rule by design (v0.3.0 non-destructive history), the rollup credits an
+archived version's matches to the live rule that superseded it — otherwise every
+edit would reset a working rule to 0 and make it look dead.
+
+**5 · Catch a scope mistake while authoring it.** Saving a rule whose Offset
+Account belongs to a different ERPNext Company than the rule is scoped to now
+raises a confirmation *before* the save persists:
+
+> ⚠ **This rule's Offset Account belongs to another Company**
+> "Fuel Expense - BL" belongs to Beta LLC, but this rule is scoped to Alpha LLC.
+> [Cancel] [Save anyway]
+
+This is v0.4.0.2's push-time cross-Company guard moved forward to authoring
+time. Left alone, such a rule saves happily, generates Journal Entries, and every
+one is blocked days later in a different part of the UI. It warns rather than
+blocks — you may be mid-reorganization — and the Offset Account field also names
+its resolved Company inline, live-updating as you change the scope:
+
+```
+Offset account (in Alpha LLC):                      ← scoped rule, Mode A
+Offset account (logical name — resolves per-Company at JE time):   ← Mode B
+```
+
+Best-effort throughout: an unconfigured or unreachable ERPNext, or an account
+whose Company can't be read, saves exactly as it did before. A Company-agnostic
+rule never warns — its offset is a logical name that resolves per Company at JE
+time (v0.4.0.3), so there's no single Company for it to disagree with.
 
 ## Counterparty overlay (v0.4.5)
 
@@ -1290,6 +1397,7 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `COUNTERPARTY_AUTO_PAIR` | `true` | v0.4.5 · pair the Customer / Supplier records that already exist into Counterparties at startup. Idempotent and additive. `false` leaves the overlay empty until you run `scripts/pair_existing_customer_supplier.py` |
 | `COUNTERPARTY_ROLLUP_INTERVAL_HOURS` | `24` | v0.4.5 · how often the background job refreshes each Counterparty's cached activity totals. `0` or negative disables the job; the reports read the ledger live either way |
 | `COUNTERPARTY_FISCAL_YEAR_START_MONTH` | `1` | v0.4.5 · first month (1-12) of your fiscal year for the "top counterparties" report. `1` is a calendar year; set `9` for a crop year starting in September |
+| `RULE_MATCH_COUNT_ROLLUP_INTERVAL_HOURS` | `24` | v0.4.6 · how often the background job refreshes the **Matches** count on each rule. Local-only (it reads the generated-entry table, never ERPNext). `0` or negative disables the job; **Rerun rules** and the **↻ refresh match counts** button update the counts either way |
 | `AUTO_BOOK_OPENING_BALANCE` | `true` | v0.4.4 · book each account's existing balance as a Draft Journal Entry when it is first imported. Set `false` to book them by hand from `/admin/accounts` instead |
 | `OPENING_BALANCE_DATE` | `today` | v0.4.4 · posting date for auto-booked opening balances. An ISO date (`2026-01-01`) backdates them to e.g. a fiscal year start; an unparseable value falls back to today with a warning rather than failing the import |
 | `OPENING_BALANCE_EQUITY_ACCOUNT_NAME` | `Opening Balance Equity` | v0.4.4 · the Equity leaf every opening balance is offset against, auto-created under the owning Company's Equity root when the chart doesn't ship one |
@@ -1383,7 +1491,7 @@ cd app
 python3 -m unittest discover -s tests -v
 ```
 
-639 tests cover Fernet encryption round-trip + key persistence, Plaid response
+738 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
 push → error + retry, one-click account import, merchant-name normalization,
@@ -1414,7 +1522,7 @@ per Company and reused; auto-booking at import and its opt-out; the configurable
 posting date including the fall-back on a bad value; re-import never
 double-booking; the backfill script's estimate, dry run, idempotency and refusal
 to overturn a rejection; the manual amount/date override endpoint; and the
-existing approve/reject workflow driving the entries unchanged), and the counterparty overlay (v0.4.5: the doctype bootstrap being idempotent and degrading to a no-op when the API user lacks DocType rights; auto-link on both the Supplier and Customer paths; dual-role detection setting the flag from both links; a human-set link never being stomped; concurrent creates recovering by re-fetching rather than failing; the pairing migration's dry run, idempotency and exact-name matching; ageing bucket boundaries and the netting across roles; the 1099 report excluding Financial Institution and Government types and declaring what it dropped; top-by-activity sorting by combined volume within the configured fiscal year; the rollup reading the ledger a fixed number of times regardless of party count, skipping unchanged records and never blanking a first-transaction date; and every screen rendering on an install that has no overlay at all). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
+existing approve/reject workflow driving the entries unchanged), and the counterparty overlay (v0.4.5: the doctype bootstrap being idempotent and degrading to a no-op when the API user lacks DocType rights; auto-link on both the Supplier and Customer paths; dual-role detection setting the flag from both links; a human-set link never being stomped; concurrent creates recovering by re-fetching rather than failing; the pairing migration's dry run, idempotency and exact-name matching; ageing bucket boundaries and the netting across roles; the 1099 report excluding Financial Institution and Government types and declaring what it dropped; top-by-activity sorting by combined volume within the configured fiscal year; the rollup reading the ledger a fixed number of times regardless of party count, skipping unchanged records and never blanking a first-transaction date; and every screen rendering on an install that has no overlay at all), and guided rule authoring (v0.4.6: the four rule-state filters partitioning the eligible transactions with no overlap and no gaps, and ignoring rows the engine has never seen; merchant grouping counts, totals and ordering, with singletons falling through to one-offs and merchantless rows grouping by description signature; the group prefill producing a `merchant_contains` rule and the per-row prefill a `merchant_exact` one whose regex actually matches the description it came from; the prefill rejecting an unknown match type and never creating a rule on its own; the match-count rollup folding an archived version's matches into its live successor, terminating on a supersede cycle, skipping unchanged rules and leaving `updated_at` alone; the scope-mismatch warning firing on a Company mismatch, staying silent for a Company-agnostic rule or an unconfigured ERPNext, persisting on the confirmed re-submit, and preserving the edited rule's id so confirming supersedes rather than duplicates; and the `match_count` migration adding the column to an existing database, idempotently, with the first rollup filling in real history). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
 so no network access or extra wheels are needed.
 
 ## Security notes
@@ -1443,6 +1551,8 @@ a vulnerability.
   one-click "reconcile" from `/admin/generated_entries`).
 - Fuzzy merchant → Supplier matching (beyond exact-name find-or-create).
 - Rule-authoring conveniences: clone a rule, import/export a rule set.
+- Bulk rule creation: write one rule per merchant group in a single pass,
+  instead of one round trip through the editor each.
 - Multi-select of Plaid categories on a single rule (currently one category per
   rule; the picker is single-select).
 
@@ -1450,6 +1560,9 @@ a vulnerability.
 categorization~~ + ~~full append-only audit trail with non-destructive rule
 history~~ (v0.3.0). ~~Rule-builder autocomplete (merchants + Plaid categories),
 category-based Name suggestions, and shadow-conflict warnings~~ (v0.3.2).
+~~Guided first-sync rule authoring: unmatched filter, merchant grouping,
+create-rule-from-group, per-rule match counts, and scope mismatches caught at
+authoring time~~ (v0.4.6).
 
 ## Compliance and disclosure
 

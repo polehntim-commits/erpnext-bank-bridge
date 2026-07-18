@@ -8,7 +8,9 @@ Pages:
                           sync frequency (cost-aware presets)
   /admin/link_bank      — Plaid Link entry point
   /admin/accounts       — map each Plaid account → ERPNext Bank Account
-  /admin/transactions   — filterable transaction list + per-row retry
+  /admin/transactions   — filterable transaction list + per-row retry, plus the
+                          v0.4.6 rule-state filter, unmatched-by-merchant
+                          grouping and "create a rule from this" shortcuts
   /admin/erpnext_settings — ERPNext connection (URL + API key/secret)
   /admin/intercompany   — review transfers detected between two owned Companies
   /admin/counterparties — unified Customer + Supplier identity, ledger, reports
@@ -32,6 +34,7 @@ from .. import erpnext_settings as erps
 from .. import intercompany
 from .. import opening_balance as obal
 from .. import plaid_settings as ps
+from .. import rule_stats
 from .. import sync_config
 from .. import sync_engine
 from ..erpnext_client import ERPNextConfigError, ERPNextError
@@ -1030,12 +1033,26 @@ TRANSACTIONS_BODY = """
       {% endfor %}
     </select>
   </label>
+  <label style="margin:0">Rule state
+    <select name="state" onchange="this.form.submit()"
+            title="What the categorization rules did with this transaction — separate from the sync Status on its left, which is about the Plaid → ERPNext push.">
+      {% for value, label in state_filters %}
+      <option value="{{ value }}" {{ 'selected' if value==cur_state else '' }}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
   <label style="margin:0">Search
     <input name="q" value="{{ cur_q }}" placeholder="name / merchant">
   </label>
   <button type="submit" class="primary">Filter</button>
 </form>
 </div>
+{% if cur_state %}
+<p style="font-size:12px;color:#888;margin:6px 0 0">
+  Rule-state filters only consider transactions the engine has actually seen —
+  posted to ERPNext and not removed. {{ state_help }}
+</p>
+{% endif %}
 
 <div style="margin:8px 0">
   <form method="post" action="/admin/transactions/rerun_rules" style="display:inline"
@@ -1044,6 +1061,75 @@ TRANSACTIONS_BODY = """
   </form>
   <span style="font-size:12px;color:#888;margin-left:8px">Explicit + logged. Editing a rule never re-runs it against past transactions — this button does, on demand.</span>
 </div>
+
+{% if cur_state == 'unmatched' %}
+{# v0.4.6 · the guided first-sync view. One rule per MERCHANT clears a whole
+   group, so the groups come first and the one-off rows come last. #}
+<style>
+  /* A <summary> laid out with display:flex loses its native disclosure
+     triangle in every engine, so the group headers would read as plain text.
+     This puts the affordance back explicitly. */
+  details.tx-group > summary { list-style: none; }
+  details.tx-group > summary::-webkit-details-marker { display: none; }
+  details.tx-group > summary .caret::before { content: '\\25B8'; }
+  details.tx-group[open] > summary .caret::before { content: '\\25BE'; }
+  details.tx-group > summary .caret { color: #2e9e5b; margin-right: 6px; }
+</style>
+<h3 style="margin-bottom:2px">Unmatched by merchant
+  <span style="font-size:13px;font-weight:400;color:#777">
+    ({{ groups|length }} group{{ '' if groups|length == 1 else 's' }},
+    {{ ungrouped|length }} one-off{{ '' if ungrouped|length == 1 else 's' }})</span>
+</h3>
+<p style="font-size:12px;color:#888;margin:0 0 8px">
+  Each group is one rule's worth of work. Write the rule, then
+  <b>Rerun rules</b> above — the whole group drops off this list.
+</p>
+{% for g in groups %}
+<details class="card tx-group" style="margin:0 0 6px;padding:8px 12px">
+  <summary style="cursor:pointer;display:flex;justify-content:space-between;
+                  align-items:center;gap:10px;flex-wrap:wrap">
+    <span>
+      <span class="caret"></span><b>{{ g.count }}</b> unmatched from
+      <b style="color:#2e9e5b">{{ g.label }}</b>
+      {% if g.kind == 'description' %}
+      <span class="pill pill-muted" title="Plaid gave these no merchant name — they are grouped by the shared start of their description.">by description</span>
+      {% endif %}
+      <span style="color:#888;font-size:12px">· {{ '%.2f'|format(g.total) }} total</span>
+    </span>
+    {# stopPropagation so following the link doesn't also toggle the <details>. #}
+    <a href="{{ g.rule_url }}" class="secondary" onclick="event.stopPropagation()"
+       style="text-decoration:none;padding:3px 10px;font-size:12px;white-space:nowrap">
+      Create rule from this group</a>
+  </summary>
+  <table style="margin-top:8px">
+    <tr><th>Date</th><th>Description</th><th class="num">Amount</th></tr>
+    {% for r in g.rows %}
+    <tr>
+      <td>{{ r.date.isoformat() if r.date else '—' }}</td>
+      <td style="max-width:340px">{{ r.name }}</td>
+      <td class="num">{{ '%.2f'|format(r.amount) }} {{ r.iso_currency_code }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</details>
+{% endfor %}
+{% if not groups %}
+<p style="font-size:13px;color:#888">
+  {% if ungrouped %}No merchant repeats more than once here — these are all
+  one-offs, listed below.{% else %}Nothing unmatched. Every posted transaction
+  fired a rule.{% endif %}
+</p>
+{% endif %}
+{% if ungrouped %}
+<h3 style="margin-bottom:2px">One-offs
+  <span style="font-size:13px;font-weight:400;color:#777">({{ ungrouped|length }})</span>
+</h3>
+<p style="font-size:12px;color:#888;margin:0 0 8px">
+  Seen once each. A rule may not be worth it — but the <b>+ Rule</b> button in
+  the table below pre-fills one if it is.
+</p>
+{% endif %}
+{% endif %}
 
 <table>
   <tr><th>Date</th><th>Account</th><th>Description</th><th class="num">Amount</th>
@@ -1064,12 +1150,19 @@ TRANSACTIONS_BODY = """
       {% if r.erpnext_bank_transaction_id %}<code>{{ r.erpnext_bank_transaction_id }}</code>{% else %}—{% endif %}
       {% if r.sync_error %}<div style="color:#a04000">{{ r.sync_error[:100] }}</div>{% endif %}
     </td>
-    <td>
+    <td style="white-space:nowrap">
       {% if not r.posted_at or r.sync_error %}
-      <form method="post" action="/admin/transactions/retry" style="margin:0">
+      <form method="post" action="/admin/transactions/retry" style="display:inline;margin:0">
         <input type="hidden" name="id" value="{{ r.id }}">
         <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">Retry</button>
       </form>
+      {% endif %}
+      {# v0.4.6 · only for rows no rule caught — for anything else the rule that
+         DID fire is the thing to edit, and a second rule would just shadow it. #}
+      {% if r.plaid_transaction_id in rule_urls %}
+      <a href="{{ rule_urls[r.plaid_transaction_id] }}" class="secondary"
+         title="Open the Rules editor pre-filled from this transaction"
+         style="text-decoration:none;padding:3px 10px;font-size:12px">+ Rule</a>
       {% endif %}
     </td>
   </tr>
@@ -1078,6 +1171,46 @@ TRANSACTIONS_BODY = """
 </table>
 <p style="font-size:12px;color:#888">Showing up to {{ limit }} most recent.</p>
 """
+
+
+# One-line explanation per rule-state filter, shown under the filter bar so the
+# operator knows what the list in front of them is (and isn't).
+_STATE_HELP = {
+    'unmatched': 'No rule matched these, so no Journal Entry was generated — '
+                 'this is the list to write rules from.',
+    'matched': 'A rule fired and a live Journal Entry exists (pending review or '
+               'approved).',
+    'je_error': 'A rule matched, but the Journal Entry could not be created — '
+                'errored, blocked cross-Company, or skipped for a missing '
+                'account. See Generated Journal Entries for the reason.',
+    'je_cancelled': 'A rule matched and the Journal Entry was rejected or '
+                    'reversed.',
+}
+
+
+def _rule_prefill_url(prefill: dict, company: str = '') -> str:
+    """A /admin/rules link that opens the editor pre-filled (v0.4.6). Only the
+    fields we can infer are sent; everything else falls back to the editor's own
+    defaults (Party Type Auto from v0.4.0.9, and the v0.4.0.4 Description
+    Template auto-fill, which needs an Offset Account the operator has yet to
+    pick)."""
+    parts = ['prefill=1']
+    for key in ('match_type', 'match_value', 'name'):
+        val = (prefill.get(key) or '').strip()
+        if val:
+            parts.append(f'{key}=' + quote_plus(val))
+    if (company or '').strip():
+        parts.append('applies_to_company=' + quote_plus(company.strip()))
+    return '/admin/rules?' + '&'.join(parts)
+
+
+def _transaction_company(row, cache: dict) -> str:
+    """The ERPNext Company owning `row`'s bank account, memoized across the page
+    render — the prefill's Applies-to-Company. Local lookup only."""
+    aid = getattr(row, 'account_id', None)
+    if aid not in cache:
+        cache[aid] = erpnext_accounts.owning_company_for_account_id(aid) or ''
+    return cache[aid]
 
 
 @bp.get('/admin/transactions')
@@ -1110,14 +1243,51 @@ def transactions_page():
         like = f'%{cur_q}%'
         q = q.filter(db.or_(BankTransaction.name.ilike(like),
                             BankTransaction.merchant_name.ilike(like)))
+    # v0.4.6 · the rule-state filter, orthogonal to `status` above (that one is
+    # about the Plaid → ERPNext push; this one about what the rules engine did
+    # afterwards). Unrecognized values degrade to "no filter".
+    cur_state = (request.args.get('state') or '').strip()
+    if not rule_stats.is_state_filter(cur_state):
+        cur_state = ''
+    q = rule_stats.apply_state_filter(q, cur_state)
     rows = q.order_by(BankTransaction.date.desc().nullslast(),
                       BankTransaction.id.desc()).limit(limit).all()
     accounts = PlaidAccount.query.order_by(PlaidAccount.name).all()
     acct_mask = {a.account_id: (a.mask or '??') for a in accounts}
+    # "+ Rule" is offered per row only where a rule is the right answer: an
+    # ELIGIBLE transaction (posted, not removed) that no rule caught. On any
+    # other row the rule that already fired is the thing to edit, so adding a
+    # second one would only shadow it.
+    with_je = rule_stats.tx_ids_with_je_among(
+        r.plaid_transaction_id for r in rows)
+    company_cache: dict = {}
+    unmatched_rows = [r for r in rows
+                      if r.plaid_transaction_id not in with_je
+                      and r.posted_at is not None and not r.removed]
+    rule_urls = {
+        r.plaid_transaction_id: _rule_prefill_url(
+            rule_stats.prefill_for(r), _transaction_company(r, company_cache))
+        for r in unmatched_rows}
+    # The merchant grouping is only built for the unmatched view — it is the
+    # first-sync workflow, and grouping a mixed list would be noise.
+    groups, ungrouped = ([], [])
+    if cur_state == 'unmatched':
+        groups, ungrouped = rule_stats.group_unmatched(rows)
+        for g in groups:
+            # A group's Company comes from its rows; they can in principle span
+            # Companies, so scope the rule only when they agree — otherwise leave
+            # it company-agnostic and let the operator choose.
+            companies = {_transaction_company(r, company_cache) for r in g['rows']}
+            company = companies.pop() if len(companies) == 1 else ''
+            g['rule_url'] = _rule_prefill_url(
+                rule_stats.prefill_for_group(g), company)
     return _page(TRANSACTIONS_BODY, page='transactions', rows=rows,
                  accounts=accounts, acct_mask=acct_mask, limit=limit,
                  cur_status=cur_status, cur_account=cur_account, cur_q=cur_q,
-                 cur_company=cur_company,
+                 cur_company=cur_company, cur_state=cur_state,
+                 state_filters=rule_stats.STATE_FILTERS,
+                 state_help=_STATE_HELP.get(cur_state, ''),
+                 groups=groups, ungrouped=ungrouped, rule_urls=rule_urls,
                  flash_msg=request.args.get('flash', ''))
 
 
@@ -1156,6 +1326,11 @@ def rerun_rules():
             matched += 1
             if gje.erpnext_journal_entry_name:
                 generated += 1
+    # v0.4.6 · a Rerun is the one moment match counts change in bulk, and the
+    # operator's next stop is the Rules tab to see what stuck. Rolling up inline
+    # (a local read + a write per changed rule) beats showing them a column that
+    # is a day out of date at exactly the moment they're relying on it.
+    rule_stats.rollup_match_counts()
     audit.record('rules_rerun', subject_type=None,
                  after={'considered': considered, 'matched': matched,
                         'generated': generated},
@@ -1474,12 +1649,33 @@ RULES_BODY = """
 </div>
 {% endif %}
 
+{% if scope_warning %}
+{# v0.4.6 · caught-at-authoring. v0.4.0.2's push-time guard would block every JE
+   this rule generates; saying so here, before the save persists, turns a silent
+   failure discovered days later into one explicit decision now. #}
+<div class="banner-warn" id="scope-warning">
+  <h3>⚠ This rule's Offset Account belongs to another Company</h3>
+  <p style="margin:6px 0">{{ scope_warning }}</p>
+  <p style="margin:6px 0;font-size:13px">
+    Journal Entries from this rule will be <b>blocked</b> at posting time by the
+    cross-Company guard. Fix it by re-scoping <b>Applies to Company</b>, or by
+    picking an Offset Account under the rule's own Company.
+  </p>
+  <a href="/admin/rules" class="secondary"
+     style="text-decoration:none;padding:5px 12px">Cancel</a>
+  <button type="submit" form="rule-form" class="secondary"
+          style="padding:5px 12px;margin-left:6px">Save anyway</button>
+</div>
+{% endif %}
+
 <h3>{{ 'Edit rule #' ~ form.id if form.id else 'Add a rule' }}</h3>
 <form class="card" id="rule-form" method="post" action="/admin/rules/save">
   <input type="hidden" name="id" value="{{ form.id or '' }}">
   {# v0.4.0.9 · set only after a Mode B party_type warning, so the SAME form
      resubmitted keeps the operator's choice instead of warning forever. #}
   {% if confirm_party_mismatch %}<input type="hidden" name="confirm_party_mismatch" value="1">{% endif %}
+  {# v0.4.6 · same one-shot confirm-token pattern for the scope-mismatch banner. #}
+  {% if confirm_scope_mismatch %}<input type="hidden" name="confirm_scope_mismatch" value="1">{% endif %}
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:2;min-width:180px">Name
       <input name="name" id="rule-name" value="{{ form.name or '' }}" placeholder="Fuel — Chevron">
@@ -1519,7 +1715,12 @@ RULES_BODY = """
     </label>
   </div>
   <div style="display:flex;gap:12px;flex-wrap:wrap">
-    <label style="flex:2;min-width:220px;position:relative">Offset account
+    <label style="flex:2;min-width:220px;position:relative">Offset account<!--
+      v0.4.6 · the resolved Company, inline in the LABEL rather than only in the
+      helper line below. Server-rendered from the form's scope so it is right
+      without JS, then live-updated by updateOffsetModeHint() when the operator
+      changes Applies-to-Company. -->
+      <span id="oa-company-label" style="font-weight:400">{% if form.applies_to_company %}(in <b style="color:#2e9e5b">{{ form.applies_to_company }}</b>){% else %}<span style="color:#b26a00">(logical name — resolves per-Company at JE time)</span>{% endif %}</span>
       <span style="font-weight:400;color:#888">— the categorized (non-bank) side</span>
       <!-- v0.4.0.6 · refetch the chart from ERPNext for an account created in
            another tab while this editor is open -->
@@ -1669,13 +1870,27 @@ RULES_BODY = """
 <h3 style="display:flex;justify-content:space-between;align-items:center">
   <span>Rules ({{ rules|length }} live)</span>
   <span style="font-size:13px;font-weight:400">
-    {% if show_archived %}<a href="/admin/rules">hide history</a>
-    {% else %}<a href="/admin/rules?archived=1">show archived / history</a>{% endif %}
+    <form method="post" action="/admin/rules/rollup_match_counts" style="display:inline;margin:0">
+      <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px"
+              title="Recount matches now instead of waiting for the daily rollup.">↻ refresh match counts</button>
+    </form>
+    {% if show_archived %}<a href="/admin/rules" style="margin-left:8px">hide history</a>
+    {% else %}<a href="/admin/rules?archived=1" style="margin-left:8px">show archived / history</a>{% endif %}
   </span>
 </h3>
+<p style="font-size:12px;color:#888;margin:0 0 6px">
+  <b>Matches</b> counts the transactions each rule has actually fired on, from
+  the cached daily rollup{% if match_count_rolled_at %} (last run {{ match_count_rolled_at }}){% endif %}.
+  A <b>0</b> means the rule is dead or scoped too narrowly to reach anything —
+  the usual causes are a Company scope that no bank account belongs to, or a
+  higher-priority rule shadowing it.
+</p>
 <table>
   <tr><th class="num">#</th><th class="num">Prio</th><th>Name</th><th>Match</th><th>Offset account</th><th>Dir</th>
-      <th>Company</th><th>Party</th><th>Active</th><th></th></tr>
+      <th>Company</th><th>Party</th>
+      <th class="num"><a href="{{ matches_sort_url }}" style="text-decoration:none"
+         title="Sort by how many transactions each rule has matched">Matches{{ matches_sort_arrow }}</a></th>
+      <th>Active</th><th></th></tr>
   {% for r in rules %}
   <tr>
     <td class="num">{{ r.id }}</td>
@@ -1686,6 +1901,7 @@ RULES_BODY = """
     <td style="font-size:12px">{{ r.offset_direction or 'auto' }}</td>
     <td style="font-size:12px">{% if r.applies_to_company %}{{ r.applies_to_company }}{% else %}<span style="color:#999">all</span>{% endif %}</td>
     <td style="font-size:12px">{% if r.skip_party %}<span class="pill pill-muted" title="This rule books a transfer between accounts you own — the generated Journal Entry carries no Party.">no party</span>{% else %}{{ (r.party_type or '') }}{% if r.party_name %}: {{ r.party_name }}{% endif %}{% endif %}</td>
+    <td class="num">{% if r.match_count %}<b>{{ r.match_count }}</b>{% else %}<span class="pill pill-muted" title="This rule has never matched a transaction. Either nothing it targets has synced yet, or its match value / Company scope is too narrow — try it against a real description in “Test a rule” above.">0</span>{% endif %}</td>
     <td>
       <form method="post" action="/admin/rules/toggle" style="margin:0">
         <input type="hidden" name="id" value="{{ r.id }}">
@@ -1704,7 +1920,7 @@ RULES_BODY = """
     </td>
   </tr>
   {% endfor %}
-  {% if not rules %}<tr><td colspan="10" style="color:#888">No live rules — add one above.</td></tr>{% endif %}
+  {% if not rules %}<tr><td colspan="11" style="color:#888">No live rules — add one above.</td></tr>{% endif %}
 </table>
 <p style="font-size:12px;color:#888">Edits never overwrite: editing a rule archives the old version and creates a new one, so past auto-JE decisions stay reconstructable. See the <a href="/admin/audit?subject_type=CategorizationRule">audit trail</a>.</p>
 
@@ -1866,7 +2082,20 @@ RULES_BODY = """
   //   * a Company is selected → Mode A: pick one of THAT Company's real accounts;
   //   * '— all Companies —'   → Mode B: pick a LOGICAL name resolved per-Company
   //     at JE time. The helper line makes the active mode explicit.
+  // v0.4.6 · keep the inline Company label in the Offset Account <label> in step
+  // with the scope select. Same Mode A / Mode B split as the helper line below.
+  var oaCompanyLabel = document.getElementById('oa-company-label');
+  function updateOffsetCompanyLabel() {
+    if (!oaCompanyLabel) return;
+    var co = accountCompany();
+    oaCompanyLabel.innerHTML = co
+      ? '(in <b style="color:#2e9e5b">' + esc(co) + '</b>)'
+      : '<span style="color:#b26a00">(logical name — resolves per-Company ' +
+        'at JE time)</span>';
+  }
+
   function updateOffsetModeHint() {
+    updateOffsetCompanyLabel();
     if (!oaModeHint) return;
     var co = accountCompany();
     if (co) {
@@ -2135,13 +2364,31 @@ RULES_BODY = """
 """
 
 
+def _matches_sort(sort: str) -> tuple:
+    """(sort_url, arrow) for the Matches column header (v0.4.6). Cycles
+    default → most-matched-first → least-matched-first → default, so the
+    "which of my rules are dead?" question is two clicks away in either
+    direction and a third click restores the priority ordering the rest of
+    the page reasons in."""
+    if sort == 'matches':
+        return '/admin/rules?sort=matches_asc', ' ↓'
+    if sort == 'matches_asc':
+        return '/admin/rules', ' ↑'
+    return '/admin/rules?sort=matches', ''
+
+
 def _rules_page(flash_msg='', test_result=None, test=None, form=None,
-                show_archived=False, confirm_party_mismatch=False):
+                show_archived=False, confirm_party_mismatch=False,
+                scope_warning='', confirm_scope_mismatch=False, sort=''):
     cur_company = _current_company()
     live = (CategorizationRule.query
             .filter(CategorizationRule.archived.is_(False))
             .order_by(CategorizationRule.priority.asc(),
                       CategorizationRule.id.asc()).all())
+    if sort == 'matches':
+        live.sort(key=lambda r: -(r.match_count or 0))
+    elif sort == 'matches_asc':
+        live.sort(key=lambda r: (r.match_count or 0))
     if cur_company:
         # In a Company scope, show rules scoped to it PLUS company-agnostic rules
         # (which apply everywhere, this Company included).
@@ -2172,7 +2419,23 @@ def _rules_page(flash_msg='', test_result=None, test=None, form=None,
                  supplier_on=current_app.config.get(
                      'ERPNEXT_AUTO_CREATE_SUPPLIERS', True),
                  confirm_party_mismatch=confirm_party_mismatch,
+                 scope_warning=scope_warning,
+                 confirm_scope_mismatch=confirm_scope_mismatch,
+                 matches_sort_url=_matches_sort(sort)[0],
+                 matches_sort_arrow=_matches_sort(sort)[1],
+                 match_count_rolled_at=_last_match_count_rollup(),
                  flash_msg=flash_msg)
+
+
+def _last_match_count_rollup() -> str:
+    """"3h ago" for the most recent match-count rollup, or '' if none has run.
+    Read from the audit trail rather than a dedicated column — the rollup already
+    records an event, and a stale-looking count is exactly the thing an operator
+    needs the age of."""
+    ev = (AuditEvent.query
+          .filter(AuditEvent.event_type == 'rule_match_counts_rolled_up')
+          .order_by(AuditEvent.at.desc()).first())
+    return _ago(ev.at) if ev is not None else ''
 
 
 @bp.get('/admin/rules')
@@ -2186,14 +2449,34 @@ def rules_page():
     # rules while scoped to a Company keeps them in that Company by default.
     form = {'active': True, 'priority': 100,
             'applies_to_company': _current_company() or None}
+    # v0.4.6 · "Create rule from this transaction / group" lands here with the
+    # match fields pre-filled (see _rule_prefill_url). Everything is validated
+    # the same way a hand-typed form is — the prefill is a starting point the
+    # operator still edits and saves, never a save of its own.
+    if request.args.get('prefill') in ('1', 'true', 'yes'):
+        match_type = (request.args.get('match_type') or '').strip()
+        if match_type not in categorization.MATCH_TYPES:
+            match_type = 'merchant_exact'
+        form.update({
+            'match_type': match_type,
+            'match_value': (request.args.get('match_value') or '').strip(),
+            'name': (request.args.get('name') or '').strip(),
+            # Party Type is deliberately absent so the editor's Auto default
+            # (v0.4.0.9) applies, and Description Template stays empty so the
+            # v0.4.0.4 auto-fill kicks in once an Offset Account is picked.
+            'applies_to_company': (
+                (request.args.get('applies_to_company') or '').strip()
+                or _current_company() or None),
+        })
     edit_id = (request.args.get('edit') or '').strip()
     if edit_id.isdigit():
         rule = db.session.get(CategorizationRule, int(edit_id))
         if rule is not None:
             form = rule.to_dict()
     show_archived = request.args.get('archived') in ('1', 'true', 'yes')
+    sort = (request.args.get('sort') or '').strip()
     return _rules_page(flash_msg=request.args.get('flash', ''), form=form,
-                       show_archived=show_archived)
+                       show_archived=show_archived, sort=sort)
 
 
 def _rule_form_values():
@@ -2242,6 +2525,19 @@ def _rule_form_values():
     }
 
 
+def _redisplay_form(vals: dict) -> dict:
+    """`vals` plus the edited rule's `id`, for re-rendering the editor after a
+    warn-and-confirm (v0.4.6).
+
+    The id matters: the editor's hidden `id` field is what makes the confirmed
+    re-submit SUPERSEDE the rule being edited rather than create a second copy
+    of it. `_rule_form_values` deliberately doesn't carry the id — it builds the
+    kwargs for `CategorizationRule(**vals)`, where an id has no business — so the
+    re-render needs it added back here."""
+    raw_id = (request.form.get('id') or '').strip()
+    return dict(vals, id=int(raw_id)) if raw_id.isdigit() else dict(vals)
+
+
 def _party_type_conflict(vals: dict) -> tuple[str, str]:
     """(severity, message) for the rule form's party_type / offset_account pair
     — the HTTP-layer wrapper around categorization.party_type_conflict
@@ -2256,6 +2552,54 @@ def _party_type_conflict(vals: dict) -> tuple[str, str]:
             vals.get('applies_to_company') or '')
     except (ERPNextConfigError, ERPNextError):
         return '', ''
+
+
+def _offset_scope_conflict(vals: dict) -> str:
+    """The scope-mismatch warning for a rule whose Offset Account belongs to a
+    different ERPNext Company than the rule is scoped to, or '' when they agree
+    (v0.4.6).
+
+    This is v0.4.0.2's push-time cross-Company guard, moved forward to authoring
+    time. Left alone, the rule saves happily, generates Journal Entries, and
+    every one of them is blocked — days later, in a different part of the UI.
+
+    Best-effort by construction, and it must stay that way: an unconfigured or
+    unreachable ERPNext, or an account whose Company can't be read, returns ''
+    and the save proceeds exactly as it did before. A Mode B (Company-agnostic)
+    rule also returns '' — its offset is a bare LOGICAL name that resolves per
+    Company at JE time (v0.4.0.3), so there is no single Company to disagree
+    with."""
+    offset = (vals.get('offset_account') or '').strip()
+    if not offset:
+        return ''
+    rule_company = _offset_account_company(vals.get('applies_to_company'))
+    if not rule_company:
+        return ''
+    if not erps.is_configured():
+        return ''
+    try:
+        account_company = erpnext_accounts.account_company(
+            erpnext_bank.get_client(), offset)
+    except (ERPNextConfigError, ERPNextError):
+        return ''
+    if not account_company or account_company == rule_company:
+        return ''
+    return (f'“{offset}” belongs to {account_company}, but this rule is scoped '
+            f'to {rule_company}.')
+
+
+@bp.post('/admin/rules/rollup_match_counts')
+def rollup_match_counts_route():
+    """Recount every rule's matches now, instead of waiting for the daily job.
+    Local-only (it reads the GeneratedJournalEntry table), so it is safe to press
+    repeatedly and works with ERPNext unreachable."""
+    result = rule_stats.rollup_match_counts()
+    audit.record('rule_match_counts_rolled_up', subject_type=None, after=result,
+                 notes=(f"recounted {result['scanned']} rule(s) — "
+                        f"{result['updated']} changed"))
+    return redirect('/admin/rules?flash=' + quote_plus(
+        f"Match counts refreshed: {result['scanned']} rule(s) scanned, "
+        f"{result['updated']} updated."))
 
 
 @bp.post('/admin/rules/save')
@@ -2273,14 +2617,25 @@ def save_rule():
     # operator only finds out when every one of them fails to approve.
     conflict, conflict_msg = _party_type_conflict(vals)
     if conflict == 'block':
-        return _rules_page(flash_msg='⚠ ' + conflict_msg, form=vals)
+        return _rules_page(flash_msg='⚠ ' + conflict_msg,
+                           form=_redisplay_form(vals))
     if conflict == 'warn' and not request.form.get('confirm_party_mismatch'):
         # A Mode B logical offset that resolves badly under SOME Company. The
         # operator may know it never fires there, so re-render with the warning
         # and a confirm flag rather than refusing outright.
         return _rules_page(
             flash_msg='⚠ ' + conflict_msg + ' Save again to keep it anyway.',
-            form=vals, confirm_party_mismatch=True)
+            form=_redisplay_form(vals), confirm_party_mismatch=True)
+    # v0.4.6 · scope mismatch, caught at authoring. Warn-and-confirm rather than
+    # block: an operator mid-reorganization may be pointing a rule at an account
+    # whose Company is about to change, and refusing outright would leave them
+    # unable to save the rule at all.
+    scope_msg = _offset_scope_conflict(vals)
+    if scope_msg and not request.form.get('confirm_scope_mismatch'):
+        return _rules_page(form=_redisplay_form(vals), scope_warning=scope_msg,
+                           confirm_scope_mismatch=True,
+                           confirm_party_mismatch=bool(
+                               request.form.get('confirm_party_mismatch')))
     raw_id = (request.form.get('id') or '').strip()
     if raw_id.isdigit():
         old = db.session.get(CategorizationRule, int(raw_id))

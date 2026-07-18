@@ -92,6 +92,12 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # account on a pre-v0.4.4 install; scripts/backfill_opening_balances.py is
     # the one-shot that estimates and books them.
     ('plaid_accounts', 'opening_balance_je_id', 'INTEGER'),
+    # v0.4.6 — cached per-rule match count for the Rules list. Backfills to 0,
+    # which reads as "not rolled up yet" rather than "never matched"; the first
+    # run of the daily rollup (or the manual trigger on the Rules page) fills in
+    # the real numbers from the existing generated_journal_entries rows, so no
+    # history is lost on upgrade.
+    ('categorization_rules', 'match_count', 'INTEGER DEFAULT 0'),
 ]
 
 

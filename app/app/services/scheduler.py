@@ -92,6 +92,39 @@ def _run_counterparty_rollup(app) -> None:
             log.exception('[scheduler] counterparty rollup crashed')
 
 
+def match_count_rollup_interval_or_none(app) -> int | None:
+    """The cadence (hours) for the rule match-count rollup, or None when it is
+    disabled. Same shape as the two above, and pure for the same reason."""
+    try:
+        hours = int(app.config.get('RULE_MATCH_COUNT_ROLLUP_INTERVAL_HOURS', 24))
+    except (TypeError, ValueError):
+        hours = 24
+    return hours if hours > 0 else None
+
+
+def _run_match_count_rollup(app) -> None:
+    """Refresh every rule's cached match count from the local
+    GeneratedJournalEntry table (v0.4.6).
+
+    Unlike the two jobs above this one never touches ERPNext or Plaid — it is a
+    single local read plus a write for the rules whose number moved — so it has
+    no configured/reachable precondition to check. Swallows everything, for the
+    same reason the others do."""
+    from .. import audit
+    from .. import rule_stats
+    with app.app_context():
+        audit.set_context('scheduler')
+        try:
+            result = rule_stats.rollup_match_counts()
+            audit.record('rule_match_counts_rolled_up', subject_type=None,
+                         after=result,
+                         notes=(f"recounted {result['scanned']} rule(s) — "
+                                f"{result['updated']} changed"))
+            log.info('[scheduler] rule match-count rollup complete: %s', result)
+        except Exception:  # pragma: no cover - never let the job die
+            log.exception('[scheduler] rule match-count rollup crashed')
+
+
 def ensure_scheduler_started(app):
     """Elect one scheduler across the container's workers and start it. No-op
     (returns None) for a non-winning worker. Runs the sync every effective
@@ -148,5 +181,16 @@ def ensure_scheduler_started(app):
                           max_instances=1, coalesce=True,
                           next_run_time=datetime.utcnow() + timedelta(minutes=5))
             log.info('[scheduler] counterparty rollup every %dh', rollup_hours)
+        # v0.4.6 — the rule match-count rollup, on the same elected scheduler.
+        # Local-only and cheap, so its first run is offset by just two minutes:
+        # the Rules page's Match Count column is blank until it has run once, and
+        # on a fresh upgrade that is the first thing an operator looks at.
+        match_hours = match_count_rollup_interval_or_none(app)
+        if match_hours is not None:
+            sched.add_job(lambda: _run_match_count_rollup(app), 'interval',
+                          hours=match_hours, id='rule_match_count_rollup',
+                          max_instances=1, coalesce=True,
+                          next_run_time=datetime.utcnow() + timedelta(minutes=2))
+            log.info('[scheduler] rule match-count rollup every %dh', match_hours)
         _schedulers[id(app)] = sched
         return sched
