@@ -105,13 +105,13 @@ class PlaidAccount(db.Model):
     # flips off if an account is ever reclassified to a depository type.
     balance_only = db.Column(db.Boolean, default=False, index=True)
     sync_enabled = db.Column(db.Boolean, default=True)
-    # v0.4.2 · the GeneratedJournalEntry holding this account's opening balance —
+    # v0.4.4 · the GeneratedJournalEntry holding this account's opening balance —
     # what it already held on the day it was linked (see app/opening_balance.py).
     # Denormalized so the Accounts page can render an "Opening Balance" column
     # without a join; the authoritative lookup is still the synthetic
     # `opening-balance:<account_id>` key on that table, which is UNIQUE and is
     # therefore what actually prevents double-booking. NULL = never booked, which
-    # is every account on a pre-v0.4.2 install (the backfill script fixes those).
+    # is every account on a pre-v0.4.4 install (the backfill script fixes those).
     #
     # Deliberately NOT a db.ForeignKey, matching bank_transactions.
     # intercompany_pair_id: rejecting an opening balance KEEPS the row as the

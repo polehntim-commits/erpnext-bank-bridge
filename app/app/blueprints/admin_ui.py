@@ -537,7 +537,7 @@ def _opening_balance_cell(a) -> str:
 
     An account with no opening balance is reporting "movement since we started
     tracking" rather than what it holds, so `none` is rendered as a prompt, not
-    as a neutral dash — that gap is exactly the thing v0.4.2 exists to close."""
+    as a neutral dash — that gap is exactly the thing v0.4.4 exists to close."""
     status = obal.opening_balance_status(a)
     entry = obal.existing_entry(a)
     amount = f' · {entry.amount:,.2f}' if entry and entry.amount else ''
@@ -910,10 +910,10 @@ def set_account_company(plaid_account_id):
 
 @bp.post('/api/accounts/<plaid_account_id>/book_opening_balance')
 def book_opening_balance_route(plaid_account_id):
-    """Book (or re-book) one account's opening balance by hand — v0.4.2.
+    """Book (or re-book) one account's opening balance by hand — v0.4.4.
 
     The auto-booking at import time covers the normal case; this is for accounts
-    linked before v0.4.2, for a Plaid balance the operator wants to override with
+    linked before v0.4.4, for a Plaid balance the operator wants to override with
     what a real statement says, and for backdating to a fiscal year start. Both
     `amount` and `posting_date` are optional: blank falls back to the account's
     cached Plaid balance and to OPENING_BALANCE_DATE respectively.

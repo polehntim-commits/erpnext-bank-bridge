@@ -1891,7 +1891,7 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
     account.import_status = 'imported'
     db.session.commit()
 
-    # v0.4.2: book what the account ALREADY HELD at this moment. Deferred import
+    # v0.4.4: book what the account ALREADY HELD at this moment. Deferred import
     # because opening_balance imports this module for its chart-walking helpers.
     # Best-effort by construction — book_opening_balance never raises, so a
     # chart-of-accounts problem leaves a linked, working account with no opening

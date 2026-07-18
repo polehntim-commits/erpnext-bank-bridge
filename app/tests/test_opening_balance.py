@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Opening balances (v0.4.2).
+"""Opening balances (v0.4.4).
 
 The gap this closes: Bank Bridge recorded transactions but never what an account
 ALREADY HELD when it was linked, so ERPNext reported movement-since-link rather
@@ -732,11 +732,11 @@ class TestApprovalWorkflow(OpeningBalanceBase):
         self.assertEqual(erp.submitted, set())
 
 
-# ── regression: nothing about the pre-v0.4.2 flows changed ─────────────────
+# ── regression: nothing about the pre-v0.4.4 flows changed ─────────────────
 
 class TestBackwardCompatibility(OpeningBalanceBase):
     def test_existing_accounts_report_no_opening_balance(self):
-        # A pre-v0.4.2 row has opening_balance_je_id NULL and no entry — which
+        # A pre-v0.4.4 row has opening_balance_je_id NULL and no entry — which
         # must read as 'none', not as an error.
         a = self._account(balance=1000.0)
         self.assertIsNone(a.opening_balance_je_id)

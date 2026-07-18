@@ -52,14 +52,14 @@ ERPNext  ──►  Bank Reconciliation Tool
   the two entities instead of letting a generic rule put an expense on one P&L
   and income on the other. Review, approve or unpair at `/admin/intercompany`.
   Auto-activates once accounts under a second Company are linked.
-- **Books opening balances** (v0.4.2) — every real bank account already holds
+- **Books opening balances** (v0.4.4) — every real bank account already holds
   something on the day you link it. Bank Bridge books that against an
   auto-created **Opening Balance Equity** account, so the balance sheet shows
   what an account *holds* rather than what has *moved through it since linking*.
   Direction follows the account's side of the chart and Plaid's per-type sign
   convention, so credit cards open as liabilities and an overdrawn account
   flips. Draft for review, never double-booked; a backfill script covers
-  accounts linked before v0.4.2.
+  accounts linked before v0.4.4.
 - **Handles the full transaction lifecycle** — pending → posted transitions,
   category and merchant-name normalization, Plaid `modified` (re-post) and
   `removed` (cancel) events.
@@ -72,7 +72,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.2 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.4 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -282,7 +282,7 @@ Create an account in ERPNext, reload the Rules editor, and it's selectable — n
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
 
-**v0.4.2** — **books the balance an account already had when you linked it**.
+**v0.4.4** — **books the balance an account already had when you linked it**.
 Bank Bridge recorded transactions and nothing else, so the ERPNext balance sheet
 answered a question nobody asked: *how much has moved through this account since
 Bank Bridge started watching it?* On an account whose recent activity is
@@ -324,7 +324,7 @@ you approve it. No Party is ever set: an opening balance is an equity event, not
 a purchase from anyone. Re-importing never books a second one (the entry claims
 a `UNIQUE` key derived from the Plaid account id).
 
-**Accounts linked before v0.4.2** are fixed by a one-shot backfill that works
+**Accounts linked before v0.4.4** are fixed by a one-shot backfill that works
 backwards from what Bank Bridge has mirrored — `opening = current balance −
 everything seen since` — with the same per-type sign handling (a purchase lowers
 a checking balance but *raises* a card's):
@@ -563,7 +563,7 @@ out of the account → withdrawal; negative = money in → deposit).
 | Table | Purpose |
 |-------|---------|
 | `plaid_items` | one linked login/institution; encrypted access token + sync cursor |
-| `plaid_accounts` | accounts within an item; ERPNext Bank Account mapping + sync toggle + import status + opening-balance JE link (v0.4.2) |
+| `plaid_accounts` | accounts within an item; ERPNext Bank Account mapping + sync toggle + import status + opening-balance JE link (v0.4.4) |
 | `bank_transactions` | local mirror of Plaid transactions + ERPNext docname/state |
 | `suppliers` | merchant → ERPNext Supplier cache (normalized name, tallies) — v0.3.0 |
 | `categorization_rules` | user rules: match predicate → offset account + direction + party + template (bank side from the txn; v0.3.1) — v0.3.0 |
@@ -1142,9 +1142,9 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `INTERCOMPANY_CONFIDENCE_THRESHOLD` | `0.75` | v0.4.1 · minimum overall confidence to pair **automatically**; below this the candidate is logged and left for a human |
 | `INTERCOMPANY_LOOKBACK_DAYS` | `30` | v0.4.1 · how far back a detection pass looks for a counterparty (each Plaid Item advances its own cursor, so the two legs often arrive on different syncs) |
 | `ERPNEXT_LOANS_ADVANCES_GROUP_NAME` | `Loans and Advances (Assets)` | v0.4.1 · Chart-of-Accounts group the auto-created intercompany `Due from …` receivables go under (the `Due to …` payables use `ERPNEXT_CURRENT_LIABILITIES_GROUP_NAME`) |
-| `AUTO_BOOK_OPENING_BALANCE` | `true` | v0.4.2 · book each account's existing balance as a Draft Journal Entry when it is first imported. Set `false` to book them by hand from `/admin/accounts` instead |
-| `OPENING_BALANCE_DATE` | `today` | v0.4.2 · posting date for auto-booked opening balances. An ISO date (`2026-01-01`) backdates them to e.g. a fiscal year start; an unparseable value falls back to today with a warning rather than failing the import |
-| `OPENING_BALANCE_EQUITY_ACCOUNT_NAME` | `Opening Balance Equity` | v0.4.2 · the Equity leaf every opening balance is offset against, auto-created under the owning Company's Equity root when the chart doesn't ship one |
+| `AUTO_BOOK_OPENING_BALANCE` | `true` | v0.4.4 · book each account's existing balance as a Draft Journal Entry when it is first imported. Set `false` to book them by hand from `/admin/accounts` instead |
+| `OPENING_BALANCE_DATE` | `today` | v0.4.4 · posting date for auto-booked opening balances. An ISO date (`2026-01-01`) backdates them to e.g. a fiscal year start; an unparseable value falls back to today with a warning rather than failing the import |
+| `OPENING_BALANCE_EQUITY_ACCOUNT_NAME` | `Opening Balance Equity` | v0.4.4 · the Equity leaf every opening balance is offset against, auto-created under the owning Company's Equity root when the chart doesn't ship one |
 | `FERNET_KEY` | "" | blank → autogenerated + persisted to `{DATA_DIR}/fernet.key` |
 | `SYNC_INTERVAL_HOURS` | `24` | v0.3.6 · background poll cadence in hours (**daily by default**). `0` or negative = **manual only** (no auto-poll; use "Sync now"). Editable in the admin UI, which persists a value that wins over this seed |
 | `PLAID_MAX_CALLS_PER_DAY` | `0` | v0.3.6 · optional per-Item safety brake — max Plaid pull calls per Item per UTC day (`0` = no limit). A pull that would exceed it is skipped with a logged warning |
@@ -1259,7 +1259,7 @@ compensating rollback when the second Company's entry fails; auto-created
 intercompany accounts; unpair reversing both entries and suppressing
 re-detection; the review UI's filters, actions and bulk operations; and the
 single-Company regression guarantee that none of it activates), and opening
-balances (v0.4.2: the direction rule across asset/liability and the
+balances (v0.4.4: the direction rule across asset/liability and the
 negative-balance flip on each; Plaid's per-type sign convention surviving into
 the debit/credit lines; the Opening Balance Equity leaf being auto-created once
 per Company and reused; auto-booking at import and its opt-out; the configurable

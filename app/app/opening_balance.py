@@ -9,7 +9,7 @@ and an account whose recent activity is net-negative shows a negative asset:
 
     Wells Fargo Money Market   opening 17,600.00
                                transactions since link  -17,550.00
-    ERPNext (pre-v0.4.2)                    -17,550.00   ← wrong, and alarming
+    ERPNext (pre-v0.4.4)                    -17,550.00   ← wrong, and alarming
     ERPNext (with opening balance)               50.00   ← the actual position
 
 So at initial import (and, for accounts linked before this shipped, via
@@ -163,7 +163,7 @@ def estimate_opening_balance(account: PlaidAccount,
     """What this account held BEFORE the first transaction Bank Bridge mirrored:
     its current Plaid balance minus everything we have seen move since.
 
-    Used only by the backfill — an account linked from v0.4.2 on books its
+    Used only by the backfill — an account linked from v0.4.4 on books its
     opening balance at import time, when the current balance IS the opening
     balance and no arithmetic is needed.
 
@@ -309,7 +309,7 @@ def existing_entry(account: PlaidAccount):
     """The GeneratedJournalEntry row holding this account's opening balance, or
     None. Looked up by the synthetic key rather than by the denormalized
     `opening_balance_je_id` so it stays correct even if that pointer was never
-    written (a pre-v0.4.2 row, or a crash between the two writes)."""
+    written (a pre-v0.4.4 row, or a crash between the two writes)."""
     return GeneratedJournalEntry.query.filter_by(
         plaid_transaction_id=synthetic_transaction_id(account)).first()
 

@@ -333,7 +333,7 @@ class Config:
     ERPNEXT_LOANS_ADVANCES_GROUP_NAME = os.environ.get(
         'ERPNEXT_LOANS_ADVANCES_GROUP_NAME', 'Loans and Advances (Assets)')
 
-    # ── v0.4.2 · opening balances (see app/opening_balance.py) ────────────
+    # ── v0.4.4 · opening balances (see app/opening_balance.py) ────────────
     # Every real bank account already holds something on the day you link it.
     # Without booking that, ERPNext reports "movement since Bank Bridge started
     # tracking" instead of the account's actual position — which reads as a

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""One-shot, idempotent: book opening balances for accounts linked BEFORE v0.4.2.
+"""One-shot, idempotent: book opening balances for accounts linked BEFORE v0.4.4.
 
-From v0.4.2 on, importing a Plaid account books what it already held at that
+From v0.4.4 on, importing a Plaid account books what it already held at that
 moment (see app/opening_balance.py). Accounts linked before that have no such
 entry, so ERPNext reports their movement-since-link instead of their position —
 which shows up as a negative asset on any account whose recent activity is
