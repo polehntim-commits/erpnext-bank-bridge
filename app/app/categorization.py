@@ -595,32 +595,79 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
 # never named a party keeps not naming one.
 PARTY_TYPES = ('', 'Supplier', 'Customer', 'Auto')
 
-# v0.4.0.8 · the party_type='Auto' derivation. Money categorized to an INCOME
-# account came IN, so the counterparty is a Customer; money categorized to an
-# EXPENSE account went OUT, so it's a Supplier. Asset / Liability / Equity
-# offsets are transfers between accounts you own and get NO party — the same
-# answer v0.4.0.7's skip_party heuristic gives, reached from the other side.
+# v0.4.0.8 · the party_type='Auto' derivation, keyed on the offset account's
+# root_type alone. RETAINED FOR REFERENCE ONLY — v0.4.0.9 supersedes it with
+# PARTY_TYPE_MATRIX below, because root_type is not the field ERPNext validates
+# against. See party_type_for_account_types for the bug this cost us.
 ROOT_TYPE_PARTY_TYPE = {
     'Income': 'Customer',
     'Expense': 'Supplier',
 }
 
+# The ERPNext account_type values that a Party may legally be attached to. This
+# is not our policy — it is ERPNext's, enforced in JournalEntry.validate_party:
+#
+#     Party Type and Party can only be set for Receivable / Payable account
+#
+# A Receivable account is an AR ledger, so its counterparty is a Customer; a
+# Payable account is AP, so its counterparty is a Supplier.
+PARTY_ACCOUNT_TYPES = {
+    'Receivable': 'Customer',
+    'Payable': 'Supplier',
+}
+
+# v0.4.0.9 · the party_type='Auto' derivation, now keyed on BOTH the offset
+# account's root_type AND its account_type.
+#
+# THE BUG THIS FIXES: v0.4.0.8 mapped root_type alone — Income → Customer,
+# Expense → Supplier. But a garden-variety Income account has root_type=Income
+# and account_type='Income Account', NOT 'Receivable', so hanging a Customer off
+# it produces a JE that CREATES fine and then fails at submit:
+#
+#     ValidationError: Party Type and Party can only be set for Receivable /
+#     Payable account Interest Income - BBT
+#
+# (ERPNext validates the party at submit, not at insert, which is why the
+# breakage surfaced only once an operator went to approve the entries.) An
+# Income root with a Receivable account_type — a real AR ledger booked under
+# Income — is the only Income shape that legitimately carries a Customer, and
+# likewise Expense + Payable for a Supplier. Every other pair, including the
+# Asset / Liability / Equity roots that were already partyless in v0.4.0.8, gets
+# NO party: a JE with no party still posts, and posting beats being right.
+PARTY_TYPE_MATRIX = {
+    ('Income', 'Receivable'): 'Customer',
+    ('Expense', 'Payable'): 'Supplier',
+}
+
+
+def party_type_for_account_types(root_type: str, account_type: str) -> str:
+    """The party side ('Customer' | 'Supplier' | '') an offset account with this
+    (root_type, account_type) pair may legally carry (v0.4.0.9).
+
+    '' means "no party" and is the safe default for every pair not in
+    PARTY_TYPE_MATRIX — an undeterminable type, a transfer between accounts you
+    own, or the Income Account / Expense Account pairs ERPNext would reject."""
+    return PARTY_TYPE_MATRIX.get(((root_type or '').strip(),
+                                  (account_type or '').strip()), '')
+
 
 def party_type_for_offset(client, offset_account: str, company: str = '') -> str:
     """The party side ('Customer' | 'Supplier' | '') implied by an offset
-    account's root_type — the `party_type='Auto'` derivation (v0.4.0.8).
+    account — the `party_type='Auto'` derivation (v0.4.0.8, refined v0.4.0.9 to
+    consult account_type as well as root_type; see PARTY_TYPE_MATRIX).
 
-    '' means "no party": either the root_type says transfer (Asset / Liability /
-    Equity) or it couldn't be determined at all. Both cases are the safe answer,
-    since a JE with no party still posts.
+    '' means "no party": the pair says transfer, says a non-party ledger like an
+    Income Account, or couldn't be determined at all. All three are the safe
+    answer, since a JE with no party still posts.
 
     Memoized on (offset_account, company) for the life of the app context. The
     JE path runs once PER TRANSACTION (sync_engine loops categorize_after_push
     over every row), and a sync that pulls hundreds of transactions through a
     handful of Auto rules would otherwise re-ask ERPNext for the same few
-    accounts' root_type hundreds of times. `g` scopes the cache to one sync run
-    / one request, so a chart edit is picked up on the next run rather than
-    needing a restart."""
+    accounts' types hundreds of times. `g` scopes the cache to one sync run /
+    one request, so a chart edit is picked up on the next run rather than
+    needing a restart. Both types come from one fetch, so v0.4.0.9's extra
+    precision costs no extra round-trips."""
     key = ((offset_account or '').strip(), (company or '').strip())
     try:
         cache = g._bb_offset_root_party
@@ -630,8 +677,9 @@ def party_type_for_offset(client, offset_account: str, company: str = '') -> str
         cache = None
     if cache is not None and key in cache:
         return cache[key]
-    root = erpnext_bank.root_type_for_account(client, offset_account, company)
-    side = ROOT_TYPE_PARTY_TYPE.get(root, '')
+    root, acct_type = erpnext_bank.account_types_for_account(
+        client, offset_account, company)
+    side = party_type_for_account_types(root, acct_type)
     if cache is not None:
         cache[key] = side
     return side
@@ -647,8 +695,17 @@ def effective_party_type(client, rule: CategorizationRule,
       2. a literal 'Supplier' / 'Customer' on the rule — the operator's explicit
          choice beats any derivation, for a chart that doesn't follow the usual
          root_type convention.
-      3. 'Auto' — derived from the offset account's root_type.
-      4. '' / NULL — no party, unchanged since v0.3.0."""
+      3. 'Auto' — derived from the offset account's types.
+      4. '' / NULL — no party, unchanged since v0.3.0.
+
+    v0.4.0.9 deliberately does NOT second-guess an explicit side here, even
+    though ERPNext will reject one on a non-Receivable/Payable account. The
+    incompatible-explicit case is handled where it can be handled well: the
+    Rules editor refuses to save a new one (party_type_conflict, below) and a
+    boot migration flips the ones already in the database
+    (migrations._migrate_incompatible_party_types). Doing it a third time at JE
+    time would mean silently dropping a party mid-sync on a transient ERPNext
+    read failure, which is a worse failure than the one it prevents."""
     if getattr(rule, 'skip_party', False):
         return ''
     declared = (rule.party_type or '').strip()
@@ -657,6 +714,76 @@ def effective_party_type(client, rule: CategorizationRule,
     if declared.lower() == 'auto':
         return party_type_for_offset(client, (rule.offset_account or ''), company)
     return ''
+
+
+def party_type_conflict(client, party_type: str, offset_account: str,
+                        company: str = '') -> tuple[str, str]:
+    """Would ERPNext reject `party_type` on `offset_account`? Returns a
+    (severity, message) pair for the Rules editor to act on (v0.4.0.9):
+
+      ('',      '')    — compatible, or not knowable, so don't stand in the way.
+      ('block', msg)   — a definite conflict on a definite account. Refuse the
+                         save; the rule could only ever produce unsubmittable
+                         Journal Entries.
+      ('warn',  msg)   — the offset is a LOGICAL name (a Mode B Company-agnostic
+                         rule) that resolves incompatibly under at least one
+                         Company but not all. The operator may well know which
+                         Companies the rule will actually fire under, so this is
+                         a confirmation, not a refusal.
+
+    Only a literal 'Supplier' / 'Customer' can conflict. 'Auto' derives a legal
+    side per transaction by construction, and '' / NULL books no party at all —
+    both always return ('', ''), which is what makes "set it to None or Auto"
+    honest advice in the message.
+
+    Silent on anything it cannot determine (ERPNext down, unresolvable account):
+    a save-time check that blocks on a network blip would be worse than the
+    submit-time failure it is trying to pre-empt."""
+    declared = (party_type or '').strip()
+    offset = (offset_account or '').strip()
+    if declared not in PARTY_ACCOUNT_TYPES.values() or not offset:
+        return '', ''
+    want = 'Payable' if declared == 'Supplier' else 'Receivable'
+    scope = (company or '').strip()
+    if scope:
+        # Mode A · a fully-qualified offset under one Company. One answer, and
+        # a wrong one is definitive — block.
+        acct_type = erpnext_bank.account_types_for_account(
+            client, offset, scope)[1]
+        if not acct_type or PARTY_ACCOUNT_TYPES.get(acct_type) == declared:
+            return '', ''
+        return 'block', _party_conflict_message(offset, acct_type, declared,
+                                                want)
+    # Mode B · a logical name resolving across every Company. Collect the
+    # DISTINCT account_types it maps to and warn if any of them is incompatible.
+    try:
+        rows = erpnext_bank.list_accounts(client, company=None)
+    except Exception:
+        return '', ''
+    bad: dict[str, str] = {}            # account_type → an example docname
+    for r in rows:
+        if (r.get('account_name') or '').strip().lower() != offset.lower():
+            continue
+        acct_type = (r.get('account_type') or '').strip()
+        if acct_type and PARTY_ACCOUNT_TYPES.get(acct_type) != declared:
+            bad.setdefault(acct_type, (r.get('name') or '').strip() or offset)
+    if not bad:
+        return '', ''
+    acct_type, example = sorted(bad.items())[0]
+    return 'warn', _party_conflict_message(example, acct_type, declared, want)
+
+
+def _party_conflict_message(account: str, acct_type: str, declared: str,
+                            want: str) -> str:
+    """The operator-facing sentence for a party_type/offset conflict. Names the
+    account, what it actually is, what was needed, and the two ways out — the
+    fix has to be obvious from the message alone, since it is the only thing the
+    operator sees when a save is refused."""
+    return (f'{account} is a{"n" if acct_type[:1] in "AEIOU" else ""} '
+            f'{acct_type}, not a {want} account. ERPNext only allows a Party on '
+            f'a Receivable or Payable account, so Bank Bridge cannot attach a '
+            f'{declared} party to it. Set Party Type to “— none —” or “Auto”, '
+            f'or pick a different offset account.')
 
 
 def resolve_party(client, rule: CategorizationRule, row, supplier_name=None,

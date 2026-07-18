@@ -30,20 +30,41 @@ from app.models import (BankTransaction, CategorizationRule,  # noqa: E402
 from scripts import backfill_customer_records as backfill  # noqa: E402
 from tests.fakes import FakeERPClient  # noqa: E402
 
-# A chart with one account of each root_type that matters, under 'Testing'.
-# `account_name` is the bare LOGICAL name a Mode B (Company-agnostic) rule uses;
-# the docname carries the Company abbreviation, like a real ERPNext chart.
+# A chart with one account of each (root_type, account_type) shape that matters,
+# under 'Testing'. `account_name` is the bare LOGICAL name a Mode B
+# (Company-agnostic) rule uses; the docname carries the Company abbreviation,
+# like a real ERPNext chart.
+#
+# v0.4.0.9 — every account now carries an `account_type`, because that is the
+# field ERPNext validates a Party against and the derivation therefore reads it.
+# Note which accounts can and cannot hold a party: an ordinary Income account is
+# an 'Income Account', NOT 'Receivable', so it takes NO party — that is Tim's
+# Interest Income bug, and 'Fruit Sales' has exactly the same shape. Only the
+# two AR/AP ledgers at the bottom are party-legal.
 CHART = [
     {'name': 'Fruit Sales - T', 'account_name': 'Fruit Sales',
-     'company': 'Testing', 'root_type': 'Income'},
+     'company': 'Testing', 'root_type': 'Income',
+     'account_type': 'Income Account'},
     {'name': 'Interest Income - T', 'account_name': 'Interest Income',
-     'company': 'Testing', 'root_type': 'Income'},
+     'company': 'Testing', 'root_type': 'Income',
+     'account_type': 'Income Account'},
     {'name': 'Fuel Expense - T', 'account_name': 'Fuel Expense',
-     'company': 'Testing', 'root_type': 'Expense'},
+     'company': 'Testing', 'root_type': 'Expense',
+     'account_type': 'Expense Account'},
     {'name': 'Bank Fees - T', 'account_name': 'Bank Fees',
-     'company': 'Testing', 'root_type': 'Expense'},
+     'company': 'Testing', 'root_type': 'Expense',
+     'account_type': 'Expense Account'},
     {'name': 'Checking 1111 - T', 'account_name': 'Checking 1111',
-     'company': 'Testing', 'root_type': 'Asset'},
+     'company': 'Testing', 'root_type': 'Asset', 'account_type': 'Bank'},
+    # The party-legal pair: a Receivable ledger booked under Income and a
+    # Payable one under Expense. These are the ONLY two shapes party_type='Auto'
+    # will hang a party off (categorization.PARTY_TYPE_MATRIX), and they are
+    # what the auto-Customer / auto-Supplier machinery is exercised through.
+    {'name': 'Grower Receivable - T', 'account_name': 'Grower Receivable',
+     'company': 'Testing', 'root_type': 'Income',
+     'account_type': 'Receivable'},
+    {'name': 'Grower Payable - T', 'account_name': 'Grower Payable',
+     'company': 'Testing', 'root_type': 'Expense', 'account_type': 'Payable'},
 ]
 
 
@@ -104,8 +125,11 @@ class Base(unittest.TestCase):
         return row
 
     def _rule(self, **kw):
+        # v0.4.0.9 — the default offset is the AR ledger, not 'Fruit Sales'. A
+        # plain Income Account cannot carry a party at all now, so a rule that
+        # is meant to exercise the party machinery has to point at a Receivable.
         vals = {'name': 'Sales', 'match_type': 'description_regex',
-                'match_value': '.*', 'offset_account': 'Fruit Sales - T',
+                'match_value': '.*', 'offset_account': 'Grower Receivable - T',
                 'offset_direction': 'auto', 'party_type': 'Auto',
                 'applies_to_company': 'Testing', 'active': True,
                 'archived': False, 'priority': 10}
@@ -124,11 +148,11 @@ class Base(unittest.TestCase):
 
 
 class AutoPartyTypeFromOffset(Base):
-    """Fix A + C — the side is derived from the offset account's root_type."""
+    """Fix A + C — the side is derived from the offset account's types."""
 
     def test_income_offset_books_a_customer(self):
-        """THE HEADLINE CASE. A fruit-buyer deposit categorized to an Income
-        account books a Customer — and creates one, on the AR side."""
+        """THE HEADLINE CASE. A fruit-buyer deposit categorized to a Receivable
+        ledger books a Customer — and creates one, on the AR side."""
         erp = _erp()
         rule = self._rule(party_name='Valley Packing')
         row = self._txn(tid='t-sale', amount=-4200.0)
@@ -145,7 +169,7 @@ class AutoPartyTypeFromOffset(Base):
     def test_expense_offset_still_books_a_supplier(self):
         """The v0.4.0.7 behaviour, reached through the new derivation."""
         erp = _erp()
-        rule = self._rule(name='Fuel', offset_account='Fuel Expense - T',
+        rule = self._rule(name='Fuel', offset_account='Grower Payable - T',
                           party_name='Tractor Supply')
         row = self._txn(tid='t-fuel', amount=120.0)
 
@@ -173,10 +197,11 @@ class AutoPartyTypeFromOffset(Base):
 
     def test_auto_resolves_a_logical_offset_for_an_agnostic_rule(self):
         """A Mode B (Company-agnostic) rule names a LOGICAL account, so the
-        root_type lookup has to fall back from docname to account_name."""
+        type lookup has to fall back from docname to account_name."""
         erp = _erp()
         rule = self._rule(applies_to_company=None,
-                          offset_account='Fruit Sales', party_name='Broker Co')
+                          offset_account='Grower Receivable',
+                          party_name='Broker Co')
         row = self._txn(tid='t-agnostic', amount=-800.0)
 
         gje = categorization.generate_journal_entry(erp, row, rule=rule)
@@ -185,29 +210,29 @@ class AutoPartyTypeFromOffset(Base):
         self.assertEqual(line['party_type'], 'Customer')
         self.assertIn('Broker Co', erp.created['Customer'])
 
-    def test_root_type_is_looked_up_once_per_offset_not_per_transaction(self):
+    def test_account_types_looked_up_once_per_offset_not_per_transaction(self):
         """sync_engine loops JE generation over EVERY row, so an un-memoized
-        derivation would re-ask ERPNext for the same account's root_type once
-        per transaction — hundreds of extra HTTP calls on a real sync."""
+        derivation would re-ask ERPNext for the same account's types once per
+        transaction — hundreds of extra HTTP calls on a real sync."""
         erp = _erp()
         rule = self._rule(party_name='Valley Packing')
         seen = []
-        real = erpnext_bank.root_type_for_account
+        real = erpnext_bank.account_types_for_account
 
         def counting(client, account, company=''):
             seen.append((account, company))
             return real(client, account, company)
 
-        categorization.erpnext_bank.root_type_for_account = counting
+        categorization.erpnext_bank.account_types_for_account = counting
         try:
             for i in range(10):
                 categorization.generate_journal_entry(
                     erp, self._txn(tid=f't-cache{i}', amount=-100.0), rule=rule)
         finally:
-            categorization.erpnext_bank.root_type_for_account = real
+            categorization.erpnext_bank.account_types_for_account = real
 
         self.assertEqual(len(erp.created['Journal Entry']), 10)
-        self.assertEqual(seen, [('Fruit Sales - T', 'Testing')])
+        self.assertEqual(seen, [('Grower Receivable - T', 'Testing')])
 
     def test_unknown_offset_root_type_books_no_party(self):
         """An account the chart doesn't have → no root_type → don't guess a
@@ -224,7 +249,11 @@ class AutoPartyTypeFromOffset(Base):
 
 
 class ExplicitPartyTypeOverrides(Base):
-    """Fix C/D — a literal party_type beats the derivation, both directions."""
+    """Fix C/D — a literal party_type beats the derivation, both directions.
+
+    v0.4.0.9 leaves this precedence alone on purpose: an explicit side that
+    ERPNext would reject is caught at SAVE time (the Rules editor) and by the
+    boot migration, not silently at JE time. See effective_party_type."""
 
     def test_customer_forced_even_on_an_expense_offset(self):
         erp = _erp()
@@ -312,7 +341,7 @@ class DualRoleParties(Base):
         is what keeps that second JE from failing on a missing party."""
         erp = _erp()
         rule = self._rule(name='Interest',
-                          offset_account='Interest Income - T',
+                          offset_account='Grower Receivable - T',
                           party_name='Wells Fargo')
         row = self._txn(tid='t-int', name='INTRST PYMNT', amount=-12.5)
 
@@ -334,7 +363,7 @@ class DualRoleParties(Base):
         other role get created."""
         erp = _erp()
         supplier_rule = self._rule(name='Fuel',
-                                   offset_account='Fuel Expense - T',
+                                   offset_account='Grower Payable - T',
                                    party_name='Tractor Supply')
         categorization.generate_journal_entry(
             erp, self._txn(tid='t-ts-buy', amount=120.0), rule=supplier_rule)
@@ -343,7 +372,7 @@ class DualRoleParties(Base):
         self.assertEqual(erp.created['Customer'], {})
 
         customer_rule = self._rule(name='Rebate', priority=5,
-                                   offset_account='Fruit Sales - T',
+                                   offset_account='Grower Receivable - T',
                                    party_name='Tractor Supply')
         categorization.generate_journal_entry(
             erp, self._txn(tid='t-ts-rebate', amount=-30.0), rule=customer_rule)
@@ -355,7 +384,7 @@ class DualRoleParties(Base):
         must still post when its counterpart can't be made."""
         erp = _erp(fail_supplier_create=True)
         rule = self._rule(name='Interest',
-                          offset_account='Interest Income - T',
+                          offset_account='Grower Receivable - T',
                           party_name='Columbia Bank')
         row = self._txn(tid='t-int2', amount=-9.0)
 

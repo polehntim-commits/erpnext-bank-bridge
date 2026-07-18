@@ -187,6 +187,10 @@ def run_migrations() -> None:
         # offset into a logical account name (Mode B). Runs after the v0.3.1
         # backfill so a rule that just gained its offset_account is considered too.
         _migrate_agnostic_offset_to_logical()
+        # v0.4.0.9: clear party_type off rules whose offset account ERPNext will
+        # not accept a party on. Runs last — it reads each rule's FINAL
+        # offset_account, so it must see whatever the two backfills above wrote.
+        _migrate_incompatible_party_types()
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)
 
@@ -276,3 +280,97 @@ def _migrate_agnostic_offset_to_logical() -> None:
         db.session.commit()
         log.info('migration: converted %d agnostic rule offset(s) to logical '
                  'account name(s)', changed)
+
+
+def _migrate_incompatible_party_types() -> None:
+    """One-shot backfill (v0.4.0.9): clear `party_type` off any rule whose OFFSET
+    ACCOUNT is one ERPNext will not accept a Party on.
+
+    THE BUG THIS REPAIRS: v0.4.0.8's party_type='Auto' derivation keyed on the
+    offset account's root_type alone — Income → Customer, Expense → Supplier —
+    and the Rules editor happily stored a literal Supplier/Customer against any
+    account at all. But ERPNext enforces the FINER `account_type`:
+
+        ValidationError: Party Type and Party can only be set for Receivable /
+        Payable account Interest Income - BBT
+
+    An ordinary Income account has root_type='Income' and account_type='Income
+    Account', so a Customer hung off it produced a Journal Entry that CREATED
+    fine and then failed at SUBMIT — leaving the operator with stuck drafts and
+    no way to approve them. Rules saved before v0.4.0.9's save-time validation
+    are still carrying those party_types, so they get repaired here.
+
+    A rule is flipped to no-party only on a POSITIVE mismatch — Supplier on a
+    non-Payable account, or Customer on a non-Receivable one. Anything we cannot
+    read is LEFT ALONE: an unconfigured/unreachable ERPNext, an offset that no
+    longer resolves, or a blank account_type all yield no verdict, and silently
+    stripping the operator's party choice on a transient outage would be a worse
+    bug than the one being fixed.
+
+    Idempotent by construction: a rule is only touched when its stored
+    party_type contradicts its offset's account_type, so the second run — and
+    every run after — flips nothing. `party_type='Auto'` and NULL are never
+    touched; Auto re-derives correctly at JE time under the new matrix.
+
+    ARCHIVED rules are deliberately left alone. A rule version is archived
+    rather than deleted precisely so a past auto-JE decision stays
+    reconstructible (see admin_ui.save_rule), and rewriting one would falsify
+    that history for no gain — an archived rule never fires again.
+
+    Best-effort throughout: any ERPNext trouble logs and returns, because a
+    migration must never block boot."""
+    insp = inspect(db.engine)
+    if 'categorization_rules' not in insp.get_table_names():
+        return
+    cols = {c['name'] for c in insp.get_columns('categorization_rules')}
+    if not {'party_type', 'offset_account', 'applies_to_company',
+            'archived'} <= cols:
+        return  # columns not all present yet (shouldn't happen post-ADD)
+    from . import erpnext_settings
+    if not erpnext_settings.is_configured():
+        return  # nothing to resolve an account_type against
+    from .categorization import PARTY_ACCOUNT_TYPES
+    from .models import CategorizationRule
+    rules = CategorizationRule.query.filter(
+        CategorizationRule.archived.is_(False),
+        CategorizationRule.party_type.in_(tuple(PARTY_ACCOUNT_TYPES.values()))
+    ).all()
+    if not rules:
+        return  # fast path: nothing declares a literal side
+    from . import erpnext_bank
+    try:
+        client = erpnext_bank.get_client()
+    except Exception:
+        log.info('migration: ERPNext unavailable, leaving party_types as-is')
+        return
+    # (offset, company) → account_type, so N rules over a handful of distinct
+    # offsets cost a handful of lookups rather than one apiece.
+    seen: dict[tuple[str, str], str] = {}
+    flipped = 0
+    for r in rules:
+        offset = (r.offset_account or '').strip()
+        if not offset:
+            continue
+        key = (offset, (r.applies_to_company or '').strip())
+        if key not in seen:
+            try:
+                seen[key] = erpnext_bank.account_types_for_account(
+                    client, key[0], key[1])[1]
+            except Exception:
+                seen[key] = ''
+        acct_type = seen[key]
+        if not acct_type:
+            continue                    # undeterminable → no verdict, leave it
+        declared = (r.party_type or '').strip()
+        if PARTY_ACCOUNT_TYPES.get(acct_type) == declared:
+            continue                    # already compatible
+        want = 'Payable' if declared == 'Supplier' else 'Receivable'
+        log.warning('migration: rule %s "%s" party_type %s → none '
+                    '(offset %s is %s not %s)',
+                    r.id, r.name or '', declared, offset, acct_type, want)
+        r.party_type = None
+        flipped += 1
+    if flipped:
+        db.session.commit()
+        log.warning('migration: cleared party_type on %d rule(s) whose offset '
+                    'account ERPNext will not accept a party on', flipped)

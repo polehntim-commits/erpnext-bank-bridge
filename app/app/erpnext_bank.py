@@ -870,24 +870,36 @@ def ensure_party(client: ERPNextClient | None, party_name: str,
     return primary
 
 
-def root_type_for_account(client: ERPNextClient | None, account: str,
-                          company: str = '') -> str:
-    """The ERPNext root_type ('Income' | 'Expense' | 'Asset' | 'Liability' |
-    'Equity') of a GL account, or '' when it can't be determined (v0.4.0.8).
+def account_types_for_account(client: ERPNextClient | None, account: str,
+                              company: str = '') -> tuple[str, str]:
+    """The ERPNext (root_type, account_type) pair of a GL account, or ('', '')
+    when it can't be determined (v0.4.0.9).
 
-    Feeds the `party_type='Auto'` derivation. `account` may be a fully-qualified
-    docname ('Fruit Sales - BBT', a Mode A rule) or a bare LOGICAL name ('Fruit
-    Sales', a Mode B Company-agnostic rule) — both resolve, because the lookup
-    falls back from an exact docname match to an account_name match scoped to
-    `company`. Returns '' rather than raising on any ERPNext trouble: an
-    undeterminable root_type means "don't guess a party", not "fail the JE"."""
+    root_type is the coarse bucket ('Income' | 'Expense' | 'Asset' | 'Liability'
+    | 'Equity'); account_type is the FINE classification ERPNext actually
+    enforces against ('Receivable', 'Payable', 'Income Account', 'Expense
+    Account', 'Bank', 'Cash', …). Both are needed for the `party_type='Auto'`
+    derivation, because ERPNext refuses a Party on any line whose account_type
+    is not Receivable or Payable — and an Income Account under an Income root is
+    exactly that case (see categorization.party_type_for_account_types).
+
+    `account` may be a fully-qualified docname ('Fruit Sales - BBT', a Mode A
+    rule) or a bare LOGICAL name ('Fruit Sales', a Mode B Company-agnostic
+    rule) — both resolve, because the lookup falls back from an exact docname
+    match to an account_name match scoped to `company`. Both fields come from a
+    SINGLE fetch, so knowing the account_type costs no extra ERPNext round-trip
+    over the v0.4.0.8 root_type-only lookup.
+
+    Returns ('', '') rather than raising on any ERPNext trouble: undeterminable
+    types mean "don't guess a party", not "fail the JE"."""
     acct = (account or '').strip()
     if not acct or client is None:
-        return ''
+        return '', ''
     try:
         doc = client.get_doc('Account', acct)
         if isinstance(doc, dict) and doc.get('root_type'):
-            return (doc.get('root_type') or '').strip()
+            return ((doc.get('root_type') or '').strip(),
+                    (doc.get('account_type') or '').strip())
     except (ERPNextAPIError, ERPNextError):
         pass                      # fall through to the account_name lookup
     try:
@@ -896,13 +908,22 @@ def root_type_for_account(client: ERPNextClient | None, account: str,
         if want:
             filters.append(['company', '=', want])
         rows = client.list_docs('Account', filters=filters,
-                                fields=['name', 'root_type'],
+                                fields=['name', 'root_type', 'account_type'],
                                 limit_page_length=1)
     except (ERPNextAPIError, ERPNextError):
-        return ''
+        return '', ''
     if rows:
-        return (rows[0].get('root_type') or '').strip()
-    return ''
+        return ((rows[0].get('root_type') or '').strip(),
+                (rows[0].get('account_type') or '').strip())
+    return '', ''
+
+
+def root_type_for_account(client: ERPNextClient | None, account: str,
+                          company: str = '') -> str:
+    """The ERPNext root_type of a GL account, or '' when undeterminable
+    (v0.4.0.8). Thin wrapper over account_types_for_account — kept because
+    callers that only care about the coarse bucket read better this way."""
+    return account_types_for_account(client, account, company)[0]
 
 
 def cancel_bank_transaction(client: ERPNextClient, name: str) -> None:

@@ -1372,6 +1372,9 @@ RULES_BODY = """
 <h3>{{ 'Edit rule #' ~ form.id if form.id else 'Add a rule' }}</h3>
 <form class="card" id="rule-form" method="post" action="/admin/rules/save">
   <input type="hidden" name="id" value="{{ form.id or '' }}">
+  {# v0.4.0.9 · set only after a Mode B party_type warning, so the SAME form
+     resubmitted keeps the operator's choice instead of warning forever. #}
+  {% if confirm_party_mismatch %}<input type="hidden" name="confirm_party_mismatch" value="1">{% endif %}
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:2;min-width:180px">Name
       <input name="name" id="rule-name" value="{{ form.name or '' }}" placeholder="Fuel — Chevron">
@@ -1442,7 +1445,7 @@ RULES_BODY = """
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:1;min-width:150px">Party type
       <select name="party_type" id="party-type"
-              title="Which side of the ledger the counterparty sits on. Auto decides per transaction from the offset account: Income → Customer, Expense → Supplier.">
+              title="Which side of the ledger the counterparty sits on. Auto decides per transaction from the offset account: a Receivable account books a Customer, a Payable one books a Supplier, anything else books no party.">
         {# A NEW rule (no party_type key at all) defaults to Auto; an EXISTING
            rule always shows what it stored, so a saved "— none —" stays none. #}
         <option value="Auto" {{ 'selected' if (form.party_type or '')|lower == 'auto' or 'party_type' not in form else '' }}>Auto (from offset account)</option>
@@ -1458,12 +1461,14 @@ RULES_BODY = """
   <!-- v0.4.0.8 · sell-side support. The live hint is swapped by JS as the
        Party type / Offset account change (see the party-type-hint script). -->
   <p id="party-type-hint" style="font-size:12px;color:#888;margin:-4px 0 6px">
-    <b>Auto</b> reads the offset account each time the rule fires — an
-    <b>Income</b> account books a <b>Customer</b> (a fruit buyer, USDA, a grant),
-    an <b>Expense</b> account books a <b>Supplier</b>, and anything else
-    (Asset / Liability / Equity — a transfer between your own accounts) books no
-    party. Pick <b>Supplier</b> or <b>Customer</b> to force one side. Banks and
-    brokerages get BOTH records created, since they bill you and pay you.
+    <b>Auto</b> reads the offset account each time the rule fires — a
+    <b>Receivable</b> account books a <b>Customer</b>, a <b>Payable</b> account
+    books a <b>Supplier</b>, and everything else books <b>no party</b>. That
+    includes ordinary Income and Expense accounts: ERPNext only allows a Party
+    on a Receivable or Payable account, and refuses to submit a Journal Entry
+    that breaks the rule. Pick <b>Supplier</b> or <b>Customer</b> to force one
+    side where the account allows it. Banks and brokerages get BOTH records
+    created, since they bill you and pay you.
   </p>
   <!-- v0.4.0.7 · pre-checked by JS when the offset resolves to another Bank
        Account of the same Company (/api/rules/skip_party_suggestion). -->
@@ -2008,7 +2013,7 @@ RULES_BODY = """
 
 
 def _rules_page(flash_msg='', test_result=None, test=None, form=None,
-                show_archived=False):
+                show_archived=False, confirm_party_mismatch=False):
     cur_company = _current_company()
     live = (CategorizationRule.query
             .filter(CategorizationRule.archived.is_(False))
@@ -2043,6 +2048,7 @@ def _rules_page(flash_msg='', test_result=None, test=None, form=None,
                      'ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES', False),
                  supplier_on=current_app.config.get(
                      'ERPNEXT_AUTO_CREATE_SUPPLIERS', True),
+                 confirm_party_mismatch=confirm_party_mismatch,
                  flash_msg=flash_msg)
 
 
@@ -2107,6 +2113,22 @@ def _rule_form_values():
     }
 
 
+def _party_type_conflict(vals: dict) -> tuple[str, str]:
+    """(severity, message) for the rule form's party_type / offset_account pair
+    — the HTTP-layer wrapper around categorization.party_type_conflict
+    (v0.4.0.9). Best-effort: an unconfigured or unreachable ERPNext yields no
+    verdict, so the save proceeds exactly as it did before."""
+    if not erps.is_configured():
+        return '', ''
+    try:
+        return categorization.party_type_conflict(
+            erpnext_bank.get_client(), vals.get('party_type') or '',
+            vals.get('offset_account') or '',
+            vals.get('applies_to_company') or '')
+    except (ERPNextConfigError, ERPNextError):
+        return '', ''
+
+
 @bp.post('/admin/rules/save')
 def save_rule():
     """Create a rule, or NON-DESTRUCTIVELY edit one: an edit clones the rule to a
@@ -2116,6 +2138,20 @@ def save_rule():
     if vals['match_type'] not in categorization.MATCH_TYPES:
         return redirect('/admin/rules?flash=' + quote_plus(
             f"Unknown match type '{vals['match_type']}'"))
+    # v0.4.0.9 · refuse a party_type the offset account can't carry. ERPNext
+    # only accepts a Party on a Receivable/Payable account and enforces it at
+    # SUBMIT, so without this check the rule saves, the JEs generate, and the
+    # operator only finds out when every one of them fails to approve.
+    conflict, conflict_msg = _party_type_conflict(vals)
+    if conflict == 'block':
+        return _rules_page(flash_msg='⚠ ' + conflict_msg, form=vals)
+    if conflict == 'warn' and not request.form.get('confirm_party_mismatch'):
+        # A Mode B logical offset that resolves badly under SOME Company. The
+        # operator may know it never fires there, so re-render with the warning
+        # and a confirm flag rather than refusing outright.
+        return _rules_page(
+            flash_msg='⚠ ' + conflict_msg + ' Save again to keep it anyway.',
+            form=vals, confirm_party_mismatch=True)
     raw_id = (request.form.get('id') or '').strip()
     if raw_id.isdigit():
         old = db.session.get(CategorizationRule, int(raw_id))

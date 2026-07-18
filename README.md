@@ -268,6 +268,40 @@ Create an account in ERPNext, reload the Rules editor, and it's selectable — n
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
 
+**v0.4.0.9** — **party type now respects `account_type`, not just `root_type`**.
+v0.4.0.8 derived the party side from the offset account's **root type** — Income
+→ Customer, Expense → Supplier. ERPNext, however, validates a Journal Entry
+line's Party against the finer **`account_type`**, and it does so at **submit**,
+not at create:
+
+```
+ValidationError: Party Type and Party can only be set for Receivable / Payable
+account Interest Income - BBT
+```
+
+An ordinary Income account has `root_type=Income` but `account_type=Income
+Account` — not `Receivable` — so an interest-income rule generated Journal
+Entries that **created fine and then could not be approved**. The entries piled
+up as un-submittable drafts with no way forward.
+
+`Auto` now reads **both** types and books a party only where ERPNext will accept
+one: a **Receivable** offset books a **Customer**, a **Payable** offset books a
+**Supplier**, and **everything else — including ordinary Income and Expense
+accounts — books no party**. Both fields come from the same account fetch, so
+the extra precision costs no additional ERPNext round-trips.
+
+Two more layers back that up. The **Rules editor refuses to save** a literal
+`Supplier`/`Customer` whose offset account can't carry it, naming the account,
+what it actually is, and the two ways out; a Company-agnostic rule whose logical
+offset resolves incompatibly under *some* Company warns and saves on
+confirmation, since the operator may know it never fires there. And a **boot
+migration repairs the rules already in the database**, clearing `party_type` on
+every rule whose offset ERPNext would reject it on and logging each flip. Both
+checks act only on a **positive** mismatch — an unreachable ERPNext or an
+unresolvable account yields no verdict and changes nothing, because silently
+stripping a party on a network blip is worse than the bug being fixed. Existing
+valid rules are untouched, and `Auto` / `— none —` are always allowed.
+
 **v0.4.0.8** — **adds the sell side**. Everything through v0.4.0.7 was Accounts
 Payable: the only party Bank Bridge would ever auto-create was a **Supplier**. A
 farm also takes money **in** — fruit-buyer deposits, USDA/FSA payments, grants,
