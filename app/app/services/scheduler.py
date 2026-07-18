@@ -52,6 +52,46 @@ def _run_sync(app) -> None:
             log.exception('[scheduler] sync crashed')
 
 
+def rollup_interval_or_none(app) -> int | None:
+    """The cadence (hours) for the Counterparty activity rollup, or None when it
+    is disabled. Pure, so the enable/disable decision is testable without
+    APScheduler — the same shape as poll_interval_or_none above."""
+    if not app.config.get('COUNTERPARTY_OVERLAY_ENABLED', True):
+        return None
+    try:
+        hours = int(app.config.get('COUNTERPARTY_ROLLUP_INTERVAL_HOURS', 24))
+    except (TypeError, ValueError):
+        hours = 24
+    return hours if hours > 0 else None
+
+
+def _run_counterparty_rollup(app) -> None:
+    """Refresh every Counterparty's cached activity totals from the live ledger.
+
+    Cheap and boring by construction: one read of the party-bearing slice of the
+    GL, then a write only for the Counterparties whose numbers actually moved
+    (see counterparty.rollup_counterparties). Swallows everything — a rollup is
+    a convenience, and a failed one must never take the scheduler thread with
+    it."""
+    from ..sync_engine import get_erp_client_or_none
+    from .. import audit
+    from .. import counterparty
+    with app.app_context():
+        audit.set_context('scheduler')
+        if not counterparty.is_enabled():
+            return
+        try:
+            client = get_erp_client_or_none()
+            if client is None:
+                log.info('[scheduler] ERPNext not configured — skipping '
+                         'counterparty rollup')
+                return
+            result = counterparty.rollup_counterparties(client)
+            log.info('[scheduler] counterparty rollup complete: %s', result)
+        except Exception:  # pragma: no cover - never let the job die
+            log.exception('[scheduler] counterparty rollup crashed')
+
+
 def ensure_scheduler_started(app):
     """Elect one scheduler across the container's workers and start it. No-op
     (returns None) for a non-winning worker. Runs the sync every effective
@@ -97,5 +137,16 @@ def ensure_scheduler_started(app):
                           next_run_time=datetime.utcnow() + timedelta(seconds=30))
             log.info('[scheduler] pid=%d elected — polling every %dh',
                      os.getpid(), hours)
+        # v0.4.5 — the Counterparty activity rollup, on its own cadence. Added
+        # to the SAME elected scheduler so there is still exactly one background
+        # thread per container. Its first run is offset well past the sync's
+        # 30-second kick so a fresh boot doesn't hit ERPNext with both at once.
+        rollup_hours = rollup_interval_or_none(app)
+        if rollup_hours is not None:
+            sched.add_job(lambda: _run_counterparty_rollup(app), 'interval',
+                          hours=rollup_hours, id='counterparty_rollup',
+                          max_instances=1, coalesce=True,
+                          next_run_time=datetime.utcnow() + timedelta(minutes=5))
+            log.info('[scheduler] counterparty rollup every %dh', rollup_hours)
         _schedulers[id(app)] = sched
         return sched

@@ -11,6 +11,7 @@ Pages:
   /admin/transactions   — filterable transaction list + per-row retry
   /admin/erpnext_settings — ERPNext connection (URL + API key/secret)
   /admin/intercompany   — review transfers detected between two owned Companies
+  /admin/counterparties — unified Customer + Supplier identity, ledger, reports
   /admin/sync_log       — recent PlaidSyncLog rows
 """
 import hmac
@@ -23,6 +24,7 @@ from werkzeug.security import check_password_hash
 
 from .. import audit
 from .. import categorization
+from .. import counterparty
 from .. import db
 from .. import erpnext_accounts
 from .. import erpnext_bank
@@ -142,6 +144,7 @@ NAV_HTML = """
   <a href="/admin/transactions" class="{{ 'active' if page == 'transactions' else '' }}">Transactions</a>
   <a href="/admin/rules" class="{{ 'active' if page == 'rules' else '' }}">Rules</a>
   <a href="/admin/suppliers" class="{{ 'active' if page == 'suppliers' else '' }}">Suppliers</a>
+  <a href="/admin/counterparties" class="{{ 'active' if page == 'counterparties' else '' }}">Counterparties</a>
   <a href="/admin/generated_entries" class="{{ 'active' if page == 'generated_entries' else '' }}">Generated JEs</a>
   <a href="/admin/intercompany" class="{{ 'active' if page == 'intercompany' else '' }}">Intercompany</a>
   <a href="/admin/audit" class="{{ 'active' if page == 'audit' else '' }}">Audit</a>
@@ -3772,3 +3775,378 @@ def sync_log_page():
     return _page(SYNC_LOG_BODY, page='sync_log', rows=rows,
                  cur_direction=cur_direction, cur_status=cur_status,
                  flash_msg=request.args.get('flash', ''))
+
+
+# ── v0.4.5 · Counterparty overlay ────────────────────────────────
+#
+# The screens ERPNext structurally cannot draw, because it has no concept that
+# the Customer "Wells Fargo" and the Supplier "Wells Fargo" are one party. Every
+# page here reads the ledger LIVE (GL Entry) rather than the cached rollup
+# fields, so a number on screen is never staler than the last ERPNext write —
+# the cached fields exist for people looking at the Counterparty inside ERPNext
+# itself.
+
+
+def _cp_client():
+    """The ERPNext client for a counterparty screen, or None. Every page here
+    degrades to an empty state rather than a 500 when ERPNext is unconfigured or
+    the overlay was never provisioned."""
+    return sync_engine.get_erp_client_or_none()
+
+
+def _erpnext_base() -> str:
+    """The ERPNext base URL for drill-through links, without a trailing slash.
+    '' when unconfigured, which the templates render as plain text instead of a
+    dead link."""
+    return (erps.load().get('url') or '').strip().rstrip('/')
+
+
+def _role_pills(row) -> str:
+    """The 💵 / 💳 role indicators for one Counterparty row."""
+    pills = []
+    if (row.get('customer_link') or '').strip():
+        pills.append('<span class="pill pill-ok" title="Customer — they pay you">'
+                     '&#128181; Customer</span>')
+    if (row.get('supplier_link') or '').strip():
+        pills.append('<span class="pill pill-warn" title="Supplier — you pay them">'
+                     '&#128179; Supplier</span>')
+    return ' '.join(pills) or '<span class="pill pill-muted">no links</span>'
+
+
+COUNTERPARTIES_BODY = """
+<h2>Counterparties</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+{% if not overlay_ok %}
+<div class="banner-warn">
+  <h3>The Counterparty overlay isn't provisioned</h3>
+  <p style="font-size:14px;margin:0">
+    Bank Bridge creates a <code>Counterparty</code> doctype in ERPNext at
+    startup. That hasn't happened here — either ERPNext isn't configured yet,
+    the API user lacks permission to create a DocType (it needs the System
+    Manager role), or <code>COUNTERPARTY_OVERLAY_ENABLED</code> is off.
+    Check the connection on <a href="/admin/erpnext_settings">ERPNext</a> and
+    restart, or run
+    <code>python -m scripts.pair_existing_customer_supplier --dry-run</code>
+    to see what it would do.
+  </p>
+</div>
+{% endif %}
+<p style="font-size:14px;color:#555">
+  One identity per party, layered over ERPNext's separate Customer and Supplier
+  records. A party with both roles is a <b>dual-role</b> counterparty — a bank
+  that pays you interest and charges you fees is the canonical case. Nothing
+  here changes how anything posts; the overlay only adds identity.
+</p>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0">
+  <a href="/admin/counterparties/reports/aged" class="secondary" style="text-decoration:none">Aged balances</a>
+  <a href="/admin/counterparties/reports/1099" class="secondary" style="text-decoration:none">1099-eligible</a>
+  <a href="/admin/counterparties/reports/top" class="secondary" style="text-decoration:none">Top by activity</a>
+</div>
+<form method="get" action="/admin/counterparties" class="card"
+      style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+  <label style="margin:0;flex:1">Search
+    <input name="q" value="{{ cur_q }}" placeholder="counterparty name">
+  </label>
+  <label style="margin:0;width:220px">Type
+    <select name="type">
+      <option value="">All types</option>
+      {% for t in types %}
+      <option value="{{ t }}" {{ 'selected' if t == cur_type else '' }}>{{ t }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit" class="primary">Filter</button>
+</form>
+<table>
+  <tr><th>Counterparty</th><th>Type</th><th>Roles</th>
+      <th class="num">AR activity</th><th class="num">AP activity</th>
+      <th>First txn</th><th></th></tr>
+  {% for r in rows %}
+  <tr>
+    <td><b>{{ r.counterparty_name or r.name }}</b>
+      {% if r.dual_role_flag %}<span class="pill pill-ok" title="Both roles">dual</span>{% endif %}</td>
+    <td>{{ r.counterparty_type or '—' }}</td>
+    <td>{{ role_pills(r)|safe }}</td>
+    <td class="num">{{ '%.2f'|format(r.total_activity_ar or 0.0) }}</td>
+    <td class="num">{{ '%.2f'|format(r.total_activity_ap or 0.0) }}</td>
+    <td>{{ r.date_of_first_transaction or '—' }}</td>
+    <td><a href="/admin/counterparties/{{ (r.name or '')|urlencode }}" class="secondary"
+           style="text-decoration:none;padding:3px 10px;font-size:12px">Ledger</a></td>
+  </tr>
+  {% endfor %}
+  {% if not rows %}
+  <tr><td colspan="7" style="color:#888">
+    {% if overlay_ok %}No counterparties yet — they appear as parties are
+    created, or run the pairing script.{% else %}Nothing to show until the
+    overlay is provisioned.{% endif %}
+  </td></tr>
+  {% endif %}
+</table>
+"""
+
+
+@bp.get('/admin/counterparties')
+def counterparties_page():
+    client = _cp_client()
+    cur_q = (request.args.get('q') or '').strip()
+    cur_type = (request.args.get('type') or '').strip()
+    rows = counterparty.list_counterparties(client, search=cur_q,
+                                            counterparty_type=cur_type)
+    return _page(COUNTERPARTIES_BODY, page='counterparties', rows=rows,
+                 cur_q=cur_q, cur_type=cur_type,
+                 types=counterparty.COUNTERPARTY_TYPES,
+                 role_pills=_role_pills,
+                 overlay_ok=counterparty.available(client),
+                 flash_msg=request.args.get('flash', ''))
+
+
+COUNTERPARTY_DETAIL_BODY = """
+<h2>{{ cp.counterparty_name or cp.name }}
+  {% if cp.dual_role_flag %}<span class="pill pill-ok">dual role</span>{% endif %}</h2>
+<p style="font-size:14px;color:#555">
+  <a href="/admin/counterparties">&larr; All counterparties</a> &nbsp;·&nbsp;
+  Type: <b>{{ cp.counterparty_type or '—' }}</b> &nbsp;·&nbsp; {{ role_pills(cp)|safe }}
+</p>
+<div class="kpis">
+  <div class="kpi"><div style="font-size:12px;color:#666">AR balance</div>
+    <div style="font-size:20px;font-weight:600">{{ '%.2f'|format(ledger.ar_balance) }}</div>
+    <div style="font-size:11px;color:#888">they owe you</div></div>
+  <div class="kpi"><div style="font-size:12px;color:#666">AP balance</div>
+    <div style="font-size:20px;font-weight:600">{{ '%.2f'|format(ledger.ap_balance) }}</div>
+    <div style="font-size:11px;color:#888">you owe them</div></div>
+  <div class="kpi"><div style="font-size:12px;color:#666">Net position</div>
+    <div style="font-size:20px;font-weight:600" class="{{ 'warn' if ledger.net_position < 0 else '' }}">
+      {{ '%.2f'|format(ledger.net_position) }}</div>
+    <div style="font-size:11px;color:#888">AR &minus; AP</div></div>
+  <div class="kpi"><div style="font-size:12px;color:#666">Entries</div>
+    <div style="font-size:20px;font-weight:600">{{ ledger.entries|length }}</div>
+    <div style="font-size:11px;color:#888">since {{ ledger.first_date or '—' }}</div></div>
+</div>
+<h2>Combined ledger</h2>
+<p style="font-size:13px;color:#666">
+  Both roles in one chronological view, straight from ERPNext's GL Entry table.
+  <b>Direction</b> is what the role implies — a Customer is a source of money,
+  a Supplier is a use of it. Click a voucher to open it in ERPNext.
+</p>
+<table>
+  <tr><th>Date</th><th>Role</th><th>Dir</th><th>Account</th>
+      <th class="num">Debit</th><th class="num">Credit</th>
+      <th class="num">Amount</th><th>Voucher</th></tr>
+  {% for e in ledger.entries %}
+  <tr>
+    <td>{{ e.posting_date or '—' }}</td>
+    <td>{% if e.role == 'Customer' %}<span class="pill pill-ok">Customer</span>
+        {% else %}<span class="pill pill-warn">Supplier</span>{% endif %}</td>
+    <td>{% if e.direction == 'IN' %}<span style="color:#1b5e20;font-weight:600">&darr; IN</span>
+        {% else %}<span style="color:#a04000;font-weight:600">&uarr; OUT</span>{% endif %}</td>
+    <td style="font-size:12px">{{ e.account }}</td>
+    <td class="num">{{ '%.2f'|format(e.debit) }}</td>
+    <td class="num">{{ '%.2f'|format(e.credit) }}</td>
+    <td class="num"><b>{{ '%.2f'|format(e.amount) }}</b></td>
+    <td style="font-size:12px">
+      {% if erp_base and e.voucher_type and e.voucher_no %}
+      <a href="{{ erp_base }}/app/{{ e.voucher_type|lower|replace(' ', '-') }}/{{ e.voucher_no|urlencode }}"
+         target="_blank" rel="noopener">{{ e.voucher_no }}</a>
+      {% else %}{{ e.voucher_no or '—' }}{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  {% if not ledger.entries %}
+  <tr><td colspan="8" style="color:#888">No ledger activity for either role yet.</td></tr>
+  {% endif %}
+</table>
+"""
+
+
+@bp.get('/admin/counterparties/<path:name>')
+def counterparty_detail_page(name):
+    client = _cp_client()
+    cp = counterparty.get_counterparty(client, name) if client else None
+    if cp is None:
+        return redirect('/admin/counterparties?flash=' + quote_plus(
+            f'No counterparty named “{name}”'))
+    ledger = counterparty.combined_ledger(client, cp,
+                                          company=_current_company())
+    return _page(COUNTERPARTY_DETAIL_BODY, page='counterparties', cp=cp,
+                 ledger=ledger, role_pills=_role_pills,
+                 erp_base=_erpnext_base())
+
+
+# ── reports ──────────────────────────────────────────────────────
+
+AGED_BODY = """
+<h2>Aged counterparty balances</h2>
+<p style="font-size:14px;color:#555">
+  <a href="/admin/counterparties">&larr; All counterparties</a> &nbsp;·&nbsp;
+  <a href="/api/counterparties/reports/aged">JSON</a>
+</p>
+<div class="banner-warn">
+  <h3>This ages GL entries by posting date, not invoices by due date</h3>
+  <p style="font-size:14px;margin:0">
+    Bank Bridge posts Journal Entries, which have no due date and no invoice
+    behind them — so ERPNext's own Accounts Receivable Summary shows a farm that
+    reconciles bank activity almost nothing. This report answers "how old is
+    this money?" instead. It will disagree with ERPNext's ageing for any party
+    you also invoice properly, and that's expected, not a bug.
+  </p>
+</div>
+<table>
+  <tr><th>Counterparty</th><th>Type</th>
+      {% for label, lo, hi in buckets %}<th class="num">{{ label }}</th>{% endfor %}
+      <th class="num">AR</th><th class="num">AP</th><th class="num">Net</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td><a href="/admin/counterparties/{{ r.counterparty|urlencode }}">{{ r.counterparty }}</a>
+      {% if r.dual_role %}<span class="pill pill-ok">dual</span>{% endif %}</td>
+    <td style="font-size:12px">{{ r.counterparty_type or '—' }}</td>
+    {% for label, lo, hi in buckets %}
+    <td class="num">{{ '%.2f'|format(r.buckets[label]) }}</td>
+    {% endfor %}
+    <td class="num">{{ '%.2f'|format(r.ar_balance) }}</td>
+    <td class="num">{{ '%.2f'|format(r.ap_balance) }}</td>
+    <td class="num {{ 'warn' if r.net < 0 else '' }}"><b>{{ '%.2f'|format(r.net) }}</b></td>
+  </tr>
+  {% endfor %}
+  {% if not rows %}<tr><td colspan="{{ buckets|length + 5 }}" style="color:#888">
+    No counterparty balances to age yet.</td></tr>{% endif %}
+</table>
+"""
+
+
+@bp.get('/admin/counterparties/reports/aged')
+def counterparty_aged_page():
+    rows = counterparty.aged_balances(_cp_client(), company=_current_company())
+    return _page(AGED_BODY, page='counterparties', rows=rows,
+                 buckets=counterparty.AGING_BUCKETS)
+
+
+NEC_1099_BODY = """
+<h2>1099-eligible counterparties</h2>
+<p style="font-size:14px;color:#555">
+  <a href="/admin/counterparties">&larr; All counterparties</a> &nbsp;·&nbsp;
+  <a href="/api/counterparties/reports/1099">JSON</a>
+</p>
+<p style="font-size:14px;color:#555">
+  Counterparties you <b>pay</b> (a Supplier link exists) whose type is neither
+  Financial Institution nor Government. This is the list "every Supplier" should
+  have been all along — it can't accidentally include your bank or the IRS,
+  because those are typed, not guessed at, when the party is created.
+</p>
+<div class="banner-warn">
+  <h3>A candidate list, not a filing</h3>
+  <p style="font-size:14px;margin:0">
+    The $600 threshold, W-9 status and the corporation exemption are judgement
+    calls a human makes. The AP activity column is here so that judgement has a
+    number to start from — it is cached by the nightly rollup, so check it
+    against ERPNext before filing anything.
+  </p>
+</div>
+<table>
+  <tr><th>Counterparty</th><th>Type</th><th>ERPNext Supplier</th>
+      <th class="num">AP activity</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td><a href="/admin/counterparties/{{ r.counterparty|urlencode }}">{{ r.counterparty }}</a>
+      {% if r.dual_role %}<span class="pill pill-ok">dual</span>{% endif %}</td>
+    <td>{{ r.counterparty_type or '—' }}</td>
+    <td><code>{{ r.supplier_link }}</code></td>
+    <td class="num">{{ '%.2f'|format(r.total_activity_ap) }}</td>
+  </tr>
+  {% endfor %}
+  {% if not rows %}<tr><td colspan="4" style="color:#888">
+    No 1099-eligible counterparties.</td></tr>{% endif %}
+</table>
+{% if excluded %}
+<h2>Excluded from the list</h2>
+<p style="font-size:13px;color:#666">
+  Suppliers the filter deliberately dropped, with the reason. Shown because a
+  report that silently omits rows is one you can't trust.
+</p>
+<table>
+  <tr><th>Counterparty</th><th>Excluded because type is</th></tr>
+  {% for r in excluded %}
+  <tr><td>{{ r.counterparty }}</td>
+      <td><span class="pill pill-muted">{{ r.counterparty_type }}</span></td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+"""
+
+
+@bp.get('/admin/counterparties/reports/1099')
+def counterparty_1099_page():
+    client = _cp_client()
+    return _page(NEC_1099_BODY, page='counterparties',
+                 rows=counterparty.nec_1099_candidates(client),
+                 excluded=counterparty.excluded_1099_counterparties(client))
+
+
+TOP_BODY = """
+<h2>Top counterparties by activity</h2>
+<p style="font-size:14px;color:#555">
+  <a href="/admin/counterparties">&larr; All counterparties</a> &nbsp;·&nbsp;
+  <a href="/api/counterparties/reports/top">JSON</a> &nbsp;·&nbsp;
+  Fiscal year from <b>{{ fy_start }}</b>
+</p>
+<p style="font-size:14px;color:#555">
+  Ranked by combined AR + AP <b>volume</b> — total money moved, not balance
+  outstanding. A customer who always pays on time would rank last on any
+  balance-based measure while being one of the most important parties you have.
+</p>
+<table>
+  <tr><th>#</th><th>Counterparty</th><th>Type</th>
+      <th class="num">AR volume</th><th class="num">AP volume</th>
+      <th class="num">Combined</th><th class="num">Entries</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td class="num">{{ loop.index }}</td>
+    <td><a href="/admin/counterparties/{{ r.counterparty|urlencode }}">{{ r.counterparty }}</a>
+      {% if r.dual_role %}<span class="pill pill-ok">dual</span>{% endif %}</td>
+    <td style="font-size:12px">{{ r.counterparty_type or '—' }}</td>
+    <td class="num">{{ '%.2f'|format(r.ar_volume) }}</td>
+    <td class="num">{{ '%.2f'|format(r.ap_volume) }}</td>
+    <td class="num"><b>{{ '%.2f'|format(r.total_volume) }}</b></td>
+    <td class="num">{{ r.entry_count }}</td>
+  </tr>
+  {% endfor %}
+  {% if not rows %}<tr><td colspan="7" style="color:#888">
+    No counterparty activity this fiscal year.</td></tr>{% endif %}
+</table>
+"""
+
+
+@bp.get('/admin/counterparties/reports/top')
+def counterparty_top_page():
+    rows = counterparty.top_by_activity(_cp_client(), company=_current_company())
+    return _page(TOP_BODY, page='counterparties', rows=rows,
+                 fy_start=counterparty.fiscal_year_start().isoformat())
+
+
+# ── JSON report endpoints ────────────────────────────────────────
+#
+# The same three reports as data, for anyone who would rather pull them into a
+# spreadsheet than read a table. Same code path as the HTML pages — these are
+# not a second implementation that can drift.
+
+@bp.get('/api/counterparties/reports/aged')
+def counterparty_aged_api():
+    return jsonify({'buckets': [b[0] for b in counterparty.AGING_BUCKETS],
+                    'rows': counterparty.aged_balances(
+                        _cp_client(), company=_current_company())})
+
+
+@bp.get('/api/counterparties/reports/1099')
+def counterparty_1099_api():
+    client = _cp_client()
+    return jsonify({
+        'excluded_types': sorted(counterparty.NON_1099_TYPES),
+        'rows': counterparty.nec_1099_candidates(client),
+        'excluded': counterparty.excluded_1099_counterparties(client)})
+
+
+@bp.get('/api/counterparties/reports/top')
+def counterparty_top_api():
+    return jsonify({
+        'fiscal_year_start': counterparty.fiscal_year_start().isoformat(),
+        'rows': counterparty.top_by_activity(_cp_client(),
+                                             company=_current_company())})

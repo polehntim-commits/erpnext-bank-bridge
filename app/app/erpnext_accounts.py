@@ -65,6 +65,10 @@ ACCOUNT_SUBTYPE_DT = 'Bank Account Subtype'
 CUSTOM_FIELD_DT = 'Custom Field'
 # The Chart-of-Accounts doctype the GL auto-create (v0.2.0) walks and creates in.
 ACCOUNT_DT = 'Account'
+# v0.4.5 — the overlay doctype app/counterparty.py provisions. Named here (as
+# well as there) so bootstrap can report on it without importing that module,
+# which imports this one.
+COUNTERPARTY_DT = 'Counterparty'
 
 # ── unavailable-doctype registry ────────────────────────────────────────────
 #
@@ -684,6 +688,18 @@ def bootstrap(client: ERPNextClient) -> dict:
         CUSTOM_FIELD_DT: ensure_custom_fields(client),
     }
     status['partial'] = not all(v for k, v in status.items() if k != 'partial')
+    # v0.4.5 — the Counterparty overlay. Imported lazily (app.counterparty
+    # imports this module) and deliberately OUTSIDE the `partial` calculation:
+    # the overlay is a reporting layer, so an ERPNext that won't give us the
+    # doctype is not a degraded import, it's just an install without the
+    # feature. Never raises.
+    try:
+        from . import counterparty as _counterparty
+        status[_counterparty.COUNTERPARTY_DT] = (
+            _counterparty.bootstrap(client).get('available', False))
+    except Exception:  # pragma: no cover - never sink bootstrap on the overlay
+        log.warning('counterparty bootstrap failed', exc_info=True)
+        status[COUNTERPARTY_DT] = False
     return status
 
 

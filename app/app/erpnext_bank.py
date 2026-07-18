@@ -363,6 +363,31 @@ def _supplier_log(direction: str, status: str, message: str = '',
         log.warning('failed to write supplier PlaidSyncLog row', exc_info=True)
 
 
+def _link_counterparty(client, party_name: str, party_type: str,
+                       erpnext_name: str | None, *, source: str = '') -> None:
+    """Attach a freshly-resolved Customer / Supplier to its Counterparty overlay
+    record, creating the Counterparty if this is the first time we've seen the
+    name (v0.4.5).
+
+    Imported lazily because app.counterparty imports app.erpnext_accounts, which
+    imports this module — a top-level import here would close that cycle.
+
+    Fire-and-forget by design. The overlay is a reporting convenience layered
+    over records that are already correct; if ERPNext refuses the write, or the
+    doctype was never provisioned, the Supplier / Customer this call was made
+    about is still perfectly good and the Journal Entry must still post. Every
+    failure is therefore swallowed and logged, never raised."""
+    if not erpnext_name:
+        return
+    try:
+        from . import counterparty
+        counterparty.link_party(client, party_name, party_type, erpnext_name,
+                                source=source)
+    except Exception:  # pragma: no cover - the overlay may never break a push
+        log.warning('counterparty link failed for %r (%s)', party_name,
+                    party_type, exc_info=True)
+
+
 def _default_supplier_group() -> str:
     return (current_app.config.get('ERPNEXT_DEFAULT_SUPPLIER_GROUP')
             or 'All Supplier Groups').strip() or 'All Supplier Groups'
@@ -458,6 +483,8 @@ def get_or_create_supplier(client: ERPNextClient | None, merchant_name: str, *,
         audit.record('supplier_auto_created', subject_type='Supplier',
                      subject_id=row.id, after=row.to_dict(),
                      notes=f'merchant_name={merchant_name!r} → {normalized!r}')
+    _link_counterparty(client, normalized, SUPPLIER_DT,
+                       row.erpnext_supplier_name, source='merchant')
     return row.erpnext_supplier_name
 
 
@@ -627,6 +654,8 @@ def ensure_supplier(client: ERPNextClient | None, party_name: str, *,
                      subject_id=row.id, after=row.to_dict(),
                      notes=f'party={name!r} (source={source or "rule"}) → '
                            f'{row.erpnext_supplier_name!r}')
+    _link_counterparty(client, name, SUPPLIER_DT, row.erpnext_supplier_name,
+                       source=source)
     return row.erpnext_supplier_name
 
 
@@ -751,6 +780,8 @@ def ensure_customer(client: ERPNextClient | None, party_name: str, *,
                      subject_id=row.id, after=row.to_dict(),
                      notes=f'party={name!r} (source={source or "rule"}) → '
                            f'{row.erpnext_customer_name!r}')
+    _link_counterparty(client, name, CUSTOMER_DT, row.erpnext_customer_name,
+                       source=source)
     return row.erpnext_customer_name
 
 

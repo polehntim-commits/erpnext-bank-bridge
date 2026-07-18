@@ -52,6 +52,12 @@ ERPNext  ──►  Bank Reconciliation Tool
   the two entities instead of letting a generic rule put an expense on one P&L
   and income on the other. Review, approve or unpair at `/admin/intercompany`.
   Auto-activates once accounts under a second Company are linked.
+- **One identity per counterparty** (v0.4.5) — ERPNext keeps Customer and
+  Supplier in unrelated doctypes, so a party that both buys from you and sells
+  to you is two records with no link between them. Bank Bridge adds a
+  **Counterparty** overlay that pairs them, giving one net position, one
+  combined ledger, and a **1099-eligible list that can't include your bank**.
+  See [Counterparty overlay](#counterparty-overlay-v045).
 - **Books opening balances** (v0.4.4) — every real bank account already holds
   something on the day you link it. Bank Bridge books that against an
   auto-created **Opening Balance Equity** account, so the balance sheet shows
@@ -72,7 +78,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.4 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.5 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -281,6 +287,47 @@ Company-agnostic logical-name list too) and reports how many accounts came back.
 Create an account in ERPNext, reload the Rules editor, and it's selectable — no
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
+
+**v0.4.5** — **one identity per counterparty**. ERPNext models the buy side and
+the sell side as unrelated doctypes. A party that trades with you in both
+directions — a bank, a wholesaler who buys your fruit and sells you bins, a
+neighbouring grower you swap labour with — becomes two records that share
+nothing but a spelling:
+
+```
+Customer  "Wells Fargo"   pays you interest      →  AR ledger
+Supplier  "Wells Fargo"   charges you fees       →  AP ledger
+                                                    (no link between them)
+```
+
+Nothing in ERPNext can answer *what is my net position with Wells Fargo?*, and
+the list you reach for at tax time — "every Supplier" — cheerfully includes your
+bank, your card issuer and the IRS. Issuing a 1099-NEC to any of those is the
+classic January own-goal.
+
+v0.4.5 adds a `Counterparty` doctype that sits **above** Customer and Supplier
+and links 0-or-1 of each. It owns no accounting: every debit and credit still
+posts exactly where it did before, so the audit trail, ERPNext's own AR/AP
+reports and every existing workflow are untouched. The overlay adds identity —
+and the four things identity makes possible:
+
+- `/admin/counterparties` — every party with its role badges, and a **combined
+  AR + AP ledger** per party in one chronological view, with drill-through to
+  the underlying ERPNext vouchers.
+- **Aged balances** — 30/60/90/120+ buckets, netted across both roles, so a bank
+  you owe fees to and that owes you interest reads as one honest number.
+- **1099-eligible counterparties** — Suppliers whose type is neither Financial
+  Institution nor Government. It shows what it excluded and why, because a
+  report that silently drops rows is one you can't trust.
+- **Top counterparties by activity** — ranked by money *moved*, not balance
+  outstanding.
+
+The doctype is created over the REST API at startup, the same idempotent
+bootstrap that already provisions Bank Account Types and custom fields — no
+second Frappe app to deploy. On upgrade, the Customer and Supplier records you
+already have are paired automatically (exact name match only; fuzzy-merging tax
+identities is a mistake that surfaces in January). If the API user can't create
+a DocType, the overlay quietly stays off and nothing else changes.
 
 **v0.4.4** — **books the balance an account already had when you linked it**.
 Bank Bridge recorded transactions and nothing else, so the ERPNext balance sheet
@@ -557,6 +604,103 @@ Idempotency is enforced two ways: a unique local row per Plaid transaction id,
 and an ERPNext find-or-create keyed on `reference_number` (the Plaid id). The
 deposit/withdrawal split follows Plaid's convention (positive amount = money
 out of the account → withdrawal; negative = money in → deposit).
+
+## Counterparty overlay (v0.4.5)
+
+ERPNext's Customer and Supplier are unrelated doctypes. That is the right call
+for accounting — each side keeps its own ledger, its own tax treatment and its
+own audit trail — and the wrong one for *identity*. A party that trades with you
+in both directions ends up as two records that share nothing but a spelling, and
+no report can put them back together.
+
+Bank Bridge adds a **`Counterparty`** doctype that links 0-or-1 Customer and
+0-or-1 Supplier. It is a pure overlay: **nothing about how anything posts
+changes.** Every debit and credit still lands on the underlying Customer or
+Supplier, so ERPNext's own reports, the audit trail and any existing workflow
+keep working exactly as before.
+
+| Field | Meaning |
+| --- | --- |
+| `counterparty_name` | the party name; also the docname (autoname `field:counterparty_name`) |
+| `counterparty_type` | Individual / Company / Financial Institution / Government / Other |
+| `customer_link` | the ERPNext Customer for this party, if any |
+| `supplier_link` | the ERPNext Supplier for this party, if any |
+| `dual_role_flag` | read-only; true exactly when **both** links are set |
+| `date_of_first_transaction` | read-only; refreshed by the nightly rollup |
+| `total_activity_ar` / `total_activity_ap` | read-only cached volume, refreshed by the rollup |
+| `notes` | free text |
+
+### How records get created
+
+Three paths, all idempotent and all additive:
+
+1. **At startup** — the doctype is provisioned over the REST API (the same
+   bootstrap that creates Bank Account Types and custom fields), then the
+   Customer and Supplier records you already have are paired into
+   Counterparties. Turn the pairing off with `COUNTERPARTY_AUTO_PAIR=false`.
+2. **At party creation** — whenever Bank Bridge auto-creates or resolves a
+   Supplier or Customer, it finds-or-creates the matching Counterparty and fills
+   in that side's link. A dual-role party (v0.4.0.8's bank heuristic) gets both
+   ERPNext records and therefore both links, so `dual_role_flag` lights up on
+   its own.
+3. **By hand** — `python -m scripts.pair_existing_customer_supplier --dry-run`
+   shows the plan; without the flag it applies it.
+
+Matching is on the **exact** party name. "Wells Fargo" and "Wells Fargo Bank NA"
+stay two Counterparties, deliberately: silently fusing two tax identities is a
+mistake that surfaces as a wrong 1099 in January, while under-pairing is visible
+and takes thirty seconds to fix by hand. Auto-link only ever *fills a blank* — a
+link you corrected by hand is never overwritten.
+
+### The screens
+
+`/admin/counterparties` lists every party with role badges (💵 Customer, 💳
+Supplier, both = dual). Clicking one opens the **combined ledger**: both roles
+in one chronological view, read live from `GL Entry`, with AR balance, AP
+balance and net position, and drill-through links to the underlying ERPNext
+vouchers.
+
+Three reports hang off it, each also available as JSON at the same path under
+`/api/`:
+
+- **Aged balances** (`/admin/counterparties/reports/aged`) — 30/60/90/120+
+  buckets, netted across both roles. Note this ages **GL entries by posting
+  date**, not invoices by due date: Bank Bridge posts Journal Entries, which
+  have no due date, so ERPNext's own Accounts Receivable Summary shows a farm
+  that reconciles bank activity almost nothing. The two will disagree for any
+  party you also invoice properly, and that is expected.
+- **1099-eligible** (`/admin/counterparties/reports/1099`) — Counterparties with
+  a Supplier link whose type is neither Financial Institution nor Government.
+  This is the list "every Supplier" should have been: it cannot accidentally
+  include your bank or the IRS, because the type is set when the party is
+  created rather than guessed at in January. It also shows what it excluded and
+  why. It is a **candidate** list — the $600 threshold, W-9 status and the
+  corporation exemption remain human judgement calls.
+- **Top by activity** (`/admin/counterparties/reports/top`) — ranked by combined
+  AR + AP **volume** for the current fiscal year. Volume, not balance: a
+  customer who always pays on time would rank last on any balance-based measure
+  while being one of the most important parties you have.
+
+### The rollup job
+
+A background job (default daily, `COUNTERPARTY_ROLLUP_INTERVAL_HOURS`) refreshes
+each Counterparty's cached activity totals and first-transaction date. It reads
+the party-bearing slice of the ledger **once** and aggregates in Python, rather
+than issuing two queries per party — so its cost is flat as the party list
+grows — then writes only the records whose numbers actually moved. On a farm
+between seasons the steady state is zero writes.
+
+The screens never depend on it: every page reads the ledger live. The cached
+fields exist for people looking at a Counterparty inside ERPNext itself.
+
+### If it can't be provisioned
+
+Creating a DocType needs a System Manager API user. If yours isn't one, the
+probe fails, the overlay is marked unavailable for the life of the process, and
+**everything else carries on unchanged** — party creation, Journal Entries and
+the whole posting path never depend on it. `/admin/counterparties` then explains
+what happened rather than erroring. Set `COUNTERPARTY_OVERLAY_ENABLED=false` to
+skip it entirely.
 
 ## Data model
 
@@ -1142,6 +1286,10 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `INTERCOMPANY_CONFIDENCE_THRESHOLD` | `0.75` | v0.4.1 · minimum overall confidence to pair **automatically**; below this the candidate is logged and left for a human |
 | `INTERCOMPANY_LOOKBACK_DAYS` | `30` | v0.4.1 · how far back a detection pass looks for a counterparty (each Plaid Item advances its own cursor, so the two legs often arrive on different syncs) |
 | `ERPNEXT_LOANS_ADVANCES_GROUP_NAME` | `Loans and Advances (Assets)` | v0.4.1 · Chart-of-Accounts group the auto-created intercompany `Due from …` receivables go under (the `Due to …` payables use `ERPNEXT_CURRENT_LIABILITIES_GROUP_NAME`) |
+| `COUNTERPARTY_OVERLAY_ENABLED` | `true` | v0.4.5 · master switch for the Counterparty overlay. `false` skips the doctype bootstrap and the auto-link, and the `/admin/counterparties` screens render an empty state |
+| `COUNTERPARTY_AUTO_PAIR` | `true` | v0.4.5 · pair the Customer / Supplier records that already exist into Counterparties at startup. Idempotent and additive. `false` leaves the overlay empty until you run `scripts/pair_existing_customer_supplier.py` |
+| `COUNTERPARTY_ROLLUP_INTERVAL_HOURS` | `24` | v0.4.5 · how often the background job refreshes each Counterparty's cached activity totals. `0` or negative disables the job; the reports read the ledger live either way |
+| `COUNTERPARTY_FISCAL_YEAR_START_MONTH` | `1` | v0.4.5 · first month (1-12) of your fiscal year for the "top counterparties" report. `1` is a calendar year; set `9` for a crop year starting in September |
 | `AUTO_BOOK_OPENING_BALANCE` | `true` | v0.4.4 · book each account's existing balance as a Draft Journal Entry when it is first imported. Set `false` to book them by hand from `/admin/accounts` instead |
 | `OPENING_BALANCE_DATE` | `today` | v0.4.4 · posting date for auto-booked opening balances. An ISO date (`2026-01-01`) backdates them to e.g. a fiscal year start; an unparseable value falls back to today with a warning rather than failing the import |
 | `OPENING_BALANCE_EQUITY_ACCOUNT_NAME` | `Opening Balance Equity` | v0.4.4 · the Equity leaf every opening balance is offset against, auto-created under the owning Company's Equity root when the chart doesn't ship one |
@@ -1266,7 +1414,7 @@ per Company and reused; auto-booking at import and its opt-out; the configurable
 posting date including the fall-back on a bad value; re-import never
 double-booking; the backfill script's estimate, dry run, idempotency and refusal
 to overturn a rejection; the manual amount/date override endpoint; and the
-existing approve/reject workflow driving the entries unchanged). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
+existing approve/reject workflow driving the entries unchanged), and the counterparty overlay (v0.4.5: the doctype bootstrap being idempotent and degrading to a no-op when the API user lacks DocType rights; auto-link on both the Supplier and Customer paths; dual-role detection setting the flag from both links; a human-set link never being stomped; concurrent creates recovering by re-fetching rather than failing; the pairing migration's dry run, idempotency and exact-name matching; ageing bucket boundaries and the netting across roles; the 1099 report excluding Financial Institution and Government types and declaring what it dropped; top-by-activity sorting by combined volume within the configured fiscal year; the rollup reading the ledger a fixed number of times regardless of party count, skipping unchanged records and never blanking a first-transaction date; and every screen rendering on an install that has no overlay at all). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
 so no network access or extra wheels are needed.
 
 ## Security notes

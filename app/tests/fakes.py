@@ -81,7 +81,11 @@ class FakeERPClient:
                  companies=None, existing_supplier_groups=None,
                  fail_supplier_group_create=False, existing_customers=None,
                  fail_customer_create=False, existing_customer_groups=None,
-                 fail_customer_group_create=False, fail_je_create_after=None):
+                 fail_customer_group_create=False, fail_je_create_after=None,
+                 counterparty_doctype=False, fail_doctype_create=False,
+                 doctype_permission_error=False, gl_entries=None,
+                 fail_counterparty_create=False,
+                 counterparty_create_race=False):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -169,12 +173,31 @@ class FakeERPClient:
         self.je_creates = 0
         # ERPNext Company docnames for list_companies() (v0.4.0 multi-entity).
         self.companies = list(companies) if companies is not None else []
+        # v0.4.5 · the Counterparty overlay. `counterparty_doctype=True` models
+        # an ERPNext that ALREADY has the doctype (the steady state after one
+        # bootstrap); False models a fresh instance where bootstrap must create
+        # it. The three failure knobs cover the ways a real instance says no.
+        self.counterparty_doctype = counterparty_doctype
+        # Every DocType create fails (a malformed spec / a Frappe that refuses).
+        self.fail_doctype_create = fail_doctype_create
+        # The API user has no DocType create right — Frappe answers 403. The
+        # overlay must degrade to "unavailable", not crash bootstrap.
+        self.doctype_permission_error = doctype_permission_error
+        # Every Counterparty create fails outright.
+        self.fail_counterparty_create = fail_counterparty_create
+        # The concurrency case: the FIRST Counterparty create raises a duplicate
+        # error AND leaves the document behind, exactly as it would when another
+        # worker won the race. The caller must recover by re-fetching, not fail.
+        self.counterparty_create_race = counterparty_create_race
+        # Preset GL Entry rows (dicts with posting_date/party_type/party/
+        # debit/credit/…). The ledger, ageing and rollup all read these.
+        self.gl_entries = [dict(g) for g in (gl_entries or [])]
         # Records created by the one-click account import, keyed by doctype.
         self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {},
                         'Bank Account Type': {}, 'Bank Account Subtype': {},
                         'Account': {}, 'Supplier': {}, 'Journal Entry': {},
                         'Supplier Group': {}, 'Customer': {},
-                        'Customer Group': {}}
+                        'Customer Group': {}, 'Counterparty': {}, 'DocType': {}}
 
     def get_logged_user(self):
         return 'admin@example.com'
@@ -213,6 +236,20 @@ class FakeERPClient:
                     or name in self.created['Customer Group']):
                 return {'name': name}
             return None
+        if doctype == 'DocType':
+            # The probe app.counterparty.ensure_counterparty_doctype makes.
+            if self.doctype_permission_error:
+                from app.erpnext_client import ERPNextAPIError
+                raise ERPNextAPIError(
+                    f'GET /api/resource/DocType/{name} -> 403', status_code=403,
+                    response_body='{"exc_type":"PermissionError","exception":'
+                                  '"frappe.exceptions.PermissionError: Not '
+                                  'permitted"}')
+            if name == 'Counterparty' and self.counterparty_doctype:
+                return {'name': name, 'module': 'Accounts', 'custom': 1}
+            return self.created['DocType'].get(name)
+        if doctype == 'Counterparty':
+            return self.created['Counterparty'].get(name)
         if doctype == 'Account':
             return ({**self.chart_accounts, **self.created['Account']}).get(name)
         if doctype == 'Bank Account':
@@ -228,6 +265,21 @@ class FakeERPClient:
             field, op, value = f[0], f[1], f[2]
             if op == '=' and str(doc.get(field, '')) != str(value):
                 return False
+        return True
+
+    @staticmethod
+    def _counterparty_matches(doc, filters):
+        """Like _matches, but also honours the `like` operator the
+        /admin/counterparties search box uses ('%acme%')."""
+        for f in (filters or []):
+            field, op, value = f[0], f[1], f[2]
+            actual = str(doc.get(field, '') or '')
+            if op == '=':
+                if actual != str(value):
+                    return False
+            elif op == 'like':
+                if str(value).strip('%').lower() not in actual.lower():
+                    return False
         return True
 
     @staticmethod
@@ -273,22 +325,42 @@ class FakeERPClient:
             flds = fields or ['name']
             return [{k: d.get(k) for k in flds} for d in pool.values()
                     if self._account_matches(d, filters)]
-        if doctype == 'Supplier':
-            # supplier_name filter → a dedup lookup against preset + created
-            # Suppliers (autonamed on supplier_name).
-            names = set(self.existing_suppliers) | set(self.created['Supplier'])
+        if doctype in ('Supplier', 'Customer'):
+            # A <party>_name filter is the dedup lookup (both doctypes autoname
+            # on their name field). Anything else — notably the v0.4.5 pairing
+            # pass's `disabled = 0` — is a full listing, projected onto whatever
+            # fields were asked for.
+            name_field = ('supplier_name' if doctype == 'Supplier'
+                          else 'customer_name')
+            preset = (self.existing_suppliers if doctype == 'Supplier'
+                      else self.existing_customers)
+            names = set(preset) | set(self.created[doctype])
             for f in (filters or []):
-                if f[0] == 'supplier_name' and f[1] == '=':
+                if f[0] == name_field and f[1] == '=':
                     return [{'name': f[2]}] if f[2] in names else []
-            return [{'name': n} for n in names]
-        if doctype == 'Customer':
-            # customer_name filter → the AR-side dedup lookup (autonamed on
-            # customer_name, exactly like Supplier above).
-            names = set(self.existing_customers) | set(self.created['Customer'])
-            for f in (filters or []):
-                if f[0] == 'customer_name' and f[1] == '=':
-                    return [{'name': f[2]}] if f[2] in names else []
-            return [{'name': n} for n in names]
+            flds = fields or ['name']
+            return [{k: (n if k in ('name', name_field) else None) for k in flds}
+                    for n in sorted(names)]
+        if doctype == 'Counterparty':
+            rows = []
+            for name, d in self.created['Counterparty'].items():
+                doc = {**d, 'name': name}
+                if not self._counterparty_matches(doc, filters):
+                    continue
+                rows.append({k: doc.get(k) for k in (fields or ['name'])}
+                            if fields else {'name': name})
+            return sorted(rows, key=lambda r: r.get('name') or
+                          r.get('counterparty_name') or '')
+        if doctype == 'GL Entry':
+            # An unset `is_cancelled` means 0 (live), matching ERPNext — so a
+            # test fixture doesn't have to spell it out on every row.
+            rows = [g for g in self.gl_entries
+                    if self._matches({'is_cancelled': 0, **g}, filters)]
+            if order_by and 'posting_date' in order_by:
+                rows = sorted(rows, key=lambda g: str(g.get('posting_date') or ''))
+            if fields:
+                rows = [{k: g.get(k) for k in fields} for g in rows]
+            return rows
         if doctype in ('Bank', 'Custom Field'):
             return [{'name': n} for n, d in self.created[doctype].items()
                     if self._matches(d, filters)]
@@ -430,6 +502,44 @@ class FakeERPClient:
             stored = dict(doc)
             self.created['Journal Entry'][name] = stored
             self.docs[name] = stored
+            return {'name': name}
+        if doctype == 'DocType':
+            from app.erpnext_client import ERPNextAPIError
+            if self.doctype_permission_error:
+                raise ERPNextAPIError(
+                    'POST /api/resource/DocType -> 403', status_code=403,
+                    response_body='{"exc_type":"PermissionError","exception":'
+                                  '"frappe.exceptions.PermissionError: Not '
+                                  'permitted"}')
+            if self.fail_doctype_create:
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body='{"exception": "ValidationError: cannot '
+                                  'create DocType"}')
+            name = doc.get('name')
+            self.created['DocType'][name] = dict(doc)
+            if name == 'Counterparty':
+                self.counterparty_doctype = True
+            return {'name': name}
+        if doctype == 'Counterparty':
+            from app.erpnext_client import ERPNextAPIError
+            name = doc.get('counterparty_name')   # autonames on the name field
+            if self.counterparty_create_race:
+                # Another worker got there first: the document EXISTS but our
+                # create still errors. Recovery is a re-fetch, not a retry.
+                self.counterparty_create_race = False
+                self.created['Counterparty'][name] = dict(doc)
+                raise ERPNextAPIError(
+                    'bad', status_code=409,
+                    response_body='{"exc_type":"DuplicateEntryError",'
+                                  '"exception":"Counterparty ' + str(name) +
+                                  ' already exists"}')
+            if self.fail_counterparty_create:
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body='{"exception": "ValidationError: cannot '
+                                  'create Counterparty"}')
+            self.created['Counterparty'][name] = dict(doc)
             return {'name': name}
         if doctype == 'Custom Field':
             name = f"{doc.get('dt')}-{doc.get('fieldname')}"

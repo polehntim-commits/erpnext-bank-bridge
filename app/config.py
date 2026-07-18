@@ -180,6 +180,40 @@ class Config:
     BANKBRIDGE_DUAL_ROLE_PARTIES = _csv('BANKBRIDGE_DUAL_ROLE_PARTIES')
     BANKBRIDGE_SINGLE_ROLE_PARTIES = _csv('BANKBRIDGE_SINGLE_ROLE_PARTIES')
 
+    # ── v0.4.5 · Counterparty overlay (see app/counterparty.py) ───────────
+    # ERPNext keeps Customer and Supplier in unrelated doctypes, so a party that
+    # both buys from you and sells to you — a bank, a wholesaler, a neighbouring
+    # grower — has no single identity and no net position. The overlay adds a
+    # `Counterparty` doctype (auto-created over REST at startup) that links
+    # 0-or-1 of each, without touching how anything posts.
+    #   * master switch. Off → no doctype bootstrap, no auto-link, and the
+    #     /admin/counterparties pages render an empty state.
+    COUNTERPARTY_OVERLAY_ENABLED = _bool('COUNTERPARTY_OVERLAY_ENABLED', True)
+    #   * pair the Customer / Supplier records that already exist into
+    #     Counterparties at startup. Idempotent and additive — it only ever
+    #     creates overlay records and fills blank links, never edits a Customer,
+    #     a Supplier or a posting. Set False to keep the overlay empty until you
+    #     run scripts/pair_existing_customer_supplier.py by hand.
+    COUNTERPARTY_AUTO_PAIR = _bool('COUNTERPARTY_AUTO_PAIR', True)
+    #   * how often the background job refreshes each Counterparty's cached
+    #     activity totals + first-transaction date from the live ledger. Daily by
+    #     default; 0 or negative disables the job entirely (the reports read the
+    #     ledger live either way, so this only affects the cached fields shown in
+    #     ERPNext itself).
+    try:
+        COUNTERPARTY_ROLLUP_INTERVAL_HOURS = int(os.environ.get(
+            'COUNTERPARTY_ROLLUP_INTERVAL_HOURS', '24'))
+    except ValueError:
+        COUNTERPARTY_ROLLUP_INTERVAL_HOURS = 24
+    #   * first month of your fiscal year (1-12) for the "top counterparties"
+    #     report. 1 = calendar year; set e.g. 9 for a crop year starting in
+    #     September.
+    try:
+        COUNTERPARTY_FISCAL_YEAR_START_MONTH = min(12, max(1, int(os.environ.get(
+            'COUNTERPARTY_FISCAL_YEAR_START_MONTH', '1'))))
+    except ValueError:
+        COUNTERPARTY_FISCAL_YEAR_START_MONTH = 1
+
     # ── v0.3.0 · categorization rules → Journal Entry generation ───────────
     # Master switch for the rules engine. Default OFF: rules can be authored and
     # tested at /admin/rules without firing, because an incorrect auto-generated
