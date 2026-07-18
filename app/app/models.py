@@ -333,9 +333,10 @@ class CategorizationRule(db.Model):
 
     `party_type` / `party_name` optionally link a Supplier /
     Customer on the offset line (party_name blank → the auto-created Supplier
-    for the transaction's merchant is used). `description_template` is a Jinja
-    string rendered into the JE's user_remark. Deliberately un-constrained on
-    match_type so a new predicate never needs a migration."""
+    for the transaction's merchant is used). `description_template` is a plain
+    `{{variable}}` string rendered into the JE's user_remark (v0.4.0.4; auto-filled
+    from the match type + offset account on the Rules editor). Deliberately
+    un-constrained on match_type so a new predicate never needs a migration."""
     __tablename__ = 'categorization_rules'
     id = db.Column(db.Integer, primary_key=True)
     priority = db.Column(db.Integer, default=100, index=True)

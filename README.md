@@ -206,6 +206,21 @@ backstop. On upgrade, existing agnostic rules with a pinned, fully-qualified
 offset are **auto-migrated** to a logical name on boot (idempotent; scoped rules
 and names that legitimately contain ` - ` are left untouched).
 
+**v0.4.0.4** — the Rules editor now **auto-fills the Description Template** from
+the Match Type + Offset Account so a new rule gets a sensible Journal Entry
+remark with zero typing. Pick an offset and the template populates (e.g. a
+`merchant_exact` rule offset to *Fuel Expense* → `{{merchant_name}} - Fuel
+Expense`); each match type has its own default. It never overwrites text you've
+typed — a manual edit takes ownership, and a **↺ reset to default** link hands it
+back. A **live preview** below the field renders the template against your most
+recent matching transaction (or sample data when none match yet). Templates are
+plain `{{variable}}` strings — `{{merchant_name}}` (falls back to the raw
+description), `{{description}}`, `{{amount}}` (signed, e.g. `42.50 USD`),
+`{{plaid_category}}`, `{{date}}` — and a variable that can't be resolved renders
+empty, with the leftover ` - ` separators compacted away so the remark always
+reads cleanly. Existing rules are unchanged: a rule with a template keeps it, and
+a blank template still yields the same default remark.
+
 ## How it works
 
 1. **Link a bank once** through Plaid Link (`/admin/link_bank`). OAuth-only

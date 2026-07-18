@@ -13,7 +13,7 @@ Pages:
   /admin/sync_log       — recent PlaidSyncLog rows
 """
 import hmac
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from urllib.parse import quote_plus
 
 from flask import (Blueprint, Response, current_app, jsonify, redirect,
@@ -1236,6 +1236,50 @@ def known_accounts_api():
                     'company': '', 'mode': 'logical'})
 
 
+def _sample_transaction_for(match_type: str, match_value: str):
+    """A representative transaction to render a Description Template preview
+    against: the most recent local transaction the (match_type, match_value)
+    predicate actually catches, or a synthetic placeholder when none match (or
+    there are no transactions yet). Returns (transaction, used_real_sample)."""
+    from types import SimpleNamespace
+    probe = CategorizationRule(match_type=(match_type or 'merchant_contains'),
+                               match_value=(match_value or ''))
+    rows = (BankTransaction.query
+            .filter(BankTransaction.removed.is_(False))
+            .order_by(BankTransaction.date.desc(), BankTransaction.id.desc())
+            .limit(500).all())
+    for r in rows:
+        if categorization.rule_matches(
+                probe, merchant_name=(r.merchant_name or ''),
+                description=(r.name or ''), category=(r.category or ''),
+                amount=(r.amount or 0.0)):
+            return r, True
+    placeholder = SimpleNamespace(
+        merchant_name='Sample Merchant', name='SAMPLE MERCHANT PURCHASE',
+        category='General Merchandise', amount=42.00,
+        iso_currency_code='USD', date=date(2026, 1, 15))
+    return placeholder, False
+
+
+@bp.get('/api/rules/preview_description')
+def preview_description_api():
+    """Live preview for the Description Template field on the Rules editor.
+    Renders `?template=` (or, when blank, the auto-fill default for the given
+    `?match_type=` + `?offset_account=`) against a sample transaction — the most
+    recent one matching `?match_value=`, else a placeholder. Read-only."""
+    match_type = (request.args.get('match_type') or '').strip()
+    match_value = (request.args.get('match_value') or '').strip()
+    offset_account = (request.args.get('offset_account') or '').strip()
+    template = request.args.get('template')
+    if template is None or not template.strip():
+        template = categorization.default_description_template(
+            match_type, offset_account)
+    row, used_sample = _sample_transaction_for(match_type, match_value)
+    preview = categorization.render_description_template(template, row)
+    return jsonify({'preview': preview, 'template': template,
+                    'used_sample': used_sample})
+
+
 RULES_BODY = """
 <h2>Categorization rules</h2>
 {% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
@@ -1367,9 +1411,18 @@ RULES_BODY = """
       </select>
     </label>
   </div>
-  <label>Description template (Jinja) <span style="font-weight:400;color:#888">— vars: merchant_name, name, date, amount, category, supplier_name</span>
-    <input name="description_template" value="{{ form.description_template or '' }}"
-           placeholder="Fuel purchase - {{ '{{ merchant_name }}' }} - {{ '{{ date }}' }}">
+  <label>Description template
+    <span style="float:right;font-weight:400">
+      <a href="#" id="dt-reset" style="font-size:11px" title="Restore the auto-generated default for this match type + offset account">↺ reset to default</a>
+    </span>
+    <span style="font-weight:400;color:#888">— vars:
+      {{ '{{merchant_name}}' }}, {{ '{{description}}' }}, {{ '{{amount}}' }},
+      {{ '{{plaid_category}}' }}, {{ '{{date}}' }} · auto-fills from match type +
+      offset account; edit freely</span>
+    <textarea name="description_template" id="description-template" rows="2"
+              style="width:100%;font-family:inherit;resize:vertical"
+              placeholder="{{ '{{merchant_name}} - {{offset_short}}' }}">{{ form.description_template or '' }}</textarea>
+    <span id="dt-preview" style="display:block;font-size:12px;color:#555;margin-top:3px"></span>
   </label>
   <button type="submit" class="primary">{{ 'Save changes' if form.id else 'Add rule' }}</button>
   {% if form.id %}<a href="/admin/rules" class="secondary" style="text-decoration:none;display:inline-block;margin-left:8px">Cancel edit</a>{% endif %}
@@ -1486,6 +1539,77 @@ RULES_BODY = """
   var oaDD = document.getElementById('oa-dd');
   var oaModeHint = document.getElementById('oa-mode-hint');
   var companySel = document.querySelector('select[name=applies_to_company]');
+  var dt = document.getElementById('description-template');
+  var dtReset = document.getElementById('dt-reset');
+  var dtPreview = document.getElementById('dt-preview');
+
+  // ── Description Template auto-fill + live preview (v0.4.0.4) ──────────
+  // The template is a tiny {{variable}} string; the editor auto-fills a sensible
+  // default per match type when the operator picks an Offset Account, and never
+  // clobbers text the operator typed. `dtAuto` tracks whether the current value
+  // is one WE generated (safe to regenerate) vs. hand-edited (leave alone).
+  var DEFAULT_TEMPLATES = {
+    merchant_exact: '{{merchant_name}} - {{offset_short}}',
+    merchant_contains: '{{merchant_name}} - {{offset_short}}',
+    description_regex: '{{offset_short}} - {{amount}}',
+    plaid_category_matches: '{{plaid_category}} - {{offset_short}} - {{merchant_name}}',
+    amount_range: '{{offset_short}} - {{merchant_name}} - {{amount}}'
+  };
+  // A value that arrived pre-filled (editing an existing rule) is the operator's,
+  // not ours — start dtAuto false unless the field is empty.
+  var dtAuto = dt ? !dt.value.trim() : false;
+
+  // Mirror categorization.logical_account_name: strip a trailing ' - ABBR'
+  // Company suffix (uppercase/digits) then a leading '<number> - ' account number.
+  function logicalName(name) {
+    var s = (name || '').trim();
+    if (!s) return '';
+    var t = s.replace(/\\s+-\\s+[A-Z0-9]{1,10}$/, '').replace(/^\\d+\\s+-\\s+/, '').trim();
+    return t || s;
+  }
+
+  function defaultTemplate() {
+    var pat = DEFAULT_TEMPLATES[mt.value] || '{{merchant_name}} - {{offset_short}}';
+    return pat.split('{{offset_short}}').join(logicalName(oa ? oa.value : ''));
+  }
+
+  // Regenerate the default only when the field is empty or still holds a value we
+  // generated — an explicit user edit (dtAuto=false) is never overwritten.
+  function maybeAutofill() {
+    if (!dt) return;
+    if (dtAuto || !dt.value.trim()) {
+      dt.value = defaultTemplate();
+      dtAuto = true;
+    }
+    refreshPreview();
+  }
+
+  var previewTimer = null;
+  function refreshPreview() {
+    if (!dtPreview) return;
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(doFetchPreview, 250);
+  }
+  function doFetchPreview() {
+    var qs = 'template=' + encodeURIComponent(dt ? dt.value : '') +
+             '&match_type=' + encodeURIComponent(mt.value) +
+             '&match_value=' + encodeURIComponent(mv ? mv.value : '') +
+             '&offset_account=' + encodeURIComponent(oa ? oa.value : '');
+    fetch('/api/rules/preview_description?' + qs)
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        var txt = (res && res.preview) || '';
+        var src = (res && res.used_sample)
+          ? ' · from your most recent matching transaction'
+          : ' · sample data (no matching transaction yet)';
+        dtPreview.innerHTML = txt
+          ? 'Preview: <b>' + esc(txt) + '</b><span style="color:#999">' +
+            esc(src) + '</span>'
+          : '<span style="color:#999">Preview: (empty description)</span>';
+      }).catch(function () { dtPreview.textContent = ''; });
+  }
+
+  function onOffsetChanged() { maybeAutofill(); }
 
   // v0.4.0.3 · the offset field is two-mode, keyed off Applies-to-Company:
   //   * a Company is selected → Mode A: pick one of THAT Company's real accounts;
@@ -1616,8 +1740,8 @@ RULES_BODY = """
     enabled: isMerchantMode,
     getOptions: function () { return merchants; },
     getLabel: function (x) { return x.name; },
-    onInput: function () { updateNameSuggestion(); runRegex(); },
-    onSelect: function () { updateNameSuggestion(); },
+    onInput: function () { updateNameSuggestion(); runRegex(); refreshPreview(); },
+    onSelect: function () { updateNameSuggestion(); refreshPreview(); },
     emptyRow: function (q) {
       var t = (q || '').trim();
       if (!t) return null;
@@ -1646,6 +1770,9 @@ RULES_BODY = """
       getOptions: function () { return accounts; },
       getLabel: function (x) { return x == null ? '' : String(x); },
       renderRow: function (x) { return esc(x); },
+      // v0.4.0.4 · a picked/typed offset drives the Description Template auto-fill.
+      onSelect: function () { onOffsetChanged(); },
+      onInput: function () { onOffsetChanged(); },
       emptyRow: function (q) {
         var t = (q || '').trim();
         if (!t) return null;
@@ -1696,9 +1823,11 @@ RULES_BODY = """
 
   // Focus / input / keyboard / outside-click for the merchant picker are owned
   // by the shared dropdown module (mvDD). Only the mode switch stays here.
-  mt.addEventListener('change', function () { applyMode(); mvDD.close(); });
+  mt.addEventListener('change', function () {
+    applyMode(); mvDD.close(); maybeAutofill();
+  });
   if (cat) cat.addEventListener('change', function () {
-    mv.value = cat.value; updateNameSuggestion(); });
+    mv.value = cat.value; updateNameSuggestion(); refreshPreview(); });
   if (regexSample) regexSample.addEventListener('input', runRegex);
   if (refresh) refresh.addEventListener('click', function (e) {
     e.preventDefault(); refresh.textContent = '↻ …'; load(true);
@@ -1709,8 +1838,19 @@ RULES_BODY = """
   if (companySel) companySel.addEventListener('change', function () {
     accounts = []; updateOffsetModeHint(); loadAccounts(false);
   });
+  // Description Template: a manual edit takes ownership (stop auto-filling);
+  // "reset to default" hands it back and regenerates. Both refresh the preview.
+  if (dt) dt.addEventListener('input', function () {
+    dtAuto = false; refreshPreview();
+  });
+  if (dtReset) dtReset.addEventListener('click', function (e) {
+    e.preventDefault();
+    if (dt) { dt.value = defaultTemplate(); dtAuto = true; }
+    refreshPreview();
+  });
 
   updateOffsetModeHint();
+  refreshPreview();
   load(false);
 })();
 </script>

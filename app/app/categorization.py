@@ -36,7 +36,6 @@ import re
 from datetime import datetime, timezone
 
 from flask import current_app
-from jinja2.sandbox import SandboxedEnvironment
 
 from . import audit
 from . import db
@@ -80,8 +79,6 @@ CATEGORY_ALIASES = {
     'Payroll': 'Payroll',
     'Transfer': 'Transfer',
 }
-
-_jinja = SandboxedEnvironment(autoescape=False)
 
 
 def _norm_category(s: str) -> str:
@@ -329,34 +326,141 @@ def logical_account_name(name: str) -> str:
     return s2 or s
 
 
+# ── Description templates (v0.4.0.4) ───────────────────────────────────
+#
+# A rule's `description_template` is a small string with `{{variable}}`
+# placeholders (whitespace-tolerant) that render into the JE's user_remark at
+# generation time. The Rules editor auto-fills a sensible default per match type
+# (default_description_template) when the operator picks an Offset Account, and
+# `render_description_template` resolves the placeholders against a transaction.
+#
+# Deliberately NOT a full templating engine (v0.4.0.3 used Jinja): plain variable
+# substitution keeps the surface tiny + predictable, and lets us COMPACT the
+# separators a missing variable would otherwise leave behind ("A -  - C" → "A -
+# C", leading/trailing " - " trimmed) — the property that makes the same template
+# read cleanly whether or not every variable resolves.
+
+# Per-match-type default templates. `{{offset_short}}` is a build-time token
+# baked in by default_description_template (the offset account's logical name);
+# every other `{{...}}` is a render-time transaction variable.
+_DEFAULT_TEMPLATES = {
+    'merchant_exact': '{{merchant_name}} - {{offset_short}}',
+    'merchant_contains': '{{merchant_name}} - {{offset_short}}',
+    'description_regex': '{{offset_short}} - {{amount}}',
+    'plaid_category_matches': '{{plaid_category}} - {{offset_short}} - {{merchant_name}}',
+    'amount_range': '{{offset_short}} - {{merchant_name}} - {{amount}}',
+}
+_DEFAULT_TEMPLATE_FALLBACK = '{{merchant_name}} - {{offset_short}}'
+
+# One `{{ variable }}` placeholder — a bare identifier, any surrounding spaces.
+_TEMPLATE_VAR_RE = re.compile(r'\{\{\s*(\w+)\s*\}\}')
+# Two ' - ' separators with nothing between (what an empty variable leaves).
+_DOUBLE_SEP = ' -  - '
+_SEP = ' - '
+
+
+def default_description_template(match_type: str, offset_account: str) -> str:
+    """The auto-fill Description Template for a (match_type, offset_account) pair
+    — the per-type pattern with `{{offset_short}}` replaced by the offset
+    account's LOGICAL name (number + Company suffix stripped; see
+    logical_account_name). The remaining `{{...}}` stay as render-time variables.
+    An unknown match type falls back to the merchant/offset pattern."""
+    pattern = _DEFAULT_TEMPLATES.get(match_type or '', _DEFAULT_TEMPLATE_FALLBACK)
+    offset_short = logical_account_name(offset_account or '')
+    return pattern.replace('{{offset_short}}', offset_short)
+
+
+def _primary_category(category: str) -> str:
+    """The primary Plaid category — the first segment of a stored 'A > B > C'
+    path (or the whole label for a raw PFC string like 'GAS_STATIONS')."""
+    cat = (category or '').strip()
+    if not cat:
+        return ''
+    parts = [p.strip() for p in re.split(r'[>,]', cat) if p.strip()]
+    return parts[0] if parts else cat
+
+
+def _format_amount(amount, currency: str) -> str:
+    """Signed amount as '123.45 USD' — keeps Plaid's sign (positive = outflow),
+    two-decimal, with the transaction's currency (default USD)."""
+    try:
+        val = float(amount or 0.0)
+    except (TypeError, ValueError):
+        val = 0.0
+    cur = (currency or 'USD').strip() or 'USD'
+    return f'{val:.2f} {cur}'
+
+
+def _template_context(row, supplier_name=None, rule_name=None) -> dict:
+    """Render-time values for the template variables, read off a transaction
+    (BankTransaction or any object exposing the same attributes). Missing values
+    resolve to '' (compacted away later). `merchant_name` falls back to the raw
+    description when the merchant is missing. `name`/`category`/`supplier_name`/
+    `rule_name` are legacy aliases (pre-v0.4.0.4 templates) kept resolving."""
+    merchant = (getattr(row, 'merchant_name', '') or '').strip()
+    description = (getattr(row, 'name', '') or '').strip()
+    d = getattr(row, 'date', None)
+    return {
+        'merchant_name': merchant or description,
+        'description': description,
+        'name': description,                       # legacy alias
+        'amount': _format_amount(getattr(row, 'amount', 0.0),
+                                 getattr(row, 'iso_currency_code', 'USD')),
+        'plaid_category': _primary_category(getattr(row, 'category', '')),
+        'category': (getattr(row, 'category', '') or ''),   # legacy alias (full)
+        'date': d.isoformat() if d else '',
+        'supplier_name': supplier_name or '',      # legacy alias
+        'rule_name': rule_name or '',              # legacy alias
+    }
+
+
+def _compact_separators(s: str) -> str:
+    """Collapse ' -  - ' chains left by empty variables to a single ' - ', then
+    trim any leading/trailing separator. Leaves separators INSIDE a resolved
+    value untouched (e.g. an account name like 'Owner - Draws')."""
+    s = s or ''
+    while _DOUBLE_SEP in s:
+        s = s.replace(_DOUBLE_SEP, _SEP)
+    # Trim only ' - ' style separators (dash with surrounding whitespace) at the
+    # ends — never a bare leading '-', which would eat a negative amount's sign.
+    s = re.sub(r'^(\s+-\s+)+', '', s)
+    s = re.sub(r'(\s+-\s+)+$', '', s)
+    return s.strip()
+
+
+def render_description_template(template: str, transaction,
+                               supplier_name=None, rule_name=None) -> str:
+    """Render a `description_template` against a transaction: substitute each
+    `{{variable}}` with its value ('' when the variable is unknown or the data is
+    missing), then compact the separators. Returns '' for a blank template. Pure
+    + total — never raises (a template is operator input, not code)."""
+    tmpl = template or ''
+    if not tmpl.strip():
+        return ''
+    ctx = _template_context(transaction, supplier_name=supplier_name,
+                            rule_name=rule_name)
+
+    def _sub(m):
+        return str(ctx.get(m.group(1), ''))
+
+    return _compact_separators(_TEMPLATE_VAR_RE.sub(_sub, tmpl))
+
+
 # ── Journal Entry construction ─────────────────────────────────────────
 
 def render_description(rule: CategorizationRule, row, supplier_name=None) -> str:
-    """Render the rule's Jinja `description_template` against the transaction.
-    Falls back to a sensible default remark when the template is blank or errors
-    (a bad template must never block generation)."""
+    """The JE user_remark for a matched transaction: the rule's rendered
+    `description_template`, or a sensible default when the template is blank (or
+    renders to nothing). A bad/empty template must never block generation."""
     default = (f'{rule.name or "Auto"} — '
                f'{row.merchant_name or row.name or "transaction"} '
                f'{row.date.isoformat() if row.date else ""}').strip()
     tmpl = (rule.description_template or '').strip()
     if not tmpl:
         return default
-    ctx = {
-        'merchant_name': row.merchant_name or '',
-        'name': row.name or '',
-        'description': row.name or '',
-        'date': row.date.isoformat() if row.date else '',
-        'amount': abs(float(row.amount or 0.0)),
-        'category': row.category or '',
-        'supplier_name': supplier_name or '',
-        'rule_name': rule.name or '',
-    }
-    try:
-        return _jinja.from_string(tmpl).render(**ctx)
-    except Exception:  # noqa: BLE001 - any Jinja error → default remark
-        log.warning('description_template render failed for rule %s; using default',
-                    rule.id, exc_info=True)
-        return default
+    rendered = render_description_template(tmpl, row, supplier_name=supplier_name,
+                                           rule_name=rule.name or '')
+    return rendered or default
 
 
 def bank_gl_account_for(row) -> str:
