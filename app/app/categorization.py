@@ -35,7 +35,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
-from flask import current_app
+from flask import current_app, g
 
 from . import audit
 from . import db
@@ -479,7 +479,8 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
                         supplier_name=None, remark: str = '',
                         bank_account: str | None = None,
                         offset_account_override: str | None = None,
-                        party_override: str | None = None) -> dict:
+                        party_override: str | None = None,
+                        party_type_override: str | None = None) -> dict:
     """Assemble the ERPNext Journal Entry payload for a matched transaction.
 
     Two lines — the OFFSET (categorized) side and the BANK side:
@@ -556,8 +557,18 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
     # LinkValidationError v0.4.0.7 exists to fix.
     party = (party_override if party_override is not None
              else (rule.party_name or supplier_name))
-    if rule.party_type and party and not getattr(rule, 'skip_party', False):
-        party_line['party_type'] = rule.party_type
+    # v0.4.0.8 · the SIDE follows the same override convention. generate_
+    # journal_entry passes the already-derived 'Supplier'/'Customer' (or '' to
+    # decline), so a party_type='Auto' rule lands the right way round. Without
+    # an override we fall back to the rule's own literal value — and a bare
+    # 'Auto' is NOT a doctype ERPNext knows, so it books no party rather than a
+    # party the server would reject.
+    party_type = (party_type_override if party_type_override is not None
+                  else (rule.party_type or ''))
+    if (party_type or '').strip().lower() == 'auto':
+        party_type = ''
+    if party_type and party and not getattr(rule, 'skip_party', False):
+        party_line['party_type'] = party_type
         party_line['party'] = party
 
     if row.erpnext_bank_transaction_id:
@@ -579,10 +590,80 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
 
 # ── v0.4.0.7: party resolution + auto-Supplier for every party source ──
 
-def resolve_party(client, rule: CategorizationRule, row, supplier_name=None):
-    """The Party docname to put on this JE's offset line, with its ERPNext
-    Supplier guaranteed to exist first. Returns None when the JE should carry no
-    party (v0.4.0.7).
+# The rule's party_type values. '' (NULL) means NO party — that has been the
+# behaviour since v0.3.0 and is deliberately preserved, so an existing rule that
+# never named a party keeps not naming one.
+PARTY_TYPES = ('', 'Supplier', 'Customer', 'Auto')
+
+# v0.4.0.8 · the party_type='Auto' derivation. Money categorized to an INCOME
+# account came IN, so the counterparty is a Customer; money categorized to an
+# EXPENSE account went OUT, so it's a Supplier. Asset / Liability / Equity
+# offsets are transfers between accounts you own and get NO party — the same
+# answer v0.4.0.7's skip_party heuristic gives, reached from the other side.
+ROOT_TYPE_PARTY_TYPE = {
+    'Income': 'Customer',
+    'Expense': 'Supplier',
+}
+
+
+def party_type_for_offset(client, offset_account: str, company: str = '') -> str:
+    """The party side ('Customer' | 'Supplier' | '') implied by an offset
+    account's root_type — the `party_type='Auto'` derivation (v0.4.0.8).
+
+    '' means "no party": either the root_type says transfer (Asset / Liability /
+    Equity) or it couldn't be determined at all. Both cases are the safe answer,
+    since a JE with no party still posts.
+
+    Memoized on (offset_account, company) for the life of the app context. The
+    JE path runs once PER TRANSACTION (sync_engine loops categorize_after_push
+    over every row), and a sync that pulls hundreds of transactions through a
+    handful of Auto rules would otherwise re-ask ERPNext for the same few
+    accounts' root_type hundreds of times. `g` scopes the cache to one sync run
+    / one request, so a chart edit is picked up on the next run rather than
+    needing a restart."""
+    key = ((offset_account or '').strip(), (company or '').strip())
+    try:
+        cache = g._bb_offset_root_party
+    except AttributeError:
+        cache = g._bb_offset_root_party = {}
+    except RuntimeError:            # no app context (direct call in a test)
+        cache = None
+    if cache is not None and key in cache:
+        return cache[key]
+    root = erpnext_bank.root_type_for_account(client, offset_account, company)
+    side = ROOT_TYPE_PARTY_TYPE.get(root, '')
+    if cache is not None:
+        cache[key] = side
+    return side
+
+
+def effective_party_type(client, rule: CategorizationRule,
+                         company: str = '') -> str:
+    """The party side this rule wants for a JE booked under `company`
+    ('Supplier' | 'Customer' | ''), resolving 'Auto' against the offset account
+    (v0.4.0.8). Precedence, highest first:
+
+      1. `skip_party` — the v0.4.0.7 override, always wins → ''.
+      2. a literal 'Supplier' / 'Customer' on the rule — the operator's explicit
+         choice beats any derivation, for a chart that doesn't follow the usual
+         root_type convention.
+      3. 'Auto' — derived from the offset account's root_type.
+      4. '' / NULL — no party, unchanged since v0.3.0."""
+    if getattr(rule, 'skip_party', False):
+        return ''
+    declared = (rule.party_type or '').strip()
+    if declared in ('Supplier', 'Customer'):
+        return declared
+    if declared.lower() == 'auto':
+        return party_type_for_offset(client, (rule.offset_account or ''), company)
+    return ''
+
+
+def resolve_party(client, rule: CategorizationRule, row, supplier_name=None,
+                  company: str = ''):
+    """The (party_type, party docname) to put on this JE's offset line, with the
+    ERPNext party guaranteed to exist first. Returns None when the JE should
+    carry no party (v0.4.0.7; tuple-valued since v0.4.0.8).
 
     THE BUG THIS FIXES: pre-v0.4.0.7 only a Plaid `merchant_name` ever triggered
     the auto-Supplier (see categorize_after_push), but a rule may name a Party
@@ -593,21 +674,27 @@ def resolve_party(client, rule: CategorizationRule, row, supplier_name=None):
         LinkValidationError: Could not find Row #1: Party: Wells Fargo
         POST /api/resource/Journal Entry -> 417
 
-    So the ensure now hangs off the PARTY, not off the merchant field. Order:
+    So the ensure now hangs off the PARTY, not off the merchant field. The SIDE
+    comes from effective_party_type (skip_party / explicit / Auto); the NAME is
+    then resolved in this order:
 
-      1. `skip_party` / no `party_type` → None (nothing to ensure).
+      1. no side at all → None (nothing to ensure).
       2. `rule.party_name` — the operator's literal name, used verbatim.
       3. the merchant Supplier already resolved by the sync path.
       4. derived from the transaction — payroll processor in the description,
          else the account's institution (erpnext_bank.derive_party_from_transaction).
 
-    Only a `Supplier` party is auto-created; a Customer party is left alone
-    (minting Customers from bank descriptions is not a call we should make). If
-    the Supplier can't be resolved we return None rather than a name we know
+    v0.4.0.8 — BOTH sides are now auto-created. A Customer party is minted just
+    like a Supplier (erpnext_bank.ensure_party), which is what makes the sell
+    side work at all: fruit-buyer deposits, USDA/FSA payments, grants and lease
+    revenue all need an AR party, and booking them against an auto-created
+    Supplier put them on the wrong ledger and polluted the 1099-NEC vendor list.
+    A dual-role name (a bank, a brokerage) additionally gets its opposite side
+    provisioned — see erpnext_bank.is_dual_role_party.
+
+    If the party can't be resolved we return None rather than a name we know
     ERPNext will reject — a JE with no party beats no JE at all."""
-    if getattr(rule, 'skip_party', False):
-        return None
-    party_type = (rule.party_type or '').strip()
+    party_type = effective_party_type(client, rule, company)
     if not party_type:
         return None
     name, source = ((rule.party_name or '').strip(), 'rule')
@@ -617,11 +704,12 @@ def resolve_party(client, rule: CategorizationRule, row, supplier_name=None):
         name, source = erpnext_bank.derive_party_from_transaction(row)
     if not name:
         return None
-    if party_type != 'Supplier':
-        return name          # Customer: honour it, but never auto-create one
     if not current_app.config.get('ERPNEXT_AUTO_CREATE_SUPPLIERS', True):
-        return name
-    return erpnext_bank.ensure_supplier(client, name, source=source)
+        return party_type, name
+    resolved = erpnext_bank.ensure_party(client, name, party_type, source=source)
+    if not resolved:
+        return None
+    return party_type, resolved
 
 
 def suggest_skip_party(offset_account: str, company: str = '') -> bool:
@@ -755,7 +843,9 @@ def generate_journal_entry(client, row, *, supplier_name=None,
     # ERPNext while the local row that guarantees one-JE-per-transaction
     # silently vanished, and the next "Rerun rules" would double-post. Staging
     # `gje` only after the Supplier work is done keeps the two apart.
-    party = resolve_party(client, rule, row, supplier_name=supplier_name)
+    resolved_party = resolve_party(client, rule, row,
+                                   supplier_name=supplier_name, company=company)
+    party_type, party = resolved_party if resolved_party else ('', '')
 
     if gje is None:
         gje = GeneratedJournalEntry.query.filter_by(
@@ -813,7 +903,8 @@ def generate_journal_entry(client, row, *, supplier_name=None,
         doc = build_journal_entry(rule, row, company,
                                   supplier_name=supplier_name, remark=remark,
                                   offset_account_override=offset_override,
-                                  party_override=(party or ''))
+                                  party_override=(party or ''),
+                                  party_type_override=(party_type or ''))
         # v0.4.0.2 retroactive guard: refuse to post a JE that references a GL
         # account from a different Company than the target (belt-and-suspenders
         # behind the scoped Offset Account dropdown). A mismatch is a blocked,

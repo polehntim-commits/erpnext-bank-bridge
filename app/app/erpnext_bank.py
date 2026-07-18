@@ -38,12 +38,14 @@ from . import db
 from . import erpnext_settings
 from .erpnext_client import (ERPNextAPIError, ERPNextClient, ERPNextConfig,
                              ERPNextConfigError, ERPNextError)
-from .models import PlaidAccount, PlaidItem, PlaidSyncLog, Supplier
+from .models import (Customer, PlaidAccount, PlaidItem, PlaidSyncLog,
+                     Supplier)
 
 log = logging.getLogger('bankbridge.erpnext')
 
 DOCTYPE = 'Bank Transaction'
 SUPPLIER_DT = 'Supplier'
+CUSTOMER_DT = 'Customer'
 
 
 def _now() -> datetime:
@@ -626,6 +628,281 @@ def ensure_supplier(client: ERPNextClient | None, party_name: str, *,
                      notes=f'party={name!r} (source={source or "rule"}) → '
                            f'{row.erpnext_supplier_name!r}')
     return row.erpnext_supplier_name
+
+
+# ── v0.4.0.8: the sell side — Customers, and dual-role parties ─────────
+
+CUSTOMER_GROUP_DT = 'Customer Group'
+CUSTOMER_GROUP_BY_SOURCE = {
+    'institution': 'Financial Institutions',
+}
+
+
+def _default_customer_group() -> str:
+    return (current_app.config.get('ERPNEXT_DEFAULT_CUSTOMER_GROUP')
+            or 'All Customer Groups').strip() or 'All Customer Groups'
+
+
+def _default_territory() -> str:
+    return (current_app.config.get('ERPNEXT_DEFAULT_TERRITORY')
+            or 'All Territories').strip() or 'All Territories'
+
+
+def ensure_customer_group(client: ERPNextClient, group: str) -> str:
+    """Find-or-create the ERPNext Customer Group `group` and return its docname,
+    or '' when it can't be provisioned. Best-effort for the same reason
+    ensure_supplier_group is: the group is a filing nicety and must never cost
+    us the Customer itself (the caller falls back to the configured default)."""
+    group = (group or '').strip()
+    if not group:
+        return ''
+    try:
+        if client.get_doc(CUSTOMER_GROUP_DT, group):
+            return group
+        created = client.create_doc(CUSTOMER_GROUP_DT, {
+            'customer_group_name': group,
+            'parent_customer_group': 'All Customer Groups',
+            'is_group': 0,
+        })
+        return (created or {}).get('name') or group
+    except (ERPNextAPIError, ERPNextError):
+        log.info('could not ensure Customer Group %r; using the default', group)
+        return ''
+
+
+def _resolve_erpnext_customer(client: ERPNextClient, normalized: str,
+                              subject_id=None,
+                              customer_group: str | None = None) -> str:
+    """Find-or-create the ERPNext Customer for a party name and return its
+    docname. The AR-side mirror of _resolve_erpnext_supplier, including the
+    stripped-down retry when this ERPNext rejects the optional
+    customer_group / territory links."""
+    existing = client.list_docs(
+        CUSTOMER_DT, filters=[['customer_name', '=', normalized]],
+        fields=['name'], limit_page_length=1)
+    if existing:
+        _supplier_log('erpnext_customer_auto_create', 'success',
+                      f'matched existing Customer {existing[0]["name"]}',
+                      subject_id=subject_id)
+        return existing[0]['name']
+    doc = {
+        'customer_name': normalized,
+        'customer_type': 'Company',
+        'customer_group': (customer_group or '').strip() or _default_customer_group(),
+        'territory': _default_territory(),
+    }
+    try:
+        created = client.create_doc(CUSTOMER_DT, doc)
+    except ERPNextAPIError:
+        created = client.create_doc(
+            CUSTOMER_DT, {'customer_name': normalized, 'customer_type': 'Company'})
+    name = created.get('name') or normalized
+    _supplier_log('erpnext_customer_auto_create', 'success',
+                  f'created Customer {name}', subject_id=subject_id)
+    return name
+
+
+def ensure_customer(client: ERPNextClient | None, party_name: str, *,
+                    source: str = '') -> str | None:
+    """Find-or-create the ERPNext Customer for an ALREADY-RESOLVED party name and
+    return its docname (v0.4.0.8) — the exact AR-side twin of ensure_supplier.
+
+    THE GAP THIS FILLS: everything through v0.4.0.7 was Accounts Payable. A farm
+    also takes money IN — fruit buyers, USDA/FSA payments, grants, lease revenue,
+    direct-to-consumer deposits — and booking those against an auto-created
+    SUPPLIER is wrong twice over: it points the JE at the AP ledger instead of
+    AR, and it seeds the 1099-NEC vendor list with people who are actually
+    customers.
+
+    Takes the name verbatim (no merchant re-normalization) and is idempotent on
+    the same three levels as ensure_supplier: the local `Customer` mirror, the
+    ERPNext search-by-customer_name, and find-or-create on the group. Returns
+    None for a blank name or a failed resolve — the caller must then put NO party
+    on the JE rather than one ERPNext will reject with a LinkValidationError."""
+    name = (party_name or '').strip()
+    if not name or client is None:
+        return None
+    row = Customer.query.filter_by(normalized_name=name[:255]).first()
+    if row is not None and row.erpnext_customer_name:
+        return row.erpnext_customer_name
+    group = ''
+    wanted = CUSTOMER_GROUP_BY_SOURCE.get(source, '')
+    if wanted:
+        group = ensure_customer_group(client, wanted)
+    is_new = row is None
+    if is_new:
+        row = Customer(merchant_name=name[:255], normalized_name=name[:255],
+                       first_seen_at=_now(), transaction_count=0,
+                       total_amount=0.0)
+        db.session.add(row)
+        db.session.flush()      # assign row.id for the audit / log cross-link
+    try:
+        row.erpnext_customer_name = _resolve_erpnext_customer(
+            client, name, subject_id=row.id, customer_group=group or None)
+    except (ERPNextAPIError, ERPNextError) as e:
+        db.session.rollback()
+        _supplier_log('erpnext_customer_auto_create', 'failed', str(e))
+        log.warning('party customer resolve failed for %r: %s', name, e)
+        return None
+    row.updated_at = _now()
+    db.session.commit()
+    if is_new:
+        audit.record('customer_auto_created', subject_type='Customer',
+                     subject_id=row.id, after=row.to_dict(),
+                     notes=f'party={name!r} (source={source or "rule"}) → '
+                           f'{row.erpnext_customer_name!r}')
+    return row.erpnext_customer_name
+
+
+# A party name containing one of these (as a whole word) is assumed to trade
+# with you in BOTH directions — see is_dual_role_party. Deliberately short and
+# conservative: a false positive costs one unused ERPNext party record, but the
+# operator can still tune both ends via config (see is_dual_role_party).
+DUAL_ROLE_KEYWORDS = (
+    'bank', 'banks', 'banking', 'bancorp', 'bancshares', 'credit union',
+    'trust', 'financial', 'federal', 'savings',
+)
+
+# Institutions with no give-away keyword in the name. Matched on the whole
+# normalized name or its first word, never as a bare substring, so "Schwab
+# Landscaping" doesn't get mistaken for the brokerage.
+DUAL_ROLE_NAMES = frozenset({
+    'wells fargo', 'chase', 'jpmorgan', 'jpmorgan chase', 'citi', 'citibank',
+    'citigroup', 'amex', 'american express', 'discover', 'capital one',
+    'usaa', 'ally', 'pnc', 'truist', 'synchrony', 'barclays',
+    'fidelity', 'schwab', 'charles schwab', 'vanguard', 'robinhood',
+    'etrade', 'e*trade', 'merrill', 'merrill lynch', 'edward jones',
+    'coinbase', 'kraken', 'gemini', 'binance',
+})
+
+# The multi-word entries above, which also match as a phrase inside a longer
+# name ('Wells Fargo Clearing Services'). Single-word entries deliberately do
+# NOT match that way — 'gemini' or 'discover' as a bare substring would sweep up
+# far too much.
+_DUAL_ROLE_PHRASES = tuple(n for n in DUAL_ROLE_NAMES if ' ' in n)
+
+_WORDS = re.compile(r"[a-z0-9*']+")
+
+
+def is_dual_role_party(party_name: str, *, source: str = '') -> bool:
+    """True when this party plausibly trades with you in BOTH directions, so
+    both an ERPNext Customer AND a Supplier should exist for it (v0.4.0.8).
+
+    The motivating case is a bank: Wells Fargo pays you interest (it is a
+    Customer on that JE) and charges you account fees (it is a Supplier on that
+    one). Whichever transaction lands first would otherwise mint only one side,
+    and the second transaction's JE would 417 on the missing party — or, worse,
+    quietly book AR activity against an AP party.
+
+    Three independent signals, any of which is sufficient:
+      1. `source='institution'` — the name was derived from a linked Plaid
+         Item's institution, so it IS a bank by construction.
+      2. a whole-word DUAL_ROLE_KEYWORDS hit ('… Bank', 'Credit Union',
+         '… Federal Savings').
+      3. a DUAL_ROLE_NAMES hit on the whole name or its first word — the
+         brokerages and exchanges whose names carry no such keyword.
+
+    Config escapes both ways, for a chart that disagrees with the heuristic:
+    `BANKBRIDGE_DUAL_ROLE_PARTIES` force-adds names, and
+    `BANKBRIDGE_SINGLE_ROLE_PARTIES` force-excludes them (it wins, so a
+    "Federal Express" or a "Trust Fruit Co" can be pinned to one role)."""
+    name = (party_name or '').strip()
+    if not name:
+        return False
+    low = name.lower()
+    forced_single = {s.strip().lower()
+                     for s in (current_app.config.get(
+                         'BANKBRIDGE_SINGLE_ROLE_PARTIES') or ()) if s.strip()}
+    if low in forced_single:
+        return False
+    forced_dual = {s.strip().lower()
+                   for s in (current_app.config.get(
+                       'BANKBRIDGE_DUAL_ROLE_PARTIES') or ()) if s.strip()}
+    if low in forced_dual:
+        return True
+    if source == 'institution':
+        return True
+    if low in DUAL_ROLE_NAMES:
+        return True
+    if any(phrase in low for phrase in _DUAL_ROLE_PHRASES):
+        return True
+    words = _WORDS.findall(low)
+    if words and words[0] in DUAL_ROLE_NAMES:
+        return True
+    wordset = set(words)
+    for kw in DUAL_ROLE_KEYWORDS:
+        if ' ' in kw:
+            if kw in low:
+                return True
+        elif kw in wordset:
+            return True
+    return False
+
+
+def ensure_party(client: ERPNextClient | None, party_name: str,
+                 party_type: str, *, source: str = '') -> str | None:
+    """Find-or-create the ERPNext party of `party_type` for `party_name` and
+    return its docname — the single entry point the JE path uses (v0.4.0.8).
+
+    Returns the docname for the REQUESTED side. When the name looks dual-role
+    (is_dual_role_party) the OTHER side is provisioned too, best-effort: a bank
+    that pays interest today will charge a fee next month, and having both
+    records already in place is what keeps that second JE from failing. The
+    counterpart create can never fail this call — its exceptions are swallowed
+    and logged, because the party we were actually asked for is what the JE
+    needs to post."""
+    name = (party_name or '').strip()
+    ptype = (party_type or '').strip()
+    if not name or ptype not in (SUPPLIER_DT, CUSTOMER_DT):
+        return None
+    primary = (ensure_customer(client, name, source=source)
+               if ptype == CUSTOMER_DT
+               else ensure_supplier(client, name, source=source))
+    if primary and is_dual_role_party(name, source=source):
+        try:
+            if ptype == CUSTOMER_DT:
+                ensure_supplier(client, name, source=source)
+            else:
+                ensure_customer(client, name, source=source)
+        except Exception:   # pragma: no cover - never cost us the primary party
+            log.warning('dual-role counterpart for %r (%s) failed', name, ptype,
+                        exc_info=True)
+    return primary
+
+
+def root_type_for_account(client: ERPNextClient | None, account: str,
+                          company: str = '') -> str:
+    """The ERPNext root_type ('Income' | 'Expense' | 'Asset' | 'Liability' |
+    'Equity') of a GL account, or '' when it can't be determined (v0.4.0.8).
+
+    Feeds the `party_type='Auto'` derivation. `account` may be a fully-qualified
+    docname ('Fruit Sales - BBT', a Mode A rule) or a bare LOGICAL name ('Fruit
+    Sales', a Mode B Company-agnostic rule) — both resolve, because the lookup
+    falls back from an exact docname match to an account_name match scoped to
+    `company`. Returns '' rather than raising on any ERPNext trouble: an
+    undeterminable root_type means "don't guess a party", not "fail the JE"."""
+    acct = (account or '').strip()
+    if not acct or client is None:
+        return ''
+    try:
+        doc = client.get_doc('Account', acct)
+        if isinstance(doc, dict) and doc.get('root_type'):
+            return (doc.get('root_type') or '').strip()
+    except (ERPNextAPIError, ERPNextError):
+        pass                      # fall through to the account_name lookup
+    try:
+        filters = [['account_name', '=', acct], ['is_group', '=', 0]]
+        want = (company or '').strip()
+        if want:
+            filters.append(['company', '=', want])
+        rows = client.list_docs('Account', filters=filters,
+                                fields=['name', 'root_type'],
+                                limit_page_length=1)
+    except (ERPNextAPIError, ERPNextError):
+        return ''
+    if rows:
+        return (rows[0].get('root_type') or '').strip()
+    return ''
 
 
 def cancel_bank_transaction(client: ERPNextClient, name: str) -> None:

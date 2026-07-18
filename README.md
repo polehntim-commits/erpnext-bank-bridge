@@ -268,6 +268,49 @@ Create an account in ERPNext, reload the Rules editor, and it's selectable — n
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
 
+**v0.4.0.8** — **adds the sell side**. Everything through v0.4.0.7 was Accounts
+Payable: the only party Bank Bridge would ever auto-create was a **Supplier**. A
+farm also takes money **in** — fruit-buyer deposits, USDA/FSA payments, grants,
+lease revenue, direct-to-consumer sales — and every one of those booked its
+counterparty as a Supplier. That put AR activity on the AP ledger, filled the
+**1099-NEC vendor list with people who are actually customers**, and
+miscategorized the party for every downstream report.
+
+Rules now carry a **Party type** of `Auto` (the default for new rules),
+`Supplier`, `Customer`, or `— none —`. **Auto reads the offset account each time
+the rule fires**: an **Income** account books a **Customer**, an **Expense**
+account books a **Supplier**, and anything else — Asset, Liability, Equity, i.e.
+a transfer between your own accounts — books **no party at all**. Deriving the
+side from the account rather than the Plaid amount sign is deliberate: the sign
+convention is ambiguous across refunds, reversals and the
+`always_debit`/`always_credit` overrides, whereas the offset account is your own
+explicit statement of what the transaction *is*. Customers are auto-created
+through the same find-or-create path Suppliers use — idempotent at three levels,
+name used verbatim, and a party that genuinely can't be created **drops the party
+rather than failing the JE**.
+
+Some counterparties trade with you **both ways**: Wells Fargo pays you interest
+and charges you fees; a packing house buys your fruit and sells you supplies. For
+a recognised **bank, credit union or brokerage** — by name keyword, by a known
+institution name, or because the party came from a linked Plaid Item's
+institution — Bank Bridge creates **both a Customer and a Supplier** at first
+encounter, each keeping its own AR/AP ledger, so the second transaction can't
+fail on a party that doesn't exist yet. Ordinary vendors (Uber, Starbucks,
+Tractor Supply) stay **single-role** until a reverse-direction transaction
+actually shows up. `BANKBRIDGE_DUAL_ROLE_PARTIES` and
+`BANKBRIDGE_SINGLE_ROLE_PARTIES` override the heuristic in either direction.
+
+**Backward compatible.** `party_type` has existed since v0.3.0 and NULL has
+always meant *no party* — that is unchanged, so an existing rule that never named
+a party still doesn't, and existing `Supplier` rules behave exactly as before.
+Only **new** rules default to `Auto`. `Skip Party field` (v0.4.0.7) still
+outranks everything. For books already posted the wrong way,
+`scripts/backfill_customer_records.py` reports every JE that booked a Supplier
+against an Income account, creates the matching Customers, and repoints the
+**draft** entries; a **submitted** JE is immutable in Frappe, so it is reported
+and left for you to cancel and re-book rather than silently amended. `--dry-run`
+reports without changing anything, and the script is idempotent.
+
 **v0.4.0.7** — **fixes Journal Entries failing for transactions Plaid gives no
 merchant name**. Interest payments, credit-card payments and payroll ACHs all
 came back `417 LinkValidationError: Could not find Row #1: Party: Wells Fargo`

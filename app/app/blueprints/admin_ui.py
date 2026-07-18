@@ -1441,16 +1441,30 @@ RULES_BODY = """
   </p>
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:1;min-width:150px">Party type
-      <select name="party_type">
-        <option value="" {{ 'selected' if not form.party_type else '' }}>— none —</option>
+      <select name="party_type" id="party-type"
+              title="Which side of the ledger the counterparty sits on. Auto decides per transaction from the offset account: Income → Customer, Expense → Supplier.">
+        {# A NEW rule (no party_type key at all) defaults to Auto; an EXISTING
+           rule always shows what it stored, so a saved "— none —" stays none. #}
+        <option value="Auto" {{ 'selected' if (form.party_type or '')|lower == 'auto' or 'party_type' not in form else '' }}>Auto (from offset account)</option>
+        <option value="" {{ 'selected' if 'party_type' in form and not form.party_type else '' }}>— none —</option>
         <option value="Supplier" {{ 'selected' if form.party_type == 'Supplier' else '' }}>Supplier</option>
         <option value="Customer" {{ 'selected' if form.party_type == 'Customer' else '' }}>Customer</option>
       </select>
     </label>
-    <label style="flex:2;min-width:200px">Party name <span style="font-weight:400;color:#888">(blank → auto-Supplier for the merchant, payroll processor, or bank)</span>
+    <label style="flex:2;min-width:200px">Party name <span style="font-weight:400;color:#888">(blank → auto-created for the merchant, payroll processor, or bank)</span>
       <input name="party_name" value="{{ form.party_name or '' }}" placeholder="(optional)">
     </label>
   </div>
+  <!-- v0.4.0.8 · sell-side support. The live hint is swapped by JS as the
+       Party type / Offset account change (see the party-type-hint script). -->
+  <p id="party-type-hint" style="font-size:12px;color:#888;margin:-4px 0 6px">
+    <b>Auto</b> reads the offset account each time the rule fires — an
+    <b>Income</b> account books a <b>Customer</b> (a fruit buyer, USDA, a grant),
+    an <b>Expense</b> account books a <b>Supplier</b>, and anything else
+    (Asset / Liability / Equity — a transfer between your own accounts) books no
+    party. Pick <b>Supplier</b> or <b>Customer</b> to force one side. Banks and
+    brokerages get BOTH records created, since they bill you and pay you.
+  </p>
   <!-- v0.4.0.7 · pre-checked by JS when the offset resolves to another Bank
        Account of the same Company (/api/rules/skip_party_suggestion). -->
   <div style="margin:2px 0 8px">
@@ -2060,7 +2074,12 @@ def _rule_form_values():
         priority = int(raw_prio)
     except ValueError:
         priority = 100
-    party_type = (request.form.get('party_type') or '').strip() or None
+    # v0.4.0.8 · canonicalize the case ('auto' → 'Auto') and drop anything the
+    # engine doesn't know, so a hand-rolled POST can't store a party_type that
+    # would later be handed to ERPNext as a doctype. Blank stays None = no Party.
+    party_type = (request.form.get('party_type') or '').strip()
+    party_type = {p.lower(): p for p in categorization.PARTY_TYPES}.get(
+        party_type.lower(), '') or None
     direction = (request.form.get('offset_direction') or 'auto').strip()
     if direction not in categorization.OFFSET_DIRECTIONS:
         direction = 'auto'

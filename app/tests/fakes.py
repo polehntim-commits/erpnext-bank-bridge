@@ -79,7 +79,9 @@ class FakeERPClient:
                  company_abbr='EC', existing_suppliers=None,
                  fail_supplier_create=False, fail_je_create=False,
                  companies=None, existing_supplier_groups=None,
-                 fail_supplier_group_create=False):
+                 fail_supplier_group_create=False, existing_customers=None,
+                 fail_customer_create=False, existing_customer_groups=None,
+                 fail_customer_group_create=False):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -147,6 +149,14 @@ class FakeERPClient:
         # When True, every Supplier create fails (both attempts) so the
         # best-effort resolve path leaves erpnext_supplier_name NULL.
         self.fail_supplier_create = fail_supplier_create
+        # v0.4.0.8 · the AR-side mirrors of the four Supplier knobs above. The
+        # sell-side auto-create (erpnext_bank.ensure_customer) walks the same
+        # find-or-create path, so the fake models it the same way.
+        self.existing_customers = set(existing_customers or ())
+        self.existing_customer_groups = set(existing_customer_groups
+                                            or ('All Customer Groups',))
+        self.fail_customer_group_create = fail_customer_group_create
+        self.fail_customer_create = fail_customer_create
         # When True, every Journal Entry create fails — exercises the
         # non-destructive `error` GeneratedJournalEntry path.
         self.fail_je_create = fail_je_create
@@ -156,7 +166,8 @@ class FakeERPClient:
         self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {},
                         'Bank Account Type': {}, 'Bank Account Subtype': {},
                         'Account': {}, 'Supplier': {}, 'Journal Entry': {},
-                        'Supplier Group': {}}
+                        'Supplier Group': {}, 'Customer': {},
+                        'Customer Group': {}}
 
     def get_logged_user(self):
         return 'admin@example.com'
@@ -188,6 +199,11 @@ class FakeERPClient:
         if doctype == 'Supplier Group':
             if (name in self.existing_supplier_groups
                     or name in self.created['Supplier Group']):
+                return {'name': name}
+            return None
+        if doctype == 'Customer Group':
+            if (name in self.existing_customer_groups
+                    or name in self.created['Customer Group']):
                 return {'name': name}
             return None
         if doctype == 'Account':
@@ -256,6 +272,14 @@ class FakeERPClient:
             names = set(self.existing_suppliers) | set(self.created['Supplier'])
             for f in (filters or []):
                 if f[0] == 'supplier_name' and f[1] == '=':
+                    return [{'name': f[2]}] if f[2] in names else []
+            return [{'name': n} for n in names]
+        if doctype == 'Customer':
+            # customer_name filter → the AR-side dedup lookup (autonamed on
+            # customer_name, exactly like Supplier above).
+            names = set(self.existing_customers) | set(self.created['Customer'])
+            for f in (filters or []):
+                if f[0] == 'customer_name' and f[1] == '=':
                     return [{'name': f[2]}] if f[2] in names else []
             return [{'name': n} for n in names]
         if doctype in ('Bank', 'Custom Field'):
@@ -363,6 +387,26 @@ class FakeERPClient:
             name = doc.get('supplier_name')   # ERPNext autonames on supplier_name
             self.created['Supplier'][name] = dict(doc)
             return {'name': name}
+        if doctype == 'Customer Group':
+            if self.fail_customer_group_create:
+                from app.erpnext_client import ERPNextAPIError
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body='{"exception": "ValidationError: cannot create '
+                                  'Customer Group"}')
+            name = doc.get('customer_group_name')  # autonames on the group name
+            self.created['Customer Group'][name] = dict(doc)
+            return {'name': name}
+        if doctype == 'Customer':
+            if self.fail_customer_create:
+                from app.erpnext_client import ERPNextAPIError
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body='{"exception": "LinkValidationError: Could not '
+                                  'find Customer Group"}')
+            name = doc.get('customer_name')   # ERPNext autonames on customer_name
+            self.created['Customer'][name] = dict(doc)
+            return {'name': name}
         if doctype == 'Journal Entry':
             if self.fail_je_create:
                 from app.erpnext_client import ERPNextAPIError
@@ -370,8 +414,12 @@ class FakeERPClient:
                                       response_body='{"exc":"ValidationError"}')
             self._counter += 1
             name = f'ACC-JV-{self._counter:04d}'
-            self.created['Journal Entry'][name] = dict(doc)
-            self.docs[name] = dict(doc)
+            # ONE dict behind both views, so a later update_doc / submit is
+            # visible through get_doc too — there is only one document in a real
+            # ERPNext, and the v0.4.0.8 backfill reads back what it just wrote.
+            stored = dict(doc)
+            self.created['Journal Entry'][name] = stored
+            self.docs[name] = stored
             return {'name': name}
         if doctype == 'Custom Field':
             name = f"{doc.get('dt')}-{doc.get('fieldname')}"

@@ -15,6 +15,13 @@ def _bool(name: str, default: bool = False) -> bool:
     return v in ('1', 'true', 'yes', 'on')
 
 
+def _csv(name: str) -> tuple:
+    """A comma-separated env var as a tuple of trimmed, non-empty values.
+    Missing / blank → (), so a caller can iterate unconditionally."""
+    return tuple(part.strip() for part in os.environ.get(name, '').split(',')
+                 if part.strip())
+
+
 class Config:
     # Flask
     SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-not-for-production')
@@ -156,6 +163,22 @@ class Config:
     ERPNEXT_DEFAULT_SUPPLIER_COUNTRY = os.environ.get(
         'ERPNEXT_DEFAULT_SUPPLIER_COUNTRY', 'United States').strip() \
         or 'United States'
+    # v0.4.0.8 · the sell-side equivalents, for a newly-created ERPNext Customer
+    # (money IN — a fruit buyer, USDA, a grant). Stock ERPNext ships "All
+    # Customer Groups" and "All Territories"; the create retries once without
+    # them if yours differ.
+    ERPNEXT_DEFAULT_CUSTOMER_GROUP = os.environ.get(
+        'ERPNEXT_DEFAULT_CUSTOMER_GROUP', 'All Customer Groups').strip() \
+        or 'All Customer Groups'
+    ERPNEXT_DEFAULT_TERRITORY = os.environ.get(
+        'ERPNEXT_DEFAULT_TERRITORY', 'All Territories').strip() \
+        or 'All Territories'
+    # v0.4.0.8 · overrides for the dual-role heuristic (a party that both bills
+    # you and pays you gets BOTH an ERPNext Customer and Supplier — see
+    # erpnext_bank.is_dual_role_party). Comma-separated party names.
+    # SINGLE wins over DUAL, so a false positive can always be pinned back.
+    BANKBRIDGE_DUAL_ROLE_PARTIES = _csv('BANKBRIDGE_DUAL_ROLE_PARTIES')
+    BANKBRIDGE_SINGLE_ROLE_PARTIES = _csv('BANKBRIDGE_SINGLE_ROLE_PARTIES')
 
     # ── v0.3.0 · categorization rules → Journal Entry generation ───────────
     # Master switch for the rules engine. Default OFF: rules can be authored and

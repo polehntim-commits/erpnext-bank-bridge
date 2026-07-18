@@ -307,6 +307,47 @@ class Supplier(db.Model):
         }
 
 
+class Customer(db.Model):
+    """Local mirror / cache of a SELL-SIDE party seen on Plaid transactions →
+    the ERPNext Customer it maps to (v0.4.0.8). The AR-side twin of `Supplier`,
+    with the same shape and the same job: a cheap local lookup that
+    short-circuits the auto-create before touching ERPNext.
+
+    A separate table rather than a `party_type` discriminator on `suppliers`
+    precisely BECAUSE of dual-role parties: Wells Fargo pays you interest (a
+    Customer) and charges you fees (a Supplier), so the same normalized name has
+    to exist on both sides at once. `suppliers.normalized_name` is UNIQUE, so
+    one table could never hold both roles for one name — and each side keeps its
+    own independent AR / AP ledger in ERPNext anyway.
+
+    `erpnext_customer_name` is the ERPNext Customer docname once resolved (NULL
+    until then, e.g. if ERPNext wasn't reachable at push time)."""
+    __tablename__ = 'customers'
+    id = db.Column(db.Integer, primary_key=True)
+    merchant_name = db.Column(db.String(255), default='', index=True)
+    normalized_name = db.Column(db.String(255), unique=True, nullable=False,
+                                index=True)
+    erpnext_customer_name = db.Column(db.String(255), nullable=True, index=True)
+    first_seen_at = db.Column(db.DateTime, default=_now)
+    last_transaction_at = db.Column(db.DateTime, nullable=True)
+    transaction_count = db.Column(db.Integer, default=0)
+    total_amount = db.Column(db.Float, default=0.0)
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'merchant_name': self.merchant_name,
+            'normalized_name': self.normalized_name,
+            'erpnext_customer_name': self.erpnext_customer_name,
+            'first_seen_at': self.first_seen_at.isoformat() if self.first_seen_at else None,
+            'last_transaction_at': (self.last_transaction_at.isoformat()
+                                    if self.last_transaction_at else None),
+            'transaction_count': self.transaction_count or 0,
+            'total_amount': self.total_amount or 0.0,
+        }
+
+
 class CategorizationRule(db.Model):
     """A user-configured rule that maps a Bank Transaction onto a Journal Entry
     (v0.3.0). Rules are evaluated in `priority` ascending order (lower wins) and
@@ -354,7 +395,22 @@ class CategorizationRule(db.Model):
     # DEPRECATED (pre-v0.3.1) — kept one release for backwards compat.
     debit_account = db.Column(db.String(255), default='')
     credit_account = db.Column(db.String(255), default='')
-    party_type = db.Column(db.String(20), nullable=True)    # Supplier | Customer
+    # '' / NULL = no Party on the JE | Supplier | Customer | Auto.
+    #
+    # v0.4.0.8 · 'Auto' derives the side from the OFFSET ACCOUNT's root_type at
+    # JE time — an Income offset is money coming IN, so the counterparty is a
+    # Customer (a fruit buyer, USDA, a grant); an Expense offset is money going
+    # OUT, so it's a Supplier. Any other root_type (Asset/Liability/Equity —
+    # typically a transfer between accounts you own) books NO party. Deriving
+    # from the account rather than the Plaid amount sign is deliberate: the sign
+    # convention is ambiguous across refunds, reversals and the
+    # always_debit/always_credit overrides, whereas the offset account is the
+    # operator's own explicit statement of what the transaction IS.
+    #
+    # A literal 'Supplier' / 'Customer' remains an override that wins over the
+    # derivation, so an operator can force the side when their chart doesn't
+    # follow the usual root_type convention.
+    party_type = db.Column(db.String(20), nullable=True)
     party_name = db.Column(db.String(255), nullable=True)
     # v0.4.0.7 · omit the Party from the generated JE entirely. ERPNext treats
     # Party as optional on a JE row, and a transfer between two accounts you own

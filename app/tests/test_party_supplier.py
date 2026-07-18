@@ -270,8 +270,10 @@ class AutoSupplierForDerivedParties(Base):
             rule=db.session.get(CategorizationRule, rule_id))
         self.assertEqual(len(erp.created['Journal Entry']), 1)
 
-    def test_customer_party_is_honoured_but_never_auto_created(self):
-        """Minting Customers from bank descriptions isn't a call we should make."""
+    def test_customer_party_is_auto_created_not_booked_as_a_supplier(self):
+        """v0.4.0.8 reverses v0.4.0.7's "honour it but never mint one": a
+        Customer party is now auto-created like a Supplier, and — the point of
+        the release — it must NOT leak onto the AP side as a Supplier."""
         erp = FakeERPClient(companies=['Testing'])
         rule = self._rule(party_type='Customer', party_name='Acme Farms')
         row = self._txn(tid='t-cust', amount=-900.0)
@@ -280,6 +282,8 @@ class AutoSupplierForDerivedParties(Base):
 
         line = self._party_lines(self._je_for(erp, gje))[0]
         self.assertEqual(line['party'], 'Acme Farms')
+        self.assertEqual(line['party_type'], 'Customer')
+        self.assertEqual(list(erp.created['Customer']), ['Acme Farms'])
         self.assertEqual(erp.creates_of('Supplier'), [])
 
     def test_derive_prefers_merchant_then_payroll_then_institution(self):

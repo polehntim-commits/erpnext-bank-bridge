@@ -65,6 +65,12 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # accounts you own). Backfills to false, so every existing rule keeps
     # naming its party exactly as before.
     ('categorization_rules', 'skip_party', 'BOOLEAN DEFAULT false'),
+    # v0.4.0.8 — sell-side support. `party_type` has been on the model since
+    # v0.3.0, so on any install it already exists and this line is a no-op; it
+    # is listed for completeness now that v0.4.0.8 gives the column a fourth
+    # value ('Auto') and makes it load-bearing. Backfills to NULL = no Party,
+    # which is exactly what a pre-v0.4.0.8 rule without one already meant.
+    ('categorization_rules', 'party_type', 'VARCHAR(20)'),
 ]
 
 
