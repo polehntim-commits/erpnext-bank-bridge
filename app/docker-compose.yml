@@ -45,7 +45,7 @@ services:
       PLAID_CLIENT_ID: ${PLAID_CLIENT_ID:-}
       PLAID_SECRET: ${PLAID_SECRET:-}
       PLAID_ENV: ${PLAID_ENV:-sandbox}
-      PLAID_REDIRECT_URI: ${PLAID_REDIRECT_URI:-http://umbrel.local:5202/plaid/oauth_return}
+      PLAID_REDIRECT_URI: ${PLAID_REDIRECT_URI:-http://umbrel.local:5202/bankbridge/plaid/oauth_return}
       # ERPNext — blank by default; configure at /admin/erpnext_settings.
       ERPNEXT_URL: ${ERPNEXT_URL:-http://umbrel.local:5300}
       ERPNEXT_API_KEY: ${ERPNEXT_API_KEY:-}

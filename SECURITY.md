@@ -49,7 +49,7 @@ not on the public Internet.
   only on a trusted LAN behind Umbrel's app proxy. **Do not expose it to the
   Internet.**
 - If you must reach the app over public HTTPS (e.g. to serve the Plaid OAuth
-  callback), expose **only** the `/plaid/*` and `/api/plaid/*` paths and keep
+  callback), expose **only** the `/bankbridge/plaid/*` and `/bankbridge/api/plaid/*` paths and keep
   `/admin` on the LAN. As defense-in-depth you can additionally enable an
   optional HTTP Basic Auth layer on `/admin` by setting `ADMIN_BASIC_AUTH_USER`
   and `ADMIN_BASIC_AUTH_PASS` (see the README "Deployment models" section). The

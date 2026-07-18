@@ -11,11 +11,18 @@ Plaid uses ONE secret per environment, so we store both and hand the active
 one to the client based on `environment`. The secrets are credentials; the
 admin page renders only masked previews and never echoes the full values."""
 import json
+import logging
 import os
 
 from flask import current_app
 
+from . import legacy_paths
 from . import sync_config
+
+log = logging.getLogger('bankbridge.plaid_settings')
+
+#: Fields whose v0.4.8 path migration has already been announced this process.
+_LOGGED_URL_MIGRATIONS: set[str] = set()
 
 _FILENAME = 'plaid_settings.json'
 # `sync_interval_hours` rides along in this same JSON blob (the sync-frequency
@@ -64,7 +71,28 @@ def load() -> dict:
         d['environment'] = 'sandbox'
     d['sync_interval_hours'] = sync_config.normalize_interval(
         d.get('sync_interval_hours'))
+    _migrate_plaid_urls(d)
     return d
+
+
+def _migrate_plaid_urls(d: dict) -> None:
+    """v0.4.8 — rewrite pre-prefix Plaid URLs onto `/bankbridge/`, in place.
+
+    Applied on read rather than as a one-shot file rewrite: it fixes the value
+    every caller sees (including the settings form) without needing a writable
+    data volume at boot, and it is idempotent, so a re-read costs nothing. The
+    next save() persists the migrated value. Logged once per field per process
+    so the operator sees it in `docker logs` without a line on every request."""
+    for field in ('redirect_uri', 'webhook_url'):
+        old = d.get(field) or ''
+        new = legacy_paths.migrate_url(old)
+        if new != old:
+            d[field] = new
+            if field not in _LOGGED_URL_MIGRATIONS:
+                _LOGGED_URL_MIGRATIONS.add(field)
+                log.info('v0.4.8 path migration: plaid %s %s → %s '
+                         '(update this URL in your Plaid dashboard)',
+                         field, old, new)
 
 
 def save(client_id: str, environment: str, redirect_uri: str = '',
@@ -80,6 +108,9 @@ def save(client_id: str, environment: str, redirect_uri: str = '',
     d['environment'] = env if env in ('sandbox', 'production') else 'sandbox'
     d['redirect_uri'] = (redirect_uri or '').strip()
     d['webhook_url'] = (webhook_url or '').strip()
+    # A form submitted with a pre-v0.4.8 path is normalized on the way in, so
+    # the migration can't be undone by re-saving the settings page.
+    _migrate_plaid_urls(d)
     if sandbox_secret is not None:
         d['sandbox_secret'] = (sandbox_secret or '').strip()
     if production_secret is not None:

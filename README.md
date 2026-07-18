@@ -89,7 +89,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.7 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.8 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -299,6 +299,22 @@ Create an account in ERPNext, reload the Rules editor, and it's selectable — n
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
 
+**v0.4.8** — **every Plaid-facing path moved under `/bankbridge/`.** No
+behavior change, one prefix change. A Tailscale Funnel hostname is per-*machine*,
+not per-app: every app on the same Umbrel shares `https://<host>.<tailnet>.ts.net`
+and is distinguished only by path. Bank Bridge owning the bare `/plaid/*` and
+`/api/plaid/*` prefixes meant the next app to want a public callback would have
+to negotiate for path space, and a line in an access log wouldn't say which app
+it belonged to. So Bank Bridge now claims exactly one prefix, `/bankbridge/`, and
+nothing outside it — see [Multi-app path prefix
+convention](#multi-app-path-prefix-convention) and [Path migration
+(v0.4.8)](#path-migration-v048) for the upgrade steps.
+
+Old paths keep working: pre-v0.4.8 URLs answer with a permanent redirect to their
+new home, logged at INFO so an operator can see whether anything still calls
+them. A `plaid_settings.json` holding an old redirect / webhook URL is rewritten
+onto the new prefix automatically on read — no manual edit, no re-linking banks.
+
 **v0.4.7** — **disconnect a bank, and pre-submission hardening.** Five fixes
 found in an audit ahead of requesting Plaid production access:
 
@@ -335,7 +351,7 @@ found in an audit ahead of requesting Plaid production access:
    `bridgeadmin` rescue superuser so future drift self-heals at boot. Both paths
    verify the resulting credentials before reporting success.
 5. **Funnel scope documented and narrowed.** The old deployment recipes forwarded
-   the whole `/plaid/*` and `/api/plaid/*` prefixes, which publishes four
+   the whole `/bankbridge/plaid/*` and `/bankbridge/api/plaid/*` prefixes, which publishes four
    unauthenticated write endpoints to the Internet. All three options now
    forward only the exact OAuth callback. See [Restricting Tailscale Funnel to
    the OAuth callback
@@ -652,7 +668,7 @@ failure, creates the missing Suppliers and re-generates the JEs back to
 ## How it works
 
 1. **Link a bank once** through Plaid Link (`/admin/link_bank`). OAuth-only
-   banks bounce through `/plaid/oauth_return` and back automatically.
+   banks bounce through `/bankbridge/plaid/oauth_return` and back automatically.
 2. The server exchanges the Link public token for a durable **access token**,
    stored **Fernet-encrypted** in Postgres.
 3. **Import accounts into ERPNext** (`/admin/accounts`) — click **Import all
@@ -1022,7 +1038,7 @@ extra setup, no auth needed.
 **2. Public HTTPS callback (required for production OAuth banks).** Production
 OAuth institutions (Wells Fargo, Chase, etc.) require an **`https://`** redirect
 URI that Plaid can reach from the public Internet. You expose **only** the
-callback paths — `/plaid/*` and `/api/plaid/*` — over HTTPS, while `/admin` and
+callback paths — `/bankbridge/plaid/*` and `/bankbridge/api/plaid/*` — over HTTPS, while `/admin` and
 everything else stay on the LAN. See
 [Production Deployment](#production-deployment-https-for-plaid-oauth) for three
 ways to do this.
@@ -1045,10 +1061,10 @@ ways to do this.
 
 Production OAuth banks require an `https://` redirect URI reachable from the
 public Internet. The goal of every pattern below is the same: **terminate TLS
-and forward only the OAuth callback `/plaid/oauth_return` to port 5202**,
+and forward only the OAuth callback `/bankbridge/plaid/oauth_return` to port 5202**,
 keeping the admin UI *and* the unauthenticated Plaid write endpoints on the LAN.
-(Earlier revisions of this guide forwarded the whole `/plaid/*` and
-`/api/plaid/*` prefixes — see [Restricting Tailscale Funnel to the OAuth
+(Earlier revisions of this guide forwarded the whole `/bankbridge/plaid/*` and
+`/bankbridge/api/plaid/*` prefixes — see [Restricting Tailscale Funnel to the OAuth
 callback only](#restricting-tailscale-funnel-to-the-oauth-callback-only) for why
 that is wider than it needs to be, and how to narrow it.) After setting one up, register the resulting HTTPS URL as the
 redirect URI in **both** the Plaid dashboard (Developers → API → Allowed
@@ -1074,27 +1090,27 @@ certificate management (Tailscale provisions the cert). Funnel can be
 # Expose ONLY the OAuth callback over HTTPS → local port 5202.
 # Note the target has NO path: Tailscale forwards the FULL request path to the
 # backend (it does not strip the mount prefix), so a request to
-# https://<host>/plaid/oauth_return arrives at 127.0.0.1:5202/plaid/oauth_return.
+# https://<host>/bankbridge/plaid/oauth_return arrives at 127.0.0.1:5202/bankbridge/plaid/oauth_return.
 tailscale funnel --bg --https=443 \
-  --set-path=/plaid/oauth_return http://127.0.0.1:5202
+  --set-path=/bankbridge/plaid/oauth_return http://127.0.0.1:5202
 
 tailscale funnel status   # shows the public https://<your-umbrel>.<your-tailnet>.ts.net URL
 ```
 Your redirect URI is then
-`https://<your-umbrel>.<your-tailnet>.ts.net/plaid/oauth_return`.
+`https://<your-umbrel>.<your-tailnet>.ts.net/bankbridge/plaid/oauth_return`.
 
 > Substitute your own port if your install doesn't publish Bank Bridge on
 > `5202` (check `docker ps`). To tear the Funnel down again:
-> `tailscale funnel --https=443 --set-path=/plaid/oauth_return off`.
+> `tailscale funnel --https=443 --set-path=/bankbridge/plaid/oauth_return off`.
 
 **Verify — do not skip this.** The point of the config is what it *refuses*:
 ```bash
 HOST=https://<your-umbrel>.<your-tailnet>.ts.net
 
-curl -sI $HOST/plaid/oauth_return        # Expect: 200 — the callback works.
+curl -sI $HOST/bankbridge/plaid/oauth_return        # Expect: 200 — the callback works.
 curl -sI $HOST/admin                     # Expect: 404 — admin UI stays LAN-only.
-curl -sI $HOST/api/plaid/create_link_token   # Expect: 404 — see below.
-curl -sI $HOST/plaid/webhook             # Expect: 404 — see below.
+curl -sI $HOST/bankbridge/api/plaid/create_link_token   # Expect: 404 — see below.
+curl -sI $HOST/bankbridge/api/plaid/webhook             # Expect: 404 — see below.
 ```
 If any of the last three return something other than 404, the Funnel is wider
 than it should be — re-check the `--set-path` value and re-run
@@ -1106,19 +1122,19 @@ than it should be — re-check the `--set-path` value and re-run
 it is not secret — it appears in TLS certificate transparency logs, and it is
 handed to every bank you link. Treat it as public knowledge.
 
-Bank Bridge's `/plaid` and `/api/plaid` blueprints are **unauthenticated by
+Bank Bridge's `/bankbridge/plaid` and `/bankbridge/api/plaid` blueprints are **unauthenticated by
 design** (the Plaid callback can't carry your admin credentials, and Umbrel's
 LAN boundary is the assumed trust boundary). Funnelling those prefixes broadly
 therefore publishes four write endpoints to the world:
 
 | Endpoint | What an attacker gets |
 | --- | --- |
-| `POST /api/plaid/create_link_token` | Burns billable Plaid API calls on your account, at whatever rate they like |
-| `POST /api/plaid/set_link_company` | Redirects which ERPNext Company a pending link will book to |
-| `POST /api/plaid/exchange_token` | Attempts to attach an Item they control to your install |
-| `POST /plaid/webhook` | Spoofs "new transactions" events — there is **no signature verification** — forcing unscheduled syncs |
+| `POST /bankbridge/api/plaid/create_link_token` | Burns billable Plaid API calls on your account, at whatever rate they like |
+| `POST /bankbridge/api/plaid/set_link_company` | Redirects which ERPNext Company a pending link will book to |
+| `POST /bankbridge/api/plaid/exchange_token` | Attempts to attach an Item they control to your install |
+| `POST /bankbridge/api/plaid/webhook` | Spoofs "new transactions" events — there is **no signature verification** — forcing unscheduled syncs |
 
-Only **`/plaid/oauth_return`** has to be publicly reachable: it is the URL the
+Only **`/bankbridge/plaid/oauth_return`** has to be publicly reachable: it is the URL the
 bank redirects the operator's browser back to after an OAuth login. Everything
 else is called by *your own browser on the LAN*, so nothing breaks by keeping it
 off the Funnel.
@@ -1126,13 +1142,13 @@ off the Funnel.
 **Do NOT do this** — the older, broader config this README used to recommend:
 ```bash
 # ✗ WRONG — publishes all four write endpoints above.
-tailscale funnel --set-path /plaid       http://localhost:5202/plaid
-tailscale funnel --set-path /api/plaid   http://localhost:5202/api/plaid
+tailscale funnel --set-path /bankbridge/plaid       http://localhost:5202/bankbridge/plaid
+tailscale funnel --set-path /bankbridge/api/plaid   http://localhost:5202/bankbridge/api/plaid
 ```
 If you set that up previously, turn both off and re-run the single-path command:
 ```bash
-tailscale funnel --https=443 --set-path=/plaid off
-tailscale funnel --https=443 --set-path=/api/plaid off
+tailscale funnel --https=443 --set-path=/bankbridge/plaid off
+tailscale funnel --https=443 --set-path=/bankbridge/api/plaid off
 ```
 
 **Security note.** With the single-path Funnel, `/admin` and every write
@@ -1165,12 +1181,12 @@ tunnel: bank-bridge
 credentials-file: /root/.cloudflared/bank-bridge.json
 ingress:
   - hostname: bank-bridge.<your-domain>
-    path: ^/plaid/oauth_return$       # the OAuth callback — the ONLY public path
+    path: ^/bankbridge/plaid/oauth_return$       # the OAuth callback — the ONLY public path
     service: http://localhost:5202
   - service: http_status:404          # /admin, the Plaid write endpoints, all else
 ```
-The exact-match path is deliberate: broadening it to `^/plaid/.*` or
-`^/api/plaid/.*` publishes four unauthenticated write endpoints — see
+The exact-match path is deliberate: broadening it to `^/bankbridge/plaid/.*` or
+`^/bankbridge/api/plaid/.*` publishes four unauthenticated write endpoints — see
 [Restricting Tailscale Funnel to the OAuth callback
 only](#restricting-tailscale-funnel-to-the-oauth-callback-only), which explains
 the risk in full (it applies to every option here, not just Funnel).
@@ -1178,11 +1194,11 @@ Then run it (or install as a service):
 ```bash
 cloudflared tunnel run bank-bridge
 ```
-Your redirect URI is `https://bank-bridge.<your-domain>/plaid/oauth_return`.
+Your redirect URI is `https://bank-bridge.<your-domain>/bankbridge/plaid/oauth_return`.
 
 **Verify**
 ```bash
-curl -sI https://bank-bridge.<your-domain>/plaid/oauth_return   # Expect 200
+curl -sI https://bank-bridge.<your-domain>/bankbridge/plaid/oauth_return   # Expect 200
 curl -sI https://bank-bridge.<your-domain>/admin                # Expect 404
 ```
 
@@ -1211,9 +1227,9 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/<your-domain>/privkey.pem;
 
     # `location =` is an EXACT match — the OAuth callback and nothing else.
-    # A prefix match (`location /plaid/`) would also publish the four
+    # A prefix match (`location /bankbridge/plaid/`) would also publish the four
     # unauthenticated Plaid write endpoints; see the Funnel section above.
-    location = /plaid/oauth_return {
+    location = /bankbridge/plaid/oauth_return {
         proxy_pass http://127.0.0.1:5202;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
@@ -1225,18 +1241,93 @@ Provision the certificate:
 ```bash
 sudo certbot --nginx -d <your-domain>
 ```
-Your redirect URI is `https://<your-domain>/plaid/oauth_return`.
+Your redirect URI is `https://<your-domain>/bankbridge/plaid/oauth_return`.
 
 **Verify**
 ```bash
-curl -sI https://<your-domain>/plaid/oauth_return   # Expect 200
+curl -sI https://<your-domain>/bankbridge/plaid/oauth_return   # Expect 200
 curl -sI https://<your-domain>/admin                # Expect connection closed (444)
 ```
 
-**Security note.** Only the exact `/plaid/oauth_return` path is proxied;
+**Security note.** Only the exact `/bankbridge/plaid/oauth_return` path is proxied;
 `location /` returns `444` so `/admin` and the Plaid write endpoints are never
 served publicly. Because a reverse proxy is the easiest place to accidentally
 widen scope, set `ADMIN_BASIC_AUTH_*` too.
+
+## Path migration (v0.4.8)
+
+In v0.4.8 every Plaid-facing route moved under a `/bankbridge/` prefix:
+
+| Pre-v0.4.8 | v0.4.8 |
+| --- | --- |
+| `GET /plaid/oauth_return` | `GET /bankbridge/plaid/oauth_return` |
+| `POST /api/plaid/create_link_token` | `POST /bankbridge/api/plaid/create_link_token` |
+| `POST /api/plaid/exchange_token` | `POST /bankbridge/api/plaid/exchange_token` |
+| `POST /api/plaid/set_link_company` | `POST /bankbridge/api/plaid/set_link_company` |
+| `POST /api/plaid/webhook` | `POST /bankbridge/api/plaid/webhook` |
+
+`/admin/*` and `/api/sync/plaid_now` are unchanged — they are LAN-only admin
+surfaces, never publicly exposed, and never handed to Plaid.
+
+**Nothing breaks on upgrade.** Two shims carry an existing install across:
+
+- **Old URLs still answer.** Every path in the left column responds with a
+  permanent redirect to its right-column equivalent, query string intact (the
+  OAuth return carries `oauth_state_id`, and dropping it would strand the
+  handoff). The GET callback redirects with `301`; the POST endpoints use `308`,
+  which is `301`'s method-preserving twin — a plain `301` would let a client
+  downgrade `POST` to `GET` and silently drop the request body. Each redirect
+  logs at INFO, so `docker logs` tells you whether anything is still on an old
+  path.
+- **Stored settings auto-migrate.** If `{DATA_DIR}/plaid_settings.json` holds a
+  redirect or webhook URL on an old path, it is rewritten onto `/bankbridge/`
+  when read — scheme, host, and port preserved. Idempotent, logged once per
+  field per boot, and persisted the next time you save the settings page. You do
+  not need to edit anything by hand or re-link any bank.
+
+**What you should still do, once.** The redirects are a safety net, not the
+destination — Plaid must be told the real URL:
+
+1. Redeploy on v0.4.8 and open `/admin/plaid_settings`. The redirect URI should
+   already show the `/bankbridge/` path.
+2. Re-point your public HTTPS path at the new callback. For Tailscale Funnel:
+   ```bash
+   tailscale funnel --https=443 --set-path=/plaid/oauth_return off
+   tailscale funnel --bg --https=443 \
+     --set-path=/bankbridge/plaid/oauth_return http://127.0.0.1:5202
+   ```
+   (The target carries no path — Tailscale forwards the full request path to the
+   backend rather than stripping the mount prefix, so adding one would produce a
+   doubled `/bankbridge/bankbridge/…`. Substitute your own port if your install
+   doesn't publish Bank Bridge on `5202`.) Cloudflare Tunnel and nginx users:
+   update the `path:` / `location =` value the same way.
+3. Register the new URL in the Plaid dashboard (Developers → API → Allowed
+   redirect URIs) and remove the old one once you've confirmed the new one works.
+4. Verify:
+   ```bash
+   HOST=https://<your-umbrel>.<your-tailnet>.ts.net
+   curl -sI $HOST/bankbridge/plaid/oauth_return   # Expect: 200
+   curl -sI $HOST/admin                           # Expect: 404
+   ```
+
+## Multi-app path prefix convention
+
+> Any Bank-Bridge-adjacent app hosted on the same Umbrel that needs public
+> Tailscale Funnel exposure **MUST** prefix its paths with `/<app-name>/` — e.g.
+> `/bankbridge/`, `/bucketlog/`, `/volumevision/`. This prevents path collisions
+> across apps sharing the same tailnet hostname and makes ownership obvious in
+> logs and audit trails.
+
+The constraint is Tailscale's: a Funnel hostname belongs to a *machine*, so every
+app on the box is reached through the same `https://<host>.<tailnet>.ts.net` and
+separated only by path. An app that claims a generic prefix (`/api/`, `/plaid/`,
+`/webhook/`) makes the next app's callback either impossible or ambiguous, and
+makes a line in an access log unattributable. One prefix per app, claimed up
+front, costs nothing and removes the whole class of problem.
+
+Within Bank Bridge the rule applies to Plaid-facing paths only. `/admin/*` and
+the internal `/api/*` endpoints stay where they are: they are LAN-only, never
+funnelled, and moving them would churn bookmarks for no gain.
 
 ## Configuration
 
@@ -1248,7 +1339,7 @@ volume) or seeded via environment variables.
 Create an app at [dashboard.plaid.com](https://dashboard.plaid.com):
 
 - Copy your **Client ID** and per-environment **Secrets** (Developers → Keys).
-- Register the redirect URI `http://umbrel.local:5202/plaid/oauth_return`
+- Register the redirect URI `http://umbrel.local:5202/bankbridge/plaid/oauth_return`
   (Developers → API → Allowed redirect URIs) — required for OAuth banks.
 - Start in **sandbox** to rehearse the flow; switch to **production** once your
   Plaid app is approved for the institutions you need.
@@ -1256,11 +1347,11 @@ Create an app at [dashboard.plaid.com](https://dashboard.plaid.com):
 **Production OAuth needs HTTPS.** Plaid accepts a plain `http://…` redirect URI
 in sandbox, but **production OAuth banks require an `https://` redirect URI**
 reachable from the public Internet. You only need to expose the two callback
-paths (`/plaid/*` and `/api/plaid/*`), not `/admin`. See
+paths (`/bankbridge/plaid/*` and `/bankbridge/api/plaid/*`), not `/admin`. See
 [Production Deployment](#production-deployment-https-for-plaid-oauth) for three
 ready-to-use patterns (Tailscale Funnel, Cloudflare Tunnel, or nginx +
 Let's Encrypt), then register the resulting HTTPS URL (e.g.
-`https://<your-host>/plaid/oauth_return`) as the redirect URI in both the Plaid
+`https://<your-host>/bankbridge/plaid/oauth_return`) as the redirect URI in both the Plaid
 dashboard and `PLAID_REDIRECT_URI`.
 
 **Sync frequency & cost.** The Plaid settings page has a **Sync frequency**
@@ -1543,10 +1634,10 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `DATABASE_URL` | — (required) | Postgres only, no SQLite fallback |
 | `SECRET_KEY` | `dev-not-for-production` | Flask secret |
 | `ADMIN_BASIC_AUTH_USER` | "" | v0.3.6 · optional Basic Auth username for `/admin`; set together with the password to enable |
-| `ADMIN_BASIC_AUTH_PASS` | "" | v0.3.6 · optional Basic Auth password for `/admin` (plaintext or a `werkzeug` hash). **Both** vars set → auth on; **either** blank → off (LAN mode). Never gates `/plaid/*` or `/api/plaid/*` |
+| `ADMIN_BASIC_AUTH_PASS` | "" | v0.3.6 · optional Basic Auth password for `/admin` (plaintext or a `werkzeug` hash). **Both** vars set → auth on; **either** blank → off (LAN mode). Never gates `/bankbridge/plaid/*` or `/bankbridge/api/plaid/*` |
 | `PLAID_CLIENT_ID` / `PLAID_SECRET` | "" | seed; editable in the UI |
 | `PLAID_ENV` | `sandbox` | `sandbox` \| `production` |
-| `PLAID_REDIRECT_URI` | `http://umbrel.local:5202/plaid/oauth_return` | must match the Plaid dashboard |
+| `PLAID_REDIRECT_URI` | `http://umbrel.local:5202/bankbridge/plaid/oauth_return` | must match the Plaid dashboard |
 | `PLAID_WEBHOOK_URL` | "" | optional; polling is enough |
 | `ERPNEXT_URL` | `http://umbrel.local:5300` | ERPNext base URL |
 | `ERPNEXT_API_KEY` / `ERPNEXT_API_SECRET` | "" | System Manager API pair |
@@ -1665,7 +1756,7 @@ cd app
 python3 -m unittest discover -s tests -v
 ```
 
-818 tests cover Fernet encryption round-trip + key persistence, Plaid response
+850 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
 push → error + retry, one-click account import, merchant-name normalization,

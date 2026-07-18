@@ -79,7 +79,8 @@ class Config:
     # OAuth redirect target for OAuth-only banks (Wells Fargo). Must EXACTLY
     # match a redirect URI registered in the Plaid dashboard.
     PLAID_REDIRECT_URI = os.environ.get(
-        'PLAID_REDIRECT_URI', 'http://umbrel.local:5202/plaid/oauth_return').strip()
+        'PLAID_REDIRECT_URI',
+        'http://umbrel.local:5202/bankbridge/plaid/oauth_return').strip()
     # Optional — leave blank for the polling pilot. When set, Plaid POSTs
     # transaction-update webhooks here so a sync can fire sooner than 6h.
     PLAID_WEBHOOK_URL = os.environ.get('PLAID_WEBHOOK_URL', '').strip()

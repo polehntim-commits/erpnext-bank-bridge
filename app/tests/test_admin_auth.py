@@ -86,7 +86,7 @@ class TestAuthEnforced(AuthBase):
         # The JSON API lives on a separate blueprint — Plaid's OAuth callback
         # must stay reachable without admin credentials. Unconfigured Plaid
         # yields a 400 (not a 401), proving no auth challenge was raised.
-        r = self.client.get('/api/plaid/create_link_token')
+        r = self.client.get('/bankbridge/api/plaid/create_link_token')
         self.assertEqual(r.status_code, 400)
         self.assertNotIn('WWW-Authenticate', r.headers)
 

@@ -251,7 +251,7 @@ class TestDisconnectedSkippedBySync(DisconnectBase):
         orig = sync_engine.sync_item
         sync_engine.sync_item = lambda *a, **k: called.append(a)
         self.addCleanup(lambda: setattr(sync_engine, 'sync_item', orig))
-        r = self.client.post('/api/plaid/webhook',
+        r = self.client.post('/bankbridge/api/plaid/webhook',
                              json={'webhook_type': 'TRANSACTIONS',
                                    'webhook_code': 'DEFAULT_UPDATE',
                                    'item_id': 'item-abc'})
@@ -264,7 +264,7 @@ class TestDisconnectedSkippedBySync(DisconnectBase):
         orig = sync_engine.sync_item
         sync_engine.sync_item = lambda *a, **k: called.append(a)
         self.addCleanup(lambda: setattr(sync_engine, 'sync_item', orig))
-        self.client.post('/api/plaid/webhook',
+        self.client.post('/bankbridge/api/plaid/webhook',
                          json={'webhook_type': 'TRANSACTIONS',
                                'webhook_code': 'DEFAULT_UPDATE',
                                'item_id': 'item-abc'})

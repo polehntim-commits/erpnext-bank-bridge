@@ -470,7 +470,7 @@ Set your Client ID + secret on the <a href="/admin/plaid_settings">Plaid setting
   var companyEl = document.getElementById('owningCompany');
   function saveCompany() {
     if (!companyEl) return Promise.resolve();
-    return fetch('/api/plaid/set_link_company', {
+    return fetch('/bankbridge/api/plaid/set_link_company', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ company: companyEl.value })
@@ -478,7 +478,7 @@ Set your Client ID + secret on the <a href="/admin/plaid_settings">Plaid setting
   }
   if (companyEl) { companyEl.addEventListener('change', saveCompany); }
 
-  fetch('/api/plaid/create_link_token', { method: 'POST' })
+  fetch('/bankbridge/api/plaid/create_link_token', { method: 'POST' })
     .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
     .then(function (res) {
       if (!res.ok) { setStatus(res.j.error || 'Could not create a link token.'); return; }
@@ -487,7 +487,7 @@ Set your Client ID + secret on the <a href="/admin/plaid_settings">Plaid setting
         onSuccess: function (public_token) {
           setStatus('Linked! Saving accounts…');
           saveCompany().then(function () {
-            return fetch('/api/plaid/exchange_token', {
+            return fetch('/bankbridge/api/plaid/exchange_token', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ public_token: public_token })
@@ -4030,10 +4030,10 @@ PLAID_SETTINGS_BODY = """
     </select>
   </label>
   <label>OAuth redirect URI
-    <input name="redirect_uri" value="{{ s.redirect_uri }}" placeholder="http://umbrel.local:5202/plaid/oauth_return">
+    <input name="redirect_uri" value="{{ s.redirect_uri }}" placeholder="http://umbrel.local:5202/bankbridge/plaid/oauth_return">
   </label>
   <label>Webhook URL <span style="font-weight:400;color:#888">(optional — leave blank for polling)</span>
-    <input name="webhook_url" value="{{ s.webhook_url }}" placeholder="http://umbrel.local:5202/api/plaid/webhook">
+    <input name="webhook_url" value="{{ s.webhook_url }}" placeholder="http://umbrel.local:5202/bankbridge/api/plaid/webhook">
   </label>
   <label>Sync frequency <span style="font-weight:400;color:#888">(how often we pull transactions from Plaid)</span>
     <select name="sync_interval_hours" id="syncFreq">

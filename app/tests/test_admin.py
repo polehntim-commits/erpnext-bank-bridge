@@ -68,7 +68,7 @@ class TestPlaidSettings(AdminBase):
         self.client.post('/admin/plaid_settings', data={
             'client_id': 'CID1', 'environment': 'sandbox',
             'sandbox_secret': 'SANDSECRET', 'production_secret': '',
-            'redirect_uri': 'http://umbrel.local:5202/plaid/oauth_return'})
+            'redirect_uri': 'http://umbrel.local:5202/bankbridge/plaid/oauth_return'})
         s = plaid_settings.load()
         self.assertEqual(s['client_id'], 'CID1')
         self.assertEqual(s['sandbox_secret'], 'SANDSECRET')
@@ -110,7 +110,7 @@ class TestExchangeTokenEncryption(AdminBase):
             'balance_available': 1.0, 'balance_current': 2.0,
             'iso_currency_code': 'USD'}])
         with mock.patch('app.sync_engine.get_plaid_client', return_value=fake):
-            r = self.client.post('/api/plaid/exchange_token',
+            r = self.client.post('/bankbridge/api/plaid/exchange_token',
                                  json={'public_token': 'public-sandbox-xyz'})
         self.assertEqual(r.status_code, 200)
         item = PlaidItem.query.filter_by(item_id='item-abc').first()

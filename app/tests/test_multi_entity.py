@@ -254,10 +254,10 @@ class TestEndpoints(MultiEntityBase):
         fake_plaid = FakePlaidClient(accounts=[])
         with mock.patch.object(sync_engine, 'get_plaid_client',
                                return_value=fake_plaid):
-            r1 = client.post('/api/plaid/set_link_company',
+            r1 = client.post('/bankbridge/api/plaid/set_link_company',
                              json={'company': 'Farm LLC'})
             self.assertEqual(r1.status_code, 200)
-            r2 = client.post('/api/plaid/exchange_token',
+            r2 = client.post('/bankbridge/api/plaid/exchange_token',
                              json={'public_token': 'public-x'})
             self.assertEqual(r2.status_code, 200)
         item = PlaidItem.query.filter_by(item_id='item-abc').first()

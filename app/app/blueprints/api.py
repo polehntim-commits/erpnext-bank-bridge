@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: MIT
 """JSON + OAuth-handoff routes for the Plaid Link flow and manual sync.
 
-  GET/POST /api/plaid/create_link_token   → { link_token }
-  POST     /api/plaid/exchange_token       → exchange public_token → PlaidItem
-  GET      /plaid/oauth_return             → OAuth handoff page (re-inits Link)
-  POST     /api/sync/plaid_now             → run the full sync now
-  POST     /api/plaid/webhook              → Plaid webhook receiver (optional)
+  GET/POST /bankbridge/api/plaid/create_link_token → { link_token }
+  POST     /bankbridge/api/plaid/exchange_token    → exchange public_token → PlaidItem
+  GET      /bankbridge/plaid/oauth_return         → OAuth handoff page (re-inits Link)
+  POST     /bankbridge/api/plaid/webhook          → Plaid webhook receiver (optional)
+  POST     /api/sync/plaid_now                    → run the full sync now
+
+v0.4.8 moved every Plaid-facing path under `/bankbridge/` so this app can share
+a Tailscale Funnel hostname with other Umbrel apps; app/legacy_paths.py keeps
+the old paths working via permanent redirects. `/api/sync/plaid_now` is an
+admin-UI button, not a Plaid callback, so it keeps its path.
 
 The admin UI is unauthenticated + LAN-only (the Umbrel trust boundary), so
 these carry no auth either. Nothing here echoes an access_token or a Plaid
@@ -35,7 +40,7 @@ def _prune_link_states() -> None:
         db.session.delete(row)
 
 
-@bp.route('/api/plaid/create_link_token', methods=['GET', 'POST'])
+@bp.route('/bankbridge/api/plaid/create_link_token', methods=['GET', 'POST'])
 def create_link_token():
     """Mint a Plaid Link token. Persists it so the OAuth return page can
     re-initialize Link with the SAME token (required for OAuth banks)."""
@@ -59,7 +64,7 @@ def create_link_token():
 SESSION_OWNING_COMPANY_KEY = 'link_owning_company'
 
 
-@bp.post('/api/plaid/set_link_company')
+@bp.post('/bankbridge/api/plaid/set_link_company')
 def set_link_company():
     """Remember the owning ERPNext Company the operator picked on the Link page
     (v0.4.0 multi-entity L1), stashed in the Flask session until the exchange
@@ -73,7 +78,7 @@ def set_link_company():
     return jsonify({'ok': True, 'owning_company': company})
 
 
-@bp.post('/api/plaid/exchange_token')
+@bp.post('/bankbridge/api/plaid/exchange_token')
 def exchange_token():
     """Exchange a Link public_token for a durable access_token, store the Item
     (access_token encrypted), and pull its accounts. Idempotent on item_id."""
@@ -149,7 +154,7 @@ OAUTH_RETURN_HTML = """<!doctype html>
     receivedRedirectUri: window.location.href,
     onSuccess: function (public_token) {
       statusEl.textContent = 'Linked! Saving your accounts…';
-      fetch('/api/plaid/exchange_token', {
+      fetch('/bankbridge/api/plaid/exchange_token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ public_token: public_token })
@@ -168,7 +173,7 @@ OAUTH_RETURN_HTML = """<!doctype html>
 </body></html>"""
 
 
-@bp.get('/plaid/oauth_return')
+@bp.get('/bankbridge/plaid/oauth_return')
 def oauth_return():
     """OAuth redirect target for OAuth-only banks (Wells Fargo). Plaid appends
     an oauth_state_id to this URL; we re-open Link with the original link_token
@@ -193,7 +198,7 @@ def sync_now():
     return jsonify({'ok': True, 'result': result})
 
 
-@bp.post('/api/plaid/webhook')
+@bp.post('/bankbridge/api/plaid/webhook')
 def plaid_webhook():
     """Optional Plaid webhook receiver. For the polling pilot this is a
     convenience: on a TRANSACTIONS update we kick a sync for the named Item so

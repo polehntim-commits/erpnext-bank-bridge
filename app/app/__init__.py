@@ -13,7 +13,7 @@ from flask_sqlalchemy import SQLAlchemy
 
 from config import Config
 
-__version__ = '0.4.7'
+__version__ = '0.4.8'
 db = SQLAlchemy()
 
 
@@ -52,6 +52,11 @@ def create_app(test_config: dict | None = None) -> Flask:
     from .blueprints import admin_ui, api
     app.register_blueprint(admin_ui.bp)
     app.register_blueprint(api.bp)
+    # v0.4.8 — the Plaid-facing routes moved under /bankbridge/. Keep the
+    # pre-v0.4.8 paths answering (permanent redirects) so an install whose Plaid
+    # dashboard still points at /plaid/oauth_return doesn't break mid-upgrade.
+    from .legacy_paths import install_legacy_redirects
+    install_legacy_redirects(app)
 
     with app.app_context():
         # v0.3.5 — before touching the schema, self-heal the one recurring
