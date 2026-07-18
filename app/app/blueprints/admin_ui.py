@@ -2170,13 +2170,61 @@ def edit_supplier():
 
 # ── Generated Journal Entries (audit) ────────────────────────────
 
+def _state_pill(state):
+    """The coloured state pill — the single source of truth the client-side JS
+    `statePill()` mirrors when it refreshes a row in place."""
+    pills = {
+        'approved': ('pill-ok', 'approved', ''),
+        'rejected': ('pill-muted', 'rejected', ''),
+        'reversed': ('pill-muted', 'reversed', ''),
+        'error': ('pill-err', 'error', ''),
+        'blocked': ('pill-err', 'blocked', ''),
+        'skipped_missing_account': (
+            'pill-err', 'skipped · missing account',
+            "No account with this logical name under the transaction's Company"),
+    }
+    cls, label, title = pills.get(state, ('pill-muted', state or '', ''))
+    t = f' title="{title}"' if title else ''
+    return f'<span class="pill {cls}"{t}>{label}</span>'
+
+
+def _row_action_buttons(g):
+    """Server-render the per-row action buttons for state `g.state`. Kept as a
+    single source of truth the client-side JS mirrors when it refreshes a row
+    in place after a successful action (see the `<script>` block below)."""
+    gid, je = g.id, (g.erpnext_journal_entry_name or '')
+    st = g.state
+
+    def btn(action, label):
+        return (
+            f'<form method="post" action="/admin/generated_entries/{action}" '
+            f'class="je-action" style="display:inline;margin:0">'
+            f'<input type="hidden" name="id" value="{gid}">'
+            f'<button type="submit" class="secondary" '
+            f'style="padding:3px 10px;font-size:12px">{label}</button></form> ')
+
+    out = ''
+    if st == 'pending_review' and je:
+        out += btn('approve', 'Approve') + btn('reject', 'Reject')
+    elif st == 'approved':
+        out += btn('reverse', 'Reverse') + btn('reject', 'Reject (cancel)')
+    elif st == 'skipped_missing_account':
+        out += btn('retry', 'Retry') + btn('reject', 'Reject')
+    elif st in ('blocked', 'error'):
+        out += btn('reject', 'Reject')
+    return out or '<span style="color:#bbb;font-size:12px">—</span>'
+
+
 GENERATED_BODY = """
 <h2>Generated Journal Entries</h2>
-{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+<div id="je-flash" class="creds" style="display:{{ 'block' if flash_msg else 'none' }}">
+  <b>{{ flash_msg }}</b></div>
 <p style="font-size:14px;color:#555">
   Audit trail of Journal Entries the rules engine created. <b>Approve</b> submits
-  a Draft JE in ERPNext; <b>Reject</b> cancels it. State reflects the local
-  audit record.
+  the Draft JE in ERPNext (Draft → Submitted); <b>Reject</b> abandons a Draft or
+  cancels a submitted JE; <b>Reverse</b> books an offsetting entry to undo an
+  approval; <b>Retry</b> re-runs a rule once its missing account exists. State
+  reflects the local audit record.
 </p>
 <form method="get" action="/admin/generated_entries" class="card"
       style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
@@ -2191,55 +2239,118 @@ GENERATED_BODY = """
   <button type="submit" class="primary">Filter</button>
 </form>
 
-<div style="margin:8px 0">
-  <form method="post" action="/admin/generated_entries/bulk" style="display:inline">
-    <input type="hidden" name="action" value="approve">
-    <button type="submit" class="secondary">Approve all pending</button>
-  </form>
-  <form method="post" action="/admin/generated_entries/bulk" style="display:inline;margin-left:8px">
-    <input type="hidden" name="action" value="reject">
-    <button type="submit" class="secondary">Reject all pending</button>
-  </form>
-</div>
+<form id="je-bulk" method="post" action="/admin/generated_entries/bulk"
+      style="margin:8px 0">
+  <button type="submit" name="action" value="approve" class="secondary">Approve selected</button>
+  <button type="submit" name="action" value="reject" class="secondary" style="margin-left:8px">Reject selected</button>
+  <span style="margin-left:12px;color:#888;font-size:12px">
+    With nothing checked, these act on <b>all pending</b> entries.</span>
+</form>
 
 <table>
-  <tr><th>Created</th><th>Merchant</th><th class="num">Amount</th><th>Rule</th>
-      <th>Journal Entry</th><th>State</th><th></th></tr>
-  {% for g in rows %}
   <tr>
+    <th style="width:26px"><input type="checkbox" id="je-check-all" title="Select all"></th>
+    <th>Created</th><th>Merchant</th><th class="num">Amount</th><th>Rule</th>
+    <th>Journal Entry</th><th>State</th><th></th></tr>
+  {% for g in rows %}
+  <tr data-je-id="{{ g.id }}" data-je-name="{{ g.erpnext_journal_entry_name or '' }}">
+    <td><input type="checkbox" class="je-check" name="ids" value="{{ g.id }}"
+               form="je-bulk"></td>
     <td style="font-size:12px">{{ g.created_at.strftime('%Y-%m-%d %H:%M') if g.created_at else '' }}</td>
     <td>{{ g.merchant_name }}<div style="font-size:11px;color:#888">{{ (g.description or '')[:60] }}</div></td>
     <td class="num">{{ '%.2f'|format(g.amount or 0.0) }}</td>
     <td style="font-size:12px">{{ g.rule_name }}</td>
     <td style="font-size:12px">{% if g.erpnext_journal_entry_name %}<code>{{ g.erpnext_journal_entry_name }}</code>{% else %}—{% endif %}
       {% if g.error_message %}<div style="color:#a04000">{{ g.error_message[:100] }}</div>{% endif %}</td>
-    <td>
-      {% if g.state == 'approved' %}<span class="pill pill-ok">approved</span>
-      {% elif g.state == 'rejected' %}<span class="pill pill-muted">rejected</span>
-      {% elif g.state == 'error' %}<span class="pill pill-err">error</span>
-      {% elif g.state == 'blocked' %}<span class="pill pill-err">blocked</span>
-      {% elif g.state == 'skipped_missing_account' %}<span class="pill pill-err" title="No account with this logical name under the transaction's Company">skipped · missing account</span>
-      {% else %}<span class="pill pill-muted">{{ g.state }}</span>{% endif %}
-    </td>
-    <td style="white-space:nowrap">
-      {% if g.erpnext_journal_entry_name and g.state not in ('approved',) %}
-      <form method="post" action="/admin/generated_entries/approve" style="display:inline;margin:0">
-        <input type="hidden" name="id" value="{{ g.id }}">
-        <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">Approve</button>
-      </form>
-      {% endif %}
-      {% if g.erpnext_journal_entry_name and g.state not in ('rejected',) %}
-      <form method="post" action="/admin/generated_entries/reject" style="display:inline;margin:0">
-        <input type="hidden" name="id" value="{{ g.id }}">
-        <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">Reject</button>
-      </form>
-      {% endif %}
-    </td>
+    <td class="je-state-cell">{{ state_pill(g.state)|safe }}</td>
+    <td class="je-actions-cell" style="white-space:nowrap">{{ row_actions(g)|safe }}</td>
   </tr>
   {% endfor %}
-  {% if not rows %}<tr><td colspan="7" style="color:#888">No generated entries yet.</td></tr>{% endif %}
+  {% if not rows %}<tr><td colspan="8" style="color:#888">No generated entries yet.</td></tr>{% endif %}
 </table>
 <p style="font-size:12px;color:#888">Showing up to {{ limit }} most recent.</p>
+
+<script>
+(function () {
+  var flash = document.getElementById('je-flash');
+  function showFlash(msg, ok) {
+    if (!flash) return;
+    flash.style.display = 'block';
+    flash.style.background = ok ? '' : '#fdecea';
+    flash.innerHTML = '<b>' + msg + '</b>';
+  }
+  // Client-side mirror of the server's state pill (state_pill in admin_ui.py).
+  function statePill(state) {
+    var map = {
+      approved: ['pill-ok', 'approved'],
+      rejected: ['pill-muted', 'rejected'],
+      reversed: ['pill-muted', 'reversed'],
+      error: ['pill-err', 'error'],
+      blocked: ['pill-err', 'blocked'],
+      skipped_missing_account: ['pill-err', 'skipped · missing account']
+    };
+    var m = map[state] || ['pill-muted', state];
+    return '<span class="pill ' + m[0] + '">' + m[1] + '</span>';
+  }
+  // Client-side mirror of _row_action_buttons.
+  function actionBtn(id, action, label) {
+    return '<form method="post" action="/admin/generated_entries/' + action +
+      '" class="je-action" style="display:inline;margin:0">' +
+      '<input type="hidden" name="id" value="' + id + '">' +
+      '<button type="submit" class="secondary" style="padding:3px 10px;' +
+      'font-size:12px">' + label + '</button></form> ';
+  }
+  function rowActions(id, state, jeName) {
+    if (state === 'pending_review' && jeName)
+      return actionBtn(id, 'approve', 'Approve') + actionBtn(id, 'reject', 'Reject');
+    if (state === 'approved')
+      return actionBtn(id, 'reverse', 'Reverse') + actionBtn(id, 'reject', 'Reject (cancel)');
+    if (state === 'skipped_missing_account')
+      return actionBtn(id, 'retry', 'Retry') + actionBtn(id, 'reject', 'Reject');
+    if (state === 'blocked' || state === 'error')
+      return actionBtn(id, 'reject', 'Reject');
+    return '<span style="color:#bbb;font-size:12px">—</span>';
+  }
+  function refreshRow(tr, state) {
+    var id = tr.getAttribute('data-je-id');
+    var jeName = tr.getAttribute('data-je-name');
+    var sc = tr.querySelector('.je-state-cell');
+    var ac = tr.querySelector('.je-actions-cell');
+    if (sc) sc.innerHTML = statePill(state);
+    if (ac) ac.innerHTML = rowActions(id, state, jeName);
+  }
+  // Intercept per-row action submits → POST via fetch → refresh just that row,
+  // no full-page reload. Delegated so refreshed rows keep working.
+  document.addEventListener('submit', function (ev) {
+    var form = ev.target;
+    if (!form.classList || !form.classList.contains('je-action')) return;
+    ev.preventDefault();
+    var tr = form.closest('tr');
+    var btn = form.querySelector('button');
+    if (btn) btn.disabled = true;
+    var body = new FormData(form);
+    fetch(form.action, {
+      method: 'POST', body: body,
+      headers: {'X-Requested-With': 'fetch'}
+    }).then(function (r) { return r.json().then(function (j) {
+        return {ok: r.ok, j: j}; }); })
+      .then(function (res) {
+        showFlash(res.j.message || (res.ok ? 'Done' : 'Failed'), res.ok);
+        if (res.ok && tr && res.j.state) refreshRow(tr, res.j.state);
+        else if (btn) btn.disabled = false;
+      })
+      .catch(function () {
+        showFlash('Network error — nothing changed', false);
+        if (btn) btn.disabled = false;
+      });
+  });
+  var all = document.getElementById('je-check-all');
+  if (all) all.addEventListener('change', function () {
+    document.querySelectorAll('.je-check').forEach(function (c) {
+      c.checked = all.checked; });
+  });
+})();
+</script>
 """
 
 
@@ -2254,24 +2365,58 @@ def generated_entries_page():
                       GeneratedJournalEntry.id.desc()).limit(limit).all()
     return _page(GENERATED_BODY, page='generated_entries', rows=rows,
                  cur_state=cur_state, limit=limit,
-                 states=('pending_review', 'approved', 'rejected', 'error',
-                         'blocked', 'skipped_missing_account'),
+                 state_pill=_state_pill, row_actions=_row_action_buttons,
+                 states=('pending_review', 'approved', 'rejected', 'reversed',
+                         'error', 'blocked', 'skipped_missing_account'),
                  flash_msg=request.args.get('flash', ''))
 
 
-def _approve_entry(g) -> bool:
-    """Submit a Draft JE in ERPNext + mark approved. Returns True on success."""
+# ── approve / reject / reverse state machine ─────────────────────
+#
+# Valid admin transitions (see README changelog · v0.4.0.5):
+#   pending_review          → approved         (ERPNext submit succeeded)
+#   pending_review          → rejected         (Draft abandoned; nothing to cancel)
+#   approved                → rejected         (cancels the submitted JE in ERPNext)
+#   approved                → reversed         (books a reversing JE — the "undo")
+#   skipped_missing_account → pending_review   (retry once the account exists)
+#   blocked / error         → rejected         (accept the block)
+# `rejected` and `reversed` are terminal. Re-approving an already-approved row
+# (or re-rejecting a rejected one) is an idempotent no-op — success, no ERPNext
+# call — so a double-click or a bulk re-run never errors.
+
+
+class _ActionResult:
+    """Outcome of one state transition. `status` is the HTTP status a JSON
+    (fetch) caller should see; `changed` is False for an idempotent no-op."""
+    __slots__ = ('ok', 'message', 'status', 'changed')
+
+    def __init__(self, ok, message, status=200, changed=True):
+        self.ok, self.message, self.status, self.changed = (
+            ok, message, status, changed)
+
+
+def _approve_entry(g) -> _ActionResult:
+    """Submit a Draft JE in ERPNext and flip the row to `approved`."""
+    if g.state == 'approved':
+        return _ActionResult(True, 'Already approved', changed=False)
+    if g.state in ('rejected', 'reversed'):
+        return _ActionResult(False, f'Cannot approve a {g.state} entry', 409)
+    if g.state != 'pending_review':
+        return _ActionResult(False, f'Cannot approve from state “{g.state}”', 409)
     if not g.erpnext_journal_entry_name:
-        return False
+        return _ActionResult(False, 'No ERPNext Journal Entry to submit', 409)
     erp = sync_engine.get_erp_client_or_none()
     if erp is None:
-        return False
+        return _ActionResult(
+            False, 'ERPNext is not configured — check the connection', 503)
     try:
         categorization._submit_je(erp, g.erpnext_journal_entry_name)
-    except (ERPNextConfigError, ERPNextError):
-        return False
+    except (ERPNextConfigError, ERPNextError) as e:
+        # Surface the actual ERPNext reason — never fail silently (the v0.4.0.4 bug).
+        return _ActionResult(False, f'ERPNext refused the submit: {e}', 502)
     before = g.to_dict()
     g.state = 'approved'
+    g.error_message = None
     g.updated_at = categorization._now()
     audit.record('journal_entry_approved', subject_type='GeneratedJournalEntry',
                  subject_id=g.id, before=before, after=g.to_dict(),
@@ -2281,72 +2426,194 @@ def _approve_entry(g) -> bool:
                  subject_type='GeneratedJournalEntry', subject_id=g.id,
                  after={'journal_entry': g.erpnext_journal_entry_name},
                  notes='submitted via admin approve', commit=False)
-    return True
+    return _ActionResult(True, 'Approved — submitted in ERPNext')
 
 
-def _reject_entry(g) -> bool:
-    """Cancel the JE in ERPNext + mark rejected. Returns True on success."""
+def _reject_entry(g) -> _ActionResult:
+    """Flip the row to `rejected`. A JE that was already submitted (`approved`)
+    is cancelled in ERPNext first; a never-submitted Draft is simply abandoned
+    (left as a Draft — nothing to cancel)."""
+    if g.state == 'rejected':
+        return _ActionResult(True, 'Already rejected', changed=False)
+    if g.state == 'reversed':
+        return _ActionResult(False, 'Cannot reject a reversed entry', 409)
+    cancel_note = ''
+    if g.state == 'approved' and g.erpnext_journal_entry_name:
+        erp = sync_engine.get_erp_client_or_none()
+        if erp is None:
+            return _ActionResult(
+                False, 'ERPNext is not configured — cannot cancel a submitted '
+                'Journal Entry', 503)
+        try:
+            erp.call_method(
+                'frappe.client.cancel', http_method='POST',
+                json_body={'doctype': categorization.JOURNAL_ENTRY_DT,
+                           'name': g.erpnext_journal_entry_name})
+        except (ERPNextConfigError, ERPNextError) as e:
+            return _ActionResult(False, f'ERPNext refused the cancel: {e}', 502)
+        cancel_note = f'cancelled {g.erpnext_journal_entry_name} in ERPNext'
     before = g.to_dict()
     g.state = 'rejected'
     g.updated_at = categorization._now()
-    if g.erpnext_journal_entry_name:
-        erp = sync_engine.get_erp_client_or_none()
-        if erp is not None:
-            try:
-                erp.call_method(
-                    'frappe.client.cancel', http_method='POST',
-                    json_body={'doctype': categorization.JOURNAL_ENTRY_DT,
-                               'name': g.erpnext_journal_entry_name})
-            except (ERPNextConfigError, ERPNextError):
-                pass  # audit still flips to rejected; JE may already be cancelled
     audit.record('journal_entry_rejected', subject_type='GeneratedJournalEntry',
                  subject_id=g.id, before=before, after=g.to_dict(),
-                 notes='rejected via admin', commit=False)
-    return True
+                 notes=cancel_note or 'rejected via admin (Draft abandoned)',
+                 commit=False)
+    return _ActionResult(
+        True, 'Rejected' + (' — cancelled in ERPNext' if cancel_note else ''))
+
+
+def _reverse_entry(g) -> _ActionResult:
+    """Undo an approved (submitted) JE by booking a reversing entry in ERPNext
+    and flipping the row to `reversed`."""
+    if g.state == 'reversed':
+        return _ActionResult(True, 'Already reversed', changed=False)
+    if g.state != 'approved':
+        return _ActionResult(
+            False, 'Only an approved (submitted) entry can be reversed', 409)
+    if not g.erpnext_journal_entry_name:
+        return _ActionResult(False, 'No ERPNext Journal Entry to reverse', 409)
+    erp = sync_engine.get_erp_client_or_none()
+    if erp is None:
+        return _ActionResult(
+            False, 'ERPNext is not configured — check the connection', 503)
+    try:
+        rev = categorization._reverse_je(erp, g.erpnext_journal_entry_name)
+    except (ERPNextConfigError, ERPNextError) as e:
+        return _ActionResult(False, f'ERPNext refused the reversal: {e}', 502)
+    before = g.to_dict()
+    g.state = 'reversed'
+    g.updated_at = categorization._now()
+    audit.record('journal_entry_reversed', subject_type='GeneratedJournalEntry',
+                 subject_id=g.id, before=before, after=g.to_dict(),
+                 notes=f'reversed {g.erpnext_journal_entry_name}'
+                       + (f' → {rev}' if rev else ''), commit=False)
+    return _ActionResult(True, 'Reversed — booked a reversing entry in ERPNext')
+
+
+def _retry_entry(g) -> _ActionResult:
+    """Re-run the rules engine for a `skipped_missing_account` row now that the
+    operator has (presumably) created the missing account. On success the row
+    moves to `pending_review` with a fresh Draft JE."""
+    if g.state != 'skipped_missing_account':
+        return _ActionResult(
+            False, 'Only a skipped (missing account) entry can be retried', 409)
+    erp = sync_engine.get_erp_client_or_none()
+    if erp is None:
+        return _ActionResult(
+            False, 'ERPNext is not configured — check the connection', 503)
+    row = BankTransaction.query.filter_by(
+        plaid_transaction_id=g.plaid_transaction_id).first()
+    if row is None:
+        return _ActionResult(
+            False, 'Original bank transaction is no longer available', 409)
+    categorization.generate_journal_entry(erp, row)
+    db.session.refresh(g)
+    if g.state == 'pending_review' and g.erpnext_journal_entry_name:
+        return _ActionResult(True, 'Retried — Journal Entry generated, pending '
+                                   'review')
+    if g.state == 'skipped_missing_account':
+        return _ActionResult(
+            False, 'Still skipped — the account for this rule does not exist '
+            'under the transaction’s Company yet', 409)
+    return _ActionResult(True, f'Retried — now “{g.state}”')
+
+
+# The named action → handler map the endpoints and bulk route share.
+_ACTIONS = {'approve': _approve_entry, 'reject': _reject_entry,
+            'reverse': _reverse_entry, 'retry': _retry_entry}
+
+
+def _wants_json() -> bool:
+    """A fetch/XHR caller (the per-row JS) tags itself so it gets JSON; a plain
+    form POST (no-JS fallback) gets a redirect + flash."""
+    if request.headers.get('X-Requested-With') == 'fetch':
+        return True
+    accept = request.headers.get('Accept', '')
+    return 'application/json' in accept and 'text/html' not in accept
+
+
+def _entry_response(g, result: _ActionResult):
+    if _wants_json():
+        body = {'ok': result.ok, 'message': result.message,
+                'id': (g.id if g else None),
+                'state': (g.state if g else None)}
+        return jsonify(body), (200 if result.ok else result.status)
+    return redirect('/admin/generated_entries?flash=' + quote_plus(result.message))
+
+
+def _do_single(action: str):
+    raw_id = (request.form.get('id') or '').strip()
+    if not raw_id.isdigit():
+        return _entry_response(None, _ActionResult(False, 'Bad id', 400))
+    g = db.session.get(GeneratedJournalEntry, int(raw_id))
+    if g is None:
+        return _entry_response(None, _ActionResult(False, 'Not found', 404))
+    result = _ACTIONS[action](g)
+    db.session.commit()
+    return _entry_response(g, result)
 
 
 @bp.post('/admin/generated_entries/approve')
 def approve_entry():
-    raw_id = (request.form.get('id') or '').strip()
-    if not raw_id.isdigit():
-        return redirect('/admin/generated_entries?flash=' + quote_plus('Bad id'))
-    g = db.session.get(GeneratedJournalEntry, int(raw_id))
-    if g is None:
-        return redirect('/admin/generated_entries?flash=' + quote_plus('Not found'))
-    ok = _approve_entry(g)
-    db.session.commit()
-    msg = 'Approved (submitted in ERPNext)' if ok else 'Could not submit — check ERPNext connection'
-    return redirect('/admin/generated_entries?flash=' + quote_plus(msg))
+    return _do_single('approve')
 
 
 @bp.post('/admin/generated_entries/reject')
 def reject_entry():
-    raw_id = (request.form.get('id') or '').strip()
-    if not raw_id.isdigit():
-        return redirect('/admin/generated_entries?flash=' + quote_plus('Bad id'))
-    g = db.session.get(GeneratedJournalEntry, int(raw_id))
-    if g is None:
-        return redirect('/admin/generated_entries?flash=' + quote_plus('Not found'))
-    _reject_entry(g)
-    db.session.commit()
-    return redirect('/admin/generated_entries?flash=' + quote_plus('Rejected'))
+    return _do_single('reject')
+
+
+@bp.post('/admin/generated_entries/reverse')
+def reverse_entry():
+    return _do_single('reverse')
+
+
+@bp.post('/admin/generated_entries/retry')
+def retry_entry():
+    return _do_single('retry')
 
 
 @bp.post('/admin/generated_entries/bulk')
 def bulk_entries():
+    """Apply one action to many rows. Explicit `ids` (the checkbox selection)
+    win; with none checked, `approve`/`reject` fall back to every pending row
+    (the "all pending" convenience buttons). Partial success is reported — a
+    failure on one row never rolls back the rows that succeeded."""
     action = (request.form.get('action') or '').strip()
-    pending = GeneratedJournalEntry.query.filter(
-        GeneratedJournalEntry.state == 'pending_review',
-        GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None)).all()
-    n = 0
-    for g in pending:
-        if action == 'approve' and _approve_entry(g):
-            n += 1
-        elif action == 'reject' and _reject_entry(g):
-            n += 1
+    handler = _ACTIONS.get(action)
+    if handler is None:
+        return _entry_response(None, _ActionResult(
+            False, f'Unknown bulk action “{action}”', 400))
+    ids = [int(i) for i in request.form.getlist('ids') if i.isdigit()]
+    if ids:
+        rows = (GeneratedJournalEntry.query
+                .filter(GeneratedJournalEntry.id.in_(ids))
+                .order_by(GeneratedJournalEntry.id).all())
+    else:
+        rows = (GeneratedJournalEntry.query
+                .filter(GeneratedJournalEntry.state == 'pending_review')
+                .order_by(GeneratedJournalEntry.id).all())
+    done = failed = 0
+    failures = []
+    for g in rows:
+        result = handler(g)
+        if result.ok:
+            done += 1
+        else:
+            failed += 1
+            failures.append({'id': g.id, 'message': result.message})
     db.session.commit()
-    verb = 'Approved' if action == 'approve' else 'Rejected'
-    return redirect('/admin/generated_entries?flash=' + quote_plus(f'{verb} {n} entr(ies)'))
+    verb = {'approve': 'Approved', 'reject': 'Rejected',
+            'reverse': 'Reversed', 'retry': 'Retried'}.get(action, action)
+    summary = f'{verb} {done} entr{"y" if done == 1 else "ies"}'
+    if failed:
+        summary += f' · {failed} failed'
+    if _wants_json():
+        return jsonify({'ok': failed == 0, 'action': action, 'done': done,
+                        'failed': failed, 'failures': failures,
+                        'message': summary}), 200
+    return redirect('/admin/generated_entries?flash=' + quote_plus(summary))
 
 
 # ── Audit trail ──────────────────────────────────────────────────

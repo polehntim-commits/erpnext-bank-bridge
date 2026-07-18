@@ -287,9 +287,10 @@ class TestGeneratedEntriesUi(AdminBase):
         r = self.client.post('/admin/generated_entries/approve',
                              data={'id': str(g.id)}, follow_redirects=True)
         db.session.refresh(g)
-        # ERPNext not configured → cannot submit → stays pending.
+        # ERPNext not configured → cannot submit → stays pending, and the reason
+        # is surfaced (not a silent no-op — the v0.4.0.5 fix).
         self.assertEqual(g.state, 'pending_review')
-        self.assertIn(b'Could not submit', r.data)
+        self.assertIn(b'ERPNext is not configured', r.data)
 
 
 class TestRuleBuilderAutocomplete(AdminBase):

@@ -221,6 +221,31 @@ empty, with the leftover ` - ` separators compacted away so the remark always
 reads cleanly. Existing rules are unchanged: a rule with a template keeps it, and
 a blank template still yields the same default remark.
 
+**v0.4.0.5** — **fixes the Generated Journal Entries approval workflow**, which
+silently did nothing. **Approve** submitted a bare `{doctype, name}` stub to
+ERPNext's `frappe.client.submit`, and because that method submits *the object it
+is handed* (it does not reload the record), ERPNext was asked to submit an empty
+Journal Entry — no accounts, nothing that balances — which it rejected. The JE
+stayed **Draft**, the local row stayed `pending_review`, and the only feedback
+was a generic "could not submit." The fix **fetches the stored Journal Entry
+first and submits that**, so the accounts, company and totals ERPNext validates
+are the ones already on the record (Draft → Submitted). Every failure now
+**surfaces the actual ERPNext reason** instead of failing silently. The page
+gains a proper **state machine** — `pending_review → approved` (submit),
+`pending_review → rejected` (Draft abandoned), `approved → rejected` (cancels the
+submitted JE), `approved → reversed` (books an offsetting **Reverse** entry to
+undo an approval), and `skipped_missing_account → pending_review` (**Retry** once
+its account exists) — with guards (you can't approve a rejected entry) and
+idempotent re-clicks. **Approve/Reject/Reverse/Retry** each POST to their own
+endpoint; a checkbox column plus **Approve selected / Reject selected** apply an
+action to many rows at once (nothing checked = all pending) with **partial-
+success reporting** so one failure never rolls back the rows that succeeded.
+Actions refresh **just their row** (JSON response, no full-page reload) and fall
+back to a plain form POST + flash without JavaScript. Every transition records an
+audit event (`journal_entry_approved` / `_rejected` / `_reversed` /
+`_submitted_to_erpnext`). Existing `pending_review` entries approve normally after
+the upgrade — no migration.
+
 ## How it works
 
 1. **Link a bank once** through Plaid Link (`/admin/link_bank`). OAuth-only

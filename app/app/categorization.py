@@ -567,9 +567,46 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
 # ── generation (the write path) ────────────────────────────────────────
 
 def _submit_je(client, name: str) -> None:
+    """Submit an existing Draft Journal Entry, by name, in ERPNext.
+
+    `frappe.client.submit` submits the *document object it is handed* — it does
+    NOT reload the record from the database. Handing it a bare
+    ``{doctype, name}`` stub therefore asks Frappe to submit an empty Journal
+    Entry: no accounts, nothing that balances. Frappe rejects that, so the real
+    JE silently stays Draft and the local row never leaves ``pending_review``.
+    That stub was the root cause of the v0.4.0.4 "Approve does nothing" bug.
+
+    Fetch the stored document first, then submit *that* full payload so the
+    accounts, company and totals Frappe validates are the ones already on the
+    record."""
+    doc = client.get_doc(JOURNAL_ENTRY_DT, name)
+    if not doc:
+        raise ERPNextAPIError(
+            f'Journal Entry {name} not found in ERPNext', status_code=404)
+    # A freshly-fetched doc already carries its `name`; set it defensively so
+    # the submit is unambiguous even if a caller passed a trimmed dict.
+    doc = {**doc, 'name': name, 'doctype': JOURNAL_ENTRY_DT}
     client.call_method('frappe.client.submit', http_method='POST',
-                       json_body={'doc': json.dumps(
-                           {'doctype': JOURNAL_ENTRY_DT, 'name': name})})
+                       json_body={'doc': json.dumps(doc)})
+
+
+def _reverse_je(client, name: str):
+    """Book a reversing Journal Entry for an already-submitted JE and return the
+    new reverse JE's name (or None). Uses ERPNext's own reversal helper so the
+    reverse mirrors the original's accounts/party with debits and credits
+    swapped, then inserts the returned draft. This is the `approved → reversed`
+    "undo" — the original submitted JE is left intact for the audit trail."""
+    rev = client.call_method(
+        'erpnext.accounts.doctype.journal_entry.journal_entry.'
+        'make_reverse_journal_entry', http_method='POST',
+        json_body={'source_name': name})
+    if not isinstance(rev, dict):
+        raise ERPNextAPIError(
+            f'ERPNext returned no reversing entry for {name}', status_code=None)
+    rev.pop('name', None)          # let ERPNext autoname the fresh draft
+    rev['doctype'] = JOURNAL_ENTRY_DT
+    created = client.create_doc(JOURNAL_ENTRY_DT, rev)
+    return created.get('name') if isinstance(created, dict) else None
 
 
 def _default_company() -> str:
