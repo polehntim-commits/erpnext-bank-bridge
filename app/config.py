@@ -333,6 +333,24 @@ class Config:
     ERPNEXT_LOANS_ADVANCES_GROUP_NAME = os.environ.get(
         'ERPNEXT_LOANS_ADVANCES_GROUP_NAME', 'Loans and Advances (Assets)')
 
+    # ── v0.4.2 · opening balances (see app/opening_balance.py) ────────────
+    # Every real bank account already holds something on the day you link it.
+    # Without booking that, ERPNext reports "movement since Bank Bridge started
+    # tracking" instead of the account's actual position — which reads as a
+    # negative asset on any account whose recent activity is net-negative.
+    # On by default: an unbooked opening balance is a wrong balance sheet, and
+    # the entry lands in `pending_review` for approval, so nothing posts unseen.
+    AUTO_BOOK_OPENING_BALANCE = _bool('AUTO_BOOK_OPENING_BALANCE', True)
+    # Posting date for auto-booked opening balances: an ISO date (YYYY-MM-DD) to
+    # backdate them to e.g. a fiscal year start, or 'today'/blank for today.
+    # An unparseable value falls back to today with a warning.
+    OPENING_BALANCE_DATE = os.environ.get('OPENING_BALANCE_DATE', '').strip()
+    # The Equity leaf every opening balance is offset against, auto-created under
+    # the owning Company's Equity root when the chart doesn't ship one.
+    OPENING_BALANCE_EQUITY_ACCOUNT_NAME = os.environ.get(
+        'OPENING_BALANCE_EQUITY_ACCOUNT_NAME', 'Opening Balance Equity').strip() \
+        or 'Opening Balance Equity'
+
     # Set false to disable the in-process scheduler entirely (e.g. drive syncs by
     # cron hitting /api/sync/plaid_now instead). Distinct from MANUAL-ONLY above:
     # this stops the scheduler process; MANUAL-ONLY runs it with no poll job.

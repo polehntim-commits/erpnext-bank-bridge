@@ -105,6 +105,18 @@ class PlaidAccount(db.Model):
     # flips off if an account is ever reclassified to a depository type.
     balance_only = db.Column(db.Boolean, default=False, index=True)
     sync_enabled = db.Column(db.Boolean, default=True)
+    # v0.4.2 · the GeneratedJournalEntry holding this account's opening balance —
+    # what it already held on the day it was linked (see app/opening_balance.py).
+    # Denormalized so the Accounts page can render an "Opening Balance" column
+    # without a join; the authoritative lookup is still the synthetic
+    # `opening-balance:<account_id>` key on that table, which is UNIQUE and is
+    # therefore what actually prevents double-booking. NULL = never booked, which
+    # is every account on a pre-v0.4.2 install (the backfill script fixes those).
+    #
+    # Deliberately NOT a db.ForeignKey, matching bank_transactions.
+    # intercompany_pair_id: rejecting an opening balance KEEPS the row as the
+    # record of that decision, so the two lifetimes are independent.
+    opening_balance_je_id = db.Column(db.Integer, nullable=True, index=True)
     # One-click-import lifecycle (see app/erpnext_accounts.py):
     #   pending     — never auto-imported (the default / freshly linked)
     #   imported    — a matching ERPNext Bank Account was created/found + linked
@@ -129,6 +141,7 @@ class PlaidAccount(db.Model):
             'owning_company': self.owning_company,
             'balance_only': bool(self.balance_only),
             'sync_enabled': bool(self.sync_enabled),
+            'opening_balance_je_id': self.opening_balance_je_id,
             'import_status': self.import_status or 'pending',
         }
 

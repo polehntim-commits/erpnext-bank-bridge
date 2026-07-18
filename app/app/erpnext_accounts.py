@@ -1891,13 +1891,25 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
     account.import_status = 'imported'
     db.session.commit()
 
+    # v0.4.2: book what the account ALREADY HELD at this moment. Deferred import
+    # because opening_balance imports this module for its chart-walking helpers.
+    # Best-effort by construction — book_opening_balance never raises, so a
+    # chart-of-accounts problem leaves a linked, working account with no opening
+    # balance rather than unwinding the import that just landed.
+    from . import opening_balance
+    opening = opening_balance.book_if_enabled(client, account)
+
     verb = 'created' if created_account else 'linked existing'
     msg = f'{verb} Bank Account {docname} under Bank {bank_name}'
+    if opening and opening['status'] == 'booked':
+        msg += f'; {opening["message"]}'
+    elif opening and opening['status'] == 'error':
+        msg += f'; opening balance not booked ({opening["message"]})'
     _log(account.item_id, 1, 'success', msg)
     log.info('import: %s → %s', account.account_id, docname)
     return {'status': 'imported', 'bank_account': docname, 'bank': bank_name,
             'created_account': created_account, 'created_bank': created_bank,
-            'retried': retried, 'message': msg}
+            'retried': retried, 'opening_balance': opening, 'message': msg}
 
 
 def _bank_exists(client: ERPNextClient, bank_name: str) -> bool:
@@ -1965,7 +1977,8 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
                     exc_info=True)
 
     stats = {'created': 0, 'unsupported': 0, 'skipped_mapped': 0,
-             'retried': 0, 'failed': 0, 'considered': 0, 'errors': []}
+             'retried': 0, 'failed': 0, 'considered': 0,
+             'opening_balances': 0, 'errors': []}
     for account in PlaidAccount.query.order_by(PlaidAccount.name).all():
         if account.erpnext_bank_account_name:
             stats['skipped_mapped'] += 1
@@ -1984,6 +1997,9 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
                 stats['created'] += 1
                 if result.get('retried'):
                     stats['retried'] += 1
+                opening = result.get('opening_balance') or {}
+                if opening.get('status') == 'booked':
+                    stats['opening_balances'] += 1
         except (ERPNextAPIError, ERPNextError) as e:
             db.session.rollback()
             stats['failed'] += 1
@@ -2000,6 +2016,9 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
         parts.append(f"skipped {stats['unsupported']} unsupported")
     if stats['retried']:
         parts.append(f"{stats['retried']} retried successfully")
+    if stats['opening_balances']:
+        parts.append(f"{stats['opening_balances']} opening balance(s) booked "
+                     f"pending review")
     if stats['failed']:
         parts.append(f"{stats['failed']} failed")
     stats['summary'] = ', '.join(parts) + '.'

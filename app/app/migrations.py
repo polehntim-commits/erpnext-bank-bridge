@@ -86,6 +86,12 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # rule booking one leg of every intercompany move to P&L — exactly the bug
     # v0.4.1 exists to fix — so the safe backfill is the protective value.
     ('categorization_rules', 'ignore_for_paired', 'BOOLEAN DEFAULT true'),
+    # v0.4.2 — opening balances. Points at the GeneratedJournalEntry booking what
+    # the account already held when it was linked (see app/opening_balance.py).
+    # Backfills to NULL = "no opening balance booked", which is true of every
+    # account on a pre-v0.4.2 install; scripts/backfill_opening_balances.py is
+    # the one-shot that estimates and books them.
+    ('plaid_accounts', 'opening_balance_je_id', 'INTEGER'),
 ]
 
 

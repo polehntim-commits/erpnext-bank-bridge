@@ -28,6 +28,7 @@ from .. import erpnext_accounts
 from .. import erpnext_bank
 from .. import erpnext_settings as erps
 from .. import intercompany
+from .. import opening_balance as obal
 from .. import plaid_settings as ps
 from .. import sync_config
 from .. import sync_engine
@@ -128,6 +129,7 @@ BASE_CSS = """
  .pill-ok{background:#c8e6c9;color:#1b5e20}
  .pill-err{background:#ffcdd2;color:#b71c1c}
  .pill-muted{background:#eee;color:#555}
+ .pill-warn{background:#ffe6a7;color:#8a5a00}
  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 """
 
@@ -529,6 +531,56 @@ def link_bank_page():
 
 # ── Accounts (ERPNext Bank Account mapping) ──────────────────────
 
+def _opening_balance_cell(a) -> str:
+    """The Opening Balance column for one account: a state pill, plus a Book
+    button whenever booking one is the useful next action.
+
+    An account with no opening balance is reporting "movement since we started
+    tracking" rather than what it holds, so `none` is rendered as a prompt, not
+    as a neutral dash — that gap is exactly the thing v0.4.2 exists to close."""
+    status = obal.opening_balance_status(a)
+    entry = obal.existing_entry(a)
+    amount = f' · {entry.amount:,.2f}' if entry and entry.amount else ''
+    pills = {
+        'booked': ('pill-ok', 'booked' + amount,
+                   'Submitted in ERPNext — the balance sheet includes it'),
+        'pending': ('pill-muted', 'pending review' + amount,
+                    'A Draft Journal Entry is waiting for approval on the '
+                    'Generated Journal Entries page'),
+        'rejected': ('pill-muted', 'rejected',
+                     'You rejected this opening balance; Book again to replace it'),
+        'reversed': ('pill-muted', 'reversed', 'The opening balance was undone'),
+        'error': ('pill-err', 'error',
+                  (entry.error_message or '')[:200] if entry else ''),
+    }
+    if status == 'none':
+        cls, label, title = ('pill-warn', 'not booked',
+                             "This account's balance sheet shows only movement "
+                             'since it was linked, not what it actually holds')
+    else:
+        cls, label, title = pills.get(status, ('pill-muted', status, ''))
+    t = f' title="{title}"' if title else ''
+    out = f'<span class="pill {cls}"{t}>{label}</span>'
+    # Booking is offered when there's nothing booked yet, when the previous
+    # attempt errored, or to replace a rejection — never over a live entry.
+    if status in ('none', 'error', 'rejected') and a.erpnext_gl_account_name:
+        verb = 'Book' if status == 'none' else 'Book again'
+        out += (
+            f'<form method="post" '
+            f'action="/api/accounts/{a.account_id}/book_opening_balance" '
+            f'style="display:flex;gap:4px;align-items:center;margin:4px 0 0">'
+            f'<input type="text" name="amount" placeholder="'
+            f'{(a.balance_current if a.balance_current is not None else 0):.2f}" '
+            f'style="width:78px;padding:3px;font-size:12px" '
+            f'title="Override the amount — blank uses the current Plaid balance">'
+            f'<input type="date" name="posting_date" '
+            f'style="width:120px;padding:3px;font-size:12px" '
+            f'title="Backdate the entry — blank uses OPENING_BALANCE_DATE">'
+            f'<button type="submit" class="secondary" '
+            f'style="padding:3px 8px;font-size:12px">{verb}</button></form>')
+    return out
+
+
 ACCOUNTS_BODY = """
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
   <h2 style="margin:0">Linked banks</h2>
@@ -597,7 +649,8 @@ ACCOUNTS_BODY = """
 </div>
 <table>
   <tr><th>Account</th><th>Mask</th><th>Type</th><th class="num">Balance</th>
-      <th>ERPNext Bank Account</th><th>Import</th><th>Company</th></tr>
+      <th>ERPNext Bank Account</th><th>Import</th><th>Opening Balance</th>
+      <th>Company</th></tr>
   {% for a in grp.accounts %}
   <tr>
     <td>{{ a.name or a.official_name or '(unnamed)' }}</td>
@@ -641,6 +694,7 @@ ACCOUNTS_BODY = """
         <span class="pill pill-muted" title="Not a Bank Account in ERPNext's model">not supported</span>
       {% endif %}
     </td>
+    <td style="white-space:nowrap">{{ opening_cell(a)|safe }}</td>
     <td>
       {% if companies %}
       <form method="post" action="/api/accounts/{{ a.account_id }}/set_company"
@@ -698,6 +752,7 @@ def accounts_page():
     return _page(ACCOUNTS_BODY, page='accounts', groups=groups,
                  bank_accounts=bank_accounts, bank_account_names=bank_account_names,
                  supported_map=supported_map, any_imported=any_imported,
+                 opening_cell=_opening_balance_cell,
                  erpnext_ok=erps.is_configured(), companies=companies,
                  bootstrap_unavailable=sorted(
                      erpnext_accounts.unavailable_doctypes()),
@@ -851,6 +906,50 @@ def set_account_company(plaid_account_id):
     else:
         msg = f'{acct.name or acct.mask} reverted to inherit its bank’s Company'
     return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
+@bp.post('/api/accounts/<plaid_account_id>/book_opening_balance')
+def book_opening_balance_route(plaid_account_id):
+    """Book (or re-book) one account's opening balance by hand — v0.4.2.
+
+    The auto-booking at import time covers the normal case; this is for accounts
+    linked before v0.4.2, for a Plaid balance the operator wants to override with
+    what a real statement says, and for backdating to a fiscal year start. Both
+    `amount` and `posting_date` are optional: blank falls back to the account's
+    cached Plaid balance and to OPENING_BALANCE_DATE respectively.
+
+    Re-booking is deliberately allowed only over a `rejected` entry — a pending
+    or approved opening balance is left alone, because replacing one silently
+    would mean two equity entries for the same account."""
+    acct = PlaidAccount.query.filter_by(account_id=plaid_account_id).first()
+    if acct is None:
+        return redirect('/admin/accounts?flash=' + quote_plus('Account not found'))
+    raw_amount = (request.form.get('amount') or '').strip()
+    amount = None
+    if raw_amount:
+        try:
+            amount = float(raw_amount.replace(',', '').replace('$', ''))
+        except ValueError:
+            return redirect('/admin/accounts?flash=' + quote_plus(
+                f'“{raw_amount}” is not a number — leave it blank to use the '
+                f'current Plaid balance.'))
+    raw_date = (request.form.get('posting_date') or '').strip()
+    posting_date = None
+    if raw_date:
+        try:
+            posting_date = date.fromisoformat(raw_date)
+        except ValueError:
+            return redirect('/admin/accounts?flash=' + quote_plus(
+                f'“{raw_date}” is not a date (YYYY-MM-DD).'))
+    erp = sync_engine.get_erp_client_or_none()
+    if erp is None:
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'ERPNext is not configured — check the connection first.'))
+    result = obal.book_opening_balance(erp, acct, amount=amount,
+                                       posting_date=posting_date, force=True)
+    label = acct.name or acct.mask or acct.account_id
+    return redirect('/admin/accounts?flash=' + quote_plus(
+        f'{label}: {result["message"]}'))
 
 
 @bp.post('/admin/items/<item_id>/set_company')
@@ -2484,7 +2583,11 @@ GENERATED_BODY = """
     <td style="font-size:12px">{{ g.created_at.strftime('%Y-%m-%d %H:%M') if g.created_at else '' }}</td>
     <td>{{ g.merchant_name }}<div style="font-size:11px;color:#888">{{ (g.description or '')[:60] }}</div></td>
     <td class="num">{{ '%.2f'|format(g.amount or 0.0) }}</td>
-    <td style="font-size:12px">{{ g.rule_name }}</td>
+    <td style="font-size:12px">
+      {% if is_opening(g) %}<span class="pill pill-warn"
+        title="Not a transaction — what this account already held when it was
+linked. Approving it corrects the account's balance sheet position."
+        >opening balance</span>{% else %}{{ g.rule_name }}{% endif %}</td>
     <td style="font-size:12px">{% if g.erpnext_journal_entry_name %}<code>{{ g.erpnext_journal_entry_name }}</code>{% else %}—{% endif %}
       {% if g.error_message %}<div style="color:#a04000">{{ g.error_message[:100] }}</div>{% endif %}</td>
     <td class="je-state-cell">{{ state_pill(g.state)|safe }}</td>
@@ -2591,6 +2694,7 @@ def generated_entries_page():
     return _page(GENERATED_BODY, page='generated_entries', rows=rows,
                  cur_state=cur_state, limit=limit,
                  state_pill=_state_pill, row_actions=_row_action_buttons,
+                 is_opening=obal.is_opening_balance_entry,
                  states=('pending_review', 'approved', 'rejected', 'reversed',
                          'error', 'blocked', 'skipped_missing_account'),
                  flash_msg=request.args.get('flash', ''))
