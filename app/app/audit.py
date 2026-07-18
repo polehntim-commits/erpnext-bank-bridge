@@ -56,6 +56,10 @@ EVENT_TYPES = (
     'fuzzy_match_rejected_by_user',
     # v0.3.5 — boot-time self-heal of postgres app-role password drift
     'db_auth_recovered',
+    # v0.4.7 — operator disconnected a bank via Plaid /item/remove. Permanent,
+    # like every event here: the Item row survives the disconnect, so this line
+    # is the record of WHO stopped the feed and WHEN.
+    'item_disconnected',
 )
 
 SUBJECT_TYPES = ('Supplier', 'CategorizationRule', 'GeneratedJournalEntry',

@@ -70,8 +70,12 @@ Because you host it, you are in full control:
 
 - **Delete everything** by removing the Umbrel app (which removes its data
   volume) or by wiping/dropping the Postgres database.
-- **Disconnect a bank** by removing the linked item; you can also revoke the
-  connection from your bank or from Plaid directly.
+- **Disconnect a bank** with the *Disconnect this bank* button on
+  `/admin/accounts`. This calls Plaid's `/item/remove`, which invalidates the
+  access token so Plaid stops pulling from that institution. Your existing
+  transactions and the Journal Entries generated from them are **kept** — the
+  disconnect stops the future feed, it does not erase history. You can also
+  revoke the connection from your bank or from Plaid directly.
 - **Export or inspect** anything at any time — it is your database.
 
 ## Contact

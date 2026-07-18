@@ -17,6 +17,7 @@ Pages:
   /admin/sync_log       — recent PlaidSyncLog rows
 """
 import hmac
+import logging
 from datetime import date, datetime, timezone
 from urllib.parse import quote_plus
 
@@ -27,6 +28,7 @@ from werkzeug.security import check_password_hash
 from .. import audit
 from .. import categorization
 from .. import counterparty
+from .. import crypto
 from .. import db
 from .. import erpnext_accounts
 from .. import erpnext_bank
@@ -38,9 +40,12 @@ from .. import rule_stats
 from .. import sync_config
 from .. import sync_engine
 from ..erpnext_client import ERPNextConfigError, ERPNextError
+from ..plaid_client import PlaidConfigError, PlaidError
 from ..models import (AuditEvent, BankTransaction, CategorizationRule,
                       GeneratedJournalEntry, IntercompanyTransferPair,
                       PlaidAccount, PlaidItem, PlaidSyncLog, Supplier)
+
+log = logging.getLogger('bankbridge.admin_ui')
 
 bp = Blueprint('admin_ui', __name__)
 
@@ -629,7 +634,24 @@ ACCOUNTS_BODY = """
 
 {% for grp in groups %}
 <h3 style="margin-bottom:2px">{{ grp.item.institution_name or '(unknown institution)' }}
-  <span style="font-weight:400;color:#888;font-size:13px">· {{ grp.item.item_id[:14] }}…</span></h3>
+  <span style="font-weight:400;color:#888;font-size:13px">· {{ grp.item.item_id[:14] }}…</span>
+  {% if grp.item.disconnected %}
+  <span class="pill pill-muted" style="vertical-align:middle;margin-left:6px"
+        title="Disconnected at Plaid on {{ grp.item.disconnected_at.strftime('%Y-%m-%d %H:%M') if grp.item.disconnected_at else 'an earlier date' }} — no new transactions will arrive. Existing data is retained.">🔌 Disconnected</span>
+  {% else %}
+  <!-- Data attributes + delegation rather than an inline onclick: an
+       institution name is arbitrary text, and interpolating it into a JS string
+       inside an HTML attribute breaks the moment it contains a quote. Jinja's
+       autoescaping handles attribute VALUES correctly, so this shape can't be
+       broken by the bank's name. -->
+  <button type="button" class="secondary"
+          style="vertical-align:middle;margin-left:8px;padding:3px 10px;font-size:12px"
+          data-bb-disconnect="{{ grp.item.item_id }}"
+          data-bb-name="{{ grp.item.institution_name or 'this bank' }}">
+    Disconnect this bank
+  </button>
+  {% endif %}
+</h3>
 <div style="margin:0 0 8px;font-size:13px;color:#555">
   Owning Company: <b>{{ grp.item.owning_company or '(unassigned — uses ERPNext default)' }}</b>
   {% if companies %}
@@ -726,6 +748,82 @@ ACCOUNTS_BODY = """
 </table>
 {% endfor %}
 {% if not groups %}<p style="color:#888">No accounts yet — <a href="/admin/link_bank">link a bank</a>.</p>{% endif %}
+
+<!-- v0.4.7 · disconnect confirmation. One modal for the whole page; the button
+     on each bank's header fills in the institution name before showing it.
+     Disconnecting is irreversible (Plaid invalidates the access_token), so it
+     is deliberately a two-step action and the copy says plainly what is and is
+     NOT destroyed. -->
+<div id="bbDisconnectModal"
+     style="display:none;position:fixed;inset:0;z-index:100;
+            background:rgba(0,0,0,.45);align-items:center;justify-content:center">
+  <div class="card" style="max-width:520px;margin:0;background:#fff">
+    <h2 style="margin-top:0;font-size:19px">Disconnect <span id="bbDiscName">this bank</span>?</h2>
+    <p style="font-size:14px;color:#444;line-height:1.5">
+      Plaid will stop sending new transactions. Your existing transactions and
+      generated Journal Entries stay in ERPNext. You can re-link this bank later.
+    </p>
+    <div id="bbDiscError"
+         style="display:none;font-size:13px;color:#a00;background:#fff3f3;
+                border:1px solid #f0caca;border-radius:6px;padding:8px 10px;
+                margin:10px 0"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
+      <button type="button" class="secondary" id="bbDiscCancel"
+              style="padding:6px 16px" onclick="bbDisconnectClose()">Cancel</button>
+      <button type="button" class="primary" id="bbDiscGo"
+              style="padding:6px 16px">Disconnect</button>
+    </div>
+  </div>
+</div>
+<script>
+var bbDiscItem = null;
+document.addEventListener('click', function (e) {
+  var t = e.target;
+  while (t && t !== document && !(t.getAttribute && t.getAttribute('data-bb-disconnect'))) {
+    t = t.parentNode;
+  }
+  if (t && t.getAttribute && t.getAttribute('data-bb-disconnect')) {
+    bbDisconnect(t.getAttribute('data-bb-disconnect'),
+                 t.getAttribute('data-bb-name'));
+  }
+});
+function bbDisconnect(itemId, name) {
+  bbDiscItem = itemId;
+  document.getElementById('bbDiscName').textContent = name || 'this bank';
+  var err = document.getElementById('bbDiscError');
+  err.style.display = 'none'; err.textContent = '';
+  var go = document.getElementById('bbDiscGo');
+  go.disabled = false; go.textContent = 'Disconnect';
+  document.getElementById('bbDisconnectModal').style.display = 'flex';
+}
+function bbDisconnectClose() {
+  document.getElementById('bbDisconnectModal').style.display = 'none';
+  bbDiscItem = null;
+}
+document.getElementById('bbDiscGo').addEventListener('click', function () {
+  if (!bbDiscItem) return;
+  var go = this, err = document.getElementById('bbDiscError');
+  go.disabled = true; go.textContent = 'Disconnecting…';
+  err.style.display = 'none';
+  fetch('/api/items/' + encodeURIComponent(bbDiscItem) + '/disconnect', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({reason: 'disconnected from the Accounts page'})
+  }).then(function (r) { return r.json().catch(function () { return {}; }); })
+    .then(function (d) {
+      if (d && d.ok) { window.location = '/admin/accounts?flash=' + encodeURIComponent(d.message || 'Bank disconnected.'); return; }
+      // Leave the modal open on failure — the Item is still connected, and the
+      // operator needs to see why rather than have the dialog vanish.
+      err.textContent = (d && d.error) || 'Could not disconnect this bank.';
+      err.style.display = 'block';
+      go.disabled = false; go.textContent = 'Disconnect';
+    }).catch(function () {
+      err.textContent = 'Could not reach Bank Bridge. Nothing was disconnected.';
+      err.style.display = 'block';
+      go.disabled = false; go.textContent = 'Disconnect';
+    });
+});
+</script>
 """
 
 
@@ -983,6 +1081,85 @@ def set_item_company(item_id):
     else:
         msg = f'{label} owning Company cleared (accounts use the ERPNext default)'
     return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
+@bp.post('/api/items/<plaid_item_id>/disconnect')
+def disconnect_item(plaid_item_id):
+    """Disconnect a linked bank: call Plaid /item/remove, then mark the Item
+    locally (v0.4.7).
+
+    This is the code behind the promise in PRIVACY.md — "Disconnect a bank by
+    removing the linked item" — and the capability Plaid's production review
+    checks for.
+
+    What it deliberately does NOT do is delete anything. The PlaidItem, its
+    PlaidAccounts, every mirrored BankTransaction and every GeneratedJournalEntry
+    stay exactly where they are, and the Journal Entries already pushed to
+    ERPNext are untouched. Disconnecting stops the FUTURE feed; the books keep
+    their history. Re-linking the bank later mints a brand-new Item (Plaid issues
+    a new item_id + access_token) and leaves this row alone as the record of the
+    old link.
+
+    ORDER MATTERS: Plaid is called FIRST and the local flag is only written if
+    it succeeded. The reverse order would leave an Item marked disconnected
+    locally while Plaid happily kept the token alive — the app would stop
+    syncing it, so nobody would notice the bank was still connected upstream,
+    which is precisely the state the disconnect exists to prevent.
+
+    Lives in admin_ui (not the public api blueprint) so it inherits this
+    blueprint's admin-auth before_request: /item/remove is irreversible and
+    billable, and must never be reachable unauthenticated.
+
+    Returns JSON either way — the confirmation modal posts via fetch()."""
+    it = PlaidItem.query.filter_by(item_id=plaid_item_id).first()
+    if it is None:
+        return jsonify({'ok': False, 'error': 'No such linked bank.'}), 404
+    if it.disconnected:
+        return jsonify({
+            'ok': False,
+            'error': f'{it.institution_name or plaid_item_id} is already '
+                     'disconnected.'}), 409
+
+    reason = (request.form.get('reason')
+              or (request.get_json(silent=True) or {}).get('reason')
+              or 'operator requested disconnect').strip()
+
+    try:
+        access_token = crypto.decrypt(it.access_token_encrypted)
+    except Exception as e:  # noqa: BLE001 - unreadable token, surface it
+        log.warning('disconnect: could not decrypt token for %s: %s',
+                    plaid_item_id, e)
+        return jsonify({'ok': False,
+                        'error': 'Could not read the stored access token for '
+                                 'this bank.'}), 500
+
+    try:
+        sync_engine.get_plaid_client().item_remove(access_token)
+    except (PlaidError, PlaidConfigError) as e:
+        log.warning('disconnect: Plaid refused /item/remove for %s: %s',
+                    plaid_item_id, e)
+        # Left CONNECTED on purpose — see the order note above.
+        return jsonify({'ok': False,
+                        'error': f'Plaid could not disconnect this bank: {e}'}), 502
+
+    before = it.to_dict()
+    it.disconnected = True
+    # Timezone-aware, matching models._now() — every other timestamp column on
+    # this table is aware, and mixing naive values into the same table makes
+    # later comparisons raise.
+    it.disconnected_at = datetime.now(timezone.utc)
+    db.session.commit()
+    audit.record('item_disconnected', subject_type='PlaidItem',
+                 subject_id=it.item_id, before=before, after=it.to_dict(),
+                 notes=(f'Disconnected {it.institution_name or it.item_id} via '
+                        f'Plaid /item/remove — {reason}. Accounts, transactions '
+                        'and generated Journal Entries retained.'))
+    label = it.institution_name or it.item_id
+    return jsonify({'ok': True, 'item_id': it.item_id,
+                    'disconnected_at': it.disconnected_at.isoformat(),
+                    'message': f'{label} disconnected. Plaid will stop sending '
+                               'new transactions; your existing data is '
+                               'unchanged.'})
 
 
 # ── Transactions ─────────────────────────────────────────────────

@@ -37,6 +37,22 @@ class PlaidItem(db.Model):
     # the operator didn't pick one) — the push path then resolves it to the
     # ERPNext default Company, so existing single-company installs are unchanged.
     owning_company = db.Column(db.String(140), nullable=True)
+    # v0.4.7 · operator-initiated disconnect (Plaid /item/remove). Set together:
+    # once `disconnected` is true the access_token no longer exists at Plaid, so
+    # every outbound call for this Item would fail — the sync loop skips it (see
+    # sync_engine.sync_all) and the UI badges it.
+    #
+    # This is deliberately a SEPARATE flag rather than a fourth `status` value:
+    # status describes the health of a LIVE link (active/error/revoked) and is
+    # written by the sync path, while this records a permanent operator decision.
+    # Overloading status would let a sync error silently clear the disconnect.
+    #
+    # The row itself is never deleted — the accounts, transactions and generated
+    # Journal Entries under it stay queryable forever, which is the whole point:
+    # disconnecting stops future pulls, it does not erase history.
+    disconnected = db.Column(db.Boolean, default=False, nullable=False,
+                             index=True)
+    disconnected_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=_now)
     last_synced_at = db.Column(db.DateTime, nullable=True)
     last_error = db.Column(db.Text, nullable=True)
@@ -55,6 +71,9 @@ class PlaidItem(db.Model):
             'has_cursor': bool(self.cursor),
             'status': self.status,
             'owning_company': self.owning_company,
+            'disconnected': bool(self.disconnected),
+            'disconnected_at': (self.disconnected_at.isoformat()
+                                if self.disconnected_at else None),
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'last_synced_at': self.last_synced_at.isoformat() if self.last_synced_at else None,
             'last_error': self.last_error,

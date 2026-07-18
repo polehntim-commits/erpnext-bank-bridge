@@ -36,6 +36,14 @@ class FakePlaidClient:
         self.calls.append(('get_accounts', access_token))
         return list(self.accounts)
 
+    def item_remove(self, access_token):
+        """v0.4.7 · /item/remove. Set `remove_error` to a PlaidError instance to
+        script the "Plaid refused the disconnect" path."""
+        self.calls.append(('item_remove', access_token))
+        if getattr(self, 'remove_error', None) is not None:
+            raise self.remove_error
+        return {'request_id': 'req-remove-1'}
+
     def transactions_sync(self, access_token, cursor=None, count=500):
         self.calls.append(('transactions_sync', cursor))
         if self.pages:

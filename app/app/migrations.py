@@ -98,6 +98,14 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # the real numbers from the existing generated_journal_entries rows, so no
     # history is lost on upgrade.
     ('categorization_rules', 'match_count', 'INTEGER DEFAULT 0'),
+    # v0.4.7 — operator-initiated disconnect (Plaid /item/remove). Backfills to
+    # false + NULL, i.e. "still linked", which is true of every Item on an
+    # existing install, so an upgrade changes nothing about what syncs. NOT NULL
+    # is safe on the ADD because the DEFAULT fills every existing row in the same
+    # statement (and it keeps a migrated schema identical to the one create_all
+    # builds on a fresh database).
+    ('plaid_items', 'disconnected', 'BOOLEAN DEFAULT false NOT NULL'),
+    ('plaid_items', 'disconnected_at', 'TIMESTAMP'),
 ]
 
 

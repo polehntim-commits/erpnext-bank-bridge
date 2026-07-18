@@ -205,7 +205,12 @@ def plaid_webhook():
     log.info('plaid webhook: %s / %s', webhook_type, data.get('webhook_code'))
     if webhook_type == 'TRANSACTIONS' and item_id:
         item = PlaidItem.query.filter_by(item_id=item_id).first()
-        if item is not None and item.status != 'revoked':
+        # v0.4.7 · a disconnected Item is skipped here for the same reason
+        # sync_all skips it: its access_token no longer exists at Plaid. This
+        # endpoint is unauthenticated, so the check also stops a spoofed webhook
+        # from provoking doomed Plaid calls for a bank the operator disconnected.
+        if (item is not None and item.status != 'revoked'
+                and not item.disconnected):
             try:
                 sync_engine.sync_item(item)
             except (PlaidError, PlaidConfigError) as e:

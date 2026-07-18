@@ -545,7 +545,15 @@ def sync_all(plaid_client: PlaidClient = None, erp_client=None) -> dict:
     plaid_client = plaid_client or get_plaid_client()
     if erp_client is None:
         erp_client = get_erp_client_or_none()
-    items = PlaidItem.query.filter(PlaidItem.status != 'revoked').all()
+    # v0.4.7 · a disconnected Item's access_token was invalidated at Plaid by
+    # /item/remove, so every call for it would fail — skip it here rather than
+    # burn a request and record an error per poll. `isnot(True)` (not
+    # `.is_(False)`) so a row that predates the column and somehow read back
+    # NULL still counts as connected; the migration backfills false, this is
+    # belt-and-braces.
+    items = (PlaidItem.query
+             .filter(PlaidItem.status != 'revoked')
+             .filter(PlaidItem.disconnected.isnot(True)).all())
     audit.record('sync_run_started', subject_type=None,
                  after={'items': len(items)},
                  notes=f'sync across {len(items)} item(s)')

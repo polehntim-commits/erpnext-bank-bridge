@@ -58,6 +58,11 @@ ERPNext  ──►  Bank Reconciliation Tool
   **Counterparty** overlay that pairs them, giving one net position, one
   combined ledger, and a **1099-eligible list that can't include your bank**.
   See [Counterparty overlay](#counterparty-overlay-v045).
+- **Disconnect a bank when you're done with it** (v0.4.7) — one button on the
+  Accounts page calls Plaid's `/item/remove`, so Plaid stops pulling from that
+  institution. Your transactions and the Journal Entries generated from them
+  **stay** — disconnecting ends the feed, it doesn't erase history — and you can
+  re-link the same bank later. See [Disconnecting a bank](#disconnecting-a-bank-v047).
 - **Guided rule authoring** (v0.4.6) — filter the Transactions tab down to what
   **no rule caught**, see it grouped by merchant, and open the Rules editor
   pre-filled from a whole group in one click. The Rules list shows a **Matches**
@@ -84,7 +89,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.6 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.7 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -293,6 +298,48 @@ Company-agnostic logical-name list too) and reports how many accounts came back.
 Create an account in ERPNext, reload the Rules editor, and it's selectable — no
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
+
+**v0.4.7** — **disconnect a bank, and pre-submission hardening.** Five fixes
+found in an audit ahead of requesting Plaid production access:
+
+1. **Disconnect flow (`/item/remove`).** `PRIVACY.md` promised you could
+   "disconnect a bank by removing the linked item" and no code implemented it.
+   Each linked bank on `/admin/accounts` now has a **Disconnect this bank**
+   button behind a confirmation modal. It calls Plaid's `/item/remove`, which
+   invalidates the access token, then flags the Item locally — **in that order**,
+   so a Plaid failure leaves the bank connected rather than silently marking it
+   dead while Plaid keeps the token alive. Nothing is deleted: the Item, its
+   accounts, every mirrored transaction and every generated Journal Entry are
+   retained, and the entries already pushed to ERPNext are untouched. A
+   disconnected Item shows a **🔌 Disconnected** badge, is skipped by the sync
+   scheduler and by the (unauthenticated) webhook kick, and re-linking the bank
+   later mints a brand-new Item without touching the old row. Audited as
+   `item_disconnected` with the actor and reason. Additive schema: `disconnected`
+   and `disconnected_at`, backfilling to "still linked".
+2. **plaid-python 18.4.0 → 40.1.0.** Twenty-two major versions, and — verified
+   against the installed SDK — **zero breaking changes to this codebase**: every
+   request model and `PlaidApi` method the wrapper touches kept an identical
+   constructor signature. The majors track Plaid's own API surface growing, not
+   renames of what we call.
+3. **gunicorn 21.2.0 → 22.0.0.** Patches two request-smuggling CVEs,
+   [CVE-2024-1135](https://github.com/advisories/GHSA-w3h3-4rj7-4ph4) and
+   [CVE-2024-6827](https://github.com/advisories/GHSA-hc5x-x2vx-497g), both fixed
+   in 22.0.0. Runtime-only; no app code depends on gunicorn's API.
+4. **`scripts/rotate_db_password.sh` works from inside the container.** It used
+   to shell out to `docker`, which the app image does not contain — so the
+   obvious invocation (`docker exec <server> bash scripts/rotate_db_password.sh`)
+   died on `docker not found` before doing anything. It now **detects its
+   execution context**: on the host it keeps the full trust-auth repair, and
+   inside the container it talks to Postgres over the wire with psycopg2 (the
+   image has no `psql`), resets the app role's password and provisions the
+   `bridgeadmin` rescue superuser so future drift self-heals at boot. Both paths
+   verify the resulting credentials before reporting success.
+5. **Funnel scope documented and narrowed.** The old deployment recipes forwarded
+   the whole `/plaid/*` and `/api/plaid/*` prefixes, which publishes four
+   unauthenticated write endpoints to the Internet. All three options now
+   forward only the exact OAuth callback. See [Restricting Tailscale Funnel to
+   the OAuth callback
+   only](#restricting-tailscale-funnel-to-the-oauth-callback-only).
 
 **v0.4.6** — **guided rule authoring**. The first sync used to end in
 guess-and-check: hundreds of raw transactions, no Journal Entries, and no way to
@@ -726,6 +773,46 @@ whose Company can't be read, saves exactly as it did before. A Company-agnostic
 rule never warns — its offset is a logical name that resolves per Company at JE
 time (v0.4.0.3), so there's no single Company for it to disagree with.
 
+## Disconnecting a bank (v0.4.7)
+
+Each linked bank on `/admin/accounts` has a **Disconnect this bank** button in
+its header. It asks for confirmation, then calls Plaid's `/item/remove`:
+
+> **Disconnect Wells Fargo?**
+> Plaid will stop sending new transactions. Your existing transactions and
+> generated Journal Entries stay in ERPNext. You can re-link this bank later.
+
+**What it does.** Plaid invalidates the Item's access token and stops pulling
+from the institution. Locally the Item is flagged `disconnected` — it shows a
+**🔌 Disconnected** badge, the sync scheduler skips it on every subsequent tick,
+and an inbound Plaid webhook naming it is ignored (that endpoint is
+unauthenticated, so this also stops a spoofed payload provoking doomed API
+calls).
+
+**What it does *not* do.** Nothing is deleted. The Item row, its Plaid accounts,
+every mirrored transaction and every generated Journal Entry stay exactly where
+they are, and the Journal Entries already submitted to ERPNext are untouched.
+**Disconnecting stops the future feed; it does not erase history** — your books
+keep every entry the bank ever produced. That is deliberate: a disconnect is an
+operational decision about data collection, never a destructive one about
+accounting records.
+
+**Ordering.** Plaid is called *first*, and the local flag is written only if the
+call succeeded. The reverse order would leave an Item marked disconnected here
+while Plaid happily kept the token live — the app would stop syncing it, so
+nobody would notice the bank was still connected upstream. If Plaid refuses, the
+modal shows the error and the bank stays connected.
+
+**Re-linking.** Link the same bank again whenever you like. Plaid issues a fresh
+`item_id` and access token, so you get a **new** Item; the disconnected one stays
+as the permanent record of the previous link. Both are visible on the Accounts
+page.
+
+**Access.** The endpoint (`POST /api/items/<item_id>/disconnect`) lives on the
+admin blueprint, so it is covered by `ADMIN_BASIC_AUTH_*` when configured and is
+never exposed by the deployment recipes above. Every disconnect writes an
+`item_disconnected` audit event recording who did it, when, and why.
+
 ## Counterparty overlay (v0.4.5)
 
 ERPNext's Customer and Supplier are unrelated doctypes. That is the right call
@@ -958,8 +1045,12 @@ ways to do this.
 
 Production OAuth banks require an `https://` redirect URI reachable from the
 public Internet. The goal of every pattern below is the same: **terminate TLS
-and forward only `/plaid/*` and `/api/plaid/*` to port 5202**, keeping the admin
-UI on the LAN. After setting one up, register the resulting HTTPS URL as the
+and forward only the OAuth callback `/plaid/oauth_return` to port 5202**,
+keeping the admin UI *and* the unauthenticated Plaid write endpoints on the LAN.
+(Earlier revisions of this guide forwarded the whole `/plaid/*` and
+`/api/plaid/*` prefixes — see [Restricting Tailscale Funnel to the OAuth
+callback only](#restricting-tailscale-funnel-to-the-oauth-callback-only) for why
+that is wider than it needs to be, and how to narrow it.) After setting one up, register the resulting HTTPS URL as the
 redirect URI in **both** the Plaid dashboard (Developers → API → Allowed
 redirect URIs) **and** the `PLAID_REDIRECT_URI` env var / `/admin/plaid_settings`.
 
@@ -980,25 +1071,75 @@ certificate management (Tailscale provisions the cert). Funnel can be
 
 **Setup**
 ```bash
-# Expose ONLY the two callback path prefixes over HTTPS → local port 5202.
-tailscale funnel --set-path /plaid       http://localhost:5202/plaid
-tailscale funnel --set-path /api/plaid   http://localhost:5202/api/plaid
-tailscale funnel status          # shows the public https://<your-umbrel>.<your-tailnet>.ts.net URL
+# Expose ONLY the OAuth callback over HTTPS → local port 5202.
+# Note the target has NO path: Tailscale forwards the FULL request path to the
+# backend (it does not strip the mount prefix), so a request to
+# https://<host>/plaid/oauth_return arrives at 127.0.0.1:5202/plaid/oauth_return.
+tailscale funnel --bg --https=443 \
+  --set-path=/plaid/oauth_return http://127.0.0.1:5202
+
+tailscale funnel status   # shows the public https://<your-umbrel>.<your-tailnet>.ts.net URL
 ```
 Your redirect URI is then
 `https://<your-umbrel>.<your-tailnet>.ts.net/plaid/oauth_return`.
 
-**Verify**
+> Substitute your own port if your install doesn't publish Bank Bridge on
+> `5202` (check `docker ps`). To tear the Funnel down again:
+> `tailscale funnel --https=443 --set-path=/plaid/oauth_return off`.
+
+**Verify — do not skip this.** The point of the config is what it *refuses*:
 ```bash
-curl -sI https://<your-umbrel>.<your-tailnet>.ts.net/plaid/oauth_return
-# Expect: HTTP/2 200 (the OAuth return page renders).
-curl -sI https://<your-umbrel>.<your-tailnet>.ts.net/admin
-# Expect: 404 — /admin is NOT funneled, so it stays LAN-only.
+HOST=https://<your-umbrel>.<your-tailnet>.ts.net
+
+curl -sI $HOST/plaid/oauth_return        # Expect: 200 — the callback works.
+curl -sI $HOST/admin                     # Expect: 404 — admin UI stays LAN-only.
+curl -sI $HOST/api/plaid/create_link_token   # Expect: 404 — see below.
+curl -sI $HOST/plaid/webhook             # Expect: 404 — see below.
+```
+If any of the last three return something other than 404, the Funnel is wider
+than it should be — re-check the `--set-path` value and re-run
+`tailscale funnel status`.
+
+#### Restricting Tailscale Funnel to the OAuth callback only
+
+**This matters.** A Funnel URL is on the public Internet. It is unguessable, but
+it is not secret — it appears in TLS certificate transparency logs, and it is
+handed to every bank you link. Treat it as public knowledge.
+
+Bank Bridge's `/plaid` and `/api/plaid` blueprints are **unauthenticated by
+design** (the Plaid callback can't carry your admin credentials, and Umbrel's
+LAN boundary is the assumed trust boundary). Funnelling those prefixes broadly
+therefore publishes four write endpoints to the world:
+
+| Endpoint | What an attacker gets |
+| --- | --- |
+| `POST /api/plaid/create_link_token` | Burns billable Plaid API calls on your account, at whatever rate they like |
+| `POST /api/plaid/set_link_company` | Redirects which ERPNext Company a pending link will book to |
+| `POST /api/plaid/exchange_token` | Attempts to attach an Item they control to your install |
+| `POST /plaid/webhook` | Spoofs "new transactions" events — there is **no signature verification** — forcing unscheduled syncs |
+
+Only **`/plaid/oauth_return`** has to be publicly reachable: it is the URL the
+bank redirects the operator's browser back to after an OAuth login. Everything
+else is called by *your own browser on the LAN*, so nothing breaks by keeping it
+off the Funnel.
+
+**Do NOT do this** — the older, broader config this README used to recommend:
+```bash
+# ✗ WRONG — publishes all four write endpoints above.
+tailscale funnel --set-path /plaid       http://localhost:5202/plaid
+tailscale funnel --set-path /api/plaid   http://localhost:5202/api/plaid
+```
+If you set that up previously, turn both off and re-run the single-path command:
+```bash
+tailscale funnel --https=443 --set-path=/plaid off
+tailscale funnel --https=443 --set-path=/api/plaid off
 ```
 
-**Security note.** Only `/plaid/*` and `/api/plaid/*` are on the public
-`ts.net` hostname; `/admin` is unreachable through Funnel and stays on the LAN.
-Even so, set `ADMIN_BASIC_AUTH_*` as defense-in-depth.
+**Security note.** With the single-path Funnel, `/admin` and every write
+endpoint are unreachable from the Internet and stay on the LAN. Set
+`ADMIN_BASIC_AUTH_*` as defense-in-depth regardless — and note it also covers
+the v0.4.7 disconnect endpoint (`POST /api/items/<id>/disconnect`), which lives
+on the admin blueprint precisely so it is never publicly reachable.
 
 ### Option B — Cloudflare Tunnel
 
@@ -1024,13 +1165,15 @@ tunnel: bank-bridge
 credentials-file: /root/.cloudflared/bank-bridge.json
 ingress:
   - hostname: bank-bridge.<your-domain>
-    path: ^/plaid/.*
+    path: ^/plaid/oauth_return$       # the OAuth callback — the ONLY public path
     service: http://localhost:5202
-  - hostname: bank-bridge.<your-domain>
-    path: ^/api/plaid/.*
-    service: http://localhost:5202
-  - service: http_status:404          # /admin and all else → 404 (not exposed)
+  - service: http_status:404          # /admin, the Plaid write endpoints, all else
 ```
+The exact-match path is deliberate: broadening it to `^/plaid/.*` or
+`^/api/plaid/.*` publishes four unauthenticated write endpoints — see
+[Restricting Tailscale Funnel to the OAuth callback
+only](#restricting-tailscale-funnel-to-the-oauth-callback-only), which explains
+the risk in full (it applies to every option here, not just Funnel).
 Then run it (or install as a service):
 ```bash
 cloudflared tunnel run bank-bridge
@@ -1043,9 +1186,10 @@ curl -sI https://bank-bridge.<your-domain>/plaid/oauth_return   # Expect 200
 curl -sI https://bank-bridge.<your-domain>/admin                # Expect 404
 ```
 
-**Security note.** The `ingress` rules publish only the two callback prefixes;
-the catch-all `http_status:404` keeps `/admin` off the public hostname. Enable
-`ADMIN_BASIC_AUTH_*` as an extra layer.
+**Security note.** The `ingress` rules publish only the exact OAuth callback
+path; the catch-all `http_status:404` keeps `/admin` and the Plaid write
+endpoints off the public hostname. Enable `ADMIN_BASIC_AUTH_*` as an extra
+layer.
 
 ### Option C — Nginx reverse proxy + Let's Encrypt
 
@@ -1066,12 +1210,10 @@ server {
     ssl_certificate     /etc/letsencrypt/live/<your-domain>/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/<your-domain>/privkey.pem;
 
-    location /plaid/ {
-        proxy_pass http://127.0.0.1:5202;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto https;
-    }
-    location /api/plaid/ {
+    # `location =` is an EXACT match — the OAuth callback and nothing else.
+    # A prefix match (`location /plaid/`) would also publish the four
+    # unauthenticated Plaid write endpoints; see the Funnel section above.
+    location = /plaid/oauth_return {
         proxy_pass http://127.0.0.1:5202;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
@@ -1091,9 +1233,10 @@ curl -sI https://<your-domain>/plaid/oauth_return   # Expect 200
 curl -sI https://<your-domain>/admin                # Expect connection closed (444)
 ```
 
-**Security note.** Only `/plaid/` and `/api/plaid/` are proxied; `location /`
-returns `444` so `/admin` is never served publicly. Because a reverse proxy is
-the easiest place to accidentally widen scope, set `ADMIN_BASIC_AUTH_*` too.
+**Security note.** Only the exact `/plaid/oauth_return` path is proxied;
+`location /` returns `444` so `/admin` and the Plaid write endpoints are never
+served publicly. Because a reverse proxy is the easiest place to accidentally
+widen scope, set `ADMIN_BASIC_AUTH_*` too.
 
 ## Configuration
 
@@ -1522,7 +1665,7 @@ cd app
 python3 -m unittest discover -s tests -v
 ```
 
-774 tests cover Fernet encryption round-trip + key persistence, Plaid response
+818 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
 push → error + retry, one-click account import, merchant-name normalization,
@@ -1553,7 +1696,7 @@ per Company and reused; auto-booking at import and its opt-out; the configurable
 posting date including the fall-back on a bad value; re-import never
 double-booking; the backfill script's estimate, dry run, idempotency and refusal
 to overturn a rejection; the manual amount/date override endpoint; and the
-existing approve/reject workflow driving the entries unchanged), and the counterparty overlay (v0.4.5: the doctype bootstrap being idempotent and degrading to a no-op when the API user lacks DocType rights; auto-link on both the Supplier and Customer paths; dual-role detection setting the flag from both links; a human-set link never being stomped; concurrent creates recovering by re-fetching rather than failing; the pairing migration's dry run, idempotency and exact-name matching; ageing bucket boundaries and the netting across roles; the 1099 report excluding Financial Institution and Government types and declaring what it dropped; top-by-activity sorting by combined volume within the configured fiscal year; the rollup reading the ledger a fixed number of times regardless of party count, skipping unchanged records and never blanking a first-transaction date; and every screen rendering on an install that has no overlay at all), and guided rule authoring (v0.4.6: the four rule-state filters partitioning the eligible transactions with no overlap and no gaps, and ignoring rows the engine has never seen; merchant grouping counts, totals and ordering, with singletons falling through to one-offs and merchantless rows grouping by description signature; the group prefill producing a `merchant_contains` rule and the per-row prefill a `merchant_exact` one whose regex actually matches the description it came from; the prefill rejecting an unknown match type and never creating a rule on its own; the match-count rollup folding an archived version's matches into its live successor, terminating on a supersede cycle, skipping unchanged rules and leaving `updated_at` alone; the scope-mismatch warning firing on a Company mismatch, staying silent for a Company-agnostic rule or an unconfigured ERPNext, persisting on the confirmed re-submit, and preserving the edited rule's id so confirming supersedes rather than duplicates; and the `match_count` migration adding the column to an existing database, idempotently, with the first rollup filling in real history), and counterparty doctype provisioning (v0.4.6: the startup job being actually registered on the elected scheduler as a one-shot — the regression guard for the v0.4.5 gap where the code existed but nothing invoked it — and provisioning, pairing, honouring the master switch, surviving an unconfigured or exploding ERPNext, and auditing its outcome; the provision report distinguishing `created` from `already_present` and naming a permission denial, a failed create and an absent DocType API with the reason ERPNext gave; every failure state carrying operator-facing help; `ensure_counterparty_doctype` keeping its boolean contract for the fifteen existing call sites; and the management CLI creating, re-running idempotently, pairing or skipping pairing, reporting a refusal without raising, and exiting non-zero so it can gate a deploy step). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
+existing approve/reject workflow driving the entries unchanged), and the counterparty overlay (v0.4.5: the doctype bootstrap being idempotent and degrading to a no-op when the API user lacks DocType rights; auto-link on both the Supplier and Customer paths; dual-role detection setting the flag from both links; a human-set link never being stomped; concurrent creates recovering by re-fetching rather than failing; the pairing migration's dry run, idempotency and exact-name matching; ageing bucket boundaries and the netting across roles; the 1099 report excluding Financial Institution and Government types and declaring what it dropped; top-by-activity sorting by combined volume within the configured fiscal year; the rollup reading the ledger a fixed number of times regardless of party count, skipping unchanged records and never blanking a first-transaction date; and every screen rendering on an install that has no overlay at all), and guided rule authoring (v0.4.6: the four rule-state filters partitioning the eligible transactions with no overlap and no gaps, and ignoring rows the engine has never seen; merchant grouping counts, totals and ordering, with singletons falling through to one-offs and merchantless rows grouping by description signature; the group prefill producing a `merchant_contains` rule and the per-row prefill a `merchant_exact` one whose regex actually matches the description it came from; the prefill rejecting an unknown match type and never creating a rule on its own; the match-count rollup folding an archived version's matches into its live successor, terminating on a supersede cycle, skipping unchanged rules and leaving `updated_at` alone; the scope-mismatch warning firing on a Company mismatch, staying silent for a Company-agnostic rule or an unconfigured ERPNext, persisting on the confirmed re-submit, and preserving the edited rule's id so confirming supersedes rather than duplicates; and the `match_count` migration adding the column to an existing database, idempotently, with the first rollup filling in real history), and counterparty doctype provisioning (v0.4.6: the startup job being actually registered on the elected scheduler as a one-shot — the regression guard for the v0.4.5 gap where the code existed but nothing invoked it — and provisioning, pairing, honouring the master switch, surviving an unconfigured or exploding ERPNext, and auditing its outcome; the provision report distinguishing `created` from `already_present` and naming a permission denial, a failed create and an absent DocType API with the reason ERPNext gave; every failure state carrying operator-facing help; `ensure_counterparty_doctype` keeping its boolean contract for the fifteen existing call sites; and the management CLI creating, re-running idempotently, pairing or skipping pairing, reporting a refusal without raising, and exiting non-zero so it can gate a deploy step), and the disconnect flow (v0.4.7: `/item/remove` being called with the DECRYPTED access token; the Item being flagged with a timestamp and audited with actor and reason; the Item, its accounts and its transactions all surviving the disconnect; a Plaid failure — API error or misconfiguration — leaving the Item CONNECTED and unaudited, which is the ordering guarantee the whole flow rests on; an unknown Item 404ing and an already-disconnected one 409ing without re-calling Plaid; the endpoint being covered by the admin Basic Auth gate; only the named Item being affected; disconnected Items dropping out of `sync_all` and out of the unauthenticated webhook kick while connected ones still run; a re-link minting a new Item and leaving the old row and its timestamp alone; the Accounts page swapping the Disconnect button for a 🔌 badge and rendering the modal copy; the wrapper building real plaid-python 40.1.0 request models for all seven endpoints — including omitting a blank cursor rather than sending `''`; the dependency pins staying at or above the CVE-patched gunicorn and the `/item/remove`-capable SDK; and `rotate_db_password.sh` parsing as valid bash, announcing its detected context, running its container path without any docker client — the v0.4.7 regression guard — reaching for psycopg2 rather than the absent `psql`, explaining itself when `DATABASE_URL` or docker is missing, and deriving the same rescue password the app does). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
 so no network access or extra wheels are needed.
 
 ## Security notes
@@ -1593,7 +1736,8 @@ history~~ (v0.3.0). ~~Rule-builder autocomplete (merchants + Plaid categories),
 category-based Name suggestions, and shadow-conflict warnings~~ (v0.3.2).
 ~~Guided first-sync rule authoring: unmatched filter, merchant grouping,
 create-rule-from-group, per-rule match counts, and scope mismatches caught at
-authoring time~~ (v0.4.6).
+authoring time~~ (v0.4.6). ~~Disconnect a linked bank from the admin UI via
+Plaid `/item/remove`, retaining all history~~ (v0.4.7).
 
 ## Compliance and disclosure
 

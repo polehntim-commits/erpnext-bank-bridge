@@ -2,12 +2,24 @@ Flask==3.0.0
 Flask-SQLAlchemy==3.1.1
 SQLAlchemy==2.0.23
 psycopg2-binary==2.9.9
-gunicorn==21.2.0
+# v0.4.7 — 22.0.0 patches the two request-smuggling CVEs that affect 21.2.0:
+# CVE-2024-1135 (GHSA-w3h3-4rj7-4ph4) and CVE-2024-6827 (GHSA-hc5x-x2vx-497g),
+# both fixed in 22.0.0. Gunicorn is a pure WSGI runner here, so this is a
+# runtime-only bump — no app code depends on its API.
+gunicorn==22.0.0
 python-dotenv==1.0.0
 requests==2.31.0
 # Encrypts the stored Plaid access_tokens at rest (Fernet).
 cryptography==41.0.7
-# Official Plaid SDK — Link token, public-token exchange, /transactions/sync.
-plaid-python==18.4.0
-# In-process scheduler for the 6-hourly transactions/sync poll.
+# Official Plaid SDK — Link token, public-token exchange, /transactions/sync,
+# /item/remove.
+#
+# v0.4.7 — 18.4.0 → 40.1.0. Despite the 22 major versions, every request model
+# and PlaidApi method app/plaid_client.py touches kept an identical constructor
+# signature; the majors track Plaid's own API additions, not breaking renames of
+# what we call. The wrapper's model-or-dict normalization (_to_dict/_resp_get)
+# absorbs the response-shape differences it does have.
+plaid-python==40.1.0
+# In-process scheduler for the transactions/sync poll (daily by default; see
+# SYNC_INTERVAL_HOURS).
 APScheduler==3.10.4

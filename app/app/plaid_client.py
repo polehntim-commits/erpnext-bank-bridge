@@ -126,6 +126,30 @@ class PlaidClient:
             raise PlaidError(f'exchange_public_token failed: {e}') from e
         return _resp_get(resp, 'access_token'), _resp_get(resp, 'item_id')
 
+    def item_remove(self, access_token: str) -> dict:
+        """Disconnect an Item at Plaid via /item/remove (v0.4.7).
+
+        This is the API side of the disconnect promise in PRIVACY.md: it tells
+        Plaid to invalidate the access_token and stop pulling from the
+        institution. It is IRREVERSIBLE and one-way — the token is dead
+        afterwards, and re-linking the same bank mints a brand-new Item.
+
+        Removing the Item at Plaid does not touch anything on our side; the
+        caller is responsible for marking the local PlaidItem (and it must NOT
+        delete the local rows — the mirrored transactions and the Journal
+        Entries generated from them stay in ERPNext either way).
+
+        Returns {'request_id': str} — /item/remove's response carries no other
+        field. Raises PlaidError on any API failure so the caller can refuse to
+        mark the Item disconnected when Plaid never accepted the removal."""
+        from plaid.model.item_remove_request import ItemRemoveRequest
+        api = self._get_api()
+        try:
+            resp = api.item_remove(ItemRemoveRequest(access_token=access_token))
+        except Exception as e:
+            raise PlaidError(f'item_remove failed: {e}') from e
+        return {'request_id': _resp_get(resp, 'request_id') or ''}
+
     # ── item / institution / accounts ────────────────────────────────
 
     def get_item(self, access_token: str) -> dict:
