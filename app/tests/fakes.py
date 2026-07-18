@@ -81,11 +81,12 @@ class FakeERPClient:
                  companies=None, existing_supplier_groups=None,
                  fail_supplier_group_create=False, existing_customers=None,
                  fail_customer_create=False, existing_customer_groups=None,
-                 fail_customer_group_create=False):
+                 fail_customer_group_create=False, fail_je_create_after=None):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
         self.cancelled = set()
+        self.deleted = set()        # v0.4.1 · frappe.client.delete targets
         self.calls = []
         self._counter = 0
         self.bank_accounts = bank_accounts or []   # preset dropdown list
@@ -160,6 +161,12 @@ class FakeERPClient:
         # When True, every Journal Entry create fails — exercises the
         # non-destructive `error` GeneratedJournalEntry path.
         self.fail_je_create = fail_je_create
+        # v0.4.1 · fail Journal Entry creates only AFTER the first N have
+        # succeeded. Set to 1 to let an intercompany pair's source leg land and
+        # its target leg fail — the only way to exercise the compensating
+        # rollback that keeps two Companies' books from going half-updated.
+        self.fail_je_create_after = fail_je_create_after
+        self.je_creates = 0
         # ERPNext Company docnames for list_companies() (v0.4.0 multi-entity).
         self.companies = list(companies) if companies is not None else []
         # Records created by the one-click account import, keyed by doctype.
@@ -408,7 +415,10 @@ class FakeERPClient:
             self.created['Customer'][name] = dict(doc)
             return {'name': name}
         if doctype == 'Journal Entry':
-            if self.fail_je_create:
+            self.je_creates += 1
+            if self.fail_je_create or (
+                    self.fail_je_create_after is not None
+                    and self.je_creates > self.fail_je_create_after):
                 from app.erpnext_client import ERPNextAPIError
                 raise ERPNextAPIError('bad', status_code=417,
                                       response_body='{"exc":"ValidationError"}')
@@ -455,6 +465,18 @@ class FakeERPClient:
             name = (json_body or {}).get('name')
             if name:
                 self.cancelled.add(name)
+        elif method == 'frappe.client.delete':
+            # v0.4.1 · the intercompany generator deletes a half-created Draft to
+            # unwind a failed pair, and abandons a rules-engine Draft it
+            # supersedes. A real delete removes the document outright, so the
+            # fake drops it from both views (create_doc stores one dict behind
+            # `created` and `docs`) and records the name for assertions.
+            doctype = (json_body or {}).get('doctype') or ''
+            name = (json_body or {}).get('name')
+            if name:
+                self.created.get(doctype, {}).pop(name, None)
+                self.docs.pop(name, None)
+                self.deleted.add(name)
         return {}
 
     # count helpers for assertions

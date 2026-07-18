@@ -46,6 +46,12 @@ ERPNext  ──►  Bank Reconciliation Tool
   auto-generate a Journal Entry, inserted as a Draft for review. Rules name only
   the categorized **offset** account; the bank side comes from the transaction's
   linked account (v0.3.1). **Off by default** — opt in once your rules are trusted.
+- **Intercompany transfer detection** (v0.4.1) — money moved between two ERPNext
+  Companies you own arrives as two Plaid transactions (equal amount, opposite
+  sign). Bank Bridge matches them and books a **Due from / Due to** pair across
+  the two entities instead of letting a generic rule put an expense on one P&L
+  and income on the other. Review, approve or unpair at `/admin/intercompany`.
+  Auto-activates once accounts under a second Company are linked.
 - **Handles the full transaction lifecycle** — pending → posted transitions,
   category and merchant-name normalization, Plaid `modified` (re-post) and
   `removed` (cancel) events.
@@ -58,7 +64,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.0.1 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.1 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -268,6 +274,69 @@ Create an account in ERPNext, reload the Rules editor, and it's selectable — n
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
 
+**v0.4.1** — **detects transfers between the Companies you own**. Moving money
+from the Farm's checking account to your Personal one is not revenue and it is
+not an expense — it is the same money in a different pocket. But Plaid delivers
+it as **two** transactions, one on each linked account, and until now nothing
+connected them:
+
+```
+Farm      -$10,000  "Transfer to Personal"   → an expense on the Farm's P&L
+Personal  +$10,000  "Transfer from Farm"     → income on Personal's P&L
+```
+
+Both sets of books then showed activity that never happened, and the error
+compounded every time money moved.
+
+Bank Bridge now **matches the two legs and books the movement properly**. A
+detection pass pairs transactions on **equal magnitude and opposite sign**
+(a hard requirement), **dates within ±3 days**
+(`INTERCOMPANY_DATE_TOLERANCE_DAYS`), **description similarity ≥ 0.6**
+(stdlib `difflib` — no new dependency), and — the part that makes it
+*intercompany* — **linked accounts belonging to different ERPNext Companies**.
+Each candidate gets a confidence score, and at **≥ 0.75** the pair is recorded
+automatically. Instead of two P&L entries, one **balanced pair** is written:
+
+| Company | Debit | Credit |
+|---------|-------|--------|
+| Farm (money out) | `Due from Personal LLC` | `Farm Checking` |
+| Personal (money in) | `Personal Checking` | `Due to Farm LLC` |
+
+Profit & loss is untouched. The transfer lands on **both balance sheets** as a
+mutual receivable/payable that nets to zero when the entities are consolidated.
+The two counterparty control accounts are **auto-created on first use** — the
+receivable under *Loans and Advances (Assets)*, the payable under *Current
+Liabilities*, numbered to match your chart's scheme — and deliberately carry no
+`Receivable`/`Payable` `account_type`, since ERPNext would then demand a Party
+and the counterparty here is another Company of yours, not a customer.
+
+Three things make this safe to leave on:
+
+- **Rules can't double-book it.** Every rule gains an **Ignore for
+  intercompany-paired transactions** checkbox, **on by default** and backfilled
+  **on** for existing rules — so a generic "Transfer" rule doesn't also book one
+  leg to P&L. Clear it per rule for the rare case you want one to fire anyway.
+- **The two entries are atomic.** Two Journal Entries in two Companies can't
+  share an ERPNext transaction, so if the second create fails the first Draft is
+  **deleted** before the failure is recorded. Approve is the same: a failed
+  second submit **cancels** the first. Your books are never half-updated.
+- **Every pairing is reversible.** `/admin/intercompany` lists each detected
+  transfer with both sides, the confidence score and both JE docnames, filtered
+  by Company, state or confidence, with bulk Approve/Unpair. **Unpair** cancels
+  whatever was booked and returns both transactions to normal categorization —
+  and the rejected pair is *kept* as the record that stops the detector
+  re-pairing them on the very next sync.
+
+Because the two legs usually arrive on **different syncs** (each Plaid Item
+advances its own cursor), a pair can form after one leg already got a
+rules-engine entry. A **Draft** is abandoned and replaced; a **submitted** entry
+is left alone and the pair reports why, because silently cancelling posted
+activity would be worse than the double-count.
+
+Detection needs linked accounts under **more than one Company**, so a
+single-Company install is completely unaffected — every pass finds nothing and
+the Intercompany page says so.
+
 **v0.4.0.9** — **party type now respects `account_type`, not just `root_type`**.
 v0.4.0.8 derived the party side from the offset account's **root type** — Income
 → Customer, Expense → Supplier. ERPNext, however, validates a Journal Entry
@@ -405,7 +474,13 @@ failure, creates the missing Suppliers and re-generates the JEs back to
    through your **CategorizationRules** and generates a **Journal Entry** for
    the first match (Draft by default). Both steps are non-destructive — a
    failure is logged and never unwinds the posted Bank Transaction.
-6. **Reconcile** in ERPNext's built-in **Bank Reconciliation Tool** (or review
+6. **Pair intercompany transfers** (v0.4.1) — before the rules run, the bridge
+   checks whether a transaction is one leg of a transfer between two Companies
+   you own (matching amount, sign, date and description across Companies). If so
+   it is held back from the normal rules and booked as a **Due from / Due to**
+   pair across both entities instead, so neither Company's P&L moves. Review at
+   `/admin/intercompany`. Inert unless accounts under two Companies are linked.
+7. **Reconcile** in ERPNext's built-in **Bank Reconciliation Tool** (or review
    the generated Journal Entries at `/admin/generated_entries`).
 
 Idempotency is enforced two ways: a unique local row per Plaid transaction id,
@@ -423,6 +498,7 @@ out of the account → withdrawal; negative = money in → deposit).
 | `suppliers` | merchant → ERPNext Supplier cache (normalized name, tallies) — v0.3.0 |
 | `categorization_rules` | user rules: match predicate → offset account + direction + party + template (bank side from the txn; v0.3.1) — v0.3.0 |
 | `generated_journal_entries` | per-JE state record (state, rule, JE docname) — v0.3.0 |
+| `intercompany_transfer_pairs` | detected transfer between two owned Companies: both legs, both Companies, confidence, both JE docnames, state — v0.4.1 |
 | `audit_events` | **permanent, append-only** audit trail of every action (before/after JSON, actor, IP) — v0.3.0 |
 | `plaid_sync_log` | HTTP-level action log (plaid_pull / erpnext_push / erpnext_supplier_auto_create, counts, errors); `subject_id` cross-links to `audit_events` |
 | `plaid_link_state` | short-lived link-token bookkeeping for the OAuth handoff |
@@ -447,6 +523,11 @@ on an HTTP Basic Auth layer (`ADMIN_BASIC_AUTH_*`) — see
   normalization or re-point the ERPNext Supplier
 - `/admin/generated_entries` — rules-generated Journal Entries; approve (submit)
   / reject (cancel) individually or in bulk
+- `/admin/intercompany` — transfers detected between two Companies you own:
+  both sides, confidence score, both generated Journal Entries; approve (submits
+  both atomically) / unpair (cancels both and returns the transactions to the
+  normal rules), individually or in bulk, filtered by Company / state /
+  confidence
 - `/admin/audit` — the permanent audit trail: filter by event type / subject /
   actor / date, drill into any event's before→after JSON, group by subject to
   see a rule's or JE's full lifecycle, and **Export CSV**
@@ -986,6 +1067,11 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES` | `false` | v0.3.0 · master switch for the rules engine — **off by default** (a wrong auto-JE is worse than none) |
 | `ERPNEXT_JOURNAL_ENTRY_AUTO_SUBMIT` | `false` | submit generated JEs (docstatus 1) vs leave as Draft for review |
 | `ERPNEXT_JOURNAL_ENTRY_REVIEW_STATE` | `pending_review` | initial audit state for a freshly generated Draft JE |
+| `INTERCOMPANY_DATE_TOLERANCE_DAYS` | `3` | v0.4.1 · ± window, in days, the two legs of one intercompany transfer may be dated apart |
+| `INTERCOMPANY_DESCRIPTION_THRESHOLD` | `0.6` | v0.4.1 · minimum description similarity (0.0–1.0, stdlib `difflib`) for two transactions to be considered a candidate pair |
+| `INTERCOMPANY_CONFIDENCE_THRESHOLD` | `0.75` | v0.4.1 · minimum overall confidence to pair **automatically**; below this the candidate is logged and left for a human |
+| `INTERCOMPANY_LOOKBACK_DAYS` | `30` | v0.4.1 · how far back a detection pass looks for a counterparty (each Plaid Item advances its own cursor, so the two legs often arrive on different syncs) |
+| `ERPNEXT_LOANS_ADVANCES_GROUP_NAME` | `Loans and Advances (Assets)` | v0.4.1 · Chart-of-Accounts group the auto-created intercompany `Due from …` receivables go under (the `Due to …` payables use `ERPNEXT_CURRENT_LIABILITIES_GROUP_NAME`) |
 | `FERNET_KEY` | "" | blank → autogenerated + persisted to `{DATA_DIR}/fernet.key` |
 | `SYNC_INTERVAL_HOURS` | `24` | v0.3.6 · background poll cadence in hours (**daily by default**). `0` or negative = **manual only** (no auto-poll; use "Sync now"). Editable in the admin UI, which persists a value that wins over this seed |
 | `PLAID_MAX_CALLS_PER_DAY` | `0` | v0.3.6 · optional per-Item safety brake — max Plaid pull calls per Item per UTC day (`0` = no limit). A pull that would exceed it is skipped with a logged warning |
@@ -1076,7 +1162,7 @@ cd app
 python3 -m unittest discover -s tests -v
 ```
 
-301 tests cover Fernet encryption round-trip + key persistence, Plaid response
+569 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
 push → error + retry, one-click account import, merchant-name normalization,
@@ -1091,8 +1177,15 @@ passwords, and the Plaid callback / JSON API staying ungated), and the
 configurable sync frequency (preset cost math, manual-only disabling the
 scheduler, interval persistence, and the per-Item daily call brake), the
 multi-entity owning-Company resolution + inheritance + drift refusal (v0.4.0),
-and balance-only investment placement + the `balance_only` flag + the
-transactions-sync skip. The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
+balance-only investment placement + the `balance_only` flag + the
+transactions-sync skip, and intercompany transfer detection (v0.4.1: the
+amount/sign, date-tolerance, description-similarity and different-Companies
+criteria and the confidence score they produce; paired transactions being hidden
+from rules that ignore them; the Due from / Due to entries balancing; the
+compensating rollback when the second Company's entry fails; auto-created
+intercompany accounts; unpair reversing both entries and suppressing
+re-detection; the review UI's filters, actions and bulk operations; and the
+single-Company regression guarantee that none of it activates). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
 so no network access or extra wheels are needed.
 
 ## Security notes

@@ -519,6 +519,15 @@ def _investments_group_name() -> str:
             or 'Investments').strip() or 'Investments'
 
 
+def _loans_advances_group_name() -> str:
+    """The Chart-of-Accounts group intercompany `Due from …` receivables are
+    created under, on the Assets side (ERPNEXT_LOANS_ADVANCES_GROUP_NAME, default
+    'Loans and Advances (Assets)' — the name stock ERPNext charts ship)."""
+    return (current_app.config.get('ERPNEXT_LOANS_ADVANCES_GROUP_NAME')
+            or 'Loans and Advances (Assets)').strip() \
+        or 'Loans and Advances (Assets)'
+
+
 def _gl_side(account: PlaidAccount) -> str:
     """Which side of the Chart of Accounts this Plaid account's GL leaf belongs
     on: 'credit' (cards / lines of credit → Current Liabilities), 'loan' (→
@@ -939,6 +948,147 @@ def ensure_loan_group(client: ERPNextClient, company: str) -> str | None:
         return _create_group_account(client, group_name, root, company)
     log.info('no Liability anchor for company %r; skipping loan GL group', company)
     return None
+
+
+# ── v0.4.1: intercompany receivable / payable accounts ──────────────────────
+#
+# A transfer between two Companies the operator owns is not revenue or expense —
+# it's a mutual receivable/payable that nets to zero across the two entities. So
+# each side of the pair needs a counterparty-specific control account:
+#
+#   source Company:  Due from <target>   Asset     → Loans and Advances (Assets)
+#   target Company:  Due to <source>     Liability → Current Liabilities
+#
+# These are created on demand, the first time a pair between those two Companies
+# is detected, and reused forever after (find-or-create keyed on account_name +
+# company, exactly like the per-account bank leaves). The account_type is left
+# UNSET on purpose: 'Receivable'/'Payable' would make ERPNext demand a Party on
+# every line, and the counterparty here is another of the operator's own
+# Companies, not a Customer or Supplier. See categorization.PARTY_ACCOUNT_TYPES
+# for the validation this sidesteps.
+
+# The two sides of the intercompany relationship, as (account-name prefix,
+# root side). `_intercompany_account_name` renders the leaf name.
+INTERCOMPANY_SIDES = ('due_from', 'due_to')
+
+
+def _intercompany_account_name(side: str, other_company: str) -> str:
+    """The leaf account_name for one side of the relationship with
+    `other_company` — 'Due from Personal LLC' / 'Due to Farm LLC'. Truncated to
+    ERPNext's 140-char account_name limit."""
+    prefix = 'Due from' if side == 'due_from' else 'Due to'
+    return f'{prefix} {(other_company or "").strip()}'.strip()[:140]
+
+
+def ensure_loans_advances_group(client: ERPNextClient, company: str) -> str | None:
+    """Find (or create) the Assets-side group intercompany `Due from …` accounts
+    live under, for `company`; return its docname. The conventional path is
+    Assets → Current Assets → Loans and Advances (Assets), which stock ERPNext
+    charts ship.
+
+    Walks down, creating only what's missing, and tolerates the spellings stock
+    charts vary on ('Loans and Advances (Assets)' / 'Loans & Advances'):
+      1. an existing group under any known spelling — reuse;
+      2. else create the configured name under 'Current Assets';
+      3. else create it under the Asset root.
+    Returns None when the company has no Asset branch to anchor to, which the
+    caller treats as "can't book this pair yet"."""
+    group_name = _loans_advances_group_name()
+    for candidate in (group_name, 'Loans and Advances (Assets)',
+                      'Loans & Advances', 'Loans and Advances'):
+        existing = _find_accounts(client, company, account_name=candidate,
+                                  is_group=1)
+        if existing:
+            return existing[0]['name']
+    current_assets = _find_accounts(client, company, account_name='Current Assets',
+                                    is_group=1)
+    if current_assets:
+        return _create_group_account(client, group_name, current_assets[0]['name'],
+                                     company)
+    root = _asset_root(client, company)
+    if root:
+        return _create_group_account(client, group_name, root, company)
+    log.info('no Asset anchor for company %r; skipping intercompany receivable '
+             'group', company)
+    return None
+
+
+def _find_or_create_leaf(client: ERPNextClient, company: str, parent_group: str,
+                         account_name: str) -> str | None:
+    """Find (or create) a plain non-group Account named `account_name` under
+    `parent_group` for `company`; return its docname. Idempotent — an existing
+    leaf with the same account_name + company is reused, so re-detecting a pair
+    between the same two Companies never mints a duplicate.
+
+    The generic sibling of find_or_create_gl_account_for: no PlaidAccount, so no
+    liquidity banding and no fuzzy reuse (an intercompany control account must be
+    the exact counterparty named, never a near-miss). Numbering follows the
+    chart's own convention via _next_account_number, so on Tim's numbered chart a
+    new 'Due from Personal LLC' lands in the Loans-and-Advances band."""
+    existing = client.list_docs(
+        ACCOUNT_DT,
+        filters=[['account_name', '=', account_name], ['company', '=', company],
+                 ['is_group', '=', 0]],
+        fields=['name'], limit_page_length=1)
+    if existing:
+        return existing[0]['name']
+    doc = {'account_name': account_name, 'parent_account': parent_group,
+           'company': company, 'is_group': 0}
+    number = _next_account_number(client, company, parent_group, is_group=False)
+    if number:
+        doc['account_number'] = number
+    created = client.create_doc(ACCOUNT_DT, doc)
+    name = created.get('name')
+    log.info("created intercompany Account '%s' under '%s'%s",
+             name or account_name, parent_group,
+             f' as #{number}' if number else '')
+    audit.record('intercompany_account_created', subject_type='Account',
+                 subject_id=name or account_name,
+                 notes=f'created {account_name} under {parent_group}',
+                 after={'account': name or account_name, 'company': company,
+                        'parent_account': parent_group,
+                        'account_number': number})
+    return name
+
+
+def ensure_intercompany_account(client: ERPNextClient, company: str,
+                                other_company: str, side: str) -> str | None:
+    """Find (or create) one side of `company`'s intercompany control account
+    facing `other_company`; return the GL Account docname.
+
+    `side` is 'due_from' (an Asset — money the other Company owes this one) or
+    'due_to' (a Liability — money this Company owes the other). Returns None when
+    the chart has no branch to anchor the group to, or on any ERPNext failure —
+    the caller then records the pair as un-bookable rather than posting half an
+    entry."""
+    company = (company or '').strip()
+    other = (other_company or '').strip()
+    if not company or not other or side not in INTERCOMPANY_SIDES:
+        return None
+    if side == 'due_from':
+        parent = ensure_loans_advances_group(client, company)
+    else:
+        parent = _ensure_current_liabilities(client, company)
+    if not parent:
+        return None
+    return _find_or_create_leaf(client, company, parent,
+                                _intercompany_account_name(side, other))
+
+
+def ensure_intercompany_accounts(client: ERPNextClient, from_company: str,
+                                 to_company: str) -> tuple:
+    """Provision BOTH accounts one intercompany pair needs and return
+    (due_from_on_source, due_to_on_target).
+
+    The source Company (money out) gains `Due from <target>` on its Assets side;
+    the target Company (money in) gains `Due to <source>` on its Liabilities
+    side. Either element is None when that side couldn't be resolved — the
+    generator refuses to book anything unless both are present, so the two books
+    never go half-updated."""
+    return (ensure_intercompany_account(client, from_company, to_company,
+                                        'due_from'),
+            ensure_intercompany_account(client, to_company, from_company,
+                                        'due_to'))
 
 
 # ── v0.4.0: investment groups (balance-only) ────────────────────────────────

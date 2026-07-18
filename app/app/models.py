@@ -153,6 +153,19 @@ class BankTransaction(db.Model):
     merchant_name = db.Column(db.String(255), default='')
     category = db.Column(db.String(255), default='')
     pending = db.Column(db.Boolean, default=False, index=True)
+    # v0.4.1 · the IntercompanyTransferPair this transaction belongs to, once the
+    # detector has matched it against its counterparty in ANOTHER Company's linked
+    # account (see app/intercompany.py). NULL = not paired, which is every
+    # transaction on a single-Company install — the normal rules engine then runs
+    # exactly as it did pre-v0.4.1. A non-NULL value makes the transaction
+    # ineligible for ordinary categorization (rules with `ignore_for_paired`) and
+    # routes it to the paired Due from / Due to Journal Entries instead.
+    #
+    # Deliberately NOT a db.ForeignKey: an Unpair clears this back to NULL while
+    # the pair row is KEPT (state='rejected') as the suppression record that stops
+    # the detector immediately re-pairing the same two rows, so the two lifetimes
+    # are independent by design.
+    intercompany_pair_id = db.Column(db.Integer, nullable=True, index=True)
     # ERPNext bookkeeping — the returned Bank Transaction docname + when posted.
     erpnext_bank_transaction_id = db.Column(db.String(255), nullable=True, index=True)
     posted_at = db.Column(db.DateTime, nullable=True)
@@ -171,6 +184,7 @@ class BankTransaction(db.Model):
             'date': self.date.isoformat() if self.date else None,
             'name': self.name, 'merchant_name': self.merchant_name,
             'category': self.category, 'pending': bool(self.pending),
+            'intercompany_pair_id': self.intercompany_pair_id,
             'erpnext_bank_transaction_id': self.erpnext_bank_transaction_id,
             'posted_at': self.posted_at.isoformat() if self.posted_at else None,
             'removed': bool(self.removed), 'sync_error': self.sync_error,
@@ -421,6 +435,19 @@ class CategorizationRule(db.Model):
     # operator can always override. Defaults False, so every pre-v0.4.0.7 rule
     # keeps its current party behaviour.
     skip_party = db.Column(db.Boolean, default=False)
+    # v0.4.1 · don't fire this rule on a transaction the intercompany detector has
+    # paired (see app/intercompany.py). Defaults TRUE — and that default is the
+    # whole point of the flag: a transfer between two Companies you own is not
+    # revenue or expense, so a generic "Transfer" rule matching it would book P&L
+    # activity that isn't real. A paired transaction gets the Due from / Due to
+    # entry pair instead.
+    #
+    # An operator can clear it per rule for the rare case where a rule really
+    # should still fire on paired transactions (e.g. booking a wire fee that rides
+    # along with the transfer). Defaulting to True rather than making it
+    # unconditional keeps that escape hatch open without anyone having to opt in
+    # to correct behaviour.
+    ignore_for_paired = db.Column(db.Boolean, default=True)
     description_template = db.Column(db.Text, default='')
     # v0.4.0.1 · multi-entity rule scoping: when set, the rule only fires for a
     # transaction whose linked Plaid account resolves to this ERPNext Company.
@@ -474,6 +501,7 @@ class CategorizationRule(db.Model):
             'credit_account': self.credit_account,
             'party_type': self.party_type, 'party_name': self.party_name,
             'skip_party': bool(self.skip_party),
+            'ignore_for_paired': bool(self.ignore_for_paired),
             'description_template': self.description_template,
             'applies_to_company': self.applies_to_company or None,
             'superseded_by': self.superseded_by,
@@ -511,6 +539,13 @@ class GeneratedJournalEntry(db.Model):
     description = db.Column(db.Text, default='')
     rule_name = db.Column(db.String(255), default='')
     error_message = db.Column(db.Text, nullable=True)
+    # v0.4.1 · when this JE is one half of an intercompany transfer, the
+    # IntercompanyTransferPair it belongs to. Denormalized (the pair already names
+    # both JE docnames) so the Generated JEs list and any report can tell a
+    # Due-from/Due-to entry apart from a rules-engine one without a join, and so a
+    # sibling lookup is one indexed query. NULL for every ordinary rule-generated
+    # JE, which is all of them on a single-Company install.
+    intercompany_pair_id = db.Column(db.Integer, nullable=True, index=True)
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -519,10 +554,81 @@ class GeneratedJournalEntry(db.Model):
             'id': self.id, 'plaid_transaction_id': self.plaid_transaction_id,
             'rule_id': self.rule_id,
             'erpnext_journal_entry_name': self.erpnext_journal_entry_name,
+            'intercompany_pair_id': self.intercompany_pair_id,
             'state': self.state, 'amount': self.amount or 0.0,
             'merchant_name': self.merchant_name, 'description': self.description,
             'rule_name': self.rule_name, 'error_message': self.error_message,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class IntercompanyTransferPair(db.Model):
+    """One detected transfer between two ERPNext Companies the operator owns
+    (v0.4.1). See app/intercompany.py for the detector and the JE generator.
+
+    When money moves from a Farm account to a Personal account, Plaid delivers
+    TWO transactions — one on each side, equal magnitude and opposite sign. Left
+    alone, a generic rule books the outflow as an expense on the Farm's P&L and
+    the inflow as income on Personal's, so both sets of books show activity that
+    isn't real revenue or expense. This row records that the two are one
+    movement, and drives the paired Due from / Due to Journal Entries that book
+    it correctly on the balance sheet instead.
+
+    DIRECTION IS FIXED BY THE MONEY, not by discovery order:
+    `from_transaction_id` is always the money-OUT side (Plaid amount > 0, the
+    source Company) and `to_transaction_id` always the money-IN side. Every
+    consumer relies on that — the generator debits `Due from {to_company}` on the
+    source and credits `Due to {from_company}` on the target — so the detector
+    normalizes the orientation before ever creating a row.
+
+    Both transaction columns hold a `plaid_transaction_id`, matching the natural
+    key `GeneratedJournalEntry` already uses, so the pair survives the local rows
+    being re-upserted by a Plaid `modified` delivery.
+
+    `state` moves pending → approved | rejected. `rejected` is TERMINAL and
+    load-bearing: an Unpair keeps the row precisely so the detector can see that
+    these two transactions were already considered and rejected, and doesn't
+    re-pair them on the very next sync (see intercompany._suppressed_keys)."""
+    __tablename__ = 'intercompany_transfer_pairs'
+    id = db.Column(db.Integer, primary_key=True)
+    # The money-OUT (source) transaction and its Company.
+    from_transaction_id = db.Column(db.String(120), nullable=False, index=True)
+    from_company = db.Column(db.String(140), default='')
+    # The money-IN (target) transaction and its Company.
+    to_transaction_id = db.Column(db.String(120), nullable=False, index=True)
+    to_company = db.Column(db.String(140), default='')
+    # Magnitude of the transfer (both sides share it, by construction).
+    amount = db.Column(db.Float, default=0.0)
+    # 0.0-1.0 — see intercompany.score_pair. Stored so the review UI can sort and
+    # filter on it, and so a later threshold change doesn't rewrite history.
+    confidence = db.Column(db.Float, default=0.0)
+    # The two generated Journal Entries, once booked (both, or neither — see
+    # intercompany.generate_pair_journal_entries).
+    from_journal_entry = db.Column(db.String(255), nullable=True, index=True)
+    to_journal_entry = db.Column(db.String(255), nullable=True, index=True)
+    # pending | approved | rejected. Left un-constrained (like plaid_sync_log and
+    # generated_journal_entries) so a future state never needs a migration.
+    state = db.Column(db.String(20), default='pending', index=True)
+    # Free-text operator-facing detail — a JE generation failure, or the reason a
+    # detected pair couldn't supersede an already-approved rules-engine JE.
+    note = db.Column(db.Text, nullable=True)
+    detected_at = db.Column(db.DateTime, default=_now, index=True)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'from_transaction_id': self.from_transaction_id,
+            'from_company': self.from_company or '',
+            'to_transaction_id': self.to_transaction_id,
+            'to_company': self.to_company or '',
+            'amount': self.amount or 0.0,
+            'confidence': round(float(self.confidence or 0.0), 4),
+            'from_journal_entry': self.from_journal_entry,
+            'to_journal_entry': self.to_journal_entry,
+            'state': self.state, 'note': self.note,
+            'detected_at': self.detected_at.isoformat() if self.detected_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
 

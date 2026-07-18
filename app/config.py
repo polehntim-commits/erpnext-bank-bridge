@@ -287,6 +287,52 @@ class Config:
         PLAID_PRICE_PER_CALL = float(os.environ.get('PLAID_PRICE_PER_CALL', '0.30'))
     except ValueError:
         PLAID_PRICE_PER_CALL = 0.30
+    # ── v0.4.1 · intercompany transfer detection ────────────────────────────
+    # A transfer between two ERPNext Companies the operator owns shows up as two
+    # Plaid transactions of equal magnitude and opposite sign, one per Company.
+    # These four knobs tune how confidently Bank Bridge matches them up; see
+    # app/intercompany.py for the scoring model. Detection is inert until linked
+    # accounts resolve to more than one Company, so a single-Company install is
+    # unaffected whatever these are set to.
+    #
+    # ± window, in days, the two legs may be dated apart. A same-bank move clears
+    # the same day; an ACH between institutions often takes two or three.
+    try:
+        INTERCOMPANY_DATE_TOLERANCE_DAYS = max(
+            0, int(os.environ.get('INTERCOMPANY_DATE_TOLERANCE_DAYS', '3')))
+    except ValueError:
+        INTERCOMPANY_DATE_TOLERANCE_DAYS = 3
+    # Minimum description similarity (0.0-1.0, stdlib difflib) for two
+    # transactions to be considered a candidate pair at all. 0.6 accepts the
+    # canonical 'Transfer to Personal' / 'Transfer from Farm' shape (0.63) while
+    # rejecting unrelated merchants (below 0.3).
+    try:
+        INTERCOMPANY_DESCRIPTION_THRESHOLD = float(os.environ.get(
+            'INTERCOMPANY_DESCRIPTION_THRESHOLD', '0.6'))
+    except ValueError:
+        INTERCOMPANY_DESCRIPTION_THRESHOLD = 0.6
+    # Minimum overall confidence to pair AUTOMATICALLY. Below this the candidate
+    # is logged and left alone rather than booked — weak evidence should reach a
+    # human, not the ledger. Raise it to make auto-pairing stricter.
+    try:
+        INTERCOMPANY_CONFIDENCE_THRESHOLD = float(os.environ.get(
+            'INTERCOMPANY_CONFIDENCE_THRESHOLD', '0.75'))
+    except ValueError:
+        INTERCOMPANY_CONFIDENCE_THRESHOLD = 0.75
+    # How far back a detection pass looks for a counterparty. Generous, because
+    # each Plaid Item advances its own cursor and the two legs routinely arrive
+    # on different syncs — but bounded, so the pass stays a small query.
+    try:
+        INTERCOMPANY_LOOKBACK_DAYS = max(
+            0, int(os.environ.get('INTERCOMPANY_LOOKBACK_DAYS', '30')))
+    except ValueError:
+        INTERCOMPANY_LOOKBACK_DAYS = 30
+    # The Chart-of-Accounts group intercompany 'Due from …' receivables are
+    # created under, on the Assets side. The 'Due to …' payables use
+    # ERPNEXT_CURRENT_LIABILITIES_GROUP_NAME (above).
+    ERPNEXT_LOANS_ADVANCES_GROUP_NAME = os.environ.get(
+        'ERPNEXT_LOANS_ADVANCES_GROUP_NAME', 'Loans and Advances (Assets)')
+
     # Set false to disable the in-process scheduler entirely (e.g. drive syncs by
     # cron hitting /api/sync/plaid_now instead). Distinct from MANUAL-ONLY above:
     # this stops the scheduler process; MANUAL-ONLY runs it with no poll job.

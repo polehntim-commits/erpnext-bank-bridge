@@ -21,7 +21,8 @@ from sqlalchemy import inspect, text  # noqa: E402
 
 from app import create_app, db, crypto  # noqa: E402
 from app import migrations  # noqa: E402
-from app.models import PlaidItem  # noqa: E402
+from app.models import (BankTransaction, CategorizationRule,  # noqa: E402
+                        PlaidItem)
 
 # The columns introduced after v0.3.x that an upgrading install must gain. The
 # regression was specifically that these never got added.
@@ -131,6 +132,80 @@ class MigrationTests(MigrationBase):
         self._downgrade_to_pre_v040()
         migrations.run_migrations()
         self.assertIn('owning_company', self._columns('plaid_items'))
+
+
+# ── v0.4.1 · intercompany transfer detection ────────────────────────────────
+
+# The columns v0.4.1 adds to tables that already exist. The pair TABLE itself is
+# built by create_all() and needs no migration line.
+V041_COLUMNS = [
+    ('bank_transactions', 'intercompany_pair_id'),
+    ('generated_journal_entries', 'intercompany_pair_id'),
+    ('categorization_rules', 'ignore_for_paired'),
+]
+
+
+class IntercompanyMigrationTests(MigrationBase):
+    def _downgrade_to_pre_v041(self):
+        """Rewind to a v0.4.0.9 install: drop the three v0.4.1 columns (indexed
+        ones lose their index first — SQLite refuses to drop an indexed column)
+        and the pair table."""
+        with db.engine.begin() as conn:
+            for index in ('ix_bank_transactions_intercompany_pair_id',
+                          'ix_generated_journal_entries_intercompany_pair_id'):
+                conn.execute(text(f'DROP INDEX IF EXISTS {index}'))
+            for table, column in V041_COLUMNS:
+                conn.execute(text(f'ALTER TABLE {table} DROP COLUMN {column}'))
+            conn.execute(text('DROP TABLE IF EXISTS intercompany_transfer_pairs'))
+
+    def test_fresh_install_has_the_columns_and_the_table(self):
+        for table, column in V041_COLUMNS:
+            self.assertIn(column, self._columns(table))
+        self.assertIn('intercompany_transfer_pairs',
+                      inspect(db.engine).get_table_names())
+
+    def test_upgrade_adds_the_missing_columns(self):
+        self._downgrade_to_pre_v041()
+        for table, column in V041_COLUMNS:
+            self.assertNotIn(column, self._columns(table))
+        migrations.run_migrations()
+        for table, column in V041_COLUMNS:
+            self.assertIn(column, self._columns(table),
+                          f'{table}.{column} should be added on upgrade')
+
+    def test_upgrade_is_idempotent(self):
+        self._downgrade_to_pre_v041()
+        migrations.run_migrations()
+        migrations.run_migrations()
+        for table, column in V041_COLUMNS:
+            self.assertIn(column, self._columns(table))
+
+    def test_existing_rules_backfill_to_ignoring_paired_transactions(self):
+        """The backfill direction is the whole safety argument: an existing
+        rule must NOT start firing on paired transactions the moment v0.4.1
+        ships, or a generic Transfer rule would keep booking one leg of every
+        intercompany move to profit & loss."""
+        rule = CategorizationRule(name='Transfers', priority=10, active=True,
+                                  archived=False, match_type='description_regex',
+                                  match_value='Transfer',
+                                  offset_account='Owner Draws')
+        db.session.add(rule)
+        db.session.commit()
+        rule_id = rule.id
+        db.session.remove()
+        self._downgrade_to_pre_v041()
+        migrations.run_migrations()
+        migrated = db.session.get(CategorizationRule, rule_id)
+        self.assertTrue(migrated.ignore_for_paired,
+                        'a pre-v0.4.1 rule must default to ignoring paired '
+                        'transactions, not to firing on them')
+
+    def test_existing_transactions_backfill_to_unpaired(self):
+        self._downgrade_to_pre_v041()
+        migrations.run_migrations()
+        # Would raise before the column is added — the same shape as the
+        # v0.4.0 → v0.4.0.1 regression this file exists to guard.
+        self.assertEqual(BankTransaction.query.all(), [])
 
 
 if __name__ == '__main__':

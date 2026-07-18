@@ -71,6 +71,21 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # value ('Auto') and makes it load-bearing. Backfills to NULL = no Party,
     # which is exactly what a pre-v0.4.0.8 rule without one already meant.
     ('categorization_rules', 'party_type', 'VARCHAR(20)'),
+    # v0.4.1 — intercompany transfer detection. The `intercompany_transfer_pairs`
+    # TABLE itself needs no line here (create_all builds a missing table); these
+    # three are the additive columns on tables that already exist.
+    #
+    # Both pair links backfill to NULL = "not part of an intercompany transfer",
+    # which is true of every transaction and every JE on an existing install, so
+    # nothing about a v0.4.0.9 database changes behaviour on upgrade.
+    ('bank_transactions', 'intercompany_pair_id', 'INTEGER'),
+    ('generated_journal_entries', 'intercompany_pair_id', 'INTEGER'),
+    # NOTE the DEFAULT true, which is the opposite of every other boolean here:
+    # an existing rule must NOT start firing on paired transactions the moment
+    # this feature ships. Backfilling to false would leave a generic "Transfer"
+    # rule booking one leg of every intercompany move to P&L — exactly the bug
+    # v0.4.1 exists to fix — so the safe backfill is the protective value.
+    ('categorization_rules', 'ignore_for_paired', 'BOOLEAN DEFAULT true'),
 ]
 
 

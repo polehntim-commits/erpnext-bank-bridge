@@ -235,6 +235,20 @@ def rule_matches(rule: CategorizationRule, *, merchant_name: str = '',
     return False
 
 
+def _rule_eligible_for_paired(rule, row) -> bool:
+    """Whether a rule may fire on this transaction given its intercompany status
+    (v0.4.1). A transaction the detector has paired is booked through the Due
+    from / Due to entries instead, so a rule carrying `ignore_for_paired` (the
+    default) is skipped for it — otherwise a generic "Transfer" rule would ALSO
+    book one leg to P&L and the transfer would be counted twice.
+
+    An unpaired transaction is always eligible, which is every transaction on a
+    single-Company install."""
+    if not getattr(row, 'intercompany_pair_id', None):
+        return True
+    return not getattr(rule, 'ignore_for_paired', True)
+
+
 def _rule_applies_to_company(rule, row_company: str) -> bool:
     """Whether a company-scoped rule is in scope for this transaction. A rule
     with a blank `applies_to_company` is company-agnostic and always applies
@@ -253,7 +267,13 @@ def evaluate_rules(row):
 
     v0.4.0.1: a rule scoped to an owning Company (`applies_to_company`) is only
     eligible when the transaction's account resolves to that Company. The row's
-    Company is resolved once (not per rule) to keep this cheap."""
+    Company is resolved once (not per rule) to keep this cheap.
+
+    v0.4.1: a rule carrying `ignore_for_paired` (the default) is skipped
+    entirely for a transaction the intercompany detector has paired — that
+    transfer is booked through its Due from / Due to entries instead. The trace
+    still records the rule as considered-and-unmatched, so the audit log shows
+    exactly why an otherwise-matching rule didn't win."""
     from . import erpnext_accounts
     row_company = erpnext_accounts.owning_company_for_account_id(
         getattr(row, 'account_id', None))
@@ -264,7 +284,8 @@ def evaluate_rules(row):
                        CategorizationRule.id.asc()).all())
     trace = []
     for rule in rules:
-        matched = (_rule_applies_to_company(rule, row_company)
+        matched = (_rule_eligible_for_paired(rule, row)
+                   and _rule_applies_to_company(rule, row_company)
                    and rule_matches(
                        rule, merchant_name=row.merchant_name,
                        description=(row.name or ''), category=(row.category or ''),

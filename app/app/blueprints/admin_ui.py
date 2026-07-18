@@ -10,6 +10,7 @@ Pages:
   /admin/accounts       — map each Plaid account → ERPNext Bank Account
   /admin/transactions   — filterable transaction list + per-row retry
   /admin/erpnext_settings — ERPNext connection (URL + API key/secret)
+  /admin/intercompany   — review transfers detected between two owned Companies
   /admin/sync_log       — recent PlaidSyncLog rows
 """
 import hmac
@@ -26,13 +27,14 @@ from .. import db
 from .. import erpnext_accounts
 from .. import erpnext_bank
 from .. import erpnext_settings as erps
+from .. import intercompany
 from .. import plaid_settings as ps
 from .. import sync_config
 from .. import sync_engine
 from ..erpnext_client import ERPNextConfigError, ERPNextError
 from ..models import (AuditEvent, BankTransaction, CategorizationRule,
-                      GeneratedJournalEntry, PlaidAccount, PlaidItem,
-                      PlaidSyncLog, Supplier)
+                      GeneratedJournalEntry, IntercompanyTransferPair,
+                      PlaidAccount, PlaidItem, PlaidSyncLog, Supplier)
 
 bp = Blueprint('admin_ui', __name__)
 
@@ -139,6 +141,7 @@ NAV_HTML = """
   <a href="/admin/rules" class="{{ 'active' if page == 'rules' else '' }}">Rules</a>
   <a href="/admin/suppliers" class="{{ 'active' if page == 'suppliers' else '' }}">Suppliers</a>
   <a href="/admin/generated_entries" class="{{ 'active' if page == 'generated_entries' else '' }}">Generated JEs</a>
+  <a href="/admin/intercompany" class="{{ 'active' if page == 'intercompany' else '' }}">Intercompany</a>
   <a href="/admin/audit" class="{{ 'active' if page == 'audit' else '' }}">Audit</a>
   <a href="/admin/sync_log" class="{{ 'active' if page == 'sync_log' else '' }}">Sync Log</a>
   <a href="/admin/plaid_settings" class="{{ 'active' if page == 'plaid_settings' else '' }}">Plaid</a>
@@ -1482,6 +1485,24 @@ RULES_BODY = """
       Recommended when the offset account is another Bank Account of the same Company.
     </span>
   </div>
+  <!-- v0.4.1 · intercompany. Defaults CHECKED for a new rule (form.get with a
+       True fallback), because a transfer between two Companies you own is not
+       revenue or expense and a generic rule firing on one leg would book P&L
+       activity that never happened. -->
+  <div style="margin:2px 0 8px">
+    <label style="font-weight:400">
+      <input type="checkbox" name="ignore_for_paired" id="ignore-for-paired" value="1"
+             style="width:auto" {{ 'checked' if form.get('ignore_for_paired', True) else '' }}>
+      Ignore for intercompany-paired transactions
+    </label>
+    <span style="display:block;font-size:11px;color:#888;margin:2px 0 0 22px">
+      Recommended. Transfers between two Companies you own are booked through
+      <b>Due from</b> / <b>Due to</b> accounts on the
+      <a href="/admin/intercompany">Intercompany</a> page instead — leave this on
+      so this rule doesn’t also book one leg to profit &amp; loss. Clear it only
+      if this rule really should still fire on a paired transaction.
+    </span>
+  </div>
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:1;min-width:220px">Applies to Company
       <span style="font-weight:400;color:#888">— multi-entity scope</span>
@@ -2107,6 +2128,12 @@ def _rule_form_values():
         # v0.4.0.7 · the checkbox is authoritative — the transfer heuristic only
         # pre-checks it in the editor, it never overrides a saved choice.
         'skip_party': bool(request.form.get('skip_party')),
+        # v0.4.1 · default ON. The checkbox renders checked, so a plain save
+        # keeps a rule out of the way of intercompany transfers; only an operator
+        # who deliberately clears it gets the old behaviour on paired rows. A
+        # hand-rolled POST omitting the field therefore reads as "don't ignore",
+        # which is why the editor always emits it (see the hidden companion input).
+        'ignore_for_paired': bool(request.form.get('ignore_for_paired')),
         'description_template': (request.form.get('description_template') or '').strip(),
         # v0.4.0.1 · optional multi-entity scope. Blank → company-agnostic.
         'applies_to_company': (request.form.get('applies_to_company') or '').strip() or None,
@@ -2812,6 +2839,329 @@ def bulk_entries():
                         'failed': failed, 'failures': failures,
                         'message': summary}), 200
     return redirect('/admin/generated_entries?flash=' + quote_plus(summary))
+
+
+# ── Intercompany transfers (v0.4.1) ──────────────────────────────
+#
+# Review queue for transfers the detector matched between two Companies the
+# operator owns. The actions mirror the Generated JEs page's shape (per-row
+# forms + a bulk bar) but act on the PAIR, so both entities' Journal Entries move
+# together — approving one entity's half of a transfer and not the other is the
+# reconciliation problem this whole feature exists to prevent.
+
+
+def _pair_state_pill(state):
+    pills = {'pending': ('pill-muted', 'pending'),
+             'approved': ('pill-ok', 'approved'),
+             'rejected': ('pill-muted', 'unpaired')}
+    cls, label = pills.get(state, ('pill-muted', state or ''))
+    return f'<span class="pill {cls}">{label}</span>'
+
+
+def _confidence_pill(confidence):
+    """Confidence as a coloured percentage. Green at/above the auto-pair
+    threshold, amber below it — a pair only lands below the threshold when an
+    operator paired it by hand or the threshold was raised after the fact, and
+    either way it deserves a second look."""
+    try:
+        pct = float(confidence or 0.0) * 100.0
+    except (TypeError, ValueError):
+        pct = 0.0
+    threshold = intercompany.confidence_threshold() * 100.0
+    cls = 'pill-ok' if pct >= threshold else 'pill-err'
+    return f'<span class="pill {cls}">{pct:.0f}%</span>'
+
+
+INTERCOMPANY_BODY = """
+<h2>Intercompany transfers</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+<p style="font-size:14px;color:#555">
+  Money moved between two Companies you own arrives as <b>two</b> Plaid
+  transactions — equal amount, opposite sign, one per Company. Booking each on
+  its own would put an expense on one entity's profit &amp; loss and income on
+  the other's, for money that never left your hands. Bank Bridge matches the two
+  up and books the movement through a <b>Due from</b> / <b>Due to</b> pair
+  instead, so it lands on both balance sheets and nets to zero across the
+  entities. <b>Approve</b> submits both Journal Entries together;
+  <b>Unpair</b> undoes the match and returns both transactions to the normal
+  rules.
+</p>
+{% if not multi_company %}
+<div class="banner-warn">
+  <h3>Detection is idle</h3>
+  Intercompany detection needs linked bank accounts under <b>more than one</b>
+  ERPNext Company. Right now they all resolve to a single Company, so there is
+  nothing to pair. Link a second Company's bank on
+  <a href="/admin/link_bank">Link a bank</a> (or set the owning Company on
+  <a href="/admin/accounts">Accounts</a>) and detection starts on the next sync.
+</div>
+{% endif %}
+<form method="get" action="/admin/intercompany" class="card"
+      style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+  <label style="margin:0">State
+    <select name="state">
+      <option value="">(any)</option>
+      {% for st in states %}
+      <option value="{{ st }}" {{ 'selected' if cur_state == st else '' }}>{{ st }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label style="margin:0">Company
+    <select name="company">
+      <option value="">(any)</option>
+      {% for c in companies %}
+      <option value="{{ c }}" {{ 'selected' if cur_company_filter == c else '' }}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label style="margin:0">Min confidence
+    <input name="min_confidence" value="{{ cur_min_confidence }}"
+           placeholder="0.75" style="width:90px">
+  </label>
+  <button type="submit" class="primary">Filter</button>
+  <a href="/admin/intercompany" class="secondary"
+     style="text-decoration:none;display:inline-block;padding:8px 16px">Clear</a>
+</form>
+
+<form id="ic-bulk" method="post" action="/admin/intercompany/bulk"
+      style="margin:8px 0">
+  <button type="submit" name="action" value="approve" class="secondary">Approve selected</button>
+  <button type="submit" name="action" value="reject" class="secondary" style="margin-left:8px">Unpair selected</button>
+  <span style="margin-left:12px;color:#888;font-size:12px">
+    With nothing checked, these act on <b>all pending</b> pairs shown.</span>
+</form>
+
+<table>
+  <tr>
+    <th style="width:26px"><input type="checkbox" id="ic-check-all" title="Select all"></th>
+    <th>Source (money out)</th><th>Target (money in)</th>
+    <th class="num">Amount</th><th>Confidence</th>
+    <th>Journal Entries</th><th>State</th><th></th></tr>
+  {% for p in rows %}
+  <tr data-ic-id="{{ p.id }}">
+    <td><input type="checkbox" class="ic-check" name="ids" value="{{ p.id }}" form="ic-bulk"></td>
+    <td style="font-size:12px">
+      <b>{{ p.from_company or '(unknown Company)' }}</b>
+      <div style="color:#888">{{ txns[p.from_transaction_id].bank if txns.get(p.from_transaction_id) else '' }}</div>
+      <div>{{ txns[p.from_transaction_id].date if txns.get(p.from_transaction_id) else '' }}
+        · {{ (txns[p.from_transaction_id].name if txns.get(p.from_transaction_id) else '')[:44] }}</div>
+    </td>
+    <td style="font-size:12px">
+      <b>{{ p.to_company or '(unknown Company)' }}</b>
+      <div style="color:#888">{{ txns[p.to_transaction_id].bank if txns.get(p.to_transaction_id) else '' }}</div>
+      <div>{{ txns[p.to_transaction_id].date if txns.get(p.to_transaction_id) else '' }}
+        · {{ (txns[p.to_transaction_id].name if txns.get(p.to_transaction_id) else '')[:44] }}</div>
+    </td>
+    <td class="num">{{ '%.2f'|format(p.amount or 0.0) }}</td>
+    <td>{{ confidence_pill(p.confidence)|safe }}</td>
+    <td style="font-size:12px">
+      {% if p.from_journal_entry %}<code>{{ p.from_journal_entry }}</code><br>
+        <code>{{ p.to_journal_entry }}</code>
+      {% else %}<span style="color:#999">not booked</span>{% endif %}
+      {% if p.note %}<div style="color:#a04000;margin-top:3px">{{ p.note[:160] }}</div>{% endif %}
+    </td>
+    <td class="ic-state-cell">{{ pair_pill(p.state)|safe }}</td>
+    <td class="ic-actions-cell" style="white-space:nowrap">{{ pair_actions(p)|safe }}</td>
+  </tr>
+  {% endfor %}
+  {% if not rows %}<tr><td colspan="8" style="color:#888">No intercompany transfers detected.</td></tr>{% endif %}
+</table>
+<p style="font-size:12px;color:#888">
+  Showing up to {{ limit }} most recent. Auto-pair threshold:
+  <b>{{ '%.0f'|format(threshold * 100) }}%</b> confidence, ±{{ tolerance }} day
+  date window.</p>
+
+<script>
+(function () {
+  var all = document.getElementById('ic-check-all');
+  if (all) all.addEventListener('change', function () {
+    document.querySelectorAll('.ic-check').forEach(function (c) {
+      c.checked = all.checked; });
+  });
+  // Unpair discards a match and (when already approved) cancels two submitted
+  // Journal Entries — confirm before doing that on the operator's behalf.
+  document.addEventListener('submit', function (ev) {
+    var f = ev.target;
+    if (!f.classList || !f.classList.contains('ic-unpair')) return;
+    if (!window.confirm('Unpair this transfer? Any generated Journal Entries ' +
+        'are cancelled and both transactions go back to the normal rules.'))
+      ev.preventDefault();
+  });
+})();
+</script>
+"""
+
+
+def _pair_action_buttons(p):
+    """Per-row actions for pair state `p.state`. Mirrors _row_action_buttons on
+    the Generated JEs page."""
+
+    def btn(action, label, cls=''):
+        return (
+            f'<form method="post" action="/admin/intercompany/{action}" '
+            f'class="{cls}" style="display:inline;margin:0">'
+            f'<input type="hidden" name="id" value="{p.id}">'
+            f'<button type="submit" class="secondary" '
+            f'style="padding:3px 10px;font-size:12px">{label}</button></form> ')
+
+    out = ''
+    if p.state == 'pending':
+        if p.from_journal_entry and p.to_journal_entry:
+            out += btn('approve', 'Approve')
+        else:
+            out += btn('retry', 'Retry')
+        out += btn('reject', 'Unpair', cls='ic-unpair')
+    elif p.state == 'approved':
+        out += btn('reject', 'Unpair (cancel)', cls='ic-unpair')
+    return out or '<span style="color:#bbb;font-size:12px">—</span>'
+
+
+def _pair_transaction_context(pairs) -> dict:
+    """{plaid_transaction_id: {date, name, bank}} for every leg on the page, so
+    the table can show what each side actually was without N queries per row."""
+    ids = set()
+    for p in pairs:
+        ids.add(p.from_transaction_id)
+        ids.add(p.to_transaction_id)
+    if not ids:
+        return {}
+    rows = (BankTransaction.query
+            .filter(BankTransaction.plaid_transaction_id.in_(ids)).all())
+    banks = {a.account_id: (a.erpnext_bank_account_name or a.name or '')
+             for a in PlaidAccount.query.all()}
+    return {r.plaid_transaction_id: {
+        'date': r.date.isoformat() if r.date else '',
+        'name': r.name or r.merchant_name or '',
+        'bank': banks.get(r.account_id, '')} for r in rows}
+
+
+def _intercompany_rows():
+    """The filtered pair list for the page, plus the active filter values.
+    Filtering on Company matches EITHER side — an operator scoped to the Farm
+    wants every transfer the Farm was involved in, whichever direction it went."""
+    cur_state = (request.args.get('state') or '').strip()
+    company = (request.args.get('company') or '').strip() or _current_company()
+    raw_min = (request.args.get('min_confidence') or '').strip()
+    try:
+        min_confidence = float(raw_min) if raw_min else None
+    except ValueError:
+        min_confidence = None
+    q = IntercompanyTransferPair.query
+    if cur_state:
+        q = q.filter(IntercompanyTransferPair.state == cur_state)
+    if company:
+        q = q.filter(db.or_(IntercompanyTransferPair.from_company == company,
+                            IntercompanyTransferPair.to_company == company))
+    if min_confidence is not None:
+        q = q.filter(IntercompanyTransferPair.confidence >= min_confidence)
+    rows = q.order_by(IntercompanyTransferPair.detected_at.desc(),
+                      IntercompanyTransferPair.id.desc()).limit(300).all()
+    return rows, cur_state, company, raw_min
+
+
+@bp.get('/admin/intercompany')
+def intercompany_page():
+    rows, cur_state, company, raw_min = _intercompany_rows()
+    return _page(INTERCOMPANY_BODY, page='intercompany', rows=rows,
+                 txns=_pair_transaction_context(rows),
+                 cur_state=cur_state, cur_company_filter=company,
+                 cur_min_confidence=raw_min, limit=300,
+                 companies=_known_companies(),
+                 multi_company=intercompany.multi_company_accounts(),
+                 threshold=intercompany.confidence_threshold(),
+                 tolerance=intercompany.date_tolerance_days(),
+                 states=('pending', 'approved', 'rejected'),
+                 pair_pill=_pair_state_pill,
+                 confidence_pill=_confidence_pill,
+                 pair_actions=_pair_action_buttons,
+                 flash_msg=request.args.get('flash', ''))
+
+
+_PAIR_ACTIONS = {
+    'approve': intercompany.approve_pair,
+    'reject': intercompany.reject_pair,
+    'retry': intercompany.retry_pair,
+}
+
+
+def _pair_response(ok: bool, message: str, pair=None, status=200):
+    if _wants_json():
+        return jsonify({'ok': ok, 'message': message,
+                        'id': (pair.id if pair else None),
+                        'state': (pair.state if pair else None)}), (
+            200 if ok else status)
+    return redirect('/admin/intercompany?flash=' + quote_plus(message))
+
+
+def _do_pair_action(action: str):
+    raw_id = (request.form.get('id') or '').strip()
+    if not raw_id.isdigit():
+        return _pair_response(False, 'Bad id', status=400)
+    pair = db.session.get(IntercompanyTransferPair, int(raw_id))
+    if pair is None:
+        return _pair_response(False, 'Not found', status=404)
+    ok, message = _PAIR_ACTIONS[action](sync_engine.get_erp_client_or_none(),
+                                        pair)
+    db.session.commit()
+    return _pair_response(ok, message, pair, status=409)
+
+
+@bp.post('/admin/intercompany/approve')
+def approve_pair_route():
+    return _do_pair_action('approve')
+
+
+@bp.post('/admin/intercompany/reject')
+def reject_pair_route():
+    return _do_pair_action('reject')
+
+
+@bp.post('/admin/intercompany/retry')
+def retry_pair_route():
+    return _do_pair_action('retry')
+
+
+@bp.post('/admin/intercompany/bulk')
+def bulk_pairs():
+    """Apply one action to many pairs. Explicit `ids` (the checkbox selection)
+    win; with none checked, act on every pending pair matching the CURRENT
+    filters — so a Company-scoped view never silently approves transfers the
+    operator can't see. Partial success is reported; one pair's failure never
+    rolls back the pairs that succeeded."""
+    action = (request.form.get('action') or '').strip()
+    handler = _PAIR_ACTIONS.get(action)
+    if handler is None:
+        return _pair_response(False, f'Unknown bulk action “{action}”',
+                              status=400)
+    ids = [int(i) for i in request.form.getlist('ids') if i.isdigit()]
+    if ids:
+        pairs = (IntercompanyTransferPair.query
+                 .filter(IntercompanyTransferPair.id.in_(ids))
+                 .order_by(IntercompanyTransferPair.id).all())
+    else:
+        pairs = [p for p in _intercompany_rows()[0] if p.state == 'pending']
+        pairs.sort(key=lambda p: p.id)
+    erp = sync_engine.get_erp_client_or_none()
+    done = failed = 0
+    failures = []
+    for pair in pairs:
+        ok, message = handler(erp, pair)
+        if ok:
+            done += 1
+        else:
+            failed += 1
+            failures.append({'id': pair.id, 'message': message})
+    db.session.commit()
+    verb = {'approve': 'Approved', 'reject': 'Unpaired',
+            'retry': 'Retried'}.get(action, action)
+    summary = f'{verb} {done} transfer{"" if done == 1 else "s"}'
+    if failed:
+        summary += f' · {failed} failed'
+    if _wants_json():
+        return jsonify({'ok': failed == 0, 'action': action, 'done': done,
+                        'failed': failed, 'failures': failures,
+                        'message': summary}), 200
+    return redirect('/admin/intercompany?flash=' + quote_plus(summary))
 
 
 # ── Audit trail ──────────────────────────────────────────────────

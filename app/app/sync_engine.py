@@ -41,6 +41,7 @@ from . import categorization
 from . import erpnext_accounts
 from . import erpnext_bank
 from . import erpnext_settings
+from . import intercompany
 from . import plaid_settings
 from . import crypto
 from .erpnext_client import ERPNextAPIError, ERPNextConfigError, ERPNextError
@@ -361,12 +362,24 @@ def push_pending(erp_client, item_id: str = '') -> dict:
     """Post every pending local row (posted_at IS NULL) whose account is mapped
     + enabled. Rows for unmapped accounts are left pending (no error). Logs one
     erpnext_push row. `item_id` scopes the log line (optional)."""
-    stats = {'posted': 0, 'cancelled': 0, 'failed': 0, 'skipped': 0, 'drift': 0}
+    stats = {'posted': 0, 'cancelled': 0, 'failed': 0, 'skipped': 0, 'drift': 0,
+             'paired': 0, 'pairs_booked': 0}
     if erp_client is None:
         return stats
     eligible = _eligible_account_map()
     q = BankTransaction.query.filter(BankTransaction.posted_at.is_(None))
     pending = q.order_by(BankTransaction.date.asc()).all()
+    # v0.4.1 · pair BEFORE categorizing. A transfer between two Companies the
+    # operator owns must not be seen by the ordinary rules engine at all — so the
+    # detection pass has to run ahead of the categorize_after_push calls below,
+    # not after them. Detection is inert on a single-Company install and never
+    # raises (see intercompany.run_detection).
+    try:
+        stats['paired'] = len(intercompany.detect_pairs(
+            limit_transaction_ids=[r.plaid_transaction_id for r in pending]))
+    except Exception:  # noqa: BLE001 — never fail a push on pair detection
+        db.session.rollback()
+        log.warning('intercompany detection failed before push', exc_info=True)
     # v0.4.0 multi-entity drift guard: only for accounts with an explicit owning
     # Company. Probed once per account per run (cached), and refused rows never
     # touch ERPNext, so a mis-set Company can't post into the wrong entity.
@@ -411,12 +424,22 @@ def push_pending(erp_client, item_id: str = '') -> dict:
             stats['failed'] += 1
             log.warning('ERPNext push failed for %s: %s',
                         row.plaid_transaction_id if row else '?', e)
+    # v0.4.1 · book the paired transfers AFTER the push, so each leg's Journal
+    # Entry can reference the ERPNext Bank Transaction that was just created for
+    # it (the reference_name on both lines).
+    try:
+        stats['pairs_booked'] = intercompany.generate_pending_journal_entries(
+            erp_client)
+    except Exception:  # noqa: BLE001 — never fail a push on pair booking
+        db.session.rollback()
+        log.warning('intercompany JE generation failed after push', exc_info=True)
     handled = stats['posted'] + stats['cancelled']
     status = 'failed' if stats['failed'] and not handled else 'success'
     _log(item_id, 'erpnext_push', handled, status,
          f"posted={stats['posted']} cancelled={stats['cancelled']} "
          f"failed={stats['failed']} skipped={stats['skipped']} "
-         f"drift={stats['drift']}")
+         f"drift={stats['drift']} paired={stats['paired']} "
+         f"pairs_booked={stats['pairs_booked']}")
     return stats
 
 
@@ -528,19 +551,29 @@ def sync_all(plaid_client: PlaidClient = None, erp_client=None) -> dict:
                  notes=f'sync across {len(items)} item(s)')
     results = []
     agg = {'added': 0, 'modified': 0, 'removed': 0, 'posted': 0,
-           'cancelled': 0, 'failed': 0}
+           'cancelled': 0, 'failed': 0, 'paired': 0, 'pairs_booked': 0}
     for item in items:
         try:
             res = sync_item(item, plaid_client, erp_client)
             results.append(res)
             for k in ('added', 'modified', 'removed'):
                 agg[k] += res.get('pull', {}).get(k, 0)
-            for k in ('posted', 'cancelled', 'failed'):
+            for k in ('posted', 'cancelled', 'failed', 'paired', 'pairs_booked'):
                 agg[k] += res.get('push', {}).get(k, 0)
         except (PlaidError, PlaidConfigError) as e:
             log.warning('sync failed for item %s: %s', item.item_id, e)
             results.append({'item_id': item.item_id, 'error': str(e)})
+    # v0.4.1 · a final cross-Item detection pass. Each Item pulls on its own
+    # cursor, so the two legs of one transfer very often arrive in DIFFERENT
+    # iterations of the loop above — the second Company's leg simply did not
+    # exist yet when the first was pushed. This pass runs once every Item has
+    # landed, which is the first moment both halves are visible together.
+    if erp_client is not None:
+        final = intercompany.run_detection(erp_client)
+        agg['paired'] += final['detected']
+        agg['pairs_booked'] += final['booked']
     audit.record('sync_run_completed', subject_type=None, after=agg,
                  notes=(f"items={len(items)} added={agg['added']} "
-                        f"posted={agg['posted']} failed={agg['failed']}"))
+                        f"posted={agg['posted']} failed={agg['failed']} "
+                        f"paired={agg['paired']}"))
     return {'items': len(items), 'results': results}
