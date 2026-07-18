@@ -154,34 +154,81 @@ def is_enabled() -> bool:
     return bool(current_app.config.get('COUNTERPARTY_OVERLAY_ENABLED', True))
 
 
-def ensure_counterparty_doctype(client: ERPNextClient) -> bool:
-    """Idempotently provision the Counterparty doctype. Returns True when it is
-    available (already present or just created), False when this ERPNext won't
-    give it to us.
+# The outcomes provision_report can return in its 'state' field. Stable strings
+# — the startup job, the management CLI and the tests all key off them.
+PROVISION_CREATED = 'created'
+PROVISION_PRESENT = 'already_present'
+PROVISION_NO_CLIENT = 'not_configured'
+PROVISION_PERMISSION = 'permission_denied'
+PROVISION_NO_DOCTYPE_API = 'doctype_api_unavailable'
+PROVISION_PROBE_FAILED = 'probe_failed'
+PROVISION_CREATE_FAILED = 'create_failed'
+
+# Operator-facing explanation per failure state. The whole point of v0.4.6's
+# change here is that a refusal says WHY in the boot log, rather than leaving an
+# install quietly without the feature (which is what happened on the v0.4.5
+# upgrade path — see provision_report).
+PROVISION_HELP = {
+    PROVISION_PERMISSION:
+        'the ERPNext API user lacks create permission on DocType. Give it the '
+        'System Manager role (or create the Counterparty doctype by hand) and '
+        'restart.',
+    PROVISION_NO_DOCTYPE_API:
+        "this ERPNext does not expose the DocType API, so the overlay cannot "
+        'provision itself. Usually a locked-down or very old Frappe.',
+    PROVISION_PROBE_FAILED:
+        'the doctype could not be probed. Check the ERPNext URL and '
+        'credentials on /admin/erpnext_settings, then restart.',
+    PROVISION_CREATE_FAILED:
+        'ERPNext rejected the doctype create. The reason it gave is in the '
+        'message above.',
+    PROVISION_NO_CLIENT:
+        'ERPNext is not configured yet. Set it up on /admin/erpnext_settings; '
+        'the overlay provisions itself on the next restart.',
+}
+
+
+def provision_report(client: ERPNextClient | None) -> dict:
+    """Idempotently provision the Counterparty doctype and REPORT what happened:
+    `{'ok': bool, 'state': str, 'reason': str}`.
+
+    Same work `ensure_counterparty_doctype` has always done — this is the
+    structured form of it, so the startup job and the management CLI can tell an
+    operator *which* of "created it", "it was already there" and "ERPNext said
+    no, because X" actually occurred. v0.4.5 only returned a bool, which is why
+    an install that never provisioned looked identical to one that did.
 
     Safe to call on every startup: the happy path on an already-provisioned
     instance is a single GET that 200s. A 404 on that GET is the one signal
-    that means "not created yet" — note that this is a genuinely absent
-    DOCUMENT of doctype DocType, which is different from the absent-MODULE 500
-    that `_is_missing_doctype_error` detects, and both are handled.
+    that means "not created yet" — a genuinely absent DOCUMENT of doctype
+    DocType, which is different from the absent-MODULE 500 that
+    `_is_missing_doctype_error` detects. Both are handled.
 
     Never raises. A refusal is recorded in the shared unavailable-doctype
     registry so the auto-link path short-circuits without re-probing."""
+    if client is None:
+        return {'ok': False, 'state': PROVISION_NO_CLIENT, 'reason': ''}
     try:
         existing = client.get_doc(DOCTYPE_DT, COUNTERPARTY_DT)
     except ERPNextAPIError as e:
-        if _is_missing_doctype_error(e) or _is_permission_error(e):
-            log.warning('Counterparty doctype cannot be probed in this ERPNext; '
-                        'the overlay stays disabled (%s)', str(e)[:200])
-            _mark_doctype_unavailable(COUNTERPARTY_DT)
-            return False
-        log.warning('unexpected error probing the Counterparty doctype: %s',
-                    str(e)[:200])
+        detail = str(e)[:300]
+        if _is_permission_error(e):
+            state = PROVISION_PERMISSION
+        elif _is_missing_doctype_error(e):
+            state = PROVISION_NO_DOCTYPE_API
+        else:
+            state = PROVISION_PROBE_FAILED
+        log.warning('Counterparty doctype NOT provisioned (%s) — %s [%s]',
+                    state, PROVISION_HELP.get(state, ''), detail)
         _mark_doctype_unavailable(COUNTERPARTY_DT)
-        return False
+        return {'ok': False, 'state': state, 'reason': detail}
     if existing is not None:
+        # v0.4.6 · say so explicitly. Silence here is what made a never-created
+        # doctype indistinguishable from a healthy one in the boot log.
+        log.info('Counterparty doctype already present — nothing to provision')
         _mark_doctype_available(COUNTERPARTY_DT)
-        return True
+        return {'ok': True, 'state': PROVISION_PRESENT, 'reason': ''}
+    log.info('Counterparty doctype absent — creating it')
     try:
         client.create_doc(DOCTYPE_DT, counterparty_doctype_spec())
     except (ERPNextAPIError, ERPNextError) as e:
@@ -189,17 +236,31 @@ def ensure_counterparty_doctype(client: ERPNextClient) -> bool:
         # re-probe rather than trusting the error text.
         try:
             if client.get_doc(DOCTYPE_DT, COUNTERPARTY_DT) is not None:
+                log.info('Counterparty doctype created concurrently by another '
+                         'worker — treating as provisioned')
                 _mark_doctype_available(COUNTERPARTY_DT)
-                return True
+                return {'ok': True, 'state': PROVISION_PRESENT, 'reason': ''}
         except (ERPNextAPIError, ERPNextError):
             pass
-        log.warning('could not create the Counterparty doctype; the overlay '
-                    'stays disabled (%s)', str(e)[:300])
+        detail = str(e)[:300]
+        state = (PROVISION_PERMISSION
+                 if isinstance(e, ERPNextAPIError) and _is_permission_error(e)
+                 else PROVISION_CREATE_FAILED)
+        log.warning('Counterparty doctype NOT provisioned (%s) — %s [%s]',
+                    state, PROVISION_HELP.get(state, ''), detail)
         _mark_doctype_unavailable(COUNTERPARTY_DT)
-        return False
+        return {'ok': False, 'state': state, 'reason': detail}
     log.info('provisioned the %s doctype', COUNTERPARTY_DT)
     _mark_doctype_available(COUNTERPARTY_DT)
-    return True
+    return {'ok': True, 'state': PROVISION_CREATED, 'reason': ''}
+
+
+def ensure_counterparty_doctype(client: ERPNextClient) -> bool:
+    """Idempotently provision the Counterparty doctype. Returns True when it is
+    available (already present or just created), False when this ERPNext won't
+    give it to us. The boolean face of `provision_report`, kept for the callers
+    that only need the gate."""
+    return provision_report(client)['ok']
 
 
 def available(client: ERPNextClient | None) -> bool:

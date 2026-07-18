@@ -92,6 +92,57 @@ def _run_counterparty_rollup(app) -> None:
             log.exception('[scheduler] counterparty rollup crashed')
 
 
+def _run_counterparty_provision(app) -> None:
+    """Provision the Counterparty doctype once, shortly after boot (v0.4.6).
+
+    THE BUG THIS FIXES: v0.4.5 only ever reached counterparty.bootstrap through
+    erpnext_accounts.bootstrap, which runs on account IMPORT and from the ERPNext
+    settings page. An install that had already imported its accounts under an
+    earlier version therefore never ran it — the doctype was never created, no
+    CREATE was ever attempted, and the only trace was a stream of 404s from the
+    read paths. `ensure_counterparty_doctype` was written to be called at
+    startup ("Safe to call on every startup", its docstring said); nothing
+    called it.
+
+    It runs HERE rather than in create_app for the same reason the sync poll
+    does: gunicorn runs several workers, and this must happen once per container,
+    not once per worker. The elected scheduler is where "once per container"
+    already lives. It also keeps boot off the network — an unreachable ERPNext
+    delays this job, not the app coming up.
+
+    Swallows everything: a container must still boot when ERPNext is down."""
+    from ..sync_engine import get_erp_client_or_none
+    from .. import audit
+    from .. import counterparty
+    with app.app_context():
+        audit.set_context('scheduler')
+        try:
+            if not counterparty.is_enabled():
+                log.info('[scheduler] counterparty overlay disabled '
+                         '(COUNTERPARTY_OVERLAY_ENABLED=false) — not provisioning')
+                return
+            client = get_erp_client_or_none()
+            report = counterparty.provision_report(client)
+            if report['ok']:
+                log.info('[scheduler] counterparty doctype ready (%s)',
+                         report['state'])
+            else:
+                log.warning(
+                    '[scheduler] counterparty doctype UNAVAILABLE (%s) — %s',
+                    report['state'],
+                    counterparty.PROVISION_HELP.get(report['state'], ''))
+            audit.record('counterparty_doctype_provision', subject_type=None,
+                         after=report,
+                         notes=f"startup provision → {report['state']}")
+            # Only pair once the doctype exists; pairing is itself idempotent.
+            if report['ok'] and app.config.get('COUNTERPARTY_AUTO_PAIR', True):
+                paired = counterparty.pair_existing_parties(client)
+                log.info('[scheduler] counterparty pairing pass: %s',
+                         {k: v for k, v in paired.items() if k != 'actions'})
+        except Exception:  # pragma: no cover - never let the job die
+            log.exception('[scheduler] counterparty provision crashed')
+
+
 def match_count_rollup_interval_or_none(app) -> int | None:
     """The cadence (hours) for the rule match-count rollup, or None when it is
     disabled. Same shape as the two above, and pure for the same reason."""
@@ -170,6 +221,14 @@ def ensure_scheduler_started(app):
                           next_run_time=datetime.utcnow() + timedelta(seconds=30))
             log.info('[scheduler] pid=%d elected — polling every %dh',
                      os.getpid(), hours)
+        # v0.4.6 — provision the Counterparty doctype once per container, ~15s
+        # after boot. A one-shot 'date' job, not an interval: provisioning is
+        # idempotent but there is nothing to re-check hourly, and it must land
+        # BEFORE the rollup below (which reads Counterparties) first fires.
+        sched.add_job(lambda: _run_counterparty_provision(app), 'date',
+                      id='counterparty_provision',
+                      run_date=datetime.utcnow() + timedelta(seconds=15))
+        log.info('[scheduler] counterparty doctype provision queued (+15s)')
         # v0.4.5 — the Counterparty activity rollup, on its own cadence. Added
         # to the SAME elected scheduler so there is still exactly one background
         # thread per container. Its first run is offset well past the sync's

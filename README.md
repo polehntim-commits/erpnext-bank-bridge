@@ -308,6 +308,20 @@ every Journal Entry it later generates. See
 `match_count` column that backfills to 0, and existing rules and transactions
 behave exactly as before.
 
+v0.4.6 also **fixes the v0.4.5 Counterparty overlay never provisioning itself on
+an upgrading install**. The doctype bootstrap was only ever reachable through the
+ERPNext *account import* path, so an install whose accounts were already imported
+under an earlier version never ran it: no `Counterparty` doctype was created, no
+CREATE was ever attempted, and the only symptom was 404s from the read paths.
+`ensure_counterparty_doctype` was written to be called at startup — nothing
+called it. It now runs once per container ~15s after boot, on the elected
+scheduler worker (not in `create_app`, so boot never waits on ERPNext and N
+gunicorn workers don't each probe). The outcome is logged explicitly as
+`created`, `already_present`, or a named failure with the reason ERPNext gave —
+v0.4.5 returned a bare boolean, which is why a broken install and a healthy one
+produced identical logs. `scripts/provision_counterparty_doctype.py` forces it
+without a restart.
+
 **v0.4.5** — **one identity per counterparty**. ERPNext models the buy side and
 the sell side as unrelated doctypes. A party that trades with you in both
 directions — a bank, a wholesaler who buys your fruit and sells you bins, a
@@ -741,17 +755,34 @@ keep working exactly as before.
 
 Three paths, all idempotent and all additive:
 
-1. **At startup** — the doctype is provisioned over the REST API (the same
-   bootstrap that creates Bank Account Types and custom fields), then the
-   Customer and Supplier records you already have are paired into
-   Counterparties. Turn the pairing off with `COUNTERPARTY_AUTO_PAIR=false`.
+1. **At startup** — about 15 seconds after boot, on the one elected worker, the
+   doctype is provisioned over the REST API and the Customer and Supplier
+   records you already have are paired into Counterparties. Turn the pairing off
+   with `COUNTERPARTY_AUTO_PAIR=false`. The boot log always says which of
+   `created` / `already_present` / a named failure occurred.
+
+   > **v0.4.5 upgraders:** this startup path only became real in **v0.4.6**.
+   > Under v0.4.5 provisioning ran *only* off the ERPNext account-import path,
+   > so an install whose accounts were already imported under an earlier version
+   > never created the doctype — the symptom is 404s in the log from the read
+   > paths and no `Counterparty` records anywhere. Upgrading to v0.4.6 fixes it
+   > on the next restart; `python -m scripts.provision_counterparty_doctype`
+   > fixes it now, without one.
 2. **At party creation** — whenever Bank Bridge auto-creates or resolves a
    Supplier or Customer, it finds-or-creates the matching Counterparty and fills
    in that side's link. A dual-role party (v0.4.0.8's bank heuristic) gets both
    ERPNext records and therefore both links, so `dual_role_flag` lights up on
    its own.
 3. **By hand** — `python -m scripts.pair_existing_customer_supplier --dry-run`
-   shows the plan; without the flag it applies it.
+   shows the plan; without the flag it applies it. To force the *doctype* itself
+   (and get the full reason if ERPNext refuses):
+
+   ```bash
+   docker exec <bankbridge_container> python -m scripts.provision_counterparty_doctype
+   ```
+
+   Idempotent, additive, and it exits non-zero when the doctype is unavailable,
+   so it can gate a deploy step. `--no-pair` provisions the doctype only.
 
 Matching is on the **exact** party name. "Wells Fargo" and "Wells Fargo Bank NA"
 stay two Counterparties, deliberately: silently fusing two tax identities is a
@@ -1491,7 +1522,7 @@ cd app
 python3 -m unittest discover -s tests -v
 ```
 
-738 tests cover Fernet encryption round-trip + key persistence, Plaid response
+774 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
 push → error + retry, one-click account import, merchant-name normalization,
@@ -1522,7 +1553,7 @@ per Company and reused; auto-booking at import and its opt-out; the configurable
 posting date including the fall-back on a bad value; re-import never
 double-booking; the backfill script's estimate, dry run, idempotency and refusal
 to overturn a rejection; the manual amount/date override endpoint; and the
-existing approve/reject workflow driving the entries unchanged), and the counterparty overlay (v0.4.5: the doctype bootstrap being idempotent and degrading to a no-op when the API user lacks DocType rights; auto-link on both the Supplier and Customer paths; dual-role detection setting the flag from both links; a human-set link never being stomped; concurrent creates recovering by re-fetching rather than failing; the pairing migration's dry run, idempotency and exact-name matching; ageing bucket boundaries and the netting across roles; the 1099 report excluding Financial Institution and Government types and declaring what it dropped; top-by-activity sorting by combined volume within the configured fiscal year; the rollup reading the ledger a fixed number of times regardless of party count, skipping unchanged records and never blanking a first-transaction date; and every screen rendering on an install that has no overlay at all), and guided rule authoring (v0.4.6: the four rule-state filters partitioning the eligible transactions with no overlap and no gaps, and ignoring rows the engine has never seen; merchant grouping counts, totals and ordering, with singletons falling through to one-offs and merchantless rows grouping by description signature; the group prefill producing a `merchant_contains` rule and the per-row prefill a `merchant_exact` one whose regex actually matches the description it came from; the prefill rejecting an unknown match type and never creating a rule on its own; the match-count rollup folding an archived version's matches into its live successor, terminating on a supersede cycle, skipping unchanged rules and leaving `updated_at` alone; the scope-mismatch warning firing on a Company mismatch, staying silent for a Company-agnostic rule or an unconfigured ERPNext, persisting on the confirmed re-submit, and preserving the edited rule's id so confirming supersedes rather than duplicates; and the `match_count` migration adding the column to an existing database, idempotently, with the first rollup filling in real history). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
+existing approve/reject workflow driving the entries unchanged), and the counterparty overlay (v0.4.5: the doctype bootstrap being idempotent and degrading to a no-op when the API user lacks DocType rights; auto-link on both the Supplier and Customer paths; dual-role detection setting the flag from both links; a human-set link never being stomped; concurrent creates recovering by re-fetching rather than failing; the pairing migration's dry run, idempotency and exact-name matching; ageing bucket boundaries and the netting across roles; the 1099 report excluding Financial Institution and Government types and declaring what it dropped; top-by-activity sorting by combined volume within the configured fiscal year; the rollup reading the ledger a fixed number of times regardless of party count, skipping unchanged records and never blanking a first-transaction date; and every screen rendering on an install that has no overlay at all), and guided rule authoring (v0.4.6: the four rule-state filters partitioning the eligible transactions with no overlap and no gaps, and ignoring rows the engine has never seen; merchant grouping counts, totals and ordering, with singletons falling through to one-offs and merchantless rows grouping by description signature; the group prefill producing a `merchant_contains` rule and the per-row prefill a `merchant_exact` one whose regex actually matches the description it came from; the prefill rejecting an unknown match type and never creating a rule on its own; the match-count rollup folding an archived version's matches into its live successor, terminating on a supersede cycle, skipping unchanged rules and leaving `updated_at` alone; the scope-mismatch warning firing on a Company mismatch, staying silent for a Company-agnostic rule or an unconfigured ERPNext, persisting on the confirmed re-submit, and preserving the edited rule's id so confirming supersedes rather than duplicates; and the `match_count` migration adding the column to an existing database, idempotently, with the first rollup filling in real history), and counterparty doctype provisioning (v0.4.6: the startup job being actually registered on the elected scheduler as a one-shot — the regression guard for the v0.4.5 gap where the code existed but nothing invoked it — and provisioning, pairing, honouring the master switch, surviving an unconfigured or exploding ERPNext, and auditing its outcome; the provision report distinguishing `created` from `already_present` and naming a permission denial, a failed create and an absent DocType API with the reason ERPNext gave; every failure state carrying operator-facing help; `ensure_counterparty_doctype` keeping its boolean contract for the fifteen existing call sites; and the management CLI creating, re-running idempotently, pairing or skipping pairing, reporting a refusal without raising, and exiting non-zero so it can gate a deploy step). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
 so no network access or extra wheels are needed.
 
 ## Security notes

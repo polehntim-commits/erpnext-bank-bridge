@@ -16,6 +16,13 @@ you turned the startup pass off, you want to SEE the plan before anything is
 written (`--dry-run`), or you added parties directly in ERPNext and want them
 picked up without a restart.
 
+NOTE FOR v0.4.5 INSTALLS. That startup pass only became real in v0.4.6. Under
+v0.4.5 the pairing — and the doctype provisioning it depends on — ran solely off
+the ERPNext account-import path, so an install whose accounts were already
+imported never got either. If you are on v0.4.5, or the log says the Counterparty
+doctype is unavailable, run `scripts/provision_counterparty_doctype.py` first:
+it creates the doctype and reports exactly why if it can't.
+
 MATCHING IS EXACT, ON PURPOSE. "Wells Fargo" and "Wells Fargo Bank NA" stay two
 Counterparties. Fuzzy-merging tax identities is the kind of clever that shows up
 as a wrong 1099 in January; under-pairing is visible and takes thirty seconds to
