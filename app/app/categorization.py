@@ -286,6 +286,49 @@ def find_matching_rule(row) -> CategorizationRule | None:
     return evaluate_rules(row)[0]
 
 
+# ── two-mode offset accounts (v0.4.0.3) ────────────────────────────────
+#
+# A rule's offset is interpreted per its scope (see CategorizationRule):
+#   * SCOPED rule  (applies_to_company set) → Mode A: offset_account is a
+#     specific, fully-qualified GL docname, used verbatim.
+#   * AGNOSTIC rule (applies_to_company NULL) → Mode B: offset_account is a
+#     LOGICAL account name (the ERPNext `account_name`, sans number + Company
+#     suffix); at JE time it's resolved to the transaction's own Company's chart
+#     (erpnext_accounts.resolve_logical_account), so one rule books to each
+#     Company's own Meals/Fuel/… account.
+#
+# `logical_account_name` reduces a fully-qualified docname to that logical name.
+# It's used both to convert a legacy agnostic rule's pinned offset on upgrade
+# (app/migrations._migrate_agnostic_offset_to_logical) and as a resolve-time
+# fallback. The trailing Company suffix is only stripped when the last ` - X`
+# segment looks like a Company ABBREVIATION (uppercase letters/digits), so a real
+# account_name that legitimately contains ` - ` (e.g. 'Owner - Draws') is left
+# intact — which also makes the reduction idempotent.
+
+# Trailing ' - <ABBR>' where ABBR is 1-10 uppercase letters/digits (ERPNext
+# autoname suffix, e.g. ' - BBT'). Case-sensitive on purpose: 'Owner - Draws'
+# ends in ' - Draws' but 'Draws' isn't all-caps, so it's not mistaken for a suffix.
+_COMPANY_ABBR_SUFFIX_RE = re.compile(r'\s+-\s+[A-Z0-9]{1,10}$')
+# Leading '<number> - ' account-number prefix ERPNext prepends in a numbered
+# chart (e.g. '5100 - Fuel Expense' → 'Fuel Expense'); account_name has no number.
+_LEADING_ACCOUNT_NUMBER_RE = re.compile(r'^\d+\s+-\s+')
+
+
+def logical_account_name(name: str) -> str:
+    """Reduce an ERPNext GL account docname to its LOGICAL account name (the
+    `account_name` field): strip a trailing ' - <ABBR>' Company suffix and a
+    leading '<number> - ' account number. 'Meals & Entertainment - BBT' and
+    '5100 - Fuel Expense - EC' both reduce to their bare name; an already-logical
+    name ('Meals & Entertainment') is returned unchanged. Idempotent:
+    logical_account_name(logical_account_name(x)) == logical_account_name(x)."""
+    s = (name or '').strip()
+    if not s:
+        return ''
+    s2 = _COMPANY_ABBR_SUFFIX_RE.sub('', s).strip()
+    s2 = _LEADING_ACCOUNT_NUMBER_RE.sub('', s2).strip()
+    return s2 or s
+
+
 # ── Journal Entry construction ─────────────────────────────────────────
 
 def render_description(rule: CategorizationRule, row, supplier_name=None) -> str:
@@ -330,7 +373,8 @@ def bank_gl_account_for(row) -> str:
 
 def build_journal_entry(rule: CategorizationRule, row, company: str, *,
                         supplier_name=None, remark: str = '',
-                        bank_account: str | None = None) -> dict:
+                        bank_account: str | None = None,
+                        offset_account_override: str | None = None) -> dict:
     """Assemble the ERPNext Journal Entry payload for a matched transaction.
 
     Two lines — the OFFSET (categorized) side and the BANK side:
@@ -347,10 +391,18 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
         behaviour — debit the rule's debit_account, credit its credit_account,
         reversing on an inflow — kept for backwards compatibility.
 
+    v0.4.0.3 — `offset_account_override` supplies the already-resolved offset for
+    a Mode B (Company-agnostic) rule, whose `offset_account` is a logical name the
+    caller has resolved to a specific account under `company` (see
+    generate_journal_entry). When None, the rule's own `offset_account` is used
+    (Mode A / legacy), unchanged.
+
     The optional party rides the offset line — `rule.party_name` wins, else the
     auto-created Supplier for this merchant."""
     amt = round(abs(float(row.amount or 0.0)), 2)
-    offset_account = (rule.offset_account or '').strip()
+    offset_account = (offset_account_override
+                      if offset_account_override is not None
+                      else (rule.offset_account or '')).strip()
 
     if offset_account:
         bank = (bank_account if bank_account is not None
@@ -470,8 +522,47 @@ def generate_journal_entry(client, row, *, supplier_name=None,
 
     cfg = current_app.config
     try:
+        # v0.4.0.3 · two-mode offset. A SCOPED rule (applies_to_company) uses its
+        # offset_account verbatim (Mode A). An AGNOSTIC rule is Mode B ONLY when
+        # its offset is a bare LOGICAL name ('Meals & Entertainment'): that name
+        # is resolved to an account under THIS transaction's Company, and a
+        # Company lacking one is skipped (no JE, no auto-created account) and
+        # surfaced for the operator. An agnostic rule whose offset is still
+        # fully-qualified ('Meals & Entertainment - BBT' — a legacy value, a
+        # single-Company install, or one not yet auto-migrated) is used verbatim,
+        # exactly like pre-.3; the push-time guard remains its cross-Company
+        # backstop. The shape test (logical_account_name is a fixed point on an
+        # already-logical name) is what distinguishes the two.
+        offset_override = None
+        is_agnostic = not (getattr(rule, 'applies_to_company', None) or '').strip()
+        offset = (rule.offset_account or '').strip()
+        logical = offset if logical_account_name(offset) == offset else ''
+        if is_agnostic and logical:
+            offset_override = erpnext_accounts.resolve_logical_account(
+                client, logical, company)
+            if offset_override is None:
+                msg = (f"Skipped: Company “{company}” has no account named "
+                       f"“{logical}”. Create it (or map this transaction's "
+                       "account to a Company that has it), then re-run the rules.")
+                gje.state = 'skipped_missing_account'
+                gje.error_message = msg[:2000]
+                gje.updated_at = _now()
+                db.session.commit()
+                log.warning('Journal Entry SKIPPED (missing account) for %s: '
+                            'no “%s” under %s', tid, logical, company)
+                audit.record('journal_entry_skipped_missing_account',
+                             subject_type='GeneratedJournalEntry',
+                             subject_id=gje.id,
+                             after={'plaid_transaction_id': tid,
+                                    'rule_id': rule.id, 'rule_name': rule.name,
+                                    'company': company,
+                                    'logical_account': logical},
+                             notes=f'rule “{rule.name}” — no “{logical}” under '
+                                   f'{company}')
+                return gje
         doc = build_journal_entry(rule, row, company,
-                                  supplier_name=supplier_name, remark=remark)
+                                  supplier_name=supplier_name, remark=remark,
+                                  offset_account_override=offset_override)
         # v0.4.0.2 retroactive guard: refuse to post a JE that references a GL
         # account from a different Company than the target (belt-and-suspenders
         # behind the scoped Offset Account dropdown). A mismatch is a blocked,

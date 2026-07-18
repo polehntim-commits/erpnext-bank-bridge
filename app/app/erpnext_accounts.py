@@ -396,6 +396,39 @@ def account_company(client: ERPNextClient, account_name: str,
     return company
 
 
+def resolve_logical_account(client: ERPNextClient, logical_name: str,
+                            company: str, cache: dict | None = None) -> str | None:
+    """Resolve a LOGICAL account name (e.g. 'Meals & Entertainment') to the
+    fully-qualified GL Account docname under `company` (e.g. 'Meals &
+    Entertainment - BBT'), matching on the Account's `account_name` field
+    (v0.4.0.3, Mode B / Company-agnostic rules). Returns the docname, or None when
+    `company` has no non-group Account with that account_name — the caller then
+    skips the Journal Entry (it does NOT auto-create the account).
+
+    Unlike account_company/je_company_mismatches, a connection error is NOT
+    swallowed here: it propagates so the caller records a retryable `error`
+    (rather than mis-labelling a transient outage as a permanently-missing
+    account). An empty result set — the account genuinely doesn't exist — is the
+    only path that yields None. `cache` memoizes (logical, company) → docname
+    across a push batch."""
+    logical = (logical_name or '').strip()
+    company = (company or '').strip()
+    if not logical or not company:
+        return None
+    key = (logical, company)
+    if cache is not None and key in cache:
+        return cache[key]
+    rows = client.list_docs(
+        ACCOUNT_DT,
+        filters=[['company', '=', company], ['account_name', '=', logical],
+                 ['is_group', '=', 0]],
+        fields=['name'], limit_page_length=1)
+    resolved = (rows[0].get('name') if rows else None)
+    if cache is not None:
+        cache[key] = resolved
+    return resolved
+
+
 def je_company_mismatches(client: ERPNextClient, doc: dict,
                           cache: dict | None = None) -> list[dict]:
     """Cross-Company guard (v0.4.0.2): every GL account referenced by a Journal

@@ -157,6 +157,27 @@ def list_accounts(client: ERPNextClient | None = None, *,
         order_by='name asc', limit_page_length=0)
 
 
+def list_account_names(client: ERPNextClient | None = None, *,
+                       company=None) -> list[str]:
+    """Deduplicated LOGICAL GL account names — the `account_name` field, stripped
+    of any number/Company suffix — across every Company (or one Company when
+    `company` is given). Feeds the Mode B (Company-agnostic rule) offset-account
+    dropdown (v0.4.0.3): the operator picks a logical name ('Meals &
+    Entertainment') that resolves to each transaction's own Company chart at JE
+    time. Sorted, unique, case-insensitively deduped (first spelling wins).
+
+    `company=None`/'' → all Companies (the agnostic default); a real name → that
+    Company only. Best-effort via list_accounts; raises the usual ERPNext errors,
+    which the UI caller swallows to leave the field free-text."""
+    rows = list_accounts(client, company=(company or None))
+    seen: dict[str, str] = {}
+    for r in rows:
+        name = (r.get('account_name') or '').strip()
+        if name and name.lower() not in seen:
+            seen[name.lower()] = name
+    return sorted(seen.values(), key=lambda s: s.lower())
+
+
 # ── field mapping ──────────────────────────────────────────────────────
 
 def _deposit_withdrawal(amount: float) -> tuple[float, float]:

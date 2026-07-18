@@ -117,16 +117,19 @@ class TestOffsetAccountFeed(ScopeBase):
         # And crucially NOT the default Company's accounts.
         self.assertNotIn('Default Co', json.dumps(data['accounts']))
 
-    def test_p2_falls_back_to_session_scope_when_rule_agnostic(self):
-        # Operator scoped to Beta via the navbar; the rule itself is agnostic
-        # (empty ?company=) → the feed follows the session scope.
+    def test_agnostic_feed_is_logical_even_under_session_scope(self):
+        # v0.4.0.3 · an AGNOSTIC rule (empty ?company=) is Mode B regardless of the
+        # navbar session scope: the feed offers deduplicated LOGICAL account names,
+        # NOT any one Company's fully-qualified accounts. (Pre-.3 this fell back to
+        # the session Company — which would have wrongly pinned the offset.)
         self.client.get('/admin/set_company?company=Beta+LLC&next=/admin/rules')
         with mock.patch('app.erpnext_bank.list_accounts',
                         side_effect=_fake_list_accounts):
             data = self._get_accounts(rule_company='')
-        self.assertEqual(data['company'], 'Beta LLC')
-        self.assertIn('Fuel Expense - BL', data['accounts'])
-        self.assertNotIn('Fuel Expense - AL', data['accounts'])
+        self.assertEqual(data['company'], '')
+        self.assertEqual(data.get('mode'), 'logical')
+        self.assertIn('Fuel Expense', data['accounts'])          # logical, no suffix
+        self.assertNotIn('Fuel Expense - BL', data['accounts'])  # not fully-qualified
 
     def test_p1_rule_scope_overrides_session_scope(self):
         # Session scoped to Beta, but the rule is explicitly Alpha → Alpha wins.
@@ -138,21 +141,22 @@ class TestOffsetAccountFeed(ScopeBase):
         self.assertIn('Fuel Expense - AL', data['accounts'])
         self.assertNotIn('Fuel Expense - BL', data['accounts'])
 
-    def test_p3_no_scope_lists_all_companies_with_suffix(self):
-        # No session scope, no rule scope → every Company's accounts, each still
-        # carrying its `- <abbr>` Company suffix so the choice is conscious.
+    def test_agnostic_feed_dedupes_logical_names_across_companies(self):
+        # v0.4.0.3 · no rule scope → Mode B: the same logical account present in
+        # both Companies' charts ('Fuel Expense', 'Meals & Entertainment') is
+        # offered ONCE, without any `- <abbr>` suffix, sorted.
         with mock.patch('app.erpnext_bank.list_accounts',
                         side_effect=_fake_list_accounts):
             data = self._get_accounts(rule_company='')
         self.assertEqual(data['company'], '')
-        self.assertIn('Fuel Expense - AL', data['accounts'])
-        self.assertIn('Fuel Expense - BL', data['accounts'])
-        self.assertEqual(len(data['accounts']), 4)
+        self.assertEqual(data.get('mode'), 'logical')
+        self.assertEqual(data['accounts'],
+                         ['Fuel Expense', 'Meals & Entertainment'])
 
     def test_feed_cached_per_company_and_invalidated_on_scope_change(self):
-        # First unscoped fetch hits ERPNext once and caches under the all-Companies
-        # key; a second identical fetch is served from cache (no extra call).
-        # A scope change clears the cache, so the next fetch re-hits ERPNext.
+        # First agnostic (Mode B) fetch hits ERPNext once and caches under the
+        # logical-names key; a second identical fetch is served from cache (no
+        # extra call). A scope change clears the cache, so the next fetch re-hits.
         spy = mock.Mock(side_effect=_fake_list_accounts)
         with mock.patch('app.erpnext_bank.list_accounts', spy):
             self._get_accounts(rule_company='')

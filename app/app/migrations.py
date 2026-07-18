@@ -165,10 +165,18 @@ def run_migrations() -> None:
         _widen_column('plaid_sync_log', 'direction', 'VARCHAR(64)', 64)
         _widen_column('plaid_sync_log', 'error_message', 'TEXT', 10 ** 9)
         _drop_not_null('plaid_sync_log', 'item_id')
+        # v0.4.0.3: the new 'skipped_missing_account' JE state (23 chars)
+        # overflows the original generated_journal_entries.state VARCHAR(20) and
+        # would make the INSERT fail on Postgres — widen it to 40.
+        _widen_column('generated_journal_entries', 'state', 'VARCHAR(40)', 40)
         # 3. ORM-based data backfills — MUST run after every ADD above, since
         # they SELECT models whose columns those ADDs create. v0.3.1: give every
         # pre-v0.3.1 rule a single offset_account from its debit/credit pair.
         _migrate_rule_offset_accounts()
+        # v0.4.0.3: convert legacy Company-agnostic rules' pinned, fully-qualified
+        # offset into a logical account name (Mode B). Runs after the v0.3.1
+        # backfill so a rule that just gained its offset_account is considered too.
+        _migrate_agnostic_offset_to_logical()
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)
 
@@ -216,3 +224,45 @@ def _migrate_rule_offset_accounts() -> None:
     if changed:
         db.session.commit()
         log.info('migration: backfilled offset_account on %d rule(s)', changed)
+
+
+def _migrate_agnostic_offset_to_logical() -> None:
+    """One-time backfill (v0.4.0.3): convert a Company-agnostic rule's
+    fully-qualified `offset_account` (a legacy value pinned to one Company's chart
+    by the v0.4.0.2 dropdown) into a LOGICAL account name. Agnostic rules are now
+    Mode B — their offset resolves to each transaction's own Company at JE time —
+    so a pinned 'Meals & Entertainment - BBT' would fail to resolve for every
+    other Company. Only ACTIVE, non-archived, agnostic (applies_to_company
+    NULL/'') rules are touched; SCOPED rules keep their specific offset.
+
+    Idempotent by construction: categorization.logical_account_name is a fixed
+    point, so a rule whose offset is already logical (logical(offset) == offset)
+    is left untouched — including a name that legitimately contains ' - ' (e.g.
+    'Owner - Draws'), which the uppercase-abbr heuristic won't over-strip. Safe on
+    a fresh DB (no legacy rules) and when the column is absent."""
+    insp = inspect(db.engine)
+    if 'categorization_rules' not in insp.get_table_names():
+        return
+    cols = {c['name'] for c in insp.get_columns('categorization_rules')}
+    if not {'offset_account', 'applies_to_company', 'active', 'archived'} <= cols:
+        return  # columns not all present yet (shouldn't happen post-ADD)
+    from .categorization import logical_account_name
+    from .models import CategorizationRule
+    rules = CategorizationRule.query.filter(
+        CategorizationRule.active.is_(True),
+        CategorizationRule.archived.is_(False)).all()
+    changed = 0
+    for r in rules:
+        if (r.applies_to_company or '').strip():
+            continue  # scoped (Mode A) — offset stays fully-qualified
+        offset = (r.offset_account or '').strip()
+        if not offset:
+            continue
+        logical = logical_account_name(offset)
+        if logical and logical != offset:
+            r.offset_account = logical
+            changed += 1
+    if changed:
+        db.session.commit()
+        log.info('migration: converted %d agnostic rule offset(s) to logical '
+                 'account name(s)', changed)

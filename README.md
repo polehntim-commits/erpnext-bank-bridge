@@ -182,6 +182,30 @@ target — it marks the JE `blocked`, records a
 so even a mis-scoped rule that slips through can't corrupt another entity's
 ledger.
 
+**v0.4.0.3** — makes Company-agnostic rules actually work across entities with
+**two-mode offset accounts**. A rule's offset is now interpreted by its scope:
+
+- **Scoped rule** (**Applies to Company** set) — *Mode A*: the offset is a
+  specific, fully-qualified GL account (`Meals & Entertainment - BBT`), used
+  verbatim. The offset dropdown lists that Company's real accounts. (Unchanged
+  from v0.4.0.2.)
+- **Agnostic rule** (Applies to Company = *all Companies*) — *Mode B*: the offset
+  is a **logical account name** (`Meals & Entertainment`). At posting time it's
+  resolved to *the transaction's own Company's* chart, so **one** "Uber Eats →
+  Meals" rule books to each Company's own Meals account. The offset dropdown
+  offers deduplicated logical names across every Company, and the form labels the
+  active mode as you toggle **Applies to Company**.
+
+If a transaction's Company has no account with that logical name, the Journal
+Entry is **skipped** (state `skipped_missing_account`) rather than posted or
+auto-created — a `journal_entry_skipped_missing_account` audit event is recorded
+so you can provision the missing account and re-run. An agnostic rule whose
+offset is still fully-qualified (a legacy value, or a single-Company install) is
+used verbatim, and the v0.4.0.2 push-time guard remains its cross-Company
+backstop. On upgrade, existing agnostic rules with a pinned, fully-qualified
+offset are **auto-migrated** to a logical name on boot (idempotent; scoped rules
+and names that legitimately contain ` - ` are left untouched).
+
 ## How it works
 
 1. **Link a bank once** through Plaid Link (`/admin/link_bank`). OAuth-only

@@ -360,6 +360,19 @@ class CategorizationRule(db.Model):
     # transaction whose linked Plaid account resolves to this ERPNext Company.
     # NULL/'' = company-agnostic (applies to every Company) — the default, so
     # pre-multi-entity rules keep matching everywhere with no change.
+    #
+    # v0.4.0.3 · this field ALSO selects how `offset_account` is interpreted (the
+    # rule's "offset mode" is inferred, not stored):
+    #   * SCOPED  (applies_to_company set)  → Mode A: `offset_account` is a
+    #     specific, fully-qualified GL account docname ('Meals & Entertainment -
+    #     BBT'); used as-is at JE time.
+    #   * AGNOSTIC (applies_to_company NULL) → Mode B: `offset_account` is a
+    #     LOGICAL account name ('Meals & Entertainment') that is resolved to the
+    #     transaction's own Company's chart at JE time (see
+    #     categorization.resolve/build_journal_entry). One agnostic rule thus
+    #     books to each Company's own Meals account. A boot migration converts a
+    #     legacy agnostic rule's fully-qualified offset to a logical name
+    #     (app/migrations._migrate_agnostic_offset_to_logical).
     applies_to_company = db.Column(db.String(140), nullable=True, index=True)
     # Non-destructive history (v0.3.0 audit): a rule is never mutated in place or
     # hard-deleted. An EDIT clones the rule and points the old row's
@@ -418,9 +431,12 @@ class GeneratedJournalEntry(db.Model):
                                      nullable=False, index=True)
     rule_id = db.Column(db.Integer, nullable=True, index=True)
     erpnext_journal_entry_name = db.Column(db.String(255), nullable=True, index=True)
-    # pending_review | approved | rejected | error — left un-constrained (like
-    # plaid_sync_log) so a future state never needs a migration.
-    state = db.Column(db.String(20), default='pending_review', index=True)
+    # pending_review | approved | rejected | error | blocked |
+    # skipped_missing_account — left un-constrained (like plaid_sync_log) so a
+    # future state never needs a migration. Widened to 40 in v0.4.0.3 because
+    # 'skipped_missing_account' (23 chars) overflows the original VARCHAR(20)
+    # (see SCHEMA/_widen_column in app/migrations.py).
+    state = db.Column(db.String(40), default='pending_review', index=True)
     # Denormalized snapshot for the audit dashboard (so it renders without a
     # join back to bank_transactions / categorization_rules).
     amount = db.Column(db.Float, default=0.0)

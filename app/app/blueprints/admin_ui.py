@@ -1123,6 +1123,9 @@ _ACCOUNTS_CACHE_KEY = 'bankbridge_offset_account_cache'
 # Cache-key marker for the explicit all-Companies feed (company='' means "no
 # filter" to list_accounts, so we key it distinctly from the None default).
 _ALL_COMPANIES_KEY = '\x00ALL'
+# Cache-key marker for the Mode B (agnostic-rule) deduplicated LOGICAL account
+# name feed — distinct from any real Company name and from _ALL_COMPANIES_KEY.
+_LOGICAL_NAMES_KEY = '\x00LOGICAL'
 
 
 def _accounts_cache() -> dict | None:
@@ -1190,25 +1193,47 @@ def _erpnext_account_names(rule_company: str | None = None) -> list:
     return names
 
 
+def _logical_account_names() -> list:
+    """Deduplicated LOGICAL GL account names across every Company — the Mode B
+    (Company-agnostic rule) offset feed (v0.4.0.3). Cached under a distinct key
+    for the session; invalidated with the rest on a scope change. Best-effort — an
+    empty list (ERPNext down / unconfigured) leaves the field free-text."""
+    if not erps.is_configured():
+        return []
+    cache = _accounts_cache()
+    if cache is not None and _LOGICAL_NAMES_KEY in cache:
+        return cache[_LOGICAL_NAMES_KEY]
+    try:
+        names = erpnext_bank.list_account_names(company=None)
+    except (ERPNextConfigError, ERPNextError):
+        return []
+    if cache is not None:
+        cache[_LOGICAL_NAMES_KEY] = names
+    return names
+
+
 @bp.get('/api/rules/known_accounts')
 def known_accounts_api():
-    """Autocomplete feed for the offset_account field: ERPNext GL Account
-    docnames (Chart-of-Accounts leaves) for the effective Company. The docname is
-    already the `<account_number> - <account_name> - <company_abbr>` display
-    string, so the dropdown matches + renders it directly. Best-effort — an empty
-    list (ERPNext down / unconfigured) just leaves the field as free-text.
+    """Autocomplete feed for the offset_account field. Its shape depends on the
+    rule's inferred offset mode, driven by the `?company=` param (the rule's
+    Applies-to-Company select value):
 
-    v0.4.0.2 — the caller passes `?company=` with the rule's Applies-to-Company
-    select value so the feed follows the rule's scope; an empty/absent value
-    falls back to the session scope, and only a fully-unscoped context lists every
-    Company's accounts. This is what stops a rule from silently drawing its offset
-    from the ERPNext default Company's chart.
+      * company set → Mode A (SCOPED rule): fully-qualified GL Account docnames
+        (`<number> - <account_name> - <company_abbr>`) under THAT Company, so the
+        offset can only be one of that Company's real accounts (v0.4.0.2).
+      * company empty → Mode B (AGNOSTIC rule, v0.4.0.3): deduplicated LOGICAL
+        account names across every Company (`Meals & Entertainment`), resolved to
+        each transaction's own Company at JE time. `mode` tells the client which
+        it got so it can label the field; `accounts` stays the load-bearing field.
 
-    Fed to the shared BankBridgeDropdown (v0.3.4) that replaced the native
-    <datalist>, which Safari collapsed mid-type."""
+    Best-effort — an empty list (ERPNext down / unconfigured) just leaves the
+    field as free-text. Fed to the shared BankBridgeDropdown (v0.3.4)."""
     rule_company = (request.args.get('company') or '').strip()
-    return jsonify({'accounts': _erpnext_account_names(rule_company),
-                    'company': _offset_account_company(rule_company) or ''})
+    if rule_company:
+        return jsonify({'accounts': _erpnext_account_names(rule_company),
+                        'company': rule_company, 'mode': 'specific'})
+    return jsonify({'accounts': _logical_account_names(),
+                    'company': '', 'mode': 'logical'})
 
 
 RULES_BODY = """
@@ -1293,6 +1318,7 @@ RULES_BODY = """
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:2;min-width:220px;position:relative">Offset account
       <span style="font-weight:400;color:#888">— the categorized (non-bank) side</span>
+      <span id="oa-mode-hint" style="display:block;font-weight:400;font-size:11px;color:#0a7;margin:2px 0 0"></span>
       <input name="offset_account" id="offset-account" autocomplete="off" value="{{ form.offset_account or '' }}"
              title="The account for the categorized side. The bank side is automatically determined from the transaction's linked Plaid account. Direction defaults to auto (withdrawal → offset is debit; deposit → offset is credit)."
              placeholder="Fuel Expense - EC">
@@ -1394,7 +1420,7 @@ RULES_BODY = """
     <td class="num">{{ r.priority }}</td>
     <td>{{ r.name }}</td>
     <td style="font-size:12px"><code>{{ r.match_type }}</code><br>{{ (r.match_value or '')[:50] }}</td>
-    <td style="font-size:12px">{{ r.offset_account or r.debit_account }}</td>
+    <td style="font-size:12px">{{ r.offset_account or r.debit_account }}{% if r.offset_account and not r.applies_to_company %}<span title="Logical name — resolves to each Company's own account at posting time" style="color:#b26a00;margin-left:4px">· logical</span>{% endif %}</td>
     <td style="font-size:12px">{{ r.offset_direction or 'auto' }}</td>
     <td style="font-size:12px">{% if r.applies_to_company %}{{ r.applies_to_company }}{% else %}<span style="color:#999">all</span>{% endif %}</td>
     <td style="font-size:12px">{{ (r.party_type or '') }}{% if r.party_name %}: {{ r.party_name }}{% endif %}</td>
@@ -1458,7 +1484,26 @@ RULES_BODY = """
   var nameHint = document.getElementById('name-hint');
   var oa = document.getElementById('offset-account');
   var oaDD = document.getElementById('oa-dd');
+  var oaModeHint = document.getElementById('oa-mode-hint');
   var companySel = document.querySelector('select[name=applies_to_company]');
+
+  // v0.4.0.3 · the offset field is two-mode, keyed off Applies-to-Company:
+  //   * a Company is selected → Mode A: pick one of THAT Company's real accounts;
+  //   * '— all Companies —'   → Mode B: pick a LOGICAL name resolved per-Company
+  //     at JE time. The helper line makes the active mode explicit.
+  function updateOffsetModeHint() {
+    if (!oaModeHint) return;
+    var co = accountCompany();
+    if (co) {
+      oaModeHint.style.color = '#0a7';
+      oaModeHint.textContent = 'Scoped: pick a real account in ' + co + '.';
+    } else {
+      oaModeHint.style.color = '#b26a00';
+      oaModeHint.textContent =
+        'Logical name — resolves to each Company’s own account at ' +
+        'posting time (e.g. “Meals & Entertainment”).';
+    }
+  }
   var CK = 'bb_known_merchants', CC = 'bb_known_categories',
       CA = 'bb_known_accounts';
   var merchants = [], categories = [], accounts = [];
@@ -1659,11 +1704,13 @@ RULES_BODY = """
     e.preventDefault(); refresh.textContent = '↻ …'; load(true);
     setTimeout(function () { refresh.textContent = '↻ refresh'; }, 600); });
   // Re-scope the offset-account feed when the rule's Company changes, so the
-  // picker never offers another Company's chart (v0.4.0.2).
+  // picker never offers another Company's chart (Mode A) — or flips to the
+  // logical-name feed (Mode B) when set back to all-Companies (v0.4.0.2/.3).
   if (companySel) companySel.addEventListener('change', function () {
-    accounts = []; loadAccounts(false);
+    accounts = []; updateOffsetModeHint(); loadAccounts(false);
   });
 
+  updateOffsetModeHint();
   load(false);
 })();
 </script>
@@ -2030,6 +2077,8 @@ GENERATED_BODY = """
       {% if g.state == 'approved' %}<span class="pill pill-ok">approved</span>
       {% elif g.state == 'rejected' %}<span class="pill pill-muted">rejected</span>
       {% elif g.state == 'error' %}<span class="pill pill-err">error</span>
+      {% elif g.state == 'blocked' %}<span class="pill pill-err">blocked</span>
+      {% elif g.state == 'skipped_missing_account' %}<span class="pill pill-err" title="No account with this logical name under the transaction's Company">skipped · missing account</span>
       {% else %}<span class="pill pill-muted">{{ g.state }}</span>{% endif %}
     </td>
     <td style="white-space:nowrap">
@@ -2065,7 +2114,8 @@ def generated_entries_page():
                       GeneratedJournalEntry.id.desc()).limit(limit).all()
     return _page(GENERATED_BODY, page='generated_entries', rows=rows,
                  cur_state=cur_state, limit=limit,
-                 states=('pending_review', 'approved', 'rejected', 'error'),
+                 states=('pending_review', 'approved', 'rejected', 'error',
+                         'blocked', 'skipped_missing_account'),
                  flash_msg=request.args.get('flash', ''))
 
 
