@@ -246,6 +246,28 @@ audit event (`journal_entry_approved` / `_rejected` / `_reversed` /
 `_submitted_to_erpnext`). Existing `pending_review` entries approve normally after
 the upgrade — no migration.
 
+**v0.4.0.6** — **fixes the Offset Account dropdown serving a stale Chart of
+Accounts**. An account created in ERPNext (e.g. `Interest Income - BBT` under
+Income → Indirect Income) did not appear in the Rules editor picker, and — unlike
+what v0.4.0.2 intended — **switching Company did not help**. The offer list was
+cached in *two* places: a per-Company server cache that only cleared on a scope
+change, and a **browser `sessionStorage` copy that outlived the Company toggle
+entirely**, so the toggle cleared the server cache and the browser then served the
+same stale list straight back. The account query itself was fine — it has always
+covered **all five root types** (Asset, Liability, Equity, Income, Expense) with
+no `root_type` / `account_type` filter, so the missing account was purely a cache
+artifact. Now **opening the Rules editor always re-reads the chart from ERPNext**:
+the page drops the server cache and its account fetch carries `?fresh=1`, which
+bypasses both layers. Caching is otherwise unchanged — repeat requests within a
+visit still hit the cache, so paging the admin UI doesn't hammer ERPNext. A new
+**↻ refresh accounts** link beside the Offset Account field covers the one case a
+page-load hook can't: creating the account in another tab while the editor sits
+open. It clears **every** cached feed (the new account belongs in the
+Company-agnostic logical-name list too) and reports how many accounts came back.
+Create an account in ERPNext, reload the Rules editor, and it's selectable — no
+Company toggle, no restart. Regression-tested against a chart spanning all five
+root types, with group and disabled accounts still correctly excluded.
+
 ## How it works
 
 1. **Link a bank once** through Plaid Link (`/admin/link_bank`). OAuth-only

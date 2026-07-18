@@ -1165,7 +1165,8 @@ def _offset_account_company(rule_company: str | None) -> str | None:
     return None
 
 
-def _erpnext_account_names(rule_company: str | None = None) -> list:
+def _erpnext_account_names(rule_company: str | None = None, *,
+                           fresh: bool = False) -> list:
     """ERPNext GL Account docnames for the rule offset-account dropdown, scoped to
     the effective Company (rule scope → session scope → all). Cached per Company
     for the session lifetime. Best-effort — an empty list (ERPNext down /
@@ -1173,13 +1174,17 @@ def _erpnext_account_names(rule_company: str | None = None) -> list:
 
     When the effective Company is None (case 3: no scope at all), every Company's
     leaves are returned; the docname already ends in ` - <company_abbr>`, so the
-    operator sees which Company each account belongs to and picks deliberately."""
+    operator sees which Company each account belongs to and picks deliberately.
+
+    v0.4.0.6 — `fresh=True` skips the cache read and re-hits ERPNext, then stores
+    the result. The Rules editor asks for a fresh feed on every load so an account
+    just created in ERPNext is selectable without a Company toggle or restart."""
     if not erps.is_configured():
         return []
     company = _offset_account_company(rule_company)
     cache = _accounts_cache()
     key = company if company else _ALL_COMPANIES_KEY
-    if cache is not None and key in cache:
+    if not fresh and cache is not None and key in cache:
         return cache[key]
     try:
         # company=None → list_accounts(company=None) → NO filter (all Companies);
@@ -1193,15 +1198,17 @@ def _erpnext_account_names(rule_company: str | None = None) -> list:
     return names
 
 
-def _logical_account_names() -> list:
+def _logical_account_names(*, fresh: bool = False) -> list:
     """Deduplicated LOGICAL GL account names across every Company — the Mode B
     (Company-agnostic rule) offset feed (v0.4.0.3). Cached under a distinct key
     for the session; invalidated with the rest on a scope change. Best-effort — an
-    empty list (ERPNext down / unconfigured) leaves the field free-text."""
+    empty list (ERPNext down / unconfigured) leaves the field free-text.
+
+    `fresh=True` bypasses the cache read and refills it (v0.4.0.6)."""
     if not erps.is_configured():
         return []
     cache = _accounts_cache()
-    if cache is not None and _LOGICAL_NAMES_KEY in cache:
+    if not fresh and cache is not None and _LOGICAL_NAMES_KEY in cache:
         return cache[_LOGICAL_NAMES_KEY]
     try:
         names = erpnext_bank.list_account_names(company=None)
@@ -1227,12 +1234,38 @@ def known_accounts_api():
         it got so it can label the field; `accounts` stays the load-bearing field.
 
     Best-effort — an empty list (ERPNext down / unconfigured) just leaves the
-    field as free-text. Fed to the shared BankBridgeDropdown (v0.3.4)."""
+    field as free-text. Fed to the shared BankBridgeDropdown (v0.3.4).
+
+    v0.4.0.6 — `?fresh=1` re-hits ERPNext instead of serving the per-Company
+    cache (and refills it). The Rules editor sets it on page load, so an account
+    created in ERPNext moments earlier is immediately selectable."""
+    rule_company = (request.args.get('company') or '').strip()
+    fresh = (request.args.get('fresh') or '').strip() in ('1', 'true', 'yes')
+    if rule_company:
+        return jsonify({'accounts': _erpnext_account_names(rule_company,
+                                                           fresh=fresh),
+                        'company': rule_company, 'mode': 'specific'})
+    return jsonify({'accounts': _logical_account_names(fresh=fresh),
+                    'company': '', 'mode': 'logical'})
+
+
+@bp.get('/api/rules/refresh_accounts')
+def refresh_accounts_api():
+    """Manual "↻ refresh accounts" affordance next to the Offset Account field
+    (v0.4.0.6). Drops EVERY cached offset feed — not just the requested Company's
+    — then returns the freshly-fetched list in the same shape as
+    /api/rules/known_accounts. Covers the case the fresh-on-load path can't: the
+    operator creates the account in another tab while the editor is already open.
+
+    A full invalidation is deliberate: the new account also belongs in the Mode B
+    logical-name feed, and the operator may switch the rule's scope next."""
+    _invalidate_accounts_cache()
     rule_company = (request.args.get('company') or '').strip()
     if rule_company:
-        return jsonify({'accounts': _erpnext_account_names(rule_company),
+        return jsonify({'accounts': _erpnext_account_names(rule_company,
+                                                           fresh=True),
                         'company': rule_company, 'mode': 'specific'})
-    return jsonify({'accounts': _logical_account_names(),
+    return jsonify({'accounts': _logical_account_names(fresh=True),
                     'company': '', 'mode': 'logical'})
 
 
@@ -1362,6 +1395,10 @@ RULES_BODY = """
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:2;min-width:220px;position:relative">Offset account
       <span style="font-weight:400;color:#888">— the categorized (non-bank) side</span>
+      <!-- v0.4.0.6 · refetch the chart from ERPNext for an account created in
+           another tab while this editor is open -->
+      <a href="#" id="oa-refresh" style="font-weight:400;font-size:11px;margin-left:8px"
+         title="Refetch this Company's Chart of Accounts from ERPNext. The list already refreshes every time you open this page.">↻ refresh accounts</a>
       <span id="oa-mode-hint" style="display:block;font-weight:400;font-size:11px;color:#0a7;margin:2px 0 0"></span>
       <input name="offset_account" id="offset-account" autocomplete="off" value="{{ form.offset_account or '' }}"
              title="The account for the categorized side. The bank side is automatically determined from the transaction's linked Plaid account. Direction defaults to auto (withdrawal → offset is debit; deposit → offset is credit)."
@@ -1538,6 +1575,7 @@ RULES_BODY = """
   var oa = document.getElementById('offset-account');
   var oaDD = document.getElementById('oa-dd');
   var oaModeHint = document.getElementById('oa-mode-hint');
+  var oaRefresh = document.getElementById('oa-refresh');
   var companySel = document.querySelector('select[name=applies_to_company]');
   var dt = document.getElementById('description-template');
   var dtReset = document.getElementById('dt-reset');
@@ -1647,15 +1685,19 @@ RULES_BODY = """
   }
   function accountsCacheKey() { return CA + '::' + accountCompany(); }
 
-  function loadAccounts(force) {
+  // `force` skips the sessionStorage copy; `fresh` additionally tells the server
+  // to skip ITS per-Company cache and re-hit ERPNext (v0.4.0.6). The editor loads
+  // with fresh=true because the sessionStorage copy outlives a Company toggle —
+  // which is why a newly-created ERPNext account used to stay invisible.
+  function loadAccounts(force, fresh) {
     var ck = accountsCacheKey();
-    var have = !force && sessionStorage.getItem(ck);
+    var have = !force && !fresh && sessionStorage.getItem(ck);
     if (have) {
       try { accounts = JSON.parse(have); } catch (e) { accounts = []; }
       onData(); return;
     }
     fetch('/api/rules/known_accounts?company=' +
-          encodeURIComponent(accountCompany()))
+          encodeURIComponent(accountCompany()) + (fresh ? '&fresh=1' : ''))
       .then(function (r) { return r.json(); })
       .then(function (res) {
         accounts = (res && res.accounts) || [];
@@ -1664,8 +1706,8 @@ RULES_BODY = """
       }).catch(function () { onData(); });
   }
 
-  function load(force) {
-    loadAccounts(force);
+  function load(force, freshAccounts) {
+    loadAccounts(force, freshAccounts);
     var haveM = !force && sessionStorage.getItem(CK);
     var haveC = !force && sessionStorage.getItem(CC);
     if (haveM && haveC) {
@@ -1836,7 +1878,27 @@ RULES_BODY = """
   // picker never offers another Company's chart (Mode A) — or flips to the
   // logical-name feed (Mode B) when set back to all-Companies (v0.4.0.2/.3).
   if (companySel) companySel.addEventListener('change', function () {
-    accounts = []; updateOffsetModeHint(); loadAccounts(false);
+    accounts = []; updateOffsetModeHint(); loadAccounts(false, true);
+  });
+  // Manual "↻ refresh accounts" — for an account created in ANOTHER tab while
+  // this editor sat open, which no page-load hook can catch (v0.4.0.6). Drops the
+  // server caches too, then repopulates this Company's sessionStorage copy.
+  if (oaRefresh) oaRefresh.addEventListener('click', function (e) {
+    e.preventDefault();
+    var ck = accountsCacheKey();
+    oaRefresh.textContent = '↻ refreshing…';
+    fetch('/api/rules/refresh_accounts?company=' +
+          encodeURIComponent(accountCompany()))
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        accounts = (res && res.accounts) || [];
+        try { sessionStorage.setItem(ck, JSON.stringify(accounts)); } catch (e) {}
+        onData();
+        oaRefresh.textContent = '↻ refreshed (' + accounts.length + ')';
+      }).catch(function () { oaRefresh.textContent = '↻ refresh failed'; })
+      .then(function () {
+        setTimeout(function () {
+          oaRefresh.textContent = '↻ refresh accounts'; }, 2000); });
   });
   // Description Template: a manual edit takes ownership (stop auto-filling);
   // "reset to default" hands it back and regenerates. Both refresh the preview.
@@ -1851,7 +1913,9 @@ RULES_BODY = """
 
   updateOffsetModeHint();
   refreshPreview();
-  load(false);
+  // Merchants/categories may come from sessionStorage; the ACCOUNT feed is always
+  // refetched from ERPNext on editor load (v0.4.0.6).
+  load(false, true);
 })();
 </script>
 {% endraw %}
@@ -1899,6 +1963,11 @@ def _rules_page(flash_msg='', test_result=None, test=None, form=None,
 
 @bp.get('/admin/rules')
 def rules_page():
+    # v0.4.0.6 · opening the editor drops the cached offset-account feeds, so the
+    # dropdown reflects accounts added in ERPNext since the last visit. The page
+    # JS also requests ?fresh=1, which is what actually carries the guarantee
+    # under multiple worker processes (this cache is process-local).
+    _invalidate_accounts_cache()
     # New rules default their scope to the active Company (if any), so building
     # rules while scoped to a Company keeps them in that Company by default.
     form = {'active': True, 'priority': 100,
