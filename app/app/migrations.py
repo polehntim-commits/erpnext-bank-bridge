@@ -61,6 +61,10 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # owning Company. NULL = company-agnostic (applies everywhere), so existing
     # rules are unaffected.
     ('categorization_rules', 'applies_to_company', 'VARCHAR(140)'),
+    # v0.4.0.7 — omit the Party from a rule's generated JE (transfers between
+    # accounts you own). Backfills to false, so every existing rule keeps
+    # naming its party exactly as before.
+    ('categorization_rules', 'skip_party', 'BOOLEAN DEFAULT false'),
 ]
 
 

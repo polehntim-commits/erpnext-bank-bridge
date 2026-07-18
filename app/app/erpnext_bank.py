@@ -38,7 +38,7 @@ from . import db
 from . import erpnext_settings
 from .erpnext_client import (ERPNextAPIError, ERPNextClient, ERPNextConfig,
                              ERPNextConfigError, ERPNextError)
-from .models import PlaidSyncLog, Supplier
+from .models import PlaidAccount, PlaidItem, PlaidSyncLog, Supplier
 
 log = logging.getLogger('bankbridge.erpnext')
 
@@ -372,11 +372,16 @@ def _default_supplier_country() -> str:
 
 
 def _resolve_erpnext_supplier(client: ERPNextClient, normalized: str,
-                              subject_id=None) -> str:
+                              subject_id=None,
+                              supplier_group: str | None = None) -> str:
     """Find-or-create the ERPNext Supplier for a normalized merchant name and
     return its docname. Searches by supplier_name first (reuse an existing
     Supplier), else creates one; on a link failure (unknown supplier_group /
-    country) retries once with those optional fields dropped."""
+    country) retries once with those optional fields dropped.
+
+    v0.4.0.7 — `supplier_group` overrides the configured default group for a
+    derived party (a bank institution → 'Financial Institutions', a payroll
+    processor → 'Payroll Providers'); None keeps the default."""
     existing = client.list_docs(
         SUPPLIER_DT, filters=[['supplier_name', '=', normalized]],
         fields=['name'], limit_page_length=1)
@@ -388,7 +393,7 @@ def _resolve_erpnext_supplier(client: ERPNextClient, normalized: str,
     doc = {
         'supplier_name': normalized,
         'supplier_type': 'Company',
-        'supplier_group': _default_supplier_group(),
+        'supplier_group': (supplier_group or '').strip() or _default_supplier_group(),
         'country': _default_supplier_country(),
     }
     try:
@@ -451,6 +456,175 @@ def get_or_create_supplier(client: ERPNextClient | None, merchant_name: str, *,
         audit.record('supplier_auto_created', subject_type='Supplier',
                      subject_id=row.id, after=row.to_dict(),
                      notes=f'merchant_name={merchant_name!r} → {normalized!r}')
+    return row.erpnext_supplier_name
+
+
+# ── v0.4.0.7: party derivation + auto-Supplier for NON-merchant txns ───
+#
+# Root cause this section fixes: pre-v0.4.0.7 the auto-Supplier only ever fired
+# for a transaction Plaid gave a `merchant_name` (Uber, Starbucks). A rule that
+# names a Party for a DESCRIPTION-only transaction ("INTRST PYMNT", "ACH
+# Electronic CreditGUSTO PAY", "CREDIT CARD 3333 PAYMENT") therefore put a Party
+# on the JE that had no matching ERPNext Supplier, and the Journal Entry create
+# came back 417 LinkValidationError ("Could not find Row #1: Party: Wells
+# Fargo"). Every party NAME — whoever derived it — now ensures its Supplier
+# exists before the JE is built (see categorization.resolve_party).
+
+# Payroll processors, matched case-insensitively as a substring of the raw
+# description. Value is the canonical Supplier name. Ordered most-specific
+# first so 'intuit payroll' wins over a bare 'intuit'.
+_PAYROLL_PROCESSORS = (
+    ('intuit payroll', 'Intuit Payroll'),
+    ('quickbooks payroll', 'QuickBooks Payroll'),
+    ('square payroll', 'Square Payroll'),
+    ('wave payroll', 'Wave Payroll'),
+    ('gusto', 'Gusto'),
+    ('adp', 'ADP'),
+    ('paychex', 'Paychex'),
+    ('paylocity', 'Paylocity'),
+    ('paycom', 'Paycom'),
+    ('paycor', 'Paycor'),
+    ('trinet', 'TriNet'),
+    ('justworks', 'Justworks'),
+    ('rippling', 'Rippling'),
+    ('zenefits', 'Zenefits'),
+    ('bamboohr', 'BambooHR'),
+    ('insperity', 'Insperity'),
+)
+
+# Supplier Groups the auto-create files a derived party under, by source. A
+# merchant keeps the configured default group (unchanged pre-v0.4.0.7
+# behaviour) — only the two derived sources get an opinionated bucket.
+SUPPLIER_GROUP_BY_SOURCE = {
+    'institution': 'Financial Institutions',
+    'payroll': 'Payroll Providers',
+}
+
+SUPPLIER_GROUP_DT = 'Supplier Group'
+
+
+def institution_name_for_account_id(account_id: str | None) -> str:
+    """The linked Plaid Item's institution name for a transaction's account
+    ('Wells Fargo'). '' when the account is unknown or its Item carries no
+    institution name — the caller then has no party to derive."""
+    if not account_id:
+        return ''
+    acct = PlaidAccount.query.filter_by(account_id=account_id).first()
+    if acct is None:
+        return ''
+    item = PlaidItem.query.filter_by(item_id=acct.item_id).first()
+    return ((item.institution_name or '').strip() if item else '')
+
+
+def payroll_processor_in(text: str) -> str:
+    """The canonical payroll-processor name mentioned in `text`, or ''. Matches
+    a bare substring because Plaid concatenates the processor into a run-on
+    description ('ACH Electronic CreditGUSTO PAY 123456' → 'Gusto')."""
+    low = (text or '').lower()
+    for key, canonical in _PAYROLL_PROCESSORS:
+        if key in low:
+            return canonical
+    return ''
+
+
+def derive_party_from_transaction(row) -> tuple[str, str]:
+    """Derive a party NAME (and the source that produced it) for a transaction
+    whose rule wants a Party. Returns `(name, source)`; `('', '')` when nothing
+    can be derived.
+
+    Order — most specific first:
+      1. `merchant` — Plaid gave a merchant_name (normalized as before).
+      2. `payroll`  — a known payroll processor appears in the raw description
+         ('ACH Electronic CreditGUSTO PAY 123456' → 'Gusto').
+      3. `institution` — fall back to the account's own institution, which is
+         the right counterparty for the bank's own postings ('INTRST PYMNT',
+         'CREDIT CARD 3333 PAYMENT' → 'Wells Fargo').
+
+    `source` selects the Supplier Group the auto-create files the party under
+    (see SUPPLIER_GROUP_BY_SOURCE)."""
+    merchant = normalize_merchant_name(getattr(row, 'merchant_name', '') or '')
+    if merchant:
+        return merchant, 'merchant'
+    payroll = payroll_processor_in(getattr(row, 'name', '') or '')
+    if payroll:
+        return payroll, 'payroll'
+    institution = institution_name_for_account_id(
+        getattr(row, 'account_id', None))
+    if institution:
+        return institution, 'institution'
+    return '', ''
+
+
+def ensure_supplier_group(client: ERPNextClient, group: str) -> str:
+    """Find-or-create the ERPNext Supplier Group `group` and return its docname,
+    or '' when it can't be provisioned. Best-effort by design: a Supplier Group
+    is a nicety, and failing to make one must never cost us the Supplier (the
+    caller then falls back to the configured default group)."""
+    group = (group or '').strip()
+    if not group:
+        return ''
+    try:
+        if client.get_doc(SUPPLIER_GROUP_DT, group):
+            return group
+        created = client.create_doc(SUPPLIER_GROUP_DT, {
+            'supplier_group_name': group,
+            'parent_supplier_group': 'All Supplier Groups',
+            'is_group': 0,
+        })
+        return (created or {}).get('name') or group
+    except (ERPNextAPIError, ERPNextError):
+        log.info('could not ensure Supplier Group %r; using the default', group)
+        return ''
+
+
+def ensure_supplier(client: ERPNextClient | None, party_name: str, *,
+                    source: str = '') -> str | None:
+    """Find-or-create the ERPNext Supplier for an ALREADY-RESOLVED party name and
+    return its docname (v0.4.0.7).
+
+    Unlike get_or_create_supplier this takes the name verbatim — no merchant
+    normalization — because the name has already been settled by whoever derived
+    it (a rule's Party name, a payroll processor, an institution). Normalizing
+    again would turn an operator's literal "GUSTO" into "Gusto" and mint a
+    duplicate alongside the Supplier they already have.
+
+    Idempotent on three levels: the local `Supplier` mirror short-circuits a
+    repeat call, `_resolve_erpnext_supplier` reuses an existing ERPNext Supplier
+    by supplier_name before creating, and the Supplier Group provisioning is
+    itself find-or-create. Returns None for a blank name or when the ERPNext
+    resolve fails (the caller then must not put a Party on the JE)."""
+    name = (party_name or '').strip()
+    if not name or client is None:
+        return None
+    row = Supplier.query.filter_by(normalized_name=name[:255]).first()
+    if row is not None and row.erpnext_supplier_name:
+        return row.erpnext_supplier_name
+    group = ''
+    wanted = SUPPLIER_GROUP_BY_SOURCE.get(source, '')
+    if wanted:
+        group = ensure_supplier_group(client, wanted)
+    is_new = row is None
+    if is_new:
+        row = Supplier(merchant_name=name[:255], normalized_name=name[:255],
+                       first_seen_at=_now(), transaction_count=0,
+                       total_amount=0.0)
+        db.session.add(row)
+        db.session.flush()      # assign row.id for the audit / log cross-link
+    try:
+        row.erpnext_supplier_name = _resolve_erpnext_supplier(
+            client, name, subject_id=row.id, supplier_group=group or None)
+    except (ERPNextAPIError, ERPNextError) as e:
+        db.session.rollback()
+        _supplier_log('erpnext_supplier_auto_create', 'failed', str(e))
+        log.warning('party supplier resolve failed for %r: %s', name, e)
+        return None
+    row.updated_at = _now()
+    db.session.commit()
+    if is_new:
+        audit.record('supplier_auto_created', subject_type='Supplier',
+                     subject_id=row.id, after=row.to_dict(),
+                     notes=f'party={name!r} (source={source or "rule"}) → '
+                           f'{row.erpnext_supplier_name!r}')
     return row.erpnext_supplier_name
 
 

@@ -478,7 +478,8 @@ def bank_gl_account_for(row) -> str:
 def build_journal_entry(rule: CategorizationRule, row, company: str, *,
                         supplier_name=None, remark: str = '',
                         bank_account: str | None = None,
-                        offset_account_override: str | None = None) -> dict:
+                        offset_account_override: str | None = None,
+                        party_override: str | None = None) -> dict:
     """Assemble the ERPNext Journal Entry payload for a matched transaction.
 
     Two lines — the OFFSET (categorized) side and the BANK side:
@@ -501,8 +502,12 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
     generate_journal_entry). When None, the rule's own `offset_account` is used
     (Mode A / legacy), unchanged.
 
-    The optional party rides the offset line — `rule.party_name` wins, else the
-    auto-created Supplier for this merchant."""
+    The optional party rides the offset line — `party_override` wins (the
+    v0.4.0.7 already-ensured Supplier docname from generate_journal_entry), then
+    `rule.party_name`, then the auto-created Supplier for this merchant.
+
+    v0.4.0.7 — a rule with `skip_party` set puts NO party on the JE at all
+    (transfers between two accounts you own have no counterparty to book)."""
     amt = round(abs(float(row.amount or 0.0)), 2)
     offset_account = (offset_account_override
                       if offset_account_override is not None
@@ -542,8 +547,16 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
             bank_line['debit_in_account_currency'] = amt
         accounts = [party_line, bank_line]
 
-    party = rule.party_name or supplier_name
-    if rule.party_type and party:
+    # `party_override` follows the same convention as offset_account_override:
+    # None means "the caller didn't resolve a party, use the legacy precedence",
+    # while ANY string — including '' — is authoritative. That distinction is
+    # load-bearing: generate_journal_entry passes '' when resolve_party declined
+    # (skip_party, or a Supplier that couldn't be created), and falling back to
+    # rule.party_name there would put back the very unbacked party whose
+    # LinkValidationError v0.4.0.7 exists to fix.
+    party = (party_override if party_override is not None
+             else (rule.party_name or supplier_name))
+    if rule.party_type and party and not getattr(rule, 'skip_party', False):
         party_line['party_type'] = rule.party_type
         party_line['party'] = party
 
@@ -562,6 +575,84 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
     if row.date:
         doc['posting_date'] = row.date.isoformat()
     return doc
+
+
+# ── v0.4.0.7: party resolution + auto-Supplier for every party source ──
+
+def resolve_party(client, rule: CategorizationRule, row, supplier_name=None):
+    """The Party docname to put on this JE's offset line, with its ERPNext
+    Supplier guaranteed to exist first. Returns None when the JE should carry no
+    party (v0.4.0.7).
+
+    THE BUG THIS FIXES: pre-v0.4.0.7 only a Plaid `merchant_name` ever triggered
+    the auto-Supplier (see categorize_after_push), but a rule may name a Party
+    for a transaction that HAS no merchant — an interest payment, a card
+    payment, a payroll ACH. That party went onto the JE with no matching
+    Supplier and ERPNext refused the whole document:
+
+        LinkValidationError: Could not find Row #1: Party: Wells Fargo
+        POST /api/resource/Journal Entry -> 417
+
+    So the ensure now hangs off the PARTY, not off the merchant field. Order:
+
+      1. `skip_party` / no `party_type` → None (nothing to ensure).
+      2. `rule.party_name` — the operator's literal name, used verbatim.
+      3. the merchant Supplier already resolved by the sync path.
+      4. derived from the transaction — payroll processor in the description,
+         else the account's institution (erpnext_bank.derive_party_from_transaction).
+
+    Only a `Supplier` party is auto-created; a Customer party is left alone
+    (minting Customers from bank descriptions is not a call we should make). If
+    the Supplier can't be resolved we return None rather than a name we know
+    ERPNext will reject — a JE with no party beats no JE at all."""
+    if getattr(rule, 'skip_party', False):
+        return None
+    party_type = (rule.party_type or '').strip()
+    if not party_type:
+        return None
+    name, source = ((rule.party_name or '').strip(), 'rule')
+    if not name and supplier_name:
+        name, source = supplier_name, 'merchant'
+    if not name:
+        name, source = erpnext_bank.derive_party_from_transaction(row)
+    if not name:
+        return None
+    if party_type != 'Supplier':
+        return name          # Customer: honour it, but never auto-create one
+    if not current_app.config.get('ERPNEXT_AUTO_CREATE_SUPPLIERS', True):
+        return name
+    return erpnext_bank.ensure_supplier(client, name, source=source)
+
+
+def suggest_skip_party(offset_account: str, company: str = '') -> bool:
+    """True when `offset_account` looks like ANOTHER Bank Account you own under
+    `company` — i.e. the rule books a transfer (credit-card payment, deposit,
+    inter-account move) rather than a purchase, so it wants no Party (v0.4.0.7).
+
+    Answered entirely from local data: an imported Plaid account carries the GL
+    account it was linked to (`erpnext_gl_account_name`), so "is the offset a
+    bank account of mine?" is a set membership test — no ERPNext round-trip, and
+    it works for both offset modes. A Mode B (Company-agnostic) rule names a
+    LOGICAL account, so both sides are compared logically too. A blank `company`
+    considers every Company's bank accounts.
+
+    Advisory only — this pre-checks the Rules editor's checkbox; the stored
+    `skip_party` is whatever the operator actually saved."""
+    offset = (offset_account or '').strip()
+    if not offset:
+        return False
+    want = (company or '').strip()
+    from . import erpnext_accounts
+    for acct in PlaidAccount.query.filter(
+            PlaidAccount.erpnext_gl_account_name.isnot(None)).all():
+        gl = (acct.erpnext_gl_account_name or '').strip()
+        if not gl:
+            continue
+        if want and erpnext_accounts.owning_company_for(acct) != want:
+            continue
+        if gl == offset or logical_account_name(gl) == logical_account_name(offset):
+            return True
+    return False
 
 
 # ── generation (the write path) ────────────────────────────────────────
@@ -651,6 +742,24 @@ def generate_journal_entry(client, row, *, supplier_name=None,
         getattr(row, 'account_id', None))
     remark = render_description(rule, row, supplier_name=supplier_name)
 
+    # v0.4.0.7 · settle the party FIRST — before the GeneratedJournalEntry row
+    # is staged — so whatever name lands on the offset line is one ERPNext
+    # already has a Supplier for. This is the single choke point every caller
+    # funnels through (the sync path, "Rerun rules", the per-row Retry), so a
+    # description-derived party can no longer 417 the JE create.
+    #
+    # The ORDER here is load-bearing, not stylistic: resolve_party ends in a
+    # Supplier auto-create, which commits (on success) or rolls the session back
+    # (on failure). Either would clobber pending, uncommitted changes to `gje` —
+    # a rollback expunges a never-flushed row outright, so the JE would post to
+    # ERPNext while the local row that guarantees one-JE-per-transaction
+    # silently vanished, and the next "Rerun rules" would double-post. Staging
+    # `gje` only after the Supplier work is done keeps the two apart.
+    party = resolve_party(client, rule, row, supplier_name=supplier_name)
+
+    if gje is None:
+        gje = GeneratedJournalEntry.query.filter_by(
+            plaid_transaction_id=tid).first()
     if gje is None:
         gje = GeneratedJournalEntry(plaid_transaction_id=tid)
         db.session.add(gje)
@@ -703,7 +812,8 @@ def generate_journal_entry(client, row, *, supplier_name=None,
                 return gje
         doc = build_journal_entry(rule, row, company,
                                   supplier_name=supplier_name, remark=remark,
-                                  offset_account_override=offset_override)
+                                  offset_account_override=offset_override,
+                                  party_override=(party or ''))
         # v0.4.0.2 retroactive guard: refuse to post a JE that references a GL
         # account from a different Company than the target (belt-and-suspenders
         # behind the scoped Offset Account dropdown). A mismatch is a blocked,

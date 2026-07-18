@@ -268,6 +268,43 @@ Create an account in ERPNext, reload the Rules editor, and it's selectable — n
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
 
+**v0.4.0.7** — **fixes Journal Entries failing for transactions Plaid gives no
+merchant name**. Interest payments, credit-card payments and payroll ACHs all
+came back `417 LinkValidationError: Could not find Row #1: Party: Wells Fargo`
+while merchant transactions (Uber, Starbucks) posted fine. The cause: the
+auto-Supplier hung off Plaid's `merchant_name` field, so a merchant transaction
+minted its Supplier and its JE posted — but a **description-only** transaction
+whose rule named a Party put that party on the document with no Supplier behind
+it, and ERPNext refused the whole JE. The ensure now hangs off the **party**, not
+the merchant field: whatever the source — the rule's own Party name, the Plaid
+merchant, a **payroll processor read out of the description** (`ACH Electronic
+CreditGUSTO PAY 123456` → `Gusto`, plus ADP / Paychex / Rippling and a dozen
+more), or a fallback to the **account's own institution** (`INTRST PYMNT` →
+`Wells Fargo`) — its Supplier is created before the JE is built. Derived parties
+get a sensible **Supplier Group**, auto-provisioned if missing: banks under
+`Financial Institutions`, payroll processors under `Payroll Providers`. A name
+the operator typed is used **verbatim** (a literal `GUSTO` is not normalized into
+a duplicate `Gusto`), the ensure is idempotent at three levels, and a Supplier
+that genuinely can't be created **drops the party rather than failing the JE** —
+a JE with no party beats no JE.
+
+Rules also gain **Skip Party field**, for a rule that books a transfer between
+two accounts you own (a card payment, a deposit, an inter-account move). Such a
+transfer has no counterparty, so naming one just mints a junk Supplier; checked,
+the generated JE carries no Party at all (ERPNext treats it as optional). The
+Rules editor **pre-checks it automatically** when the chosen Offset Account
+resolves to another Bank Account of the same Company — answered from local data,
+so it works with ERPNext unreachable — and the operator can always override; only
+what they save is stored. Existing rules default to unchecked and keep naming
+their party exactly as before.
+
+To clear entries already stuck in `error`, either click **Rerun rules** on
+/admin/transactions (they're eligible — a failed row has no Journal Entry yet) or
+run `scripts/backfill_missing_suppliers.py`, which parses the party out of each
+failure, creates the missing Suppliers and re-generates the JEs back to
+`pending_review`. Both are idempotent. No migration beyond the additive
+`skip_party` column, which backfills to false.
+
 ## How it works
 
 1. **Link a bank once** through Plaid Link (`/admin/link_bank`). OAuth-only

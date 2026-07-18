@@ -78,7 +78,8 @@ class FakeERPClient:
                  chart_accounts=None, fail_account_create=False,
                  company_abbr='EC', existing_suppliers=None,
                  fail_supplier_create=False, fail_je_create=False,
-                 companies=None):
+                 companies=None, existing_supplier_groups=None,
+                 fail_supplier_group_create=False):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -136,6 +137,13 @@ class FakeERPClient:
         self.fail_account_create = fail_account_create
         # Suppliers that already exist in ERPNext (list_docs by supplier_name).
         self.existing_suppliers = set(existing_suppliers or ())
+        # Supplier Groups that already exist in ERPNext (get_doc hits). The
+        # v0.4.0.7 derived-party auto-create find-or-creates its group first.
+        self.existing_supplier_groups = set(existing_supplier_groups
+                                            or ('All Supplier Groups',))
+        # When True, every Supplier Group create fails — the auto-create must
+        # then fall back to the configured default group, not lose the Supplier.
+        self.fail_supplier_group_create = fail_supplier_group_create
         # When True, every Supplier create fails (both attempts) so the
         # best-effort resolve path leaves erpnext_supplier_name NULL.
         self.fail_supplier_create = fail_supplier_create
@@ -147,7 +155,8 @@ class FakeERPClient:
         # Records created by the one-click account import, keyed by doctype.
         self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {},
                         'Bank Account Type': {}, 'Bank Account Subtype': {},
-                        'Account': {}, 'Supplier': {}, 'Journal Entry': {}}
+                        'Account': {}, 'Supplier': {}, 'Journal Entry': {},
+                        'Supplier Group': {}}
 
     def get_logged_user(self):
         return 'admin@example.com'
@@ -174,6 +183,11 @@ class FakeERPClient:
             return None
         if doctype == 'Bank Account Subtype':
             if name in self.existing_subtypes or name in self.created['Bank Account Subtype']:
+                return {'name': name}
+            return None
+        if doctype == 'Supplier Group':
+            if (name in self.existing_supplier_groups
+                    or name in self.created['Supplier Group']):
                 return {'name': name}
             return None
         if doctype == 'Account':
@@ -328,6 +342,16 @@ class FakeERPClient:
         if doctype == 'Bank Account Subtype':
             name = doc.get('account_subtype')  # autonames on account_subtype
             self.created['Bank Account Subtype'][name] = dict(doc)
+            return {'name': name}
+        if doctype == 'Supplier Group':
+            if self.fail_supplier_group_create:
+                from app.erpnext_client import ERPNextAPIError
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body='{"exception": "ValidationError: cannot create '
+                                  'Supplier Group"}')
+            name = doc.get('supplier_group_name')  # autonames on the group name
+            self.created['Supplier Group'][name] = dict(doc)
             return {'name': name}
         if doctype == 'Supplier':
             if self.fail_supplier_create:

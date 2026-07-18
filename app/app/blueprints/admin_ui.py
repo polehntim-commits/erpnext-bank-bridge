@@ -1269,6 +1269,24 @@ def refresh_accounts_api():
                     'company': '', 'mode': 'logical'})
 
 
+@bp.get('/api/rules/skip_party_suggestion')
+def skip_party_suggestion_api():
+    """Transfer-detection for the Rules editor (v0.4.0.7): does `?offset_account=`
+    resolve to another Bank Account you own under `?company=`? When it does, the
+    rule is booking a transfer (a credit-card payment, a deposit, an
+    inter-account move) — there is no counterparty, so the editor pre-checks
+    "Skip Party field". Advisory: the operator can always uncheck it, and only
+    what they save is stored.
+
+    Read-only and local-only (it reads the imported accounts' GL links), so it
+    stays fast and works with ERPNext unreachable."""
+    offset_account = (request.args.get('offset_account') or '').strip()
+    company = (request.args.get('company') or '').strip()
+    suggest = categorization.suggest_skip_party(offset_account, company)
+    return jsonify({'skip_party': suggest, 'offset_account': offset_account,
+                    'company': company})
+
+
 def _sample_transaction_for(match_type: str, match_value: str):
     """A representative transaction to render a Description Template preview
     against: the most recent local transaction the (match_type, match_value)
@@ -1352,7 +1370,7 @@ RULES_BODY = """
 {% endif %}
 
 <h3>{{ 'Edit rule #' ~ form.id if form.id else 'Add a rule' }}</h3>
-<form class="card" method="post" action="/admin/rules/save">
+<form class="card" id="rule-form" method="post" action="/admin/rules/save">
   <input type="hidden" name="id" value="{{ form.id or '' }}">
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:2;min-width:180px">Name
@@ -1429,9 +1447,21 @@ RULES_BODY = """
         <option value="Customer" {{ 'selected' if form.party_type == 'Customer' else '' }}>Customer</option>
       </select>
     </label>
-    <label style="flex:2;min-width:200px">Party name <span style="font-weight:400;color:#888">(blank → auto-Supplier for the merchant)</span>
+    <label style="flex:2;min-width:200px">Party name <span style="font-weight:400;color:#888">(blank → auto-Supplier for the merchant, payroll processor, or bank)</span>
       <input name="party_name" value="{{ form.party_name or '' }}" placeholder="(optional)">
     </label>
+  </div>
+  <!-- v0.4.0.7 · pre-checked by JS when the offset resolves to another Bank
+       Account of the same Company (/api/rules/skip_party_suggestion). -->
+  <div style="margin:2px 0 8px">
+    <label style="font-weight:400">
+      <input type="checkbox" name="skip_party" id="skip-party" value="1"
+             style="width:auto" {{ 'checked' if form.skip_party else '' }}>
+      Skip Party field (for transfers between accounts you own)
+    </label>
+    <span id="skip-party-hint" style="display:block;font-size:11px;color:#888;margin:2px 0 0 22px">
+      Recommended when the offset account is another Bank Account of the same Company.
+    </span>
   </div>
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:1;min-width:220px">Applies to Company
@@ -1513,7 +1543,7 @@ RULES_BODY = """
     <td style="font-size:12px">{{ r.offset_account or r.debit_account }}{% if r.offset_account and not r.applies_to_company %}<span title="Logical name — resolves to each Company's own account at posting time" style="color:#b26a00;margin-left:4px">· logical</span>{% endif %}</td>
     <td style="font-size:12px">{{ r.offset_direction or 'auto' }}</td>
     <td style="font-size:12px">{% if r.applies_to_company %}{{ r.applies_to_company }}{% else %}<span style="color:#999">all</span>{% endif %}</td>
-    <td style="font-size:12px">{{ (r.party_type or '') }}{% if r.party_name %}: {{ r.party_name }}{% endif %}</td>
+    <td style="font-size:12px">{% if r.skip_party %}<span class="pill pill-muted" title="This rule books a transfer between accounts you own — the generated Journal Entry carries no Party.">no party</span>{% else %}{{ (r.party_type or '') }}{% if r.party_name %}: {{ r.party_name }}{% endif %}{% endif %}</td>
     <td>
       <form method="post" action="/admin/rules/toggle" style="margin:0">
         <input type="hidden" name="id" value="{{ r.id }}">
@@ -1647,7 +1677,48 @@ RULES_BODY = """
       }).catch(function () { dtPreview.textContent = ''; });
   }
 
-  function onOffsetChanged() { maybeAutofill(); }
+  // v0.4.0.7 · transfer detection. When the chosen offset is another Bank
+  // Account of the same Company the rule books a transfer, which has no
+  // counterparty — pre-check "Skip Party field". Suggestion only: once the
+  // operator touches the box themselves we never move it again.
+  var skipParty = document.getElementById('skip-party');
+  var skipPartyHint = document.getElementById('skip-party-hint');
+  // Editing an existing rule counts as already-decided: its stored skip_party
+  // is the operator's own choice, so the heuristic stays out of the way.
+  var ruleIdField = document.querySelector('#rule-form input[name="id"]');
+  var skipPartyTouched = !!(ruleIdField && ruleIdField.value);
+  if (skipParty) {
+    skipParty.addEventListener('change', function () { skipPartyTouched = true; });
+  }
+  // Debounced like the description preview — onOffsetChanged runs on every
+  // keystroke, and this suggestion isn't worth a request per character.
+  var skipPartyTimer = null;
+  function refreshSkipPartySuggestion() {
+    if (!skipParty || skipPartyTouched) return;
+    if (skipPartyTimer) clearTimeout(skipPartyTimer);
+    skipPartyTimer = setTimeout(doFetchSkipPartySuggestion, 250);
+  }
+  function doFetchSkipPartySuggestion() {
+    if (!skipParty || skipPartyTouched) return;
+    var offset = oa ? oa.value : '';
+    if (!offset) return;
+    fetch('/api/rules/skip_party_suggestion?offset_account=' +
+          encodeURIComponent(offset) + '&company=' +
+          encodeURIComponent(accountCompany()))
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (skipPartyTouched || !res || !res.skip_party) return;
+        skipParty.checked = true;
+        if (skipPartyHint) {
+          skipPartyHint.style.color = '#0a7';
+          skipPartyHint.textContent =
+            'Auto-checked: “' + offset + '” is another Bank Account you own, ' +
+            'so this rule looks like a transfer. Uncheck to book a Party anyway.';
+        }
+      }).catch(function () { /* advisory only — leave the box as-is */ });
+  }
+
+  function onOffsetChanged() { maybeAutofill(); refreshSkipPartySuggestion(); }
 
   // v0.4.0.3 · the offset field is two-mode, keyed off Applies-to-Company:
   //   * a Company is selected → Mode A: pick one of THAT Company's real accounts;
@@ -2008,6 +2079,9 @@ def _rule_form_values():
         'credit_account': (request.form.get('credit_account') or '').strip(),
         'party_type': party_type,
         'party_name': (request.form.get('party_name') or '').strip() or None,
+        # v0.4.0.7 · the checkbox is authoritative — the transfer heuristic only
+        # pre-checks it in the editor, it never overrides a saved choice.
+        'skip_party': bool(request.form.get('skip_party')),
         'description_template': (request.form.get('description_template') or '').strip(),
         # v0.4.0.1 · optional multi-entity scope. Blank → company-agnostic.
         'applies_to_company': (request.form.get('applies_to_company') or '').strip() or None,

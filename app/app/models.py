@@ -356,6 +356,15 @@ class CategorizationRule(db.Model):
     credit_account = db.Column(db.String(255), default='')
     party_type = db.Column(db.String(20), nullable=True)    # Supplier | Customer
     party_name = db.Column(db.String(255), nullable=True)
+    # v0.4.0.7 · omit the Party from the generated JE entirely. ERPNext treats
+    # Party as optional on a JE row, and a transfer between two accounts you own
+    # (a credit-card payment, a deposit, an inter-account move) has no
+    # counterparty worth booking — naming one just mints a junk Supplier. The
+    # Rules editor pre-checks this when the offset resolves to another Bank
+    # Account of the same Company (categorization.suggest_skip_party); the
+    # operator can always override. Defaults False, so every pre-v0.4.0.7 rule
+    # keeps its current party behaviour.
+    skip_party = db.Column(db.Boolean, default=False)
     description_template = db.Column(db.Text, default='')
     # v0.4.0.1 · multi-entity rule scoping: when set, the rule only fires for a
     # transaction whose linked Plaid account resolves to this ERPNext Company.
@@ -408,6 +417,7 @@ class CategorizationRule(db.Model):
             'debit_account': self.debit_account,
             'credit_account': self.credit_account,
             'party_type': self.party_type, 'party_name': self.party_name,
+            'skip_party': bool(self.skip_party),
             'description_template': self.description_template,
             'applies_to_company': self.applies_to_company or None,
             'superseded_by': self.superseded_by,
