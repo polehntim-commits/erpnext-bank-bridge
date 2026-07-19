@@ -103,7 +103,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.10 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.11 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -312,6 +312,61 @@ Company-agnostic logical-name list too) and reports how many accounts came back.
 Create an account in ERPNext, reload the Rules editor, and it's selectable — no
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
+
+**v0.4.11** — **reconnecting a bank without losing what you set up.**
+Two problems, one expensive and one quietly destructive.
+
+The expensive one: nothing detected Plaid's `ITEM_LOGIN_REQUIRED`. When a bank
+decided it wanted you to sign in again, the poll loop kept calling it — a
+failed, billable request every cycle, forever — and the first anyone knew was
+that transactions had stopped arriving. Bank Bridge now recognises that state
+from **two independent signals**: Plaid's ITEM webhook (instant, and free —
+handling one makes no API calls at all) and the error text of a failed sync, so
+an install with no public webhook URL still works, one poll later. A bank in
+that state is **parked**: not polled, badged on the Accounts page, with a
+Reconnect button. Parking it is a cost *saving* — the same reasoning v0.4.7
+already applied to disconnected Items.
+
+The destructive one: **a re-link is not a reconnect.** Plaid mints a new
+`item_id` *and new `account_id`s* for a new connection, and everything this app
+keys on `account_id` then misses. Your ERPNext mapping, Company assignment and
+import status revert to blank — but worse, two invisible things break. The
+ERPNext Bank Account dedup key (`plaid_account_id`) no longer matches, so the
+next import tries to create a **duplicate Bank Account** whose name collides and
+fails outright. And the opening-balance idempotency key
+(`opening-balance:<account_id>`) no longer matches, so a **second opening
+balance** becomes eligible for an account that already has one — silently
+double-counting the starting position.
+
+So there are now two paths, and the right one is usually the cheap one:
+
+* **Reconnect** uses Plaid's *update mode*, which repairs the existing Item in
+  place. `item_id` and every `account_id` survive, so nothing is re-mapped and
+  no second billable Item is created at Plaid. This is what expired credentials
+  need.
+* **Re-link** (a genuinely new connection) now runs **fingerprint adoption**:
+  each new account is matched against retired ones on
+  (institution, last-4, type, subtype), and on an *unambiguous single match* the
+  configuration is **moved** across — mapping, Company, import status, and the
+  opening-balance entry, which is re-keyed so no second one can ever be booked.
+
+Adoption moves rather than copies, deliberately: two rows naming one ERPNext
+Bank Account would both push into it and duplicate every transaction in the
+overlap. The donor is retired in the same operation and stamped with
+`superseded_by_account_id`. Matching is exact and unambiguous-only — zero or two
+candidates means you map that one by hand — for the reason the counterparty
+pairing states: fuzzy matching would silently attach one bank account's ledger
+history to a different bank account, and exact matching can only ever
+under-adopt, which is the safe direction to be wrong in.
+
+Also here: the disconnect modal used to end *"You can re-link this bank later"*
+with no caveat, which was a promise the code did not keep. It now says what
+actually happens, and points at Reconnect.
+
+Cost control: the only webhook behaviour that spends Plaid calls beyond the
+scheduled poll is the TRANSACTIONS sync kick, which has been on since the pilot.
+It can now be turned off with `PLAID_WEBHOOK_TRIGGERS_SYNC=false` while keeping
+the free ITEM re-auth handling.
 
 **v0.4.10** — **the statements show up in ERPNext.** v0.4.9 fetched the bank's
 own monthly PDFs and filed them under `/admin/statements`, which is a fine place
@@ -1065,6 +1120,75 @@ The boot log says which of these happened, with ERPNext's own reason attached:
 
 Every failure is fail-open: statements stay local, nothing is lost, and the next
 scheduler tick retries.
+
+## Reconnecting a bank (v0.4.11)
+
+Banks expire. Plaid signals it with `ITEM_LOGIN_REQUIRED` (or warns first with
+`PENDING_EXPIRATION`), and until you sign in again every call for that bank
+fails.
+
+Bank Bridge detects this from **two independent signals**, so neither is
+required:
+
+| Signal | Needs | Speed | Plaid cost |
+|---|---|---|---|
+| ITEM webhook | a public webhook URL | instant | **none** — handling it makes zero API calls |
+| Failed-sync error text | nothing | next poll | none beyond the poll that failed |
+
+A bank in that state is **parked**: it is not polled (so it stops burning a
+failed billable request every cycle), it is badged on `/admin/accounts`, and it
+gets a **Reconnect** button. A successful sync clears the flag automatically, so
+a warning the bank later resolves on its own can't strand the connection.
+
+### Reconnect vs. re-link — they are not the same thing
+
+**Reconnect** uses Plaid's *update mode*: Link is handed the access token you
+already hold, and re-authenticates the **existing** Item. `item_id` and every
+`account_id` survive, so every mapping keeps working and there is nothing to
+exchange afterwards. It also doesn't create a second billable Item at Plaid.
+**This is what you want for expired credentials.**
+
+**Re-linking** — adding the bank again as a new connection — creates a genuinely
+new Item, and Plaid issues **new account ids** for the same real-world accounts.
+Everything keyed on the old ids misses.
+
+### Fingerprint adoption
+
+For the re-link case, each new account is matched against retired ones on
+**(institution, last-4, type, subtype)**. On an *unambiguous single match*, the
+configuration is **moved** across:
+
+- the ERPNext Bank Account and GL account mapping
+- the owning Company (unless you picked one for this link — your explicit choice
+  wins)
+- import status and sync toggle
+- the opening-balance entry, **re-keyed** to the new account id
+
+That last one is the load-bearing part. The thing that actually prevents a
+double-booked opening balance is the unique synthetic key
+`opening-balance:<account_id>` — not the denormalized pointer. Leaving it on the
+dead id would make the re-linked account look like one that had never been
+booked, and it would book a second opening balance, silently double-counting.
+
+Adoption **moves** rather than copies: two rows naming one ERPNext Bank Account
+would both push into it and duplicate every transaction in the overlap. The
+donor is retired in the same operation and stamped with
+`superseded_by_account_id`, so the history stays queryable.
+
+Matching is exact and **unambiguous-only**. Zero matches or two, and you map
+that account by hand — fuzzy matching would silently attach one bank account's
+ledger to a different one, and exact matching can only ever under-adopt, which
+is the safe direction to be wrong in. An account with no last-4 is never
+adopted, because without it "depository/checking" matches every checking account
+at the bank.
+
+Bank Bridge also rewrites the `plaid_account_id` custom field on the mapped
+ERPNext Bank Account. Without that, ERPNext's own dedup can't see the account and
+the next import tries to create a duplicate whose name collides. If ERPNext is
+down at the time, the local adoption still commits and the repoint converges on
+a later sync.
+
+Turn the whole behaviour off with `RECONNECT_ADOPT_ENABLED=false`.
 
 ## Disconnecting a bank (v0.4.7)
 
@@ -1957,6 +2081,8 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `ERPNEXT_STATEMENTS_AUTO_SYNC` | `true` | v0.4.10 · upload automatically at startup and after each pull. Off leaves the doctype provisioned but makes uploading a manual step (`scripts.backfill_erpnext_statements`) |
 | `ERPNEXT_STATEMENT_VARIANCE_THRESHOLD` | `10.00` | v0.4.10 · how large a reconciliation variance must be to earn a row in the discrepancy report. Distinct from `STATEMENTS_RECONCILE_TOLERANCE`, which decides whether a period reconciles *at all* — this decides what is worth a human's attention |
 | `ERPNEXT_STATEMENT_COVERAGE_MONTHS` | `12` | v0.4.10 · how many closed months the statement coverage report looks back over for gaps |
+| `RECONNECT_ADOPT_ENABLED` | `true` | v0.4.11 · when a bank is re-linked, let each new account inherit the ERPNext mapping, Company and opening balance of the retired account it replaces, on an unambiguous (institution, last-4, type, subtype) match. Off → a re-link produces unconfigured accounts, as before v0.4.11 |
+| `PLAID_WEBHOOK_TRIGGERS_SYNC` | `true` | v0.4.11 · whether a Plaid TRANSACTIONS webhook kicks an immediate sync. This costs Plaid calls **beyond** the scheduled poll — the one webhook behaviour that shows up on a bill. Turning it off keeps the free ITEM re-auth webhooks working and lets the scheduled poll do the fetching |
 | `FERNET_KEY` | "" | blank → autogenerated + persisted to `{DATA_DIR}/fernet.key` |
 | `SYNC_INTERVAL_HOURS` | `24` | v0.3.6 · background poll cadence in hours (**daily by default**). `0` or negative = **manual only** (no auto-poll; use "Sync now"). Editable in the admin UI, which persists a value that wins over this seed |
 | `PLAID_MAX_CALLS_PER_DAY` | `0` | v0.3.6 · optional per-Item safety brake — max Plaid pull calls per Item per UTC day (`0` = no limit). A pull that would exceed it is skipped with a logged warning |

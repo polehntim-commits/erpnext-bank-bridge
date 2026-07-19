@@ -38,6 +38,7 @@ from .. import erpnext_settings as erps
 from .. import intercompany
 from .. import opening_balance as obal
 from .. import plaid_settings as ps
+from .. import reconnect
 from .. import rule_stats
 from .. import sync_config
 from .. import sync_engine
@@ -648,6 +649,17 @@ ACCOUNTS_BODY = """
        inside an HTML attribute breaks the moment it contains a quote. Jinja's
        autoescaping handles attribute VALUES correctly, so this shape can't be
        broken by the bank's name. -->
+  {% if grp.item.needs_reauth %}
+  <span class="pill" style="vertical-align:middle;margin-left:6px;
+        background:#fff3cd;border-color:#f0d68a;color:#7a5b00"
+        title="{{ grp.item.reauth_reason or 'Re-authentication required' }} — syncing is paused for this bank, so no Plaid calls are being spent on it.">⚠ Needs reconnect</span>
+  <button type="button"
+          style="vertical-align:middle;margin-left:8px;padding:3px 10px;font-size:12px"
+          data-bb-reconnect="{{ grp.item.item_id }}"
+          data-bb-name="{{ grp.item.institution_name or 'this bank' }}">
+    Reconnect
+  </button>
+  {% endif %}
   <button type="button" class="secondary"
           style="vertical-align:middle;margin-left:8px;padding:3px 10px;font-size:12px"
           data-bb-disconnect="{{ grp.item.item_id }}"
@@ -656,6 +668,17 @@ ACCOUNTS_BODY = """
   </button>
   {% endif %}
 </h3>
+{% if grp.item.needs_reauth %}
+<div class="banner-warn" style="margin:4px 0 10px">
+  <p style="font-size:14px;margin:0">
+    <b>{{ grp.item.institution_name or 'This bank' }} needs you to sign in
+    again.</b> {{ grp.reauth_help }}
+    Syncing for this bank is <b>paused</b> until you reconnect — no Plaid calls
+    are being spent on it in the meantime. Reconnecting repairs this same
+    connection, so your account mappings and Company assignment are unaffected.
+  </p>
+</div>
+{% endif %}
 <div style="margin:0 0 8px;font-size:13px;color:#555">
   Owning Company: <b>{{ grp.item.owning_company or '(unassigned — uses ERPNext default)' }}</b>
   {% if companies %}
@@ -765,7 +788,15 @@ ACCOUNTS_BODY = """
     <h2 style="margin-top:0;font-size:19px">Disconnect <span id="bbDiscName">this bank</span>?</h2>
     <p style="font-size:14px;color:#444;line-height:1.5">
       Plaid will stop sending new transactions. Your existing transactions and
-      generated Journal Entries stay in ERPNext. You can re-link this bank later.
+      generated Journal Entries stay in ERPNext.
+    </p>
+    <p style="font-size:13px;color:#444;line-height:1.5">
+      You can link this bank again later, but Plaid issues <b>new account ids</b>
+      for a new connection. Bank Bridge will try to recognise each account by its
+      last-4, type and subtype and carry its ERPNext mapping across — if an
+      account can't be matched unambiguously, you'll re-map that one by hand.
+      <b>If you only need to fix expired credentials, use Reconnect instead</b> —
+      it repairs this connection in place and nothing is re-mapped.
     </p>
     <div id="bbDiscError"
          style="display:none;font-size:13px;color:#a00;background:#fff3f3;
@@ -779,6 +810,12 @@ ACCOUNTS_BODY = """
     </div>
   </div>
 </div>
+{% if any_needs_reauth %}
+<!-- v0.4.11 · Plaid Link, for the Reconnect button only. Loaded conditionally
+     so an accounts page with nothing to reconnect — the normal case — fetches
+     no third-party script at all. -->
+<script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+{% endif %}
 <script>
 var bbDiscItem = null;
 document.addEventListener('click', function (e) {
@@ -791,6 +828,53 @@ document.addEventListener('click', function (e) {
                  t.getAttribute('data-bb-name'));
   }
 });
+
+// v0.4.11 · Reconnect = Plaid Link in UPDATE MODE. The link token is minted
+// against the Item's existing access_token, so Link re-authenticates the
+// connection we already have rather than creating a second one. On success
+// there is nothing to exchange — the access_token never changed — so we just
+// tell the server to un-park the Item.
+document.addEventListener('click', function (e) {
+  var t = e.target;
+  while (t && t !== document && !(t.getAttribute && t.getAttribute('data-bb-reconnect'))) {
+    t = t.parentNode;
+  }
+  if (t && t.getAttribute && t.getAttribute('data-bb-reconnect')) {
+    bbReconnect(t, t.getAttribute('data-bb-reconnect'));
+  }
+});
+function bbReconnect(btn, itemId) {
+  var original = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Opening…';
+  function fail(msg) {
+    btn.disabled = false; btn.textContent = original;
+    alert('Reconnect failed: ' + msg);
+  }
+  fetch('/bankbridge/api/plaid/create_link_token', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({item_id: itemId})
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.link_token) { fail(d.error || 'no link token'); return; }
+    if (typeof Plaid === 'undefined') {
+      fail('the Plaid Link script did not load'); return;
+    }
+    Plaid.create({
+      token: d.link_token,
+      onSuccess: function () {
+        btn.textContent = 'Reconnecting…';
+        fetch('/bankbridge/api/plaid/reconnect_complete', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({item_id: itemId})
+        }).then(function () { window.location.reload(); })
+          .catch(function () { window.location.reload(); });
+      },
+      onExit: function (err) {
+        btn.disabled = false; btn.textContent = original;
+        if (err) { alert('Reconnect cancelled: ' + (err.error_message || err.error_code || '')); }
+      }
+    }).open();
+  }).catch(function (e) { fail(e); });
+}
 function bbDisconnect(itemId, name) {
   bbDiscItem = itemId;
   document.getElementById('bbDiscName').textContent = name || 'this bank';
@@ -844,7 +928,15 @@ def accounts_page():
             supported_map[a.account_id] = erpnext_accounts.is_supported(a)
             if a.erpnext_bank_account_name:
                 any_imported = True
-        groups.append({'item': it, 'accounts': accts})
+        groups.append({
+            'item': it, 'accounts': accts,
+            # v0.4.11 · the operator-facing sentence for why this bank stopped.
+            # '' for a healthy Item, so the banner renders nothing extra.
+            'reauth_help': (reconnect.REAUTH_HELP.get(it.reauth_reason or '', '')
+                            if it.needs_reauth else ''),
+        })
+    any_needs_reauth = any(g['item'].needs_reauth and not g['item'].disconnected
+                           for g in groups)
     bank_accounts, erp_error = [], ''
     companies = []
     if erps.is_configured():
@@ -862,6 +954,7 @@ def accounts_page():
                  supported_map=supported_map, any_imported=any_imported,
                  opening_cell=_opening_balance_cell,
                  erpnext_ok=erps.is_configured(), companies=companies,
+                 any_needs_reauth=any_needs_reauth,
                  bootstrap_unavailable=sorted(
                      erpnext_accounts.unavailable_doctypes()),
                  erp_error=erp_error, flash_msg=request.args.get('flash', ''))

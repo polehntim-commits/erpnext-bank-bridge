@@ -348,7 +348,15 @@ class TestDisconnectUI(DisconnectBase):
         self.assertIn('bbDisconnectModal', html)
         self.assertIn('Plaid will stop sending new transactions', html)
         self.assertIn('stay in ERPNext', html)
-        self.assertIn('re-link this bank later', html)
+        # v0.4.11 · the copy used to end at "You can re-link this bank later",
+        # which was a promise the code did not keep: Plaid mints new account ids
+        # for a new connection, so mappings only survive if fingerprint adoption
+        # can match each account unambiguously. The modal now says that, and
+        # points at Reconnect — which really is lossless — for the expired-
+        # credentials case people actually hit.
+        self.assertIn('link this bank again later', html)
+        self.assertIn('new account ids', html)
+        self.assertIn('Reconnect instead', html)
         self.assertIn('>Cancel<', html)
 
     def test_accounts_page_renders_with_no_items(self):

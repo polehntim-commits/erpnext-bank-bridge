@@ -43,6 +43,7 @@ from . import erpnext_bank
 from . import erpnext_settings
 from . import intercompany
 from . import plaid_settings
+from . import reconnect
 from . import crypto
 from .erpnext_client import ERPNextAPIError, ERPNextConfigError, ERPNextError
 from .models import (BankTransaction, PlaidAccount, PlaidItem, PlaidSyncLog)
@@ -168,11 +169,13 @@ def refresh_accounts(item: PlaidItem, plaid_client: PlaidClient,
     balances. Preserves operator-set erpnext mapping + sync toggle. Returns the
     account count."""
     accounts = plaid_client.get_accounts(access_token)
+    adopted: list = []
     for a in accounts:
         acct_id = a.get('account_id')
         if not acct_id:
             continue
         acct = PlaidAccount.query.filter_by(account_id=acct_id).first()
+        fresh = acct is None
         if acct is None:
             acct = PlaidAccount(account_id=acct_id, item_id=item.item_id)
             db.session.add(acct)
@@ -196,7 +199,18 @@ def refresh_accounts(item: PlaidItem, plaid_client: PlaidClient,
         acct.balance_only = erpnext_accounts.is_investment_type(
             acct.type, acct.subtype)
         acct.updated_at = _now()
+        # v0.4.11 · a newly-seen account at a bank we have linked BEFORE is
+        # usually the same real account under a new Plaid id — a re-link, not a
+        # new account. Adopt the retired row's mapping when exactly one
+        # candidate matches, so the operator doesn't re-map by hand (and, more
+        # importantly, so a second opening balance can't be booked). Deferred
+        # until after the fields above are set: the fingerprint reads mask,
+        # type and subtype. See app/reconnect.py.
+        if fresh:
+            adopted.append(acct)
     db.session.commit()
+    for acct in adopted:
+        reconnect.adopt_if_unambiguous(acct, item)
     return len(accounts)
 
 
@@ -307,6 +321,11 @@ def pull_item(item: PlaidItem, plaid_client: PlaidClient) -> dict:
         item.last_error = None
         item.updated_at = _now()
         db.session.commit()
+        # v0.4.11 · a sync that completed is proof the link works, whatever a
+        # stale webhook or an earlier failure claimed. Self-healing matters
+        # here: a PENDING_EXPIRATION warning that the bank later resolves on
+        # its own must not park the Item permanently.
+        reconnect.clear_reauth(item)
     except PlaidError as e:
         db.session.rollback()
         item = db.session.get(PlaidItem, item.id)
@@ -315,6 +334,15 @@ def pull_item(item: PlaidItem, plaid_client: PlaidClient) -> dict:
             item.last_error = str(e)[:2000]
             item.updated_at = _now()
             db.session.commit()
+            # v0.4.11 · classify the failure. ITEM_LOGIN_REQUIRED and friends
+            # need a human, not a retry, so park the Item rather than paying to
+            # rediscover this every poll. Deriving it from the error text here
+            # — as well as from the ITEM webhook — is what makes the feature
+            # work on an install with no public webhook URL, which is most of
+            # them.
+            code = reconnect.is_reauth_error(e)
+            if code:
+                reconnect.mark_needs_reauth(item, code, source='sync error')
         _log(item.item_id if item else '', 'plaid_pull', 0, 'failed', str(e))
         raise
     _log(item.item_id, 'plaid_pull',
@@ -536,6 +564,17 @@ def sync_item(item: PlaidItem, plaid_client: PlaidClient = None,
         except (ERPNextAPIError, ERPNextError):
             log.warning('investment balance refresh failed for %s',
                         item.item_id, exc_info=True)
+        # v0.4.11 · finish any adoption whose ERPNext half couldn't be done at
+        # the time (ERPNext down, or not configured yet). Until the Bank
+        # Account's `plaid_account_id` names the CURRENT account, ERPNext's own
+        # dedup can't see it — and the next import would try to create a
+        # duplicate Bank Account and fail. Cheap: only ever-superseded accounts
+        # are considered, and a correct one costs a GET and no write.
+        try:
+            reconnect.repoint_adopted_accounts(erp_client)
+        except (ERPNextAPIError, ERPNextError):
+            log.warning('repointing adopted accounts failed for %s',
+                        item.item_id, exc_info=True)
     return {'item_id': item.item_id, 'pull': pull_stats, 'push': push_stats}
 
 
@@ -551,9 +590,22 @@ def sync_all(plaid_client: PlaidClient = None, erp_client=None) -> dict:
     # `.is_(False)`) so a row that predates the column and somehow read back
     # NULL still counts as connected; the migration backfills false, this is
     # belt-and-braces.
+    # v0.4.11 · an Item the bank wants re-authenticated is skipped for exactly
+    # the reason above: every call for it fails until a HUMAN signs in again, so
+    # polling it just burns a billable request and writes an error row per
+    # cycle. Before this release that happened on every poll, forever. The
+    # operator sees it on /admin/accounts with a Reconnect button; nothing here
+    # can clear the state, so nothing here should keep paying to rediscover it.
     items = (PlaidItem.query
              .filter(PlaidItem.status != 'revoked')
-             .filter(PlaidItem.disconnected.isnot(True)).all())
+             .filter(PlaidItem.disconnected.isnot(True))
+             .filter(PlaidItem.needs_reauth.isnot(True)).all())
+    parked = (PlaidItem.query
+              .filter(PlaidItem.needs_reauth.is_(True),
+                      PlaidItem.disconnected.isnot(True)).count())
+    if parked:
+        log.info('[sync] %d item(s) parked awaiting re-authentication — not '
+                 'polled. Reconnect them on /admin/accounts.', parked)
     audit.record('sync_run_started', subject_type=None,
                  after={'items': len(items)},
                  notes=f'sync across {len(items)} item(s)')

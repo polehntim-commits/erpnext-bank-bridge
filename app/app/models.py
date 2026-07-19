@@ -53,6 +53,26 @@ class PlaidItem(db.Model):
     disconnected = db.Column(db.Boolean, default=False, nullable=False,
                              index=True)
     disconnected_at = db.Column(db.DateTime, nullable=True)
+    # v0.4.11 · the bank wants the operator to log in again (Plaid's
+    # ITEM_LOGIN_REQUIRED / PENDING_EXPIRATION). Until they do, every call for
+    # this Item fails, so the sync loop skips it — the same economics that
+    # already govern `disconnected`: don't burn a billable request on a link
+    # that cannot answer.
+    #
+    # A separate flag rather than a fourth `status` value, for two reasons.
+    # `status` carries a CHECK constraint, so a new value means a constraint
+    # migration on a live database. And, as with `disconnected`, status is
+    # written by the sync path on every poll — folding reauth into it would let
+    # a transient error silently clear a state only a HUMAN can resolve.
+    #
+    # Set from two independent signals so neither is required: Plaid's ITEM
+    # webhook (instant, free, needs a public webhook URL) and the error text of
+    # a failed sync (always available, one poll late). Cleared only by a
+    # successful update-mode reconnect or a successful sync.
+    needs_reauth = db.Column(db.Boolean, default=False, nullable=False,
+                             index=True)
+    reauth_reason = db.Column(db.String(255), nullable=True)
+    reauth_detected_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=_now)
     last_synced_at = db.Column(db.DateTime, nullable=True)
     last_error = db.Column(db.Text, nullable=True)
@@ -74,6 +94,10 @@ class PlaidItem(db.Model):
             'disconnected': bool(self.disconnected),
             'disconnected_at': (self.disconnected_at.isoformat()
                                 if self.disconnected_at else None),
+            'needs_reauth': bool(self.needs_reauth),
+            'reauth_reason': self.reauth_reason,
+            'reauth_detected_at': (self.reauth_detected_at.isoformat()
+                                   if self.reauth_detected_at else None),
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'last_synced_at': self.last_synced_at.isoformat() if self.last_synced_at else None,
             'last_error': self.last_error,
@@ -136,13 +160,29 @@ class PlaidAccount(db.Model):
     # intercompany_pair_id: rejecting an opening balance KEEPS the row as the
     # record of that decision, so the two lifetimes are independent.
     opening_balance_je_id = db.Column(db.Integer, nullable=True, index=True)
+    # v0.4.11 · when this account's configuration was HANDED OVER to a
+    # re-linked replacement, the account_id that took it. Plaid mints new
+    # account_ids under a new Item, so a re-link produces a fresh row for the
+    # same real-world account; fingerprint adoption moves the mapping across
+    # (see app/reconnect.py) and stamps the donor here.
+    #
+    # The mapping is MOVED, not copied, and this column is what records that.
+    # Two rows pointing at one ERPNext Bank Account would both push the same
+    # transactions into it — so the donor is retired as part of the same
+    # operation, and this is the audit trail of where its identity went.
+    superseded_by_account_id = db.Column(db.String(120), nullable=True,
+                                         index=True)
     # One-click-import lifecycle (see app/erpnext_accounts.py):
     #   pending     — never auto-imported (the default / freshly linked)
     #   imported    — a matching ERPNext Bank Account was created/found + linked
     #   unsupported — the Plaid type/subtype isn't a Bank Account in ERPNext's
     #                 model (loans, investments, 401k, …) so no button is offered
+    #   superseded  — v0.4.11: this row's configuration was handed to a
+    #                 re-linked replacement (see superseded_by_account_id). The
+    #                 row stays queryable as history; it just no longer syncs.
     # Left deliberately un-constrained (like plaid_sync_log) so a future status
-    # never needs a migration.
+    # never needs a migration — which is exactly what let 'superseded' be added
+    # in v0.4.11 with no constraint change.
     import_status = db.Column(db.String(20), default='pending', index=True)
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
@@ -162,6 +202,7 @@ class PlaidAccount(db.Model):
             'sync_enabled': bool(self.sync_enabled),
             'opening_balance_je_id': self.opening_balance_je_id,
             'import_status': self.import_status or 'pending',
+            'superseded_by_account_id': self.superseded_by_account_id,
         }
 
 

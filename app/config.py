@@ -461,6 +461,20 @@ class Config:
     except ValueError:
         ERPNEXT_STATEMENT_COVERAGE_MONTHS = 12
 
+    # ── v0.4.11 · reconnecting a bank (see app/reconnect.py) ─────────────
+    #   * whether a re-linked account inherits the ERPNext mapping, Company and
+    #     opening balance of the retired account it replaces, when exactly one
+    #     retired account matches on (institution, mask, type, subtype). Off →
+    #     a re-link produces an unconfigured account, as it did before v0.4.11.
+    RECONNECT_ADOPT_ENABLED = _bool('RECONNECT_ADOPT_ENABLED', True)
+    #   * whether a Plaid TRANSACTIONS webhook kicks an immediate sync. This has
+    #     been the behaviour since the pilot, so it defaults ON — but it costs
+    #     Plaid calls BEYOND the scheduled poll, which is the one webhook
+    #     behaviour that shows up on a bill. Turning it off keeps the (free)
+    #     ITEM re-auth webhooks working and lets the scheduled poll do the
+    #     fetching.
+    PLAID_WEBHOOK_TRIGGERS_SYNC = _bool('PLAID_WEBHOOK_TRIGGERS_SYNC', True)
+
     # Set false to disable the in-process scheduler entirely (e.g. drive syncs by
     # cron hitting /api/sync/plaid_now instead). Distinct from MANUAL-ONLY above:
     # this stops the scheduler process; MANUAL-ONLY runs it with no poll job.

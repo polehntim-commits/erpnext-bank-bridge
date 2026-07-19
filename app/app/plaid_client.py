@@ -87,7 +87,8 @@ class PlaidClient:
 
     def create_link_token(self, user_id: str, *, redirect_uri: str = None,
                           webhook: str = None, statements: bool = False,
-                          statements_months: int = 24) -> str:
+                          statements_months: int = 24,
+                          access_token: str = None) -> str:
         """Create a short-lived link_token for Plaid Link. `redirect_uri` is
         required for OAuth-only banks (Wells Fargo) and must be registered in
         the Plaid dashboard. Returns the link_token string.
@@ -108,8 +109,31 @@ class PlaidClient:
 
         `statements_months` is how far back Link asks the institution to make
         statements available (Plaid caps this per institution; asking for more
-        than a bank offers just yields fewer)."""
+        than a bank offers just yields fewer).
+
+        `access_token` (v0.4.11) switches Link into UPDATE MODE: instead of
+        creating a new Item, Link re-authenticates the EXISTING one. This is the
+        only way to repair an ITEM_LOGIN_REQUIRED without losing everything, and
+        it matters for two independent reasons.
+
+        Correctness: update mode preserves `item_id` AND every `account_id`, so
+        the operator's Company assignment, ERPNext account mapping and opening
+        balance all keep working. A fresh link mints new ids for the same real
+        accounts, which orphans all of it (see app/reconnect.py for what it
+        costs and how the fallback recovers it).
+
+        Cost: a fresh link creates a second billable Item at Plaid for a bank
+        already being paid for. Update mode does not.
+
+        Plaid REJECTS `products` alongside `access_token` — an Item's products
+        are fixed at creation and update mode cannot change them — so both the
+        product list and the `statements` request are dropped here rather than
+        left to fail at the API."""
         api = self._get_api()
+        if access_token:
+            return self._link_token_create(
+                api, self._update_mode_kwargs(user_id, redirect_uri, webhook,
+                                              access_token))
         kwargs = self._link_token_kwargs(user_id, redirect_uri, webhook)
         if statements:
             with_statements = self._with_statements(dict(kwargs),
@@ -141,6 +165,23 @@ class PlaidClient:
         wh = webhook if webhook is not None else self.webhook_url
         if wh:
             kwargs['webhook'] = wh
+        return kwargs
+
+    def _update_mode_kwargs(self, user_id, redirect_uri, webhook,
+                            access_token) -> dict:
+        """LinkTokenCreateRequest kwargs for update mode (v0.4.11).
+
+        Deliberately built by SUBTRACTION from the normal kwargs rather than
+        assembled separately, so anything added to a link token later (a new
+        country, a language change) reaches update mode too and the two cannot
+        drift. `products` is the one thing removed: Plaid rejects it outright
+        alongside an access_token.
+
+        `redirect_uri` is kept — an OAuth bank needs it on re-auth exactly as it
+        did on the first link."""
+        kwargs = self._link_token_kwargs(user_id, redirect_uri, webhook)
+        kwargs.pop('products', None)
+        kwargs['access_token'] = access_token
         return kwargs
 
     @staticmethod

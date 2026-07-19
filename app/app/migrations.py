@@ -121,6 +121,16 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # scheduler tick with no manual step.
     ('plaid_statements', 'erpnext_docname', 'VARCHAR(255)'),
     ('plaid_statements', 'erpnext_synced_at', 'TIMESTAMP'),
+    # v0.4.11 — reconnect safety. `needs_reauth` gets a NOT NULL default so the
+    # sync loop's filter can treat it as a plain boolean on an upgrading
+    # database rather than having to spell out `IS NOT TRUE` for legacy NULLs
+    # (the lesson `disconnected` learned in v0.4.7 — see sync_all's comment).
+    ('plaid_items', 'needs_reauth', 'BOOLEAN DEFAULT false NOT NULL'),
+    ('plaid_items', 'reauth_reason', 'VARCHAR(255)'),
+    ('plaid_items', 'reauth_detected_at', 'TIMESTAMP'),
+    # Backfills to NULL = "this account was never superseded", which is true of
+    # every account on an existing install.
+    ('plaid_accounts', 'superseded_by_account_id', 'VARCHAR(120)'),
 ]
 
 

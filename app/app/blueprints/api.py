@@ -20,9 +20,11 @@ import logging
 from flask import (Blueprint, current_app, jsonify, render_template_string,
                    request, session)
 
+from .. import audit
 from .. import db
 from .. import crypto
 from .. import plaid_settings
+from .. import reconnect
 from .. import sync_engine
 from ..models import PlaidAccount, PlaidItem, PlaidLinkState
 from ..plaid_client import PlaidError, PlaidConfigError
@@ -47,6 +49,27 @@ def create_link_token():
     if not plaid_settings.is_configured():
         return jsonify({'error': 'Plaid is not configured. Set your Client ID '
                         'and secret in Plaid settings first.'}), 400
+    # v0.4.11 · `item_id` switches Link into UPDATE MODE for an Item that
+    # already exists — repairing it in place instead of creating a second one.
+    # This is what a Reconnect button asks for, and it is both the correct and
+    # the cheaper path: the Item keeps its id and all its account_ids (so every
+    # mapping survives), and no second billable Item is created at Plaid.
+    data = request.get_json(silent=True) or request.form or {}
+    item_id = (data.get('item_id') or request.args.get('item_id') or '').strip()
+    access_token = None
+    if item_id:
+        item = PlaidItem.query.filter_by(item_id=item_id).first()
+        if item is None:
+            return jsonify({'error': 'unknown item_id'}), 404
+        if item.disconnected:
+            return jsonify({'error': 'that bank was disconnected; link it as '
+                                     'a new connection instead'}), 409
+        try:
+            access_token = crypto.decrypt(item.access_token_encrypted)
+        except Exception:
+            return jsonify({'error': 'stored credentials for that bank could '
+                                     'not be read; link it as a new '
+                                     'connection instead'}), 500
     try:
         client = sync_engine.get_plaid_client()
         # v0.4.9 · also request the `statements` product, so the linked Item can
@@ -55,9 +78,14 @@ def create_link_token():
         # isn't enabled on the application, or the institution doesn't offer
         # it), so linking a bank keeps working exactly as it did pre-v0.4.9 and
         # starts carrying statements on the next link after Plaid approves them.
+        #
+        # In update mode the statements flag is ignored: Plaid rejects a
+        # products list alongside an access_token, because an Item's products
+        # are fixed when it is created.
         link_token = client.create_link_token(
             user_id='erpnext-bank-bridge',
-            statements=current_app.config.get('STATEMENTS_ENABLED', True))
+            statements=current_app.config.get('STATEMENTS_ENABLED', True),
+            access_token=access_token)
     except (PlaidError, PlaidConfigError) as e:
         return jsonify({'error': str(e)}), 502
     try:
@@ -66,7 +94,42 @@ def create_link_token():
         db.session.commit()
     except Exception:  # pragma: no cover - non-fatal bookkeeping
         db.session.rollback()
-    return jsonify({'link_token': link_token})
+    return jsonify({'link_token': link_token, 'update_mode': bool(access_token)})
+
+
+@bp.post('/bankbridge/api/plaid/reconnect_complete')
+def reconnect_complete():
+    """Called by the Reconnect page when update-mode Link succeeds (v0.4.11).
+
+    There is no token to exchange. That is the whole point of update mode: the
+    Item and its access_token are the ones we already hold, so a successful Link
+    means the existing credentials work again. All that remains is to clear the
+    parked flag so the poll loop picks the Item back up.
+
+    Idempotent — clearing an already-clear flag is a no-op — because Link's
+    onSuccess can fire more than once across a retry."""
+    data = request.get_json(silent=True) or request.form or {}
+    item_id = (data.get('item_id') or '').strip()
+    if not item_id:
+        return jsonify({'error': 'item_id required'}), 400
+    item = PlaidItem.query.filter_by(item_id=item_id).first()
+    if item is None:
+        return jsonify({'error': 'unknown item_id'}), 404
+    cleared = reconnect.clear_reauth(item)
+    if cleared:
+        audit.record('item_reconnected', subject_type='PlaidItem',
+                     subject_id=item_id, after={'needs_reauth': False},
+                     notes='update-mode reconnect succeeded')
+    # Refresh accounts immediately: a reconnect is also how NEW_ACCOUNTS_AVAILABLE
+    # gets resolved, and the operator expects to see them without waiting for
+    # the next poll. Best-effort — the flag is already cleared either way.
+    try:
+        client = sync_engine.get_plaid_client()
+        sync_engine.refresh_accounts(
+            item, client, crypto.decrypt(item.access_token_encrypted))
+    except Exception as e:  # pragma: no cover - never fail the reconnect
+        log.info('post-reconnect account refresh failed for %s: %s', item_id, e)
+    return jsonify({'ok': True, 'item_id': item_id, 'was_parked': cleared})
 
 
 SESSION_OWNING_COMPANY_KEY = 'link_owning_company'
@@ -214,8 +277,44 @@ def plaid_webhook():
     unauthenticated (LAN-only); Plaid webhook verification can be added later."""
     data = request.get_json(silent=True) or {}
     webhook_type = (data.get('webhook_type') or '').upper()
+    webhook_code = (data.get('webhook_code') or '').upper()
     item_id = data.get('item_id') or ''
-    log.info('plaid webhook: %s / %s', webhook_type, data.get('webhook_code'))
+    log.info('plaid webhook: %s / %s', webhook_type, webhook_code)
+
+    # v0.4.11 · ITEM webhooks are the free, instant signal that a bank wants the
+    # operator to sign in again. Before this release they were logged and
+    # dropped, so the first anyone knew was that transactions had stopped —
+    # while the poll loop kept paying for a failed call every cycle.
+    #
+    # Handling one costs NOTHING at Plaid: it sets a flag on a row and makes
+    # zero API calls. It is cost-NEGATIVE, because parking the Item stops the
+    # doomed polling (see sync_engine.sync_all).
+    if webhook_type == 'ITEM' and item_id:
+        item = PlaidItem.query.filter_by(item_id=item_id).first()
+        if item is not None and not item.disconnected:
+            code = webhook_code
+            if code == 'ERROR':
+                # The interesting part of an ERROR webhook is the nested error
+                # code — a plain 'ERROR' says nothing actionable.
+                nested = (data.get('error') or {})
+                code = (nested.get('error_code') or '').upper() or code
+            if code in reconnect.REAUTH_WEBHOOK_CODES:
+                reconnect.mark_needs_reauth(item, code, source='webhook')
+                audit.record('item_needs_reauth', subject_type='PlaidItem',
+                             subject_id=item_id, after={'code': code},
+                             notes=f'Plaid ITEM webhook: {code}')
+        return jsonify({'ok': True})
+
+    # v0.4.11 · the TRANSACTIONS branch kicks a full sync, which DOES cost Plaid
+    # calls beyond the scheduled poll. That has been the behaviour since the
+    # pilot, so it stays on by default — but an operator watching their bill can
+    # now turn it off and keep the (free) ITEM handling above.
+    if (webhook_type == 'TRANSACTIONS'
+            and not current_app.config.get('PLAID_WEBHOOK_TRIGGERS_SYNC', True)):
+        log.info('plaid webhook: TRANSACTIONS sync kick disabled '
+                 '(PLAID_WEBHOOK_TRIGGERS_SYNC=false) — the scheduled poll '
+                 'will pick these up')
+        return jsonify({'ok': True})
     if webhook_type == 'TRANSACTIONS' and item_id:
         item = PlaidItem.query.filter_by(item_id=item_id).first()
         # v0.4.7 · a disconnected Item is skipped here for the same reason
