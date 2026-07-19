@@ -1,16 +1,16 @@
-Flask==3.0.0
+Flask==3.1.3
 Flask-SQLAlchemy==3.1.1
-SQLAlchemy==2.0.23
-psycopg2-binary==2.9.9
+SQLAlchemy==2.0.51
+psycopg2-binary==2.9.12
 # v0.4.7 — 22.0.0 patches the two request-smuggling CVEs that affect 21.2.0:
 # CVE-2024-1135 (GHSA-w3h3-4rj7-4ph4) and CVE-2024-6827 (GHSA-hc5x-x2vx-497g),
 # both fixed in 22.0.0. Gunicorn is a pure WSGI runner here, so this is a
 # runtime-only bump — no app code depends on its API.
-gunicorn==22.0.0
-python-dotenv==1.0.0
-requests==2.31.0
+gunicorn==26.0.0
+python-dotenv==1.2.2
+requests==2.34.2
 # Encrypts the stored Plaid access_tokens at rest (Fernet).
-cryptography==41.0.7
+cryptography==49.0.0
 # Official Plaid SDK — Link token, public-token exchange, /transactions/sync,
 # /item/remove.
 #
@@ -22,7 +22,7 @@ cryptography==41.0.7
 plaid-python==40.1.0
 # In-process scheduler for the transactions/sync poll (daily by default; see
 # SYNC_INTERVAL_HOURS).
-APScheduler==3.10.4
+APScheduler==3.11.3
 # v0.4.9 — reads bank-statement PDFs pulled from Plaid /statements so the
 # opening and closing balances printed inside them can be recovered as numbers
 # (see app/statements.py). Plaid returns those balances ONLY in the PDF, never
@@ -33,4 +33,4 @@ APScheduler==3.10.4
 # statements.extract_text, so the app still boots and the suite still runs if
 # the wheel is ever missing; a parse then just returns "no balance found" and
 # every caller falls back to the v0.4.4 estimate.
-pypdf==5.1.0
+pypdf==6.14.2
