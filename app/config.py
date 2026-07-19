@@ -475,6 +475,31 @@ class Config:
     #     fetching.
     PLAID_WEBHOOK_TRIGGERS_SYNC = _bool('PLAID_WEBHOOK_TRIGGERS_SYNC', True)
 
+    # ── v0.4.12 · investment mark-to-market (see app/revaluation.py) ─────
+    #   * whether balance-only investment accounts are marked to market. Off →
+    #     the GL leaf keeps the value it opened at and the live number appears
+    #     only on the Bank Account's informational `plaid_balance` field,
+    #     exactly as in v0.4.0–v0.4.11.
+    INVESTMENT_REVALUATION_ENABLED = _bool('INVESTMENT_REVALUATION_ENABLED',
+                                           True)
+    #   * the account revaluations post against. Defaults to an EQUITY leaf,
+    #     auto-created under the company's Equity branch: an unrealized gain is
+    #     a paper movement, and routing it to income would let a market rally
+    #     report a profit the farm never earned. Point this at an income account
+    #     if your accountant wants it in the P&L — every future entry follows.
+    UNREALIZED_GAIN_ACCOUNT_NAME = os.environ.get(
+        'UNREALIZED_GAIN_ACCOUNT_NAME',
+        'Unrealized Gain/Loss on Investments').strip() or \
+        'Unrealized Gain/Loss on Investments'
+    #   * the smallest movement worth a Journal Entry. A brokerage moves every
+    #     day; without a floor a daily sync files an entry for eleven cents and
+    #     buries the ones that matter.
+    try:
+        INVESTMENT_REVALUATION_MIN_DELTA = abs(float(os.environ.get(
+            'INVESTMENT_REVALUATION_MIN_DELTA', '1.00')))
+    except ValueError:
+        INVESTMENT_REVALUATION_MIN_DELTA = 1.00
+
     # Set false to disable the in-process scheduler entirely (e.g. drive syncs by
     # cron hitting /api/sync/plaid_now instead). Distinct from MANUAL-ONLY above:
     # this stops the scheduler process; MANUAL-ONLY runs it with no poll job.

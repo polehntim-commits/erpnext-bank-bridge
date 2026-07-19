@@ -103,7 +103,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.11 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.12 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -312,6 +312,56 @@ Company-agnostic logical-name list too) and reports how many accounts came back.
 Create an account in ERPNext, reload the Rules editor, and it's selectable — no
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
+
+**v0.4.12** — **investments stop lying on the balance sheet.**
+v0.4.0 brought investment accounts in as *balance-only*: Bank Bridge creates the
+Bank Account and GL leaf, books an opening balance, and mirrors each refreshed
+balance onto an informational field on the Bank Account. That field is not a
+posting — so the GL leaf kept the value it opened at, **forever**. A brokerage
+that grew from $50,000 to $65,000 read $50,000 on the balance sheet, with the
+real number visible only to someone who opened the Bank Account form and knew to
+look.
+
+Now the difference is posted as a Journal Entry. Value up debits the investment
+and credits **Unrealized Gain/Loss on Investments**; value down reverses it. The
+equity leaf is auto-created under the company's Equity branch, once, in the 3100
+slot beside Opening Balance Equity.
+
+**Why equity and not income.** An unrealized gain is a paper movement — the
+market moved, the farm did nothing, and no cash exists. Routing it to income
+would put market noise straight into the operating result, so a quarter where
+the orchard did badly but the brokerage rallied would report a profit nobody can
+spend. Equity keeps the balance sheet honest while leaving the income statement
+to say what the *farm* did. It's also the reversible choice: point
+`UNREALIZED_GAIN_ACCOUNT_NAME` at an income account and every future entry
+follows.
+
+**The delta is measured against the ledger, not against yesterday.** Each entry
+posts the gap between the live balance and what the GL leaf currently reflects,
+so entries compose: +5,000 then −2,000 then +1,000 leaves the leaf at
+opening +4,000, which is what a running ledger has to mean. A movement under
+`INVESTMENT_REVALUATION_MIN_DELTA` (default $1) is skipped — a brokerage moves
+every day, and nobody wants to approve a Journal Entry for eleven cents — and
+the skipped amount is not lost, because the next entry measures from the ledger
+and absorbs it.
+
+**The rule that makes this safe to upgrade into.** A NULL baseline means "we
+don't know what the ledger reflects" — which is true of *every* investment
+account the moment you upgrade. Posting in that state would book each account's
+entire value as a fictional one-off gain. So the first pass over an account
+**seeds** the baseline and posts nothing: from the booked opening balance when
+there is one, otherwise from the current balance, so revaluation tracks change
+from when the feature was switched on. It never invents a gain that didn't
+happen. Entries land as `pending_review` Drafts, like opening balances, so a
+human approves every one.
+
+Also here, and overdue: **investment accounts get their own type and subtype.**
+They were typed `Current` — describing a 401k as a chequing-class account — with
+subtype `Other`, losing exactly the precision v0.3.9 added for depository
+accounts on the class where *which kind of investment* is the whole question.
+Now `Investment`, with Brokerage / Ira / Roth / 401K / Retirement / Hsa /
+Mutual Fund / Stock / Bond / Crypto Exchange mapped 1:1. Plaid's underscore
+form (`crypto_exchange`) resolves too.
 
 **v0.4.11** — **reconnecting a bank without losing what you set up.**
 Two problems, one expensive and one quietly destructive.
@@ -1120,6 +1170,68 @@ The boot log says which of these happened, with ERPNext's own reason attached:
 
 Every failure is fail-open: statements stay local, nothing is lost, and the next
 scheduler tick retries.
+
+## Investment accounts (v0.4.0, mark-to-market v0.4.12)
+
+Plaid `investment` accounts — brokerage, IRA, 401k, HSA, crypto — are supported
+**balance-only**: Bank Bridge creates the Bank Account and a GL leaf under
+Assets → Non-current Assets → Investments, books an opening balance, and tracks
+the value. It does not fetch holdings or investment transactions (that needs
+Plaid's separate `investments` product, which this app does not request).
+
+### Typing
+
+| | Value |
+|---|---|
+| Bank Account Type | `Investment` |
+| Bank Account Subtype | `Brokerage`, `Ira`, `Roth`, `401K`, `Retirement`, `Hsa`, `Mutual Fund`, `Stock`, `Bond`, `Crypto Exchange` |
+| GL parent | Investments → Retirement / Marketable Securities / Digital Assets |
+
+Before v0.4.12 every investment was typed `Current` with subtype `Other`.
+
+### Mark-to-market
+
+Each sync compares the account's current value against what the GL leaf
+reflects and posts the difference:
+
+```
+value up      Dr  <investment leaf>                Cr  Unrealized Gain/Loss
+value down    Dr  Unrealized Gain/Loss             Cr  <investment leaf>
+```
+
+The equity leaf is auto-created once per company under the Equity branch (slot
+3100, beside Opening Balance Equity). Entries are `pending_review` Drafts —
+nothing posts to your books without approval — and appear on
+`/admin/generated_entries` labelled *Investment revaluation*.
+
+**Equity, not income, by default.** An unrealized gain is a paper movement: the
+market moved, the farm did nothing, no cash exists. Booking it to income would
+let a market rally report a profit the farm never earned. Set
+`UNREALIZED_GAIN_ACCOUNT_NAME` to an income account if your accountant prefers
+that treatment.
+
+**Deltas compose.** Each entry measures against the ledger, not against the
+previous reading, so +5,000 then −2,000 then +1,000 leaves the leaf at
+opening +4,000. Movements under `INVESTMENT_REVALUATION_MIN_DELTA` (default $1)
+are skipped, and the skipped amount is picked up by the next entry rather than
+lost.
+
+**On upgrade, nothing is posted on the first pass.** Every existing investment
+account has no recorded baseline, and posting in that state would book the whole
+account value as a fictitious gain. The first pass **seeds** the baseline
+instead — from the booked opening balance if there is one, otherwise from the
+current balance — and revaluation starts from there. An opening balance still
+sitting in `pending_review` does not count as booked, because the ledger has not
+moved yet.
+
+Turn the whole behaviour off with `INVESTMENT_REVALUATION_ENABLED=false`.
+
+### What is still not covered
+
+No holdings, cost basis, realized gain/loss, or dividend detail — those need
+Plaid's `investments` product. Mark-to-market moves the *total value* of the
+account, which is what the balance sheet needs; it is not a substitute for a
+broker's own statement at tax time.
 
 ## Reconnecting a bank (v0.4.11)
 
@@ -2083,6 +2195,9 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `ERPNEXT_STATEMENT_COVERAGE_MONTHS` | `12` | v0.4.10 · how many closed months the statement coverage report looks back over for gaps |
 | `RECONNECT_ADOPT_ENABLED` | `true` | v0.4.11 · when a bank is re-linked, let each new account inherit the ERPNext mapping, Company and opening balance of the retired account it replaces, on an unambiguous (institution, last-4, type, subtype) match. Off → a re-link produces unconfigured accounts, as before v0.4.11 |
 | `PLAID_WEBHOOK_TRIGGERS_SYNC` | `true` | v0.4.11 · whether a Plaid TRANSACTIONS webhook kicks an immediate sync. This costs Plaid calls **beyond** the scheduled poll — the one webhook behaviour that shows up on a bill. Turning it off keeps the free ITEM re-auth webhooks working and lets the scheduled poll do the fetching |
+| `INVESTMENT_REVALUATION_ENABLED` | `true` | v0.4.12 · mark balance-only investment accounts to market by posting the change in value as a Journal Entry. Off → the GL leaf keeps its opening value, as in v0.4.0–v0.4.11 |
+| `UNREALIZED_GAIN_ACCOUNT_NAME` | `Unrealized Gain/Loss on Investments` | v0.4.12 · the account revaluations post against, auto-created under the company's **Equity** branch. Point it at an income account if your accountant wants unrealized movement in the P&L |
+| `INVESTMENT_REVALUATION_MIN_DELTA` | `1.00` | v0.4.12 · the smallest movement worth a Journal Entry. Skipped amounts aren't lost — the next entry measures against the ledger and absorbs them |
 | `FERNET_KEY` | "" | blank → autogenerated + persisted to `{DATA_DIR}/fernet.key` |
 | `SYNC_INTERVAL_HOURS` | `24` | v0.3.6 · background poll cadence in hours (**daily by default**). `0` or negative = **manual only** (no auto-poll; use "Sync now"). Editable in the admin UI, which persists a value that wins over this seed |
 | `PLAID_MAX_CALLS_PER_DAY` | `0` | v0.3.6 · optional per-Item safety brake — max Plaid pull calls per Item per UTC day (`0` = no limit). A pull that would exceed it is skipped with a logged warning |

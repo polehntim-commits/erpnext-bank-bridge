@@ -172,6 +172,19 @@ class PlaidAccount(db.Model):
     # operation, and this is the audit trail of where its identity went.
     superseded_by_account_id = db.Column(db.String(120), nullable=True,
                                          index=True)
+    # v0.4.12 · mark-to-market for balance-only investment accounts. The GL leaf
+    # only ever held the OPENING value — refreshed balances went to an
+    # informational custom field on the Bank Account, never to a posting — so a
+    # brokerage that grew from $50k to $65k showed $50k on the balance sheet
+    # indefinitely.
+    #
+    # `last_revalued_balance` is the value the LEDGER currently reflects, not the
+    # latest balance Plaid reported. That distinction is the whole mechanism:
+    # each revaluation posts only the DELTA between the two, so the entries
+    # compose instead of double-counting. NULL = never revalued, which is when
+    # the baseline is seeded (see revaluation.baseline_for) rather than posted.
+    last_revalued_balance = db.Column(db.Float, nullable=True)
+    last_revalued_at = db.Column(db.DateTime, nullable=True)
     # One-click-import lifecycle (see app/erpnext_accounts.py):
     #   pending     — never auto-imported (the default / freshly linked)
     #   imported    — a matching ERPNext Bank Account was created/found + linked

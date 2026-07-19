@@ -131,6 +131,12 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # Backfills to NULL = "this account was never superseded", which is true of
     # every account on an existing install.
     ('plaid_accounts', 'superseded_by_account_id', 'VARCHAR(120)'),
+    # v0.4.12 — investment mark-to-market. Both backfill to NULL, which reads as
+    # "never revalued": the first pass then SEEDS the baseline from the booked
+    # opening balance and posts nothing, so an upgrading install cannot have the
+    # whole account value booked as a fictional one-off gain.
+    ('plaid_accounts', 'last_revalued_balance', 'DOUBLE PRECISION'),
+    ('plaid_accounts', 'last_revalued_at', 'TIMESTAMP'),
 ]
 
 

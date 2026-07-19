@@ -228,24 +228,32 @@ class TestBankAccountTypes(ImportBase):
         return [c for c in erp.calls
                 if c[0] == 'create_doc' and c[1] == 'Bank Account Type']
 
+    # Derived from the constant rather than hardcoded: v0.4.12 added
+    # 'Investment' (an investment account was typed 'Current' before it), and
+    # these three tests are about the provisioning BEHAVIOUR — created when
+    # missing, skipped when present, partial when some exist — not about how
+    # many types there happen to be this release.
+    ALL_TYPES = set(erpnext_accounts.DEFAULT_BANK_ACCOUNT_TYPES)
+
     def test_bank_account_types_created_when_missing(self):
-        erp = FakeERPClient()   # neither type exists (GET → 404)
+        erp = FakeERPClient()   # none exist (GET → 404)
         erpnext_accounts.ensure_bank_account_types(erp)
-        self.assertEqual(len(self._created_types(erp)), 2)
+        self.assertEqual(len(self._created_types(erp)), len(self.ALL_TYPES))
         names = {d['account_type'] for d in erp.created['Bank Account Type'].values()}
-        self.assertEqual(names, {'Current', 'Credit'})
+        self.assertEqual(names, self.ALL_TYPES)
 
     def test_bank_account_types_skip_when_present(self):
-        erp = FakeERPClient(existing_types={'Current', 'Credit'})
+        erp = FakeERPClient(existing_types=set(self.ALL_TYPES))
         erpnext_accounts.ensure_bank_account_types(erp)
         self.assertEqual(len(self._created_types(erp)), 0)
 
     def test_bank_account_types_partial(self):
-        erp = FakeERPClient(existing_types={'Current'})   # only Credit missing
+        missing = 'Credit'
+        erp = FakeERPClient(existing_types=self.ALL_TYPES - {missing})
         erpnext_accounts.ensure_bank_account_types(erp)
         created = self._created_types(erp)
         self.assertEqual(len(created), 1)
-        self.assertEqual(created[0][2]['account_type'], 'Credit')
+        self.assertEqual(created[0][2]['account_type'], missing)
 
     def test_single_import_provisions_types(self):
         self._item()

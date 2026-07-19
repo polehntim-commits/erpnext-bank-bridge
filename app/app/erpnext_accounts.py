@@ -124,7 +124,10 @@ def _is_missing_doctype_error(e: ERPNextAPIError) -> bool:
 # The Bank Account Type records the import flow references. Stock ERPNext ships
 # without them, so an out-of-box instance would reject a Bank Account that links
 # one — we provision them as part of the idempotent bootstrap.
-DEFAULT_BANK_ACCOUNT_TYPES = ('Current', 'Credit')
+# 'Investment' joins these in v0.4.12. Before it, every investment account was
+# typed 'Current' — describing a 401k as a current/chequing-class account, which
+# is the same coarse-bucket problem v0.3.9 fixed for subtypes.
+DEFAULT_BANK_ACCOUNT_TYPES = ('Current', 'Credit', 'Investment')
 
 # The Bank Account Subtype records `Bank Account.account_subtype` links to. That
 # field is a Link (ERPNext v15: options "Bank Account Subtype"), so a Bank Account
@@ -137,6 +140,13 @@ DEFAULT_ACCOUNT_SUBTYPES = (
     'Checking', 'Savings', 'Current', 'Other',
     'Credit Card', 'Cd', 'Money Market',
     'Cash Management', 'Paypal', 'Line Of Credit',
+    # v0.4.12 — the investment subtypes. v0.4.0 brought investment accounts in
+    # as balance-only but never gave them a subtype, so brokerage, IRA and 401k
+    # all landed on 'Other' — losing exactly the precision v0.3.9 added for
+    # depository accounts, on the class where "which kind of investment" is the
+    # whole question a reader has.
+    'Brokerage', 'Ira', 'Roth', '401K', 'Retirement', 'Hsa',
+    'Mutual Fund', 'Stock', 'Bond', 'Crypto Exchange',
 )
 
 # ── Plaid subtype → ERPNext support / typing ───────────────────────────────
@@ -255,6 +265,11 @@ def erpnext_account_type(account: PlaidAccount) -> str:
     s = (account.subtype or '').strip().lower()
     if s in _CREDIT_SUBTYPES or (account.type or '').strip().lower() == 'credit':
         return 'Credit'
+    # v0.4.12 · investments are their own class. Typing a brokerage or a 401k
+    # 'Current' said it was a chequing-class account — wrong on the face of it,
+    # and misleading in any ERPNext report that groups by account type.
+    if is_investment(account):
+        return 'Investment'
     return 'Current'
 
 
@@ -272,6 +287,19 @@ _SUBTYPE_MAP = {
     'paypal': 'Paypal',
     'credit card': 'Credit Card',
     'line of credit': 'Line Of Credit',
+    # v0.4.12 · the investment subtypes, mapped 1:1 onto the masters above.
+    # Keys are normalized the way is_investment_type normalizes them, so
+    # 'crypto_exchange' and 'crypto exchange' both resolve.
+    'brokerage': 'Brokerage',
+    'ira': 'Ira',
+    'roth': 'Roth',
+    '401k': '401K',
+    'retirement': 'Retirement',
+    'hsa': 'Hsa',
+    'mutual fund': 'Mutual Fund',
+    'stock': 'Stock',
+    'bond': 'Bond',
+    'crypto exchange': 'Crypto Exchange',
 }
 
 
@@ -280,8 +308,13 @@ def erpnext_account_subtype(account: PlaidAccount) -> str:
     the Plaid subtype (v0.3.9). Title Case, to match the Bank Account Subtype
     link-target docnames provisioned in bootstrap. A `credit`-type account with
     no recognized subtype still reads as 'Credit Card'; everything else unmapped
-    falls back to 'Other'."""
-    s = (account.subtype or '').strip().lower()
+    falls back to 'Other'.
+
+    v0.4.12 normalizes through `_norm_subtype` (underscores → spaces) rather
+    than a bare lower(), so Plaid's `crypto_exchange` resolves the same way it
+    already does for the investment-subgroup lookup. Depository keys are
+    unaffected — none of them contains an underscore."""
+    s = _norm_subtype(account.subtype)
     if s in _SUBTYPE_MAP:
         return _SUBTYPE_MAP[s]
     if (account.type or '').strip().lower() == 'credit':

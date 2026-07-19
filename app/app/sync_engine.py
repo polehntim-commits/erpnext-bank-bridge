@@ -44,6 +44,7 @@ from . import erpnext_settings
 from . import intercompany
 from . import plaid_settings
 from . import reconnect
+from . import revaluation
 from . import crypto
 from .erpnext_client import ERPNextAPIError, ERPNextConfigError, ERPNextError
 from .models import (BankTransaction, PlaidAccount, PlaidItem, PlaidSyncLog)
@@ -575,6 +576,17 @@ def sync_item(item: PlaidItem, plaid_client: PlaidClient = None,
         except (ERPNextAPIError, ERPNextError):
             log.warning('repointing adopted accounts failed for %s',
                         item.item_id, exc_info=True)
+        # v0.4.12 · mark investment accounts to market. Runs right after the
+        # balance refresh above, because it measures against the balance that
+        # refresh just cached. Posts a Draft for the DELTA only, and only when
+        # a baseline is known — see app/revaluation.py. Best-effort: a
+        # chart-of-accounts problem must never fail a sync that has already
+        # mirrored transactions correctly.
+        try:
+            revaluation.revalue_all(erp_client)
+        except Exception:  # pragma: no cover - revalue_all is already total
+            log.warning('investment revaluation failed for %s', item.item_id,
+                        exc_info=True)
     return {'item_id': item.item_id, 'pull': pull_stats, 'push': push_stats}
 
 
