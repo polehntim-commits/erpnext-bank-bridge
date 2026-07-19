@@ -103,7 +103,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.14 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.15 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -312,6 +312,66 @@ Company-agnostic logical-name list too) and reports how many accounts came back.
 Create an account in ERPNext, reload the Rules editor, and it's selectable — no
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
+
+**v0.4.15** — **re-linking a bank stops colliding with your own records.**
+v0.4.11 promised an idempotent reconnect and did not deliver one. Disconnecting
+a bank and linking it again still failed with `DuplicateEntryError` on account
+after account, and the loan types v0.4.14 added failed the same way.
+
+**Why.** A Bank Account was deduped on exactly one key — the `plaid_account_id`
+custom field — and a re-link mints a brand-new Plaid `account_id` for the same
+real account. That key misses by construction, and the create that follows
+collides with the record already on your books, because ERPNext autonames a Bank
+Account `<account_name> - <bank>` and none of the parts that feed it changed.
+
+v0.4.11 tried to close this one layer up: fingerprint the new local rows against
+the retired ones and move the mapping across, so the import short-circuits on
+"already mapped". That works when it fires — but it is a best-effort matcher
+with several honest ways to decline (Plaid returned no mask, the older Item
+carries no `institution_id`, more than one candidate matched), and **every**
+decline fell through to the unguarded create. It also only ever ran for
+newly-seen accounts inside the reconnect path, so the loan and investment types
+were never covered at all.
+
+**The fix asks ERPNext instead of guessing.** When the Plaid id misses, the
+import now looks up the Bank Account this real account is already on the books
+as, in two tiers, stopping at the first hit:
+
+1. **Bank + last-4 + Company** — the tier that fires on virtually every re-link.
+2. **Bank + subtype + Company**, and only when exactly one record matches — for
+   the rare case where the bank actually reissued the account and the last-4
+   changed.
+
+An adopted record is repointed at the new Plaid id and the adoption is written
+to the audit trail with the tier that matched. Because this lives in the shared
+find-or-create path it covers depository, credit, **loan** and **investment**
+accounts in one place, which is the half v0.4.14 missed.
+
+**Three things it deliberately will not do.** It never adopts across Companies —
+a record under another Company is another entity's books, so the correct move is
+to create a fresh one under the target. It never takes a record that a *live*
+Plaid account still claims, because two accounts pointing at one Bank Account
+double-post every transaction in the overlap (a record is fair game only when
+the account claiming it is gone, superseded, or belongs to a bank you
+disconnected). And on the subtype tier, two candidates means it declines and
+tells you, rather than welding one real account's ledger onto another.
+Under-adopting costs a manual mapping; over-adopting corrupts the books quietly.
+
+**New: `/admin/accounts/cleanup`.** Lists every ERPNext Bank Account no live
+Plaid account claims — the leftovers from dry-runs and from imports that
+targeted a different Company — grouped by bank, with a delete-or-ignore choice.
+Deletion is idempotent, re-checks that the record is still unlinked before
+acting, and reports (rather than forces) ERPNext's refusal to delete anything
+with linked documents.
+
+> **Migration — if you hit duplicate errors on v0.4.11–v0.4.14.** Deploy
+> v0.4.15, then open **Accounts → Clean up unlinked accounts** and delete the
+> stale records from your earlier attempts (anything ERPNext refuses to delete
+> has real documents attached — leave it). Then disconnect and re-link the bank
+> as normal. Records that survive under the Company you are importing into are
+> adopted rather than duplicated; nothing needs to be re-mapped by hand.
+> Fresh installs are unaffected, and no existing mapping changes on upgrade.
+> `ERPNEXT_ADOPT_EXISTING=false` restores the old single-key behaviour.
 
 **v0.4.14** — **the mortgage joins the books.**
 Until now `is_supported` refused every loan account, so a farm with a $200,000
@@ -2365,6 +2425,7 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `ERPNEXT_STATEMENT_VARIANCE_THRESHOLD` | `10.00` | v0.4.10 · how large a reconciliation variance must be to earn a row in the discrepancy report. Distinct from `STATEMENTS_RECONCILE_TOLERANCE`, which decides whether a period reconciles *at all* — this decides what is worth a human's attention |
 | `ERPNEXT_STATEMENT_COVERAGE_MONTHS` | `12` | v0.4.10 · how many closed months the statement coverage report looks back over for gaps |
 | `RECONNECT_ADOPT_ENABLED` | `true` | v0.4.11 · when a bank is re-linked, let each new account inherit the ERPNext mapping, Company and opening balance of the retired account it replaces, on an unambiguous (institution, last-4, type, subtype) match. Off → a re-link produces unconfigured accounts, as before v0.4.11 |
+| `ERPNEXT_ADOPT_EXISTING` | `true` | v0.4.15 · when the `plaid_account_id` dedup key misses (which on a re-link it always does), reuse the Bank Account this real account is already on the books as, matched on Bank + last-4 + Company then Bank + subtype + Company. Never adopts across Companies or over a record a live Plaid account still claims. Off → `plaid_account_id` is the only dedup key, as before v0.4.15 |
 | `PLAID_WEBHOOK_TRIGGERS_SYNC` | `true` | v0.4.11 · whether a Plaid TRANSACTIONS webhook kicks an immediate sync. This costs Plaid calls **beyond** the scheduled poll — the one webhook behaviour that shows up on a bill. Turning it off keeps the free ITEM re-auth webhooks working and lets the scheduled poll do the fetching |
 | `INVESTMENT_REVALUATION_ENABLED` | `true` | v0.4.12 · mark balance-only investment accounts to market by posting the change in value as a Journal Entry. Off → the GL leaf keeps its opening value, as in v0.4.0–v0.4.11 |
 | `UNREALIZED_GAIN_ACCOUNT_NAME` | `Unrealized Gain/Loss on Investments` | v0.4.12 · the account revaluations post against, auto-created under the company's **Equity** branch. Point it at an income account if your accountant wants unrealized movement in the P&L |

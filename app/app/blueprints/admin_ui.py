@@ -8,6 +8,9 @@ Pages:
                           sync frequency (cost-aware presets)
   /admin/link_bank      — Plaid Link entry point
   /admin/accounts       — map each Plaid account → ERPNext Bank Account
+  /admin/accounts/cleanup — ERPNext Bank Accounts no live Plaid account claims,
+                          grouped by bank, with a delete-or-ignore choice
+                          (v0.4.15; for clearing out earlier dry-runs)
   /admin/transactions   — filterable transaction list + per-row retry, plus the
                           v0.4.6 rule-state filter, unmatched-by-merchant
                           grouping and "create a rule from this" shortcuts
@@ -27,6 +30,7 @@ from flask import (Blueprint, Response, current_app, jsonify, redirect,
                    render_template_string, request, session, url_for)
 from werkzeug.security import check_password_hash
 
+from .. import account_cleanup
 from .. import audit
 from .. import categorization
 from .. import counterparty
@@ -611,6 +615,12 @@ ACCOUNTS_BODY = """
   {% endif %}
 </div>
 {% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+{% if erpnext_ok %}
+<p style="font-size:13px;color:#666;margin:6px 0 0">
+  Left-over Bank Accounts in ERPNext from an earlier dry-run?
+  <a href="/admin/accounts/cleanup">Clean up unlinked accounts</a>.
+</p>
+{% endif %}
 {% if bootstrap_unavailable %}
 <div class="banner-warn">
   <h3>ERPNext bootstrap partially failed — some import features may not work</h3>
@@ -1018,6 +1028,113 @@ def accounts_page():
                  bootstrap_unavailable=sorted(
                      erpnext_accounts.unavailable_doctypes()),
                  erp_error=erp_error, flash_msg=request.args.get('flash', ''))
+
+
+# ── Unlinked-account cleanup (v0.4.15) ───────────────────────────────
+
+CLEANUP_BODY = """
+<h2>Unlinked ERPNext Bank Accounts</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+
+<p style="font-size:14px;color:#444;max-width:760px">
+  These Bank Accounts exist in ERPNext but no connected Plaid account points at
+  them &mdash; usually left over from an earlier dry-run or from an import that
+  targeted a different Company. They are harmless: nothing syncs into them.
+  Delete them if you want a clean slate, or leave them alone.
+</p>
+
+{% if not erpnext_ok %}
+<div class="banner-warn">ERPNext isn't configured yet, so there's nothing to
+  list. Set it up on the <a href="/admin/erpnext_settings">ERPNext settings</a>
+  page.</div>
+{% elif erp_error %}
+<div class="banner-warn">Couldn't read your Bank Accounts from ERPNext:
+  {{ erp_error }}</div>
+{% elif not groups %}
+<div class="card"><b>Nothing to clean up.</b> Every Bank Account in ERPNext is
+  claimed by a connected Plaid account.</div>
+{% else %}
+<form method="post" action="/admin/accounts/cleanup"
+      onsubmit="return confirm('Delete the selected Bank Accounts from ERPNext? \
+This cannot be undone. Records that still have linked documents will be kept.');">
+{% for grp in groups %}
+  <div class="card">
+    <h3 style="margin-top:0">{{ grp.bank }}
+      <span style="font-weight:normal;color:#666">
+        &middot; {{ grp.count }} unlinked</span></h3>
+    <table>
+      <tr><th style="width:28px"></th><th>Account</th><th>Company</th>
+          <th>Last 4</th><th>Subtype</th></tr>
+      {% for a in grp.accounts %}
+      <tr>
+        <td><input type="checkbox" name="docname" value="{{ a.name }}"></td>
+        <td><b>{{ a.account_name or a.name }}</b><br>
+            <span style="font-size:12px;color:#666">{{ a.name }}</span></td>
+        <td>{{ a.company or '—' }}</td>
+        <td>{{ a.last_4 or '—' }}</td>
+        <td>{{ a.account_subtype or a.account_type or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+{% endfor %}
+  <p><button type="submit">Delete selected</button>
+     <a href="/admin/accounts" style="margin-left:12px">Back to accounts</a></p>
+</form>
+{% endif %}
+
+{% if results %}
+<div class="card">
+  <h3 style="margin-top:0">Result</h3>
+  <table><tr><th>Record</th><th>Outcome</th></tr>
+  {% for r in results %}
+    <tr><td>{{ r.name }}</td><td>{{ r.message }}</td></tr>
+  {% endfor %}
+  </table>
+</div>
+{% endif %}
+"""
+
+
+def _cleanup_page(results=None, flash_msg=''):
+    """Render the cleanup list. Shared by the GET and the POST-result view so
+    the outcome table appears above a freshly-read list, not a stale one."""
+    groups, erp_error = [], ''
+    configured = erps.is_configured()
+    if configured:
+        try:
+            groups = account_cleanup.group_by_bank(
+                account_cleanup.unlinked_bank_accounts())
+        except (ERPNextConfigError, ERPNextError) as e:
+            erp_error = str(e)
+    return _page(CLEANUP_BODY, page='accounts', groups=groups,
+                 erpnext_ok=configured, erp_error=erp_error,
+                 results=results or [], flash_msg=flash_msg)
+
+
+@bp.get('/admin/accounts/cleanup')
+def accounts_cleanup_page():
+    return _cleanup_page(flash_msg=request.args.get('flash', ''))
+
+
+@bp.post('/admin/accounts/cleanup')
+def accounts_cleanup_delete():
+    """Delete the ticked records, then re-render the list.
+
+    Re-rendering rather than redirecting is deliberate: a record ERPNext refused
+    to delete needs its reason shown next to it, and a redirect would have
+    nowhere to carry that. Selecting nothing is a no-op, not an error."""
+    names = request.form.getlist('docname')
+    if not names:
+        return _cleanup_page(flash_msg='Nothing was selected.')
+    try:
+        outcome = account_cleanup.delete_many(names)
+    except (ERPNextConfigError, ERPNextError) as e:
+        return _cleanup_page(flash_msg=f'Could not reach ERPNext: {e}')
+    msg = f"{outcome['deleted']} deleted"
+    if outcome['skipped']:
+        msg += f", {outcome['skipped']} kept"
+    return _cleanup_page(results=outcome['results'], flash_msg=msg)
 
 
 FUZZY_MODAL_BODY = """

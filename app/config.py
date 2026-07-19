@@ -467,6 +467,14 @@ class Config:
     #     retired account matches on (institution, mask, type, subtype). Off →
     #     a re-link produces an unconfigured account, as it did before v0.4.11.
     RECONNECT_ADOPT_ENABLED = _bool('RECONNECT_ADOPT_ENABLED', True)
+    #   * v0.4.15 · the second, independent tier: when the Plaid id misses (which
+    #     on a re-link it always does), ask ERPNext whether this real account is
+    #     already on its books and reuse that record instead of colliding with
+    #     it. Matched on Bank + last-4 + Company, then Bank + subtype + Company
+    #     when unambiguous — never across Companies, never over a record a live
+    #     Plaid account still claims. Off → `plaid_account_id` is the only dedup
+    #     key, as it was before v0.4.15. See app/erpnext_accounts.py.
+    ERPNEXT_ADOPT_EXISTING = _bool('ERPNEXT_ADOPT_EXISTING', True)
     #   * whether a Plaid TRANSACTIONS webhook kicks an immediate sync. This has
     #     been the behaviour since the pilot, so it defaults ON — but it costs
     #     Plaid calls BEYOND the scheduled poll, which is the one webhook

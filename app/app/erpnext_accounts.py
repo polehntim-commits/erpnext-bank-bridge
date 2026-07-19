@@ -1861,6 +1861,235 @@ def _find_bank_account(client: ERPNextClient, account: PlaidAccount) -> str | No
     return matches[0]['name'] if matches else None
 
 
+# ── v0.4.15 · multi-tier fingerprint against ERPNext ────────────────────────
+#
+# WHY THIS EXISTS. `_find_bank_account` above dedups on ONE key: the
+# `plaid_account_id` custom field. A disconnect-and-re-link mints a brand-new
+# Plaid account_id for the same real account, so that key misses by
+# construction — and the create that follows collides with the record already
+# in ERPNext, because Frappe autonames a Bank Account
+# '<account_name> - <bank>' and account_name is derived from institution,
+# subtype and mask, none of which changed. The operator sees
+# DuplicateEntryError and the import stops.
+#
+# v0.4.11 tried to close this one layer up, in app/reconnect.py: fingerprint the
+# new PlaidAccount against the RETIRED PlaidAccount rows and move the mapping
+# across, so the import short-circuits on `already mapped`. That works, but it
+# is a best-effort optimisation with many legitimate ways to decline — a blank
+# mask, a blank institution_id on the older Item, more than one candidate,
+# adoption switched off — and EVERY decline lands on the unguarded create.
+# Rather than widen the local matcher (which can only ever guess at what is in
+# ERPNext), this tier asks ERPNext directly. It is the layer that actually
+# knows whether the docname is taken.
+#
+# WHY IT IS SAFE TO ADOPT HERE AND NOT ELSEWHERE. Adopting means "this existing
+# ERPNext record IS this Plaid account" — the same claim `_find_bank_account`
+# already makes, reached by a different key. The guard rails are:
+#
+#   * NEVER cross-Company. A record under another Company is a different
+#     entity's books; the correct move is to create a new one under the target.
+#   * NEVER steal a record another LIVE Plaid account still claims (see
+#     `_claimed_by_live_account`) — that is the double-posting failure
+#     app/reconnect.py's docstring describes.
+#   * Match on the mask first, subtype only as a fallback, and adopt on a
+#     subtype match ONLY when it is unambiguous. Under-adopting leaves the
+#     operator a manual mapping; over-adopting silently welds one real
+#     account's ledger onto another. Wrong in the safe direction, on purpose.
+#
+# Because it lives in the shared find-or-create path it covers every supported
+# kind at once — depository, credit, loan (v0.4.14) and investment (v0.4.12) —
+# which is the second half of the v0.4.15 bug: the loan types added in v0.4.14
+# were never wired into the reconnect-layer adoption at all.
+
+# Fields the fingerprint tiers read back. `modified` breaks ties (most recently
+# touched wins); the rest are the match keys.
+_FINGERPRINT_FIELDS = ['name', 'account_name', 'bank', 'company', 'last_4',
+                       'account_subtype', 'plaid_account_id', 'modified']
+
+# The mask ERPNext keeps inside an account_name ('Wells Fargo Checking - 0000').
+# Distinct from _MASK_SUFFIX_RE above, which STRIPS the suffix for fuzzy GL
+# matching and so needs no capture group; this one reads the digits back out.
+_TRAILING_MASK_RE = re.compile(r'-\s*([\w*]+)\s*$')
+
+
+def is_erpnext_adoption_enabled() -> bool:
+    """Master switch (ERPNEXT_ADOPT_EXISTING, default on). Off → the only dedup
+    key is `plaid_account_id`, exactly as it was before v0.4.15."""
+    return bool(current_app.config.get('ERPNEXT_ADOPT_EXISTING', True))
+
+
+def _claimed_by_live_account(plaid_account_id: str,
+                             heir: PlaidAccount) -> bool:
+    """Whether an existing Bank Account's `plaid_account_id` still belongs to a
+    LIVE Plaid account other than `heir`.
+
+    THIS IS THE LOAD-BEARING CHECK. A record carrying a stale id is exactly what
+    a re-link leaves behind and exactly what we want to adopt; a record carrying
+    a live id belongs to a different account that is still syncing into it, and
+    adopting it would point two accounts at one ledger. The id is stale when the
+    row it names is gone, has already been superseded by an adoption, or belongs
+    to an Item the operator disconnected."""
+    pid = (plaid_account_id or '').strip()
+    if not pid or pid == heir.account_id:
+        return False
+    other = PlaidAccount.query.filter_by(account_id=pid).first()
+    if other is None:
+        return False                      # dangling — the row it named is gone
+    if other.superseded_by_account_id:
+        return False                      # retired by a v0.4.11 adoption
+    item = PlaidItem.query.filter_by(item_id=other.item_id).first()
+    if item is not None and item.disconnected:
+        return False                      # its bank was disconnected
+    return True
+
+
+def _same_company(row_company: str, target_company: str) -> bool:
+    """Company equality for adoption purposes. Both blank counts as equal — a
+    personal Bank Account carries no Company on either side — but a blank NEVER
+    matches a named one, so a record booked under the ERPNext default is not
+    quietly pulled into a named Company's books."""
+    return (row_company or '').strip() == (target_company or '').strip()
+
+
+def _mask_of(row: dict) -> str:
+    """The last-4 of an existing Bank Account. Prefers the `last_4` custom
+    field; falls back to the trailing '- 1234' of the account_name, because an
+    ERPNext whose Custom Field doctype was unavailable at bootstrap has the mask
+    in the name and nowhere else."""
+    mask = (row.get('last_4') or '').strip()
+    if mask:
+        return mask
+    trailing = _TRAILING_MASK_RE.search(row.get('account_name') or '')
+    return trailing.group(1) if trailing else ''
+
+
+def _most_recent(rows: list[dict]) -> dict:
+    """The most recently modified row. Ties (or a missing `modified`, which the
+    REST API omits unless asked for) fall back to docname order so the choice is
+    deterministic rather than dict-ordering-dependent."""
+    return sorted(rows, key=lambda r: (str(r.get('modified') or ''),
+                                       str(r.get('name') or '')))[-1]
+
+
+def _adoptable_bank_accounts(client: ERPNextClient, account: PlaidAccount,
+                             bank_name: str, company: str) -> list[dict]:
+    """Every Bank Account under this Bank that this Plaid account could legally
+    adopt: same Company, and not claimed by a live account.
+
+    One query, filtered in Python. `company` is not pushed into the filter
+    because a personal Bank Account stores it blank and ERPNext's `=` would not
+    return those rows — `_same_company` handles both shapes."""
+    try:
+        rows = client.list_docs(BANK_ACCOUNT_DT,
+                                filters=[['bank', '=', bank_name]],
+                                fields=_FINGERPRINT_FIELDS)
+    except (ERPNextAPIError, ERPNextError) as e:
+        # A failed lookup must never sink an import: fall through to the create,
+        # which is exactly the pre-v0.4.15 behaviour.
+        log.info('fingerprint lookup failed for bank %s: %s', bank_name,
+                 str(e)[:200])
+        return []
+    return [r for r in (rows or [])
+            if r.get('name')
+            and _same_company(r.get('company') or '', company)
+            and not _claimed_by_live_account(r.get('plaid_account_id') or '',
+                                             account)]
+
+
+def fingerprint_existing_bank_account(client: ERPNextClient,
+                                      account: PlaidAccount, bank_name: str,
+                                      company: str) -> tuple[str | None, str]:
+    """The existing ERPNext Bank Account this Plaid account should adopt, as
+    (docname, tier). Tier is 'mask', 'subtype' or '' when nothing matched.
+
+    Tiers are tried in order and the first that yields a match wins:
+
+      1. mask     — Bank + last-4 + Company. The last-4 is what distinguishes
+                    two accounts of the same kind at the same bank, so this is
+                    the tier that should fire on virtually every re-link.
+      2. subtype  — Bank + subtype + Company, and ONLY when exactly one row
+                    matches. This covers the rare case where the bank actually
+                    reissued the account and the last-4 changed; ambiguity here
+                    means two accounts of one kind at one bank, which a human
+                    must resolve.
+
+    Within a tier, several matches resolve to the most recently modified row
+    (and are logged) — an operator who has been re-running a dry-run wants the
+    newest of their attempts, not an arbitrary one."""
+    if not is_erpnext_adoption_enabled():
+        return None, ''
+    candidates = _adoptable_bank_accounts(client, account, bank_name, company)
+    if not candidates:
+        return None, ''
+
+    mask = (account.mask or '').strip()
+    if mask:
+        hits = [r for r in candidates if _mask_of(r) == mask]
+        if hits:
+            if len(hits) > 1:
+                log.warning('%d existing Bank Accounts match %s ...%s under '
+                            '%s — adopting the most recently modified',
+                            len(hits), bank_name, mask, company or 'no Company')
+            return _most_recent(hits)['name'], 'mask'
+
+    subtype = (erpnext_account_subtype(account) or '').strip().lower()
+    if subtype:
+        hits = [r for r in candidates
+                if (r.get('account_subtype') or '').strip().lower() == subtype]
+        # Unambiguous only. Two savings accounts at one bank and a changed
+        # last-4 is precisely the case where a guess welds the wrong ledgers
+        # together, so it is reported and left for the operator.
+        if len(hits) == 1:
+            return hits[0]['name'], 'subtype'
+        if len(hits) > 1:
+            log.warning('account %s (%s at %s) matches %d existing Bank '
+                        'Accounts by subtype and none by last-4 — not '
+                        'adopting; map it by hand on /admin/accounts',
+                        account.account_id, subtype, bank_name, len(hits))
+    return None, ''
+
+
+def adopt_existing_bank_account(client: ERPNextClient, account: PlaidAccount,
+                                docname: str, tier: str) -> bool:
+    """Repoint an adopted Bank Account's `plaid_account_id` (and `last_4`) at
+    this account's CURRENT Plaid id, and audit it.
+
+    Without the repoint the adoption is only half done: the next import looks
+    the record up by the new id, misses again, and re-creates the duplicate this
+    whole path exists to prevent. Best-effort on the WRITE only — a failed write
+    still returns the docname to the caller, because linking the local mapping
+    to the right record is worth more than the custom field, and
+    `reconnect.repoint_adopted_accounts` retries it on the next sync."""
+    ok = True
+    if not is_doctype_unavailable(CUSTOM_FIELD_DT):
+        try:
+            client.update_doc(BANK_ACCOUNT_DT, docname,
+                              {'plaid_account_id': account.account_id,
+                               'last_4': account.mask or ''})
+        except (ERPNextAPIError, ERPNextError) as e:
+            log.warning('adopted %s but could not repoint it at %s: %s',
+                        docname, account.account_id, str(e)[:200])
+            ok = False
+    log.info('adopted existing ERPNext Bank Account %s for %s (matched on %s)',
+             docname, account.account_id, tier)
+    try:
+        from . import audit
+        audit.record('erpnext_bank_account_adopted',
+                     subject_type='PlaidAccount', subject_id=account.account_id,
+                     after={'bank_account': docname, 'matched_on': tier,
+                            'mask': account.mask or '',
+                            'type': account.type or '',
+                            'subtype': account.subtype or '',
+                            'company': owning_company_for(account),
+                            'repointed': ok},
+                     notes=(f're-linked account reused the existing Bank '
+                            f'Account {docname} (matched on {tier}) instead of '
+                            f'creating a duplicate'))
+    except Exception:  # pragma: no cover - auditing must not break an import
+        log.debug('adoption audit failed', exc_info=True)
+    return ok
+
+
 def _bank_account_name(account: PlaidAccount, institution: str) -> str:
     """The Bank Account (and matching GL Account) account_name — follows
     '<Institution> <TitleCasedSubtype> - <mask>' (e.g. 'Wells Fargo Checking -
@@ -1927,6 +2156,17 @@ def find_or_create_bank_account(client: ERPNextClient, account: PlaidAccount,
     existing = _find_bank_account(client, account)
     if existing:
         return existing, False, False, None
+    # v0.4.15 · the Plaid id missed, which on a re-link it always does. Ask
+    # ERPNext whether this real account is already on its books under the id it
+    # used to carry, and reuse that record rather than colliding with it.
+    adopted, tier = fingerprint_existing_bank_account(client, account,
+                                                      bank_name, company or '')
+    if adopted:
+        adopt_existing_bank_account(client, account, adopted, tier)
+        _log(account.item_id, 1, 'success',
+             f'Adopted existing Bank Account {adopted} (matched on {tier}) '
+             f'instead of creating a duplicate')
+        return adopted, False, False, None
     account_name = _bank_account_name(account, institution)
     # Best-effort GL Account for a company import; None degrades to v0.1.5.
     gl_account = None

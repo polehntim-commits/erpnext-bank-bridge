@@ -161,6 +161,12 @@ class FakeERPClient:
         self.calls = []
         self._counter = 0
         self.bank_accounts = bank_accounts or []   # preset dropdown list
+        # v0.4.15 · Bank Account records already on the operator's books before
+        # this run — {docname: doc}. The multi-tier fingerprint reads these, so
+        # a test can stage "a previous install already imported this account".
+        self.existing_bank_accounts = {}
+        # ('<method name>', (status, body)) — make one call_method target raise.
+        self.method_error = None
         self.fail_create = fail_create             # fail Bank Transaction create
         self.fail_bank_account = fail_bank_account  # fail Bank Account create
         # Fields ERPNext will reject as "not a valid field" on a Bank Account
@@ -358,7 +364,15 @@ class FakeERPClient:
         if doctype == 'Bank Account':
             # v0.4.0 drift check reads a Bank Account's `company`; created
             # accounts live in self.created, keyed by '<account_name> - <bank>'.
-            return self.created['Bank Account'].get(name)
+            # v0.4.15 · pre-existing records (the cleanup page and the
+            # fingerprint) are staged in existing_bank_accounts, and a deleted
+            # record must read back as missing so the delete is idempotent.
+            if name in self.deleted:
+                return None
+            doc = self.created['Bank Account'].get(name)
+            if doc is None and name in self.existing_bank_accounts:
+                doc = self.existing_bank_accounts[name]
+            return {**doc, 'name': name} if doc is not None else None
         return self.docs.get(name)
 
     @staticmethod
@@ -489,6 +503,28 @@ class FakeERPClient:
                                for f in filters):
                 return [{'name': n} for n, d in self.created['Bank Account'].items()
                         if self._matches(d, filters)]
+            # v0.4.15 · a `bank` filter is the multi-tier fingerprint lookup. It
+            # reads created accounts AND `existing_bank_accounts`, the fixture
+            # for records already on the operator's books from an earlier
+            # install — which is the whole case the fingerprint exists for.
+            if filters and any(f[0] == 'bank' for f in filters):
+                pool = {**self.existing_bank_accounts,
+                        **self.created['Bank Account']}
+                rows = [{**d, 'name': n} for n, d in pool.items()
+                        if self._matches(d, filters)]
+                return [{k: r.get(k) for k in fields} for r in rows] if fields \
+                    else [{'name': r['name']} for r in rows]
+            # v0.4.15 · an UNfiltered read that asks for plaid_account_id is the
+            # cleanup page enumerating the operator's books; it must see preset,
+            # pre-existing and created records alike. An unfiltered read without
+            # that field is the mapping dropdown, which reads presets only.
+            if fields and 'plaid_account_id' in fields:
+                pool = {**{(b.get('name') or ''): b for b in self.bank_accounts},
+                        **self.existing_bank_accounts,
+                        **self.created['Bank Account']}
+                return [{k: {**d, 'name': n}.get(k) for k in fields}
+                        for n, d in pool.items() if n
+                        and n not in self.deleted]
             return list(self.bank_accounts)
         return []
 
@@ -711,6 +747,12 @@ class FakeERPClient:
             pool[name].update(doc)
         elif name in self.docs:
             self.docs[name].update(doc)
+        elif (doctype == 'Bank Account'
+                and name in self.existing_bank_accounts):
+            # v0.4.15 · a fingerprint adoption repoints a PRE-EXISTING record.
+            # Merge in place so the record keeps its bank/company/account_name —
+            # storing only the patch would make it invisible to the next lookup.
+            self.existing_bank_accounts[name].update(doc)
         else:
             # Track the update even if we never saw the create (tests may map an
             # account to a Bank Account name without a prior create).
@@ -743,6 +785,14 @@ class FakeERPClient:
 
     def call_method(self, method, params=None, http_method='GET', json_body=None):
         self.calls.append(('call_method', method, json_body))
+        # v0.4.15 · stage a refusal from one whitelisted method — the cleanup
+        # page needs ERPNext to decline a delete (LinkExistsError) so the
+        # "still has linked documents" outcome is exercised for real.
+        if self.method_error and self.method_error[0] == method:
+            from app.erpnext_client import ERPNextAPIError
+            status, body = self.method_error[1]
+            raise ERPNextAPIError(f'POST {method} -> {status}',
+                                  status_code=status, response_body=body)
         if method == 'frappe.client.submit':
             inner = json.loads((json_body or {}).get('doc', '{}'))
             if inner.get('name'):
