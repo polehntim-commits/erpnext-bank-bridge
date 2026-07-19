@@ -8,14 +8,52 @@ class FakePlaidClient:
     """Same method surface the sync engine calls. `pages` is the scripted
     /transactions/sync response sequence (re-arm between syncs by reassigning
     `self.pages`). `accounts` is what get_accounts returns."""
-    def __init__(self, accounts=None, pages=None):
+    def __init__(self, accounts=None, pages=None, statements=None,
+                 statement_pdfs=None, statements_error=None,
+                 download_failures=0):
         self.accounts = accounts or []
         self.pages = list(pages or [])
         self.calls = []
+        # v0.4.9 · what /statements/list returns: a flat list of
+        # {'account_id', 'statement_id', 'month', 'year', 'date_posted'} —
+        # the shape PlaidClient.statements_list normalizes to. Default [] models
+        # the common case: an institution or application without Statements.
+        self.statements = list(statements or [])
+        # statement_id -> PDF bytes. A statement_id with no entry here models
+        # Plaid listing a statement it then won't hand over.
+        self.statement_pdfs = dict(statement_pdfs or {})
+        # Set to a PlaidError to model /statements/list itself failing. The real
+        # wrapper swallows that and returns [], so the fake raises and lets the
+        # wrapper's own behaviour be asserted where it is used directly.
+        self.statements_error = statements_error
+        # Fail the first N download attempts before succeeding — exercises the
+        # exponential-backoff retry without needing a flaky network.
+        self.download_failures = int(download_failures or 0)
+        self.download_attempts = {}
 
-    def create_link_token(self, user_id, redirect_uri=None, webhook=None):
-        self.calls.append(('create_link_token', user_id))
+    def create_link_token(self, user_id, redirect_uri=None, webhook=None,
+                          statements=False, statements_months=24):
+        self.calls.append(('create_link_token', user_id, bool(statements)))
         return 'link-sandbox-test-token'
+
+    def statements_list(self, access_token):
+        self.calls.append(('statements_list', access_token))
+        if self.statements_error is not None:
+            raise self.statements_error
+        return [dict(s) for s in self.statements]
+
+    def statements_download(self, access_token, statement_id):
+        self.calls.append(('statements_download', statement_id))
+        seen = self.download_attempts.get(statement_id, 0) + 1
+        self.download_attempts[statement_id] = seen
+        if seen <= self.download_failures:
+            from app.plaid_client import PlaidError
+            raise PlaidError(f'transient failure {seen} for {statement_id}')
+        data = self.statement_pdfs.get(statement_id)
+        if data is None:
+            from app.plaid_client import PlaidError
+            raise PlaidError(f'no such statement {statement_id}')
+        return data
 
     def exchange_public_token(self, public_token):
         self.calls.append(('exchange_public_token', public_token))

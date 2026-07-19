@@ -38,6 +38,14 @@ ERPNext  ──►  Bank Reconciliation Tool
   scheme (v0.3.9).
 - **Creates ERPNext Bank Transaction records** ready for the built-in Bank
   Reconciliation Tool (deposit/withdrawal split from Plaid's amount sign).
+- **Bank statement PDFs + monthly reconciliation** (v0.4.9) — pulls the
+  statements your bank issued from Plaid, stores the PDFs, and checks each month
+  against what Bank Bridge mirrored: *does the statement's opening balance plus
+  our transactions land on the bank's closing balance?* A mismatch is shown as a
+  dollar delta for a named month at `/admin/statements`. Statement balances can
+  also replace the estimated opening balance on accounts linked before v0.4.4 —
+  but only for a statement that reconciles. See
+  [Bank statements](#bank-statements-v049).
 - **Auto-creates ERPNext Suppliers** from merchant names (v0.3.0) — a never-seen
   merchant is normalized ("SQ \*STARBUCKS 92104" → "Starbucks") and find-or-
   created as a Supplier so the transaction is instantly linkable. On by default.
@@ -89,7 +97,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.8 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.9 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -299,6 +307,52 @@ Create an account in ERPNext, reload the Rules editor, and it's selectable — n
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
 
+**v0.4.9** — **bank statements: reconciliation, and opening balances the bank
+wrote down.** Every number Bank Bridge held until now was either a transaction
+Plaid mirrored or something this app derived from those transactions. A statement
+is neither — it is the institution's own monthly assertion — and that buys two
+things.
+
+First, **reconciliation**. `/admin/statements` lists each month's statement and
+measures it: the statement's own opening balance, plus the movement Bank Bridge
+mirrored in that period, against the bank's closing balance. When they agree the
+month is marked reconciled; when they don't, the difference is shown as a dollar
+delta. That is a *"do my books match my bank?"* check for a named month, without
+opening ERPNext.
+
+Second, **opening balances without arithmetic**. The v0.4.4 backfill works
+backwards from today's balance by subtracting everything mirrored since, which is
+exact only if the mirror is complete — which is exactly why those entries land in
+`pending_review` for someone to check against a real statement. Running
+`scripts/backfill_statements.py --rebook` replaces both the arithmetic and the
+manual check with the bank's own figure.
+
+**It only does that for a statement that reconciles.** Booking an opening balance
+dated a statement's period start asserts the ledger from that date forward is
+exactly the mirrored transactions, so Bank Bridge tests that claim rather than
+assuming it: a statement whose closing balance the mirror cannot reproduce, or
+one older than transactions already mirrored, is refused and the estimate stands.
+
+Two honest limits worth knowing before you enable it:
+
+- **Balances are parsed out of the PDF, because Plaid does not return them.**
+  `/statements/list` carries a statement id, a month, a year and a posting date —
+  no balances at all. So Bank Bridge reads the PDF text and looks for the labels
+  US institutions actually print ("beginning balance", "previous balance",
+  "ending balance", "new balance"). A layout it doesn't recognize — or a scanned
+  statement with no text layer — yields **no balance**, never a guess. The PDF is
+  still stored and viewable; that account just keeps its v0.4.4 behaviour.
+- **The `statements` product must be approved on your Plaid application** and
+  requested when the bank was linked. Bank Bridge now asks for it at Link time
+  and **falls back to a transactions-only token if Plaid says no**, so linking
+  banks keeps working unchanged on an application that hasn't been approved yet;
+  statements start arriving on the next link after approval.
+
+Existing installs are untouched on upgrade: the import path still books the
+cached Plaid balance (at link time that *is* the bank's number — there is no
+estimate there to improve on), so no balance sheet moves. Statements only ever
+add information. Set `STATEMENTS_ENABLED=false` to opt out entirely.
+
 **v0.4.8** — **every Plaid-facing path moved under `/bankbridge/`.** No
 behavior change, one prefix change. A Tailscale Funnel hostname is per-*machine*,
 not per-app: every app on the same Umbrel shares `https://<host>.<tailnet>.ts.net`
@@ -487,6 +541,12 @@ date. The script is idempotent and will not overturn a rejection.
 
 Set `AUTO_BOOK_OPENING_BALANCE=false` to book them all by hand instead, or
 `OPENING_BALANCE_DATE=2026-01-01` to backdate to a fiscal year start.
+
+Since v0.4.9 there is a way to skip that manual check entirely:
+`scripts/backfill_statements.py --rebook` replaces the estimate with the opening
+balance printed on a statement the bank issued — for any statement that
+reconciles against the mirrored transactions. See
+[Bank statements](#bank-statements-v049).
 
 **v0.4.1** — **detects transfers between the Companies you own**. Moving money
 from the Farm's checking account to your Personal one is not revenue and it is
@@ -789,6 +849,87 @@ whose Company can't be read, saves exactly as it did before. A Company-agnostic
 rule never warns — its offset is a logical name that resolves per Company at JE
 time (v0.4.0.3), so there's no single Company for it to disagree with.
 
+## Bank statements (v0.4.9)
+
+Bank Bridge pulls the statements your bank issued from Plaid's `/statements`
+API, stores the PDFs, and reconciles each period against what it mirrored.
+
+### Reconciliation — "do my books match my bank?"
+
+`/admin/statements` groups statements by account and, for each month, computes:
+
+```
+statement opening balance
+  +  the movement Bank Bridge mirrored inside that period
+  =  what our books say the account closed at
+  vs the bank's own closing balance
+```
+
+| Period | Opening | Movement | Expected | Bank closing | Delta | Status |
+|--------|--------:|---------:|---------:|-------------:|------:|--------|
+| 2026-07 | 17,600.00 | -50.00 | 17,650.00 | 17,650.00 | +0.00 | reconciled |
+| 2026-08 | 4,100.00 | -210.00 | 4,310.00 | 4,660.00 | -350.00 | ⚠ off by 350.00 |
+
+A delta means the mirror is missing transactions for that month — a named month
+and a dollar figure, rather than a vague sense that something is off. The
+direction of "movement" follows the account type: for a checking account a
+purchase lowers the balance, for a credit card it raises what you owe.
+
+A statement whose balances couldn't be read shows **no balances** rather than a
+discrepancy. An unreadable PDF says nothing about whether the books agree, and
+flagging it as a mismatch would train you to ignore the icon that matters.
+
+### Opening balances from a statement
+
+For accounts linked before v0.4.4, `scripts/backfill_opening_balances.py`
+estimates the opening balance arithmetically. To replace those estimates with the
+bank's own figure:
+
+```bash
+docker exec <bankbridge_container> python -m scripts.backfill_statements --dry-run
+docker exec <bankbridge_container> python -m scripts.backfill_statements --rebook
+```
+
+`--rebook` is opt-in because it changes the books: it replaces an entry you may
+already have reviewed and moves the posting date to the statement's period start.
+An **approved** opening balance is never touched.
+
+**A statement is only used when it reconciles.** Booking an opening balance dated
+a statement's period start asserts that the ledger from that date forward is
+exactly the mirrored transactions — so Bank Bridge checks that rather than
+assuming it. A statement is refused when the mirror can't reproduce its closing
+balance, or when transactions predating it already exist (they'd be counted
+twice). A refused statement leaves the v0.4.4 estimate in place.
+
+### What Plaid actually provides
+
+`/statements/list` returns a statement id, month, year and posting date — **no
+balances**. Those exist only inside the PDF, so Bank Bridge extracts the text and
+looks for the labels US institutions print:
+
+| | Labels recognized |
+|---|---|
+| Opening | beginning balance, opening balance, previous balance, balance forward, previous statement balance, starting balance |
+| Closing | ending balance, closing balance, new balance, ending daily balance, statement balance |
+
+Negative amounts are read in both printed forms (`-1,234.56` and `(1,234.56)`).
+An unrecognized layout, or a scanned statement with no text layer, yields **no
+balance** — never a guess. The PDF is still stored and viewable.
+
+### Enabling it
+
+The `statements` product must be approved on your Plaid application and requested
+when the bank is linked. Bank Bridge requests it automatically and **retries
+without it if Plaid refuses**, so linking banks is unaffected on an application
+that hasn't been approved. After approval, re-link the bank (or run
+`backfill_statements`) to start receiving statements.
+
+PDFs are stored under `{DATA_DIR}/statements/{item_id}/{account_id}/{yyyy-mm}.pdf`
+— on the persistent volume, so they survive a redeploy. A scheduled job checks
+for new statements every `STATEMENTS_PULL_INTERVAL_DAYS` (default 30); one
+already stored is never re-downloaded, and one whose PDF has gone missing is
+fetched again.
+
 ## Disconnecting a bank (v0.4.7)
 
 Each linked bank on `/admin/accounts` has a **Disconnect this bank** button in
@@ -954,6 +1095,7 @@ skip it entirely.
 | `categorization_rules` | user rules: match predicate → offset account + direction + party + template (bank side from the txn; v0.3.1) — v0.3.0 |
 | `generated_journal_entries` | per-JE state record (state, rule, JE docname) — v0.3.0 |
 | `intercompany_transfer_pairs` | detected transfer between two owned Companies: both legs, both Companies, confidence, both JE docnames, state — v0.4.1 |
+| `plaid_statements` | one bank-issued statement: Plaid's statement id (UNIQUE — the idempotency guard), period, opening/closing balances parsed from the PDF (NULL when unreadable), stored PDF path — v0.4.9 |
 | `audit_events` | **permanent, append-only** audit trail of every action (before/after JSON, actor, IP) — v0.3.0 |
 | `plaid_sync_log` | HTTP-level action log (plaid_pull / erpnext_push / erpnext_supplier_auto_create, counts, errors); `subject_id` cross-links to `audit_events` |
 | `plaid_link_state` | short-lived link-token bookkeeping for the OAuth handoff |
@@ -983,6 +1125,10 @@ on an HTTP Basic Auth layer (`ADMIN_BASIC_AUTH_*`) — see
   both atomically) / unpair (cancels both and returns the transactions to the
   normal rules), individually or in bulk, filtered by Company / state /
   confidence
+- `/admin/statements` — bank statement PDFs per account and month, each
+  reconciled against the mirrored transactions (opening + movement vs the bank's
+  closing balance), with mismatches flagged as a dollar delta; view any PDF
+  inline, or pull new statements on demand
 - `/admin/audit` — the permanent audit trail: filter by event type / subject /
   actor / date, drill into any event's before→after JSON, group by subject to
   see a rule's or JE's full lifecycle, and **Export CSV**
@@ -1666,6 +1812,11 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `AUTO_BOOK_OPENING_BALANCE` | `true` | v0.4.4 · book each account's existing balance as a Draft Journal Entry when it is first imported. Set `false` to book them by hand from `/admin/accounts` instead |
 | `OPENING_BALANCE_DATE` | `today` | v0.4.4 · posting date for auto-booked opening balances. An ISO date (`2026-01-01`) backdates them to e.g. a fiscal year start; an unparseable value falls back to today with a warning rather than failing the import |
 | `OPENING_BALANCE_EQUITY_ACCOUNT_NAME` | `Opening Balance Equity` | v0.4.4 · the Equity leaf every opening balance is offset against, auto-created under the owning Company's Equity root when the chart doesn't ship one |
+| `STATEMENTS_ENABLED` | `true` | v0.4.9 · pull bank-issued statement PDFs from Plaid. Off → nothing is listed, downloaded or stored, and opening balances behave exactly as in v0.4.4 |
+| `STATEMENTS_PULL_INTERVAL_DAYS` | `30` | v0.4.9 · how often the background job checks each linked bank for statements not already held. Monthly, because that is how often a bank issues one. `0` or negative disables the job |
+| `STATEMENTS_STORAGE_PATH` | `{DATA_DIR}/statements` | v0.4.9 · where statement PDFs are filed, as `{item_id}/{account_id}/{yyyy-mm}.pdf`. Defaults onto the persistent volume so PDFs survive a redeploy |
+| `STATEMENTS_DOWNLOAD_ATTEMPTS` | `3` | v0.4.9 · attempts per statement download before giving up, with exponential backoff. The row is kept either way, so the next pull retries it |
+| `STATEMENTS_RECONCILE_TOLERANCE` | `1.00` | v0.4.9 · how far a statement's closing balance may sit from the mirror's own arithmetic before the period is flagged. Also load-bearing: a statement outside this tolerance is never used to book an opening balance |
 | `FERNET_KEY` | "" | blank → autogenerated + persisted to `{DATA_DIR}/fernet.key` |
 | `SYNC_INTERVAL_HOURS` | `24` | v0.3.6 · background poll cadence in hours (**daily by default**). `0` or negative = **manual only** (no auto-poll; use "Sync now"). Editable in the admin UI, which persists a value that wins over this seed |
 | `PLAID_MAX_CALLS_PER_DAY` | `0` | v0.3.6 · optional per-Item safety brake — max Plaid pull calls per Item per UTC day (`0` = no limit). A pull that would exceed it is skipped with a logged warning |
@@ -1756,7 +1907,7 @@ cd app
 python3 -m unittest discover -s tests -v
 ```
 
-850 tests cover Fernet encryption round-trip + key persistence, Plaid response
+922 tests cover Fernet encryption round-trip + key persistence, Plaid response
 normalization, sync idempotency, deposit/withdrawal mapping, modified →
 cancel+replace, removed → cancel, unmapped/disabled account handling, failed
 push → error + retry, one-click account import, merchant-name normalization,
@@ -1787,7 +1938,7 @@ per Company and reused; auto-booking at import and its opt-out; the configurable
 posting date including the fall-back on a bad value; re-import never
 double-booking; the backfill script's estimate, dry run, idempotency and refusal
 to overturn a rejection; the manual amount/date override endpoint; and the
-existing approve/reject workflow driving the entries unchanged), and the counterparty overlay (v0.4.5: the doctype bootstrap being idempotent and degrading to a no-op when the API user lacks DocType rights; auto-link on both the Supplier and Customer paths; dual-role detection setting the flag from both links; a human-set link never being stomped; concurrent creates recovering by re-fetching rather than failing; the pairing migration's dry run, idempotency and exact-name matching; ageing bucket boundaries and the netting across roles; the 1099 report excluding Financial Institution and Government types and declaring what it dropped; top-by-activity sorting by combined volume within the configured fiscal year; the rollup reading the ledger a fixed number of times regardless of party count, skipping unchanged records and never blanking a first-transaction date; and every screen rendering on an install that has no overlay at all), and guided rule authoring (v0.4.6: the four rule-state filters partitioning the eligible transactions with no overlap and no gaps, and ignoring rows the engine has never seen; merchant grouping counts, totals and ordering, with singletons falling through to one-offs and merchantless rows grouping by description signature; the group prefill producing a `merchant_contains` rule and the per-row prefill a `merchant_exact` one whose regex actually matches the description it came from; the prefill rejecting an unknown match type and never creating a rule on its own; the match-count rollup folding an archived version's matches into its live successor, terminating on a supersede cycle, skipping unchanged rules and leaving `updated_at` alone; the scope-mismatch warning firing on a Company mismatch, staying silent for a Company-agnostic rule or an unconfigured ERPNext, persisting on the confirmed re-submit, and preserving the edited rule's id so confirming supersedes rather than duplicates; and the `match_count` migration adding the column to an existing database, idempotently, with the first rollup filling in real history), and counterparty doctype provisioning (v0.4.6: the startup job being actually registered on the elected scheduler as a one-shot — the regression guard for the v0.4.5 gap where the code existed but nothing invoked it — and provisioning, pairing, honouring the master switch, surviving an unconfigured or exploding ERPNext, and auditing its outcome; the provision report distinguishing `created` from `already_present` and naming a permission denial, a failed create and an absent DocType API with the reason ERPNext gave; every failure state carrying operator-facing help; `ensure_counterparty_doctype` keeping its boolean contract for the fifteen existing call sites; and the management CLI creating, re-running idempotently, pairing or skipping pairing, reporting a refusal without raising, and exiting non-zero so it can gate a deploy step), and the disconnect flow (v0.4.7: `/item/remove` being called with the DECRYPTED access token; the Item being flagged with a timestamp and audited with actor and reason; the Item, its accounts and its transactions all surviving the disconnect; a Plaid failure — API error or misconfiguration — leaving the Item CONNECTED and unaudited, which is the ordering guarantee the whole flow rests on; an unknown Item 404ing and an already-disconnected one 409ing without re-calling Plaid; the endpoint being covered by the admin Basic Auth gate; only the named Item being affected; disconnected Items dropping out of `sync_all` and out of the unauthenticated webhook kick while connected ones still run; a re-link minting a new Item and leaving the old row and its timestamp alone; the Accounts page swapping the Disconnect button for a 🔌 badge and rendering the modal copy; the wrapper building real plaid-python 40.1.0 request models for all seven endpoints — including omitting a blank cursor rather than sending `''`; the dependency pins staying at or above the CVE-patched gunicorn and the `/item/remove`-capable SDK; and `rotate_db_password.sh` parsing as valid bash, announcing its detected context, running its container path without any docker client — the v0.4.7 regression guard — reaching for psycopg2 rather than the absent `psql`, explaining itself when `DATABASE_URL` or docker is missing, and deriving the same rescue password the app does). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
+existing approve/reject workflow driving the entries unchanged), and the counterparty overlay (v0.4.5: the doctype bootstrap being idempotent and degrading to a no-op when the API user lacks DocType rights; auto-link on both the Supplier and Customer paths; dual-role detection setting the flag from both links; a human-set link never being stomped; concurrent creates recovering by re-fetching rather than failing; the pairing migration's dry run, idempotency and exact-name matching; ageing bucket boundaries and the netting across roles; the 1099 report excluding Financial Institution and Government types and declaring what it dropped; top-by-activity sorting by combined volume within the configured fiscal year; the rollup reading the ledger a fixed number of times regardless of party count, skipping unchanged records and never blanking a first-transaction date; and every screen rendering on an install that has no overlay at all), and guided rule authoring (v0.4.6: the four rule-state filters partitioning the eligible transactions with no overlap and no gaps, and ignoring rows the engine has never seen; merchant grouping counts, totals and ordering, with singletons falling through to one-offs and merchantless rows grouping by description signature; the group prefill producing a `merchant_contains` rule and the per-row prefill a `merchant_exact` one whose regex actually matches the description it came from; the prefill rejecting an unknown match type and never creating a rule on its own; the match-count rollup folding an archived version's matches into its live successor, terminating on a supersede cycle, skipping unchanged rules and leaving `updated_at` alone; the scope-mismatch warning firing on a Company mismatch, staying silent for a Company-agnostic rule or an unconfigured ERPNext, persisting on the confirmed re-submit, and preserving the edited rule's id so confirming supersedes rather than duplicates; and the `match_count` migration adding the column to an existing database, idempotently, with the first rollup filling in real history), and counterparty doctype provisioning (v0.4.6: the startup job being actually registered on the elected scheduler as a one-shot — the regression guard for the v0.4.5 gap where the code existed but nothing invoked it — and provisioning, pairing, honouring the master switch, surviving an unconfigured or exploding ERPNext, and auditing its outcome; the provision report distinguishing `created` from `already_present` and naming a permission denial, a failed create and an absent DocType API with the reason ERPNext gave; every failure state carrying operator-facing help; `ensure_counterparty_doctype` keeping its boolean contract for the fifteen existing call sites; and the management CLI creating, re-running idempotently, pairing or skipping pairing, reporting a refusal without raising, and exiting non-zero so it can gate a deploy step), and the disconnect flow (v0.4.7: `/item/remove` being called with the DECRYPTED access token; the Item being flagged with a timestamp and audited with actor and reason; the Item, its accounts and its transactions all surviving the disconnect; a Plaid failure — API error or misconfiguration — leaving the Item CONNECTED and unaudited, which is the ordering guarantee the whole flow rests on; an unknown Item 404ing and an already-disconnected one 409ing without re-calling Plaid; the endpoint being covered by the admin Basic Auth gate; only the named Item being affected; disconnected Items dropping out of `sync_all` and out of the unauthenticated webhook kick while connected ones still run; a re-link minting a new Item and leaving the old row and its timestamp alone; the Accounts page swapping the Disconnect button for a 🔌 badge and rendering the modal copy; the wrapper building real plaid-python 40.1.0 request models for all seven endpoints — including omitting a blank cursor rather than sending `''`; the dependency pins staying at or above the CVE-patched gunicorn and the `/item/remove`-capable SDK; and `rotate_db_password.sh` parsing as valid bash, announcing its detected context, running its container path without any docker client — the v0.4.7 regression guard — reaching for psycopg2 rather than the absent `psql`, explaining itself when `DATABASE_URL` or docker is missing, and deriving the same rescue password the app does), and bank statements (v0.4.9: `/statements/list` flattened across accounts with the owning account_id carried onto every row; the deliberate asymmetry where a listing failure returns `[]` — an Item without the product is the common case — while a download failure raises, because Plaid promised that document; the `statements` product being requested at Link time and the token FALLING BACK to transactions-only when Plaid refuses, which is what keeps an unapproved application linking banks; balance recovery from real PDF text in both the depository and credit-card vocabularies, negatives printed as `-` and as parentheses, and the NULL — never a guess — for an unrecognized layout, an image-only statement or a label whose amount sits outside its own window; the storage layout, path components that cannot escape the store even when spelled `..`, atomic writes and a re-issued statement not overwriting the first; idempotency on both levels, where a statement already held costs no download and a row whose PDF vanished is re-fetched into the same row; exponential backoff on a failed download and the row that survives total failure so the next pull retries it; reconciliation across account types with pending, removed and out-of-period rows excluded, and `no_data` held distinct from `mismatch`; ANCHOR SAFETY — a statement being refused when the mirror cannot reproduce its closing balance or when movement predates it, the oldest qualifying statement winning, and a quiet period reconciling trivially; the upgrade guarantee that import fetches statements but books exactly what v0.4.4 booked, with only the backfill path anchoring; the admin page flagging a discrepancy by dollar delta, the PDF served inline with no-store and nosniff, and a missing file 404ing rather than 500ing; and the monthly job's cadence, its disable switch and its refusal to die on a failed pull). The Plaid SDK and ERPNext are mocked (`tests/fakes.py`),
 so no network access or extra wheels are needed.
 
 ## Security notes
@@ -1796,7 +1947,8 @@ so no network access or extra wheels are needed.
   returns a token.
 - Plaid access tokens are encrypted at rest with Fernet; the key lives on the
   app's data volume (`fernet.key`, mode `0600`), never in the database or git.
-- Least-privilege Plaid scope: `transactions` only.
+- Least-privilege Plaid scope: `transactions`, plus `statements` when enabled
+  (read-only access to statement documents the bank already issued you).
 - Calls to Plaid use HTTPS/TLS; ERPNext is reached over the local network at an
   operator-configured URL and never exposed to the Internet.
 - No telemetry or analytics — outbound connections go only to Plaid and your
@@ -1828,7 +1980,9 @@ category-based Name suggestions, and shadow-conflict warnings~~ (v0.3.2).
 ~~Guided first-sync rule authoring: unmatched filter, merchant grouping,
 create-rule-from-group, per-rule match counts, and scope mismatches caught at
 authoring time~~ (v0.4.6). ~~Disconnect a linked bank from the admin UI via
-Plaid `/item/remove`, retaining all history~~ (v0.4.7).
+Plaid `/item/remove`, retaining all history~~ (v0.4.7). ~~Bank statement PDFs
+with per-month reconciliation against the mirrored transactions, and
+statement-sourced opening balances gated on that reconciliation~~ (v0.4.9).
 
 ## Compliance and disclosure
 

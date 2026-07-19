@@ -1907,6 +1907,16 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
     account.import_status = 'imported'
     db.session.commit()
 
+    # v0.4.9: pull this account's oldest bank statement. Purely additive — it
+    # populates /admin/statements and the audit trail, and does NOT change the
+    # opening balance booked below (at link time the cached Plaid balance is
+    # already the bank's own figure; see app/statements.py's module docstring for
+    # why anchoring belongs to the backfill path instead). Best-effort: the fetch
+    # swallows its own failures and returns stats.
+    from . import statements
+    statement_stats = statements.fetch_on_import(account,
+                                                 plaid_client=plaid_client)
+
     # v0.4.4: book what the account ALREADY HELD at this moment. Deferred import
     # because opening_balance imports this module for its chart-walking helpers.
     # Best-effort by construction — book_opening_balance never raises, so a
@@ -1921,11 +1931,14 @@ def import_plaid_account_to_erpnext(plaid_account_id: str, *,
         msg += f'; {opening["message"]}'
     elif opening and opening['status'] == 'error':
         msg += f'; opening balance not booked ({opening["message"]})'
+    if statement_stats and statement_stats.get('stored'):
+        msg += f"; {statement_stats['stored']} bank statement(s) fetched"
     _log(account.item_id, 1, 'success', msg)
     log.info('import: %s → %s', account.account_id, docname)
     return {'status': 'imported', 'bank_account': docname, 'bank': bank_name,
             'created_account': created_account, 'created_bank': created_bank,
-            'retried': retried, 'opening_balance': opening, 'message': msg}
+            'retried': retried, 'opening_balance': opening,
+            'statements': statement_stats, 'message': msg}
 
 
 def _bank_exists(client: ERPNextClient, bank_name: str) -> bool:
@@ -1994,7 +2007,7 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
 
     stats = {'created': 0, 'unsupported': 0, 'skipped_mapped': 0,
              'retried': 0, 'failed': 0, 'considered': 0,
-             'opening_balances': 0, 'errors': []}
+             'opening_balances': 0, 'statements': 0, 'errors': []}
     for account in PlaidAccount.query.order_by(PlaidAccount.name).all():
         if account.erpnext_bank_account_name:
             stats['skipped_mapped'] += 1
@@ -2016,6 +2029,8 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
                 opening = result.get('opening_balance') or {}
                 if opening.get('status') == 'booked':
                     stats['opening_balances'] += 1
+                stats['statements'] += (result.get('statements')
+                                        or {}).get('stored', 0)
         except (ERPNextAPIError, ERPNextError) as e:
             db.session.rollback()
             stats['failed'] += 1
@@ -2035,6 +2050,8 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
     if stats['opening_balances']:
         parts.append(f"{stats['opening_balances']} opening balance(s) booked "
                      f"pending review")
+    if stats['statements']:
+        parts.append(f"{stats['statements']} bank statement(s) fetched")
     if stats['failed']:
         parts.append(f"{stats['failed']} failed")
     stats['summary'] = ', '.join(parts) + '.'

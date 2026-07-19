@@ -18,6 +18,13 @@ When you link a bank through Plaid, the app pulls and stores:
 - **Balances** — the current and available balance for each account, refreshed
   periodically. For investment accounts, only the balance is stored (no
   holdings, no investment transactions).
+- **Bank statement PDFs** (v0.4.9, only if enabled) — the monthly statements
+  your bank issued, fetched through Plaid and stored as files on your data
+  volume. These are complete statement documents, so they may contain more than
+  the app itself reads from them (it extracts only the opening and closing
+  balances). They are stored **unencrypted**, the same as the rest of the local
+  database, and are readable by anyone with access to the app's data volume or
+  its admin interface. Set `STATEMENTS_ENABLED=false` to never fetch them.
 - **A Plaid access token** — the credential Plaid issues so the app can fetch
   your data. It is stored **encrypted at rest** (Fernet symmetric encryption) and
   is never written to logs or shown in the UI.
@@ -76,6 +83,10 @@ Because you host it, you are in full control:
   transactions and the Journal Entries generated from them are **kept** — the
   disconnect stops the future feed, it does not erase history. You can also
   revoke the connection from your bank or from Plaid directly.
+- **Delete stored statement PDFs** by removing the `statements/` directory in
+  the app's data volume, or prevent them being fetched at all with
+  `STATEMENTS_ENABLED=false`. Deleting the files does not affect any Journal
+  Entry already booked from them.
 - **Export or inspect** anything at any time — it is your database.
 
 ## Contact

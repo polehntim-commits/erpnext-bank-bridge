@@ -386,6 +386,54 @@ class Config:
         'OPENING_BALANCE_EQUITY_ACCOUNT_NAME', 'Opening Balance Equity').strip() \
         or 'Opening Balance Equity'
 
+    # ── v0.4.9 · Plaid Statements (see app/statements.py) ─────────────────
+    # Bank-issued statement PDFs, pulled from Plaid's /statements API. They give
+    # two things nothing else in the system can: an opening balance the BANK
+    # asserts (rather than the current-balance-minus-mirrored-movement estimate
+    # the v0.4.4 backfill computes), and a monthly closing balance the mirror can
+    # be reconciled against at /admin/statements.
+    #
+    # Feature-gated on the Plaid side too: `statements` must be an approved
+    # product on your Plaid application AND requested at Link time, so this stays
+    # inert — every path falls back to v0.4.4 behaviour — until that lands. An
+    # institution that doesn't support Statements is handled the same way.
+    #   * master switch. Off → no statements are listed, downloaded or stored,
+    #     and the opening balance path is exactly v0.4.4's.
+    STATEMENTS_ENABLED = _bool('STATEMENTS_ENABLED', True)
+    #   * how often the background job checks each linked Item for statements it
+    #     hasn't already stored. Monthly by default, because that is how often a
+    #     bank issues one; 0 or negative disables the job (the import path and
+    #     scripts/backfill_statements.py still work by hand).
+    try:
+        STATEMENTS_PULL_INTERVAL_DAYS = int(os.environ.get(
+            'STATEMENTS_PULL_INTERVAL_DAYS', '30'))
+    except ValueError:
+        STATEMENTS_PULL_INTERVAL_DAYS = 30
+    #   * where the PDFs live. Blank → {DATA_DIR}/statements, which is
+    #     /data/statements in the stock container and keeps the files on the same
+    #     persistent volume as everything else that must survive a redeploy.
+    STATEMENTS_STORAGE_PATH = os.environ.get(
+        'STATEMENTS_STORAGE_PATH', '').strip() or os.path.join(
+            DATA_DIR, 'statements')
+    #   * how many times a failed /statements/download is retried before the
+    #     statement is left unfetched (exponential backoff between attempts).
+    #     The row is still written, so the next pull re-tries it.
+    try:
+        STATEMENTS_DOWNLOAD_ATTEMPTS = max(1, int(os.environ.get(
+            'STATEMENTS_DOWNLOAD_ATTEMPTS', '3')))
+    except ValueError:
+        STATEMENTS_DOWNLOAD_ATTEMPTS = 3
+    #   * the tolerance, in currency units, within which a statement's closing
+    #     balance must agree with (opening + mirrored movement) for the period to
+    #     count as reconciled. Drives both the /admin/statements warning icons
+    #     and — load-bearing — whether a statement is trusted enough to anchor an
+    #     opening balance on (see statements.choose_anchor_statement).
+    try:
+        STATEMENTS_RECONCILE_TOLERANCE = abs(float(os.environ.get(
+            'STATEMENTS_RECONCILE_TOLERANCE', '1.00')))
+    except ValueError:
+        STATEMENTS_RECONCILE_TOLERANCE = 1.00
+
     # Set false to disable the in-process scheduler entirely (e.g. drive syncs by
     # cron hitting /api/sync/plaid_now instead). Distinct from MANUAL-ONLY above:
     # this stops the scheduler process; MANUAL-ONLY runs it with no poll job.

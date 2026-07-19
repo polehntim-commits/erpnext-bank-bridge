@@ -726,6 +726,89 @@ class AuditEvent(db.Model):
         }
 
 
+class PlaidStatement(db.Model):
+    """One bank-issued statement pulled from Plaid's /statements API (v0.4.9).
+
+    A statement is the only thing in this system that carries a number the BANK
+    asserts rather than one Bank Bridge derived. That makes it useful twice:
+
+      1. as an ANCHOR for an opening balance. `opening_balance` is what the
+         account held at `period_start` according to the institution — which
+         beats `opening_balance.estimate_opening_balance`'s
+         current-balance-minus-mirrored-movement arithmetic, because the
+         estimate is only exact if the mirror is complete (see that function's
+         docstring, and statements.choose_anchor_statement for the check that
+         decides whether a given statement is safe to anchor on).
+      2. as a RECONCILIATION checkpoint. `closing_balance` is a monthly
+         assertion the mirror can be measured against without opening ERPNext —
+         opening + Σ(mirrored movement in the period) should land on closing,
+         and a delta means the mirror has a gap (see statements.reconcile).
+
+    `statement_id` is Plaid's opaque identifier and is UNIQUE — that column IS
+    the idempotency guard, so a re-run of the monthly job, the backfill script
+    and the import path all converge on one row per statement rather than
+    re-downloading a PDF we already hold.
+
+    `opening_balance` / `closing_balance` are NULLABLE and routinely NULL: Plaid
+    returns statement balances only inside the PDF, never as structured fields
+    (/statements/list carries statement_id, month, year and date_posted, and
+    nothing else), so both are recovered by regex over extracted PDF text and a
+    layout we cannot parse yields NULL rather than a guess. Every consumer
+    treats NULL as "no bank-issued figure available" and falls back — an
+    unparseable statement degrades to v0.4.4 behaviour, it does not corrupt one.
+
+    `pdf_path` is where the bytes landed on disk. It may point at a file that no
+    longer exists (a wiped data volume); the fetch path re-downloads on that
+    case rather than trusting the row alone."""
+    __tablename__ = 'plaid_statements'
+    id = db.Column(db.Integer, primary_key=True)
+    # Plaid's opaque statement identifier — the natural key, and the reason a
+    # duplicate fetch is a no-op instead of a second PDF.
+    statement_id = db.Column(db.String(255), unique=True, nullable=False,
+                             index=True)
+    plaid_item_id = db.Column(db.String(120), db.ForeignKey('plaid_items.item_id'),
+                              nullable=False, index=True)
+    plaid_account_id = db.Column(db.String(120),
+                                 db.ForeignKey('plaid_accounts.account_id'),
+                                 nullable=False, index=True)
+    # The statement period. Derived from Plaid's month + year (the only period
+    # fields /statements/list returns) as the first and last day of that month.
+    period_start = db.Column(db.Date, nullable=True, index=True)
+    period_end = db.Column(db.Date, nullable=True, index=True)
+    # Bank-asserted balances, parsed out of the PDF text. NULL = not parseable.
+    opening_balance = db.Column(db.Float, nullable=True)
+    closing_balance = db.Column(db.Float, nullable=True)
+    # Absolute path of the stored PDF; '' when the download never succeeded.
+    pdf_path = db.Column(db.Text, default='')
+    # Size of the stored PDF in bytes — lets the admin list show "is there
+    # really a file there" without stat-ing every row.
+    pdf_bytes = db.Column(db.Integer, default=0)
+    fetched_at = db.Column(db.DateTime, default=_now, index=True)
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def period_label(self) -> str:
+        """'2026-07' — the period key the PDF is filed under on disk."""
+        if self.period_start:
+            return f'{self.period_start.year:04d}-{self.period_start.month:02d}'
+        return ''
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'statement_id': self.statement_id,
+            'plaid_item_id': self.plaid_item_id,
+            'plaid_account_id': self.plaid_account_id,
+            'period_start': self.period_start.isoformat() if self.period_start else None,
+            'period_end': self.period_end.isoformat() if self.period_end else None,
+            'period_label': self.period_label(),
+            'opening_balance': self.opening_balance,
+            'closing_balance': self.closing_balance,
+            'pdf_path': self.pdf_path or '',
+            'pdf_bytes': int(self.pdf_bytes or 0),
+            'fetched_at': self.fetched_at.isoformat() if self.fetched_at else None,
+        }
+
+
 class PlaidLinkState(db.Model):
     """Ephemeral link-token bookkeeping for the OAuth handoff. When Plaid Link
     is initialized for an OAuth-only bank (Wells Fargo), the redirect back to

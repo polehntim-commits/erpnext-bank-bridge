@@ -106,6 +106,12 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # builds on a fresh database).
     ('plaid_items', 'disconnected', 'BOOLEAN DEFAULT false NOT NULL'),
     ('plaid_items', 'disconnected_at', 'TIMESTAMP'),
+    # v0.4.9 — bank statements. The `plaid_statements` TABLE needs no line here:
+    # create_all builds a missing table, and this release adds no column to any
+    # table that already exists (the same situation as v0.4.1's
+    # intercompany_transfer_pairs above). An upgrading install therefore gains
+    # one empty table and changes no existing row — statements only ever ADD
+    # information, so there is nothing to backfill and nothing to undo.
 ]
 
 

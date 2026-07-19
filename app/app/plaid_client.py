@@ -86,16 +86,49 @@ class PlaidClient:
     # ── link / token exchange ────────────────────────────────────────
 
     def create_link_token(self, user_id: str, *, redirect_uri: str = None,
-                          webhook: str = None) -> str:
+                          webhook: str = None, statements: bool = False,
+                          statements_months: int = 24) -> str:
         """Create a short-lived link_token for Plaid Link. `redirect_uri` is
         required for OAuth-only banks (Wells Fargo) and must be registered in
-        the Plaid dashboard. Returns the link_token string."""
-        from plaid.model.link_token_create_request import LinkTokenCreateRequest
+        the Plaid dashboard. Returns the link_token string.
+
+        `statements` (v0.4.9) additionally requests the `statements` product, so
+        the resulting Item can serve /statements/list — bank-issued statement
+        PDFs for opening balances and monthly reconciliation. It is opt-in and
+        FAILS SOFT: `statements` must be enabled on the Plaid application before
+        Plaid will mint a token for it, and asking for a product the application
+        doesn't hold is a hard 400 that would otherwise make "Link a bank" stop
+        working entirely. So a rejected statements request is retried once
+        without it, which lands on exactly the pre-v0.4.9 token.
+
+        That retry is the whole reason this is safe to default on for the
+        operator: an install whose Plaid application hasn't been approved for
+        Statements yet keeps linking banks exactly as it did, and the feature
+        starts working on the next link after approval with no code change.
+
+        `statements_months` is how far back Link asks the institution to make
+        statements available (Plaid caps this per institution; asking for more
+        than a bank offers just yields fewer)."""
+        api = self._get_api()
+        kwargs = self._link_token_kwargs(user_id, redirect_uri, webhook)
+        if statements:
+            with_statements = self._with_statements(dict(kwargs),
+                                                    statements_months)
+            try:
+                return self._link_token_create(api, with_statements)
+            except PlaidError as e:
+                log.warning(
+                    'create_link_token with the `statements` product failed '
+                    '(%s) — retrying without it. Statements stay unavailable '
+                    'for this Item until `statements` is enabled on the Plaid '
+                    'application and the bank is re-linked.', e)
+        return self._link_token_create(api, kwargs)
+
+    def _link_token_kwargs(self, user_id, redirect_uri, webhook) -> dict:
+        """The LinkTokenCreateRequest kwargs common to both attempts."""
         from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
         from plaid.model.country_code import CountryCode
         from plaid.model.products import Products
-
-        api = self._get_api()
         kwargs = dict(
             user=LinkTokenCreateRequestUser(client_user_id=str(user_id)),
             client_name='ERPNext Bank Bridge',
@@ -108,6 +141,28 @@ class PlaidClient:
         wh = webhook if webhook is not None else self.webhook_url
         if wh:
             kwargs['webhook'] = wh
+        return kwargs
+
+    @staticmethod
+    def _with_statements(kwargs: dict, months: int) -> dict:
+        """Add the `statements` product + its required date window to a set of
+        link-token kwargs. Plaid requires BOTH: the product in the list, and a
+        `statements` config naming the period Link should request."""
+        from datetime import date, timedelta
+        from plaid.model.link_token_create_request_statements import \
+            LinkTokenCreateRequestStatements
+        from plaid.model.products import Products
+        end = date.today()
+        start = end - timedelta(days=31 * max(1, int(months or 1)))
+        kwargs['products'] = list(kwargs.get('products') or []) + \
+            [Products('statements')]
+        kwargs['statements'] = LinkTokenCreateRequestStatements(
+            start_date=start, end_date=end)
+        return kwargs
+
+    @staticmethod
+    def _link_token_create(api, kwargs: dict) -> str:
+        from plaid.model.link_token_create_request import LinkTokenCreateRequest
         try:
             resp = api.link_token_create(LinkTokenCreateRequest(**kwargs))
         except Exception as e:  # plaid.ApiException + anything else
@@ -237,6 +292,83 @@ class PlaidClient:
             'has_more': bool(_resp_get(resp, 'has_more')),
         }
 
+    # ── statements (v0.4.9) ──────────────────────────────────────────
+
+    def statements_list(self, access_token: str) -> list[dict]:
+        """Every statement Plaid holds for this Item, flattened across accounts:
+        [{'account_id', 'statement_id', 'month', 'year', 'date_posted'}].
+
+        NOTE what is NOT here, because it shapes everything downstream: Plaid's
+        /statements/list carries no balances and no explicit period bounds. The
+        period is `month` + `year` and the only other field is a nullable
+        `date_posted`. Opening and closing balances exist ONLY inside the PDF,
+        which is why app/statements.py parses them out of extracted text rather
+        than reading them off this response.
+
+        Returns [] — never raises — when the Item can't serve Statements. That
+        is the common case, not an edge one: the product must be approved on the
+        Plaid application AND requested at Link time AND supported by the
+        institution, so an install that has none of that must degrade to "no
+        statements" rather than break the caller. A genuine outage looks the
+        same from here and is safe to treat identically, because every caller's
+        fallback (the v0.4.4 estimate) is correct on its own."""
+        from plaid.model.statements_list_request import StatementsListRequest
+        api = self._get_api()
+        try:
+            resp = api.statements_list(
+                StatementsListRequest(access_token=access_token))
+        except Exception as e:
+            log.warning('statements_list unavailable for this Item: %s', e)
+            return []
+        out = []
+        for acct in (_resp_get(resp, 'accounts') or []):
+            d = _to_dict(acct)
+            account_id = _get(d, 'account_id')
+            for st in (_get(d, 'statements', []) or []):
+                s = _to_dict(st)
+                statement_id = _get(s, 'statement_id')
+                if not statement_id:
+                    continue
+                posted = _get(s, 'date_posted')
+                out.append({
+                    'account_id': account_id,
+                    'statement_id': statement_id,
+                    'month': _int_or_none(_get(s, 'month')),
+                    'year': _int_or_none(_get(s, 'year')),
+                    'date_posted': str(posted) if posted is not None else None,
+                })
+        return out
+
+    def statements_download(self, access_token: str,
+                            statement_id: str) -> bytes:
+        """One statement's PDF as raw bytes, via /statements/download.
+
+        Raises PlaidError on any failure — UNLIKE statements_list, which returns
+        empty. The asymmetry is deliberate: listing failing means "this Item has
+        no statements", a normal state with a correct fallback, whereas a
+        download failing means "Plaid told us this exact statement exists and
+        then wouldn't give it to us", which is a transient fault worth retrying
+        (see statements.download_with_retry). Swallowing it would silently store
+        an empty PDF.
+
+        The SDK declares this endpoint's return as `file_type`, so what comes
+        back is a file-like object rather than bytes; _read_bytes normalizes
+        every shape (bytes, a read()-able, or a path) to bytes."""
+        from plaid.model.statements_download_request import \
+            StatementsDownloadRequest
+        api = self._get_api()
+        try:
+            resp = api.statements_download(StatementsDownloadRequest(
+                access_token=access_token, statement_id=statement_id))
+        except Exception as e:
+            raise PlaidError(
+                f'statements_download failed for {statement_id}: {e}') from e
+        data = _read_bytes(resp)
+        if not data:
+            raise PlaidError(
+                f'statements_download returned no bytes for {statement_id}')
+        return data
+
 
 # ── response normalization helpers ────────────────────────────────────
 #
@@ -267,6 +399,46 @@ def _get(d, key, default=None):
     if isinstance(d, dict):
         return d.get(key, default)
     return getattr(d, key, default)
+
+
+def _int_or_none(value):
+    """An int, or None for anything that isn't one (Plaid's month/year are
+    required by the schema, but a fake or a future response shape may omit
+    them and a statement with no period is still worth listing)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_bytes(resp) -> bytes:
+    """Coerce whatever /statements/download handed back into PDF bytes.
+
+    The SDK types this endpoint as `file_type` and, depending on version and on
+    the _preload_content setting, returns a tempfile-backed file object, an
+    object with .read(), raw bytes, or a path string. Tests inject plain bytes.
+    Anything unreadable yields b'' so the caller raises a clear PlaidError
+    rather than persisting a truncated PDF."""
+    if isinstance(resp, (bytes, bytearray)):
+        return bytes(resp)
+    read = getattr(resp, 'read', None)
+    if callable(read):
+        try:
+            data = read()
+            return data if isinstance(data, bytes) else bytes(data or b'')
+        except Exception:  # pragma: no cover - defensive
+            return b''
+    # A path to a downloaded temp file (the SDK's file_type default).
+    if isinstance(resp, str):
+        try:
+            with open(resp, 'rb') as fh:
+                return fh.read()
+        except OSError:  # pragma: no cover - defensive
+            return b''
+    data = getattr(resp, 'data', None)
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    return b''
 
 
 def _normalize_account(a) -> dict:

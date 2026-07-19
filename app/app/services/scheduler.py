@@ -176,6 +176,52 @@ def _run_match_count_rollup(app) -> None:
             log.exception('[scheduler] rule match-count rollup crashed')
 
 
+def statements_interval_or_none(app) -> int | None:
+    """The cadence (DAYS, not hours) for the statement pull, or None when it is
+    disabled — either by STATEMENTS_ENABLED or by a non-positive interval. Pure,
+    matching the three above; days rather than hours because a bank issues a
+    statement monthly and checking more often just spends Plaid calls."""
+    if not app.config.get('STATEMENTS_ENABLED', True):
+        return None
+    try:
+        days = int(app.config.get('STATEMENTS_PULL_INTERVAL_DAYS', 30))
+    except (TypeError, ValueError):
+        days = 30
+    return days if days > 0 else None
+
+
+def _run_statements_pull(app) -> None:
+    """Download any bank statements Plaid has that we don't already hold
+    (v0.4.9).
+
+    Cheap in the steady state by construction: a statement whose row exists and
+    whose PDF is on disk is skipped without a download, so a monthly run over a
+    settled install lists once per Item and stops. Swallows everything — the
+    statements are an audit-trail and reconciliation convenience, and a failed
+    pull must never take the scheduler thread (or the nightly sync sharing it)
+    down with it."""
+    from .. import audit
+    from .. import plaid_settings
+    from .. import statements
+    with app.app_context():
+        audit.set_context('scheduler')
+        try:
+            if not statements.is_enabled():
+                return
+            if not plaid_settings.is_configured():
+                log.info('[scheduler] Plaid not configured — skipping '
+                         'statement pull')
+                return
+            result = statements.fetch_all()
+            audit.record('statements_pulled', subject_type=None, after=result,
+                         notes=(f"listed {result['listed']}, stored "
+                                f"{result['stored']}, skipped "
+                                f"{result['skipped_existing']}"))
+            log.info('[scheduler] statement pull complete: %s', result)
+        except Exception:  # pragma: no cover - never let the job die
+            log.exception('[scheduler] statement pull crashed')
+
+
 def ensure_scheduler_started(app):
     """Elect one scheduler across the container's workers and start it. No-op
     (returns None) for a non-winning worker. Runs the sync every effective
@@ -251,5 +297,16 @@ def ensure_scheduler_started(app):
                           max_instances=1, coalesce=True,
                           next_run_time=datetime.utcnow() + timedelta(minutes=2))
             log.info('[scheduler] rule match-count rollup every %dh', match_hours)
+        # v0.4.9 — the bank-statement pull, on the same elected scheduler. Its
+        # first run is offset by 10 minutes: it is the least urgent job here (a
+        # statement arrives once a month), it costs Plaid calls, and a fresh boot
+        # should get the sync and both rollups in before spending them.
+        statement_days = statements_interval_or_none(app)
+        if statement_days is not None:
+            sched.add_job(lambda: _run_statements_pull(app), 'interval',
+                          days=statement_days, id='statements_pull',
+                          max_instances=1, coalesce=True,
+                          next_run_time=datetime.utcnow() + timedelta(minutes=10))
+            log.info('[scheduler] bank statement pull every %dd', statement_days)
         _schedulers[id(app)] = sched
         return sched

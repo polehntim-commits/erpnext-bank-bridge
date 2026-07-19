@@ -49,7 +49,15 @@ def create_link_token():
                         'and secret in Plaid settings first.'}), 400
     try:
         client = sync_engine.get_plaid_client()
-        link_token = client.create_link_token(user_id='erpnext-bank-bridge')
+        # v0.4.9 · also request the `statements` product, so the linked Item can
+        # serve bank-issued statement PDFs. Safe to ask for unconditionally:
+        # create_link_token retries WITHOUT it if Plaid says no (the product
+        # isn't enabled on the application, or the institution doesn't offer
+        # it), so linking a bank keeps working exactly as it did pre-v0.4.9 and
+        # starts carrying statements on the next link after Plaid approves them.
+        link_token = client.create_link_token(
+            user_id='erpnext-bank-bridge',
+            statements=current_app.config.get('STATEMENTS_ENABLED', True))
     except (PlaidError, PlaidConfigError) as e:
         return jsonify({'error': str(e)}), 502
     try:

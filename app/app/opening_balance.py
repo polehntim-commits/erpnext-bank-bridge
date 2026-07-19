@@ -271,7 +271,8 @@ def is_opening_balance_entry(entry: GeneratedJournalEntry) -> bool:
 
 def build_opening_balance_document(account: PlaidAccount, gl_account: str,
                                    equity_account: str, company: str,
-                                   amount: float, posting_date) -> dict:
+                                   amount: float, posting_date,
+                                   statement=None) -> dict:
     """The ERPNext Journal Entry payload for one account's opening balance, as a
     plain two-line Dr/Cr that balances by construction.
 
@@ -281,18 +282,28 @@ def build_opening_balance_document(account: PlaidAccount, gl_account: str,
     with the SIGN expressed as which account is debited.
 
     No `party_type` / `party` on either line, and no `reference_type` — an
-    opening balance answers to no transaction and no counterparty."""
+    opening balance answers to no transaction and no counterparty.
+
+    `statement` (v0.4.9), when given, is the PlaidStatement the amount was taken
+    from; it only changes the human remark, so a reviewer approving the Draft can
+    tell a bank-issued figure from a derived one without leaving ERPNext."""
     magnitude = round(abs(float(amount or 0.0)), 2)
     debit_first = opening_balance_direction(account, amount)
     debit_account = gl_account if debit_first else equity_account
     credit_account = equity_account if debit_first else gl_account
     label = (account.name or account.official_name or account.mask
              or account.account_id)
+    if statement is not None:
+        remark = (f'Opening Balance for {label} from bank statement '
+                  f'{statement.period_label()} (Plaid statement '
+                  f'{statement.statement_id})')
+    else:
+        remark = f'Opening Balance for {label} at initial link'
     doc = {
         'doctype': JOURNAL_ENTRY_DT,
         'voucher_type': 'Journal Entry',
         'company': company,
-        'user_remark': f'Opening Balance for {label} at initial link',
+        'user_remark': remark,
         'accounts': [
             {'account': debit_account, 'debit_in_account_currency': magnitude},
             {'account': credit_account, 'credit_in_account_currency': magnitude},
@@ -357,9 +368,29 @@ def _result(status: str, message: str, entry=None) -> dict:
             'entry_id': (entry.id if entry else None)}
 
 
+def statement_anchor(account: PlaidAccount):
+    """(amount, posting_date, statement) from a bank-issued statement it is safe
+    to open this account at, or None (v0.4.9).
+
+    Thin, deliberately: every judgement about WHICH statement qualifies lives in
+    statements.choose_anchor_statement, next to the reconciliation arithmetic it
+    depends on. This wrapper exists so the booking path can consult statements
+    without importing them at module scope — app/statements.py imports THIS
+    module for opens_by_debit, and a top-level import either way would be
+    circular."""
+    try:
+        from . import statements
+        return statements.anchor_for(account)
+    except Exception:  # pragma: no cover - a statement must never block booking
+        log.warning('statement anchor lookup failed for %s',
+                    account.account_id, exc_info=True)
+        return None
+
+
 def book_opening_balance(client, account: PlaidAccount, *,
                          amount: float | None = None,
-                         posting_date=None, force: bool = False) -> dict:
+                         posting_date=None, force: bool = False,
+                         prefer_statement: bool = False) -> dict:
     """Book one account's opening balance as a Draft Journal Entry in ERPNext.
 
     Returns {'status': booked|skipped|error, 'message', 'journal_entry',
@@ -370,7 +401,25 @@ def book_opening_balance(client, account: PlaidAccount, *,
     `amount` overrides the account's cached Plaid balance (the manual endpoint
     and the backfill's estimate both pass one); `posting_date` overrides the
     configured date. `force` re-books over a previously rejected entry, which is
-    the only way an already-decided opening balance is ever revisited."""
+    the only way an already-decided opening balance is ever revisited.
+
+    `prefer_statement` (v0.4.9) consults Plaid Statements for a BANK-ISSUED
+    opening balance first, and books that — dated the statement's period start —
+    when one qualifies. It defaults OFF, and the asymmetry is the point:
+
+      * the IMPORT path leaves it off, because at link time `balances.current`
+        is already the bank's own number and posting it as of today is exact.
+        There is no estimate there to improve on, so switching an import to a
+        statement anchor would move an operator's balance sheet on upgrade for
+        no accuracy gained.
+      * the BACKFILL path turns it on, because that is where the estimate
+        actually lives — current-balance-minus-mirrored-movement, exact only if
+        the mirror is complete, which is why those entries land in
+        `pending_review` for a human to check against a statement. A statement
+        that reconciles replaces both the arithmetic and the manual check.
+
+    An explicit `amount` always wins: a caller naming a figure has more context
+    than any heuristic here."""
     if client is None:
         return _result('skipped', 'ERPNext is not configured')
 
@@ -386,6 +435,24 @@ def book_opening_balance(client, account: PlaidAccount, *,
         return _result('skipped',
                        'No GL Account linked — an opening balance needs a real '
                        'Chart-of-Accounts leaf to book against')
+
+    # v0.4.9 · a bank-issued statement beats anything computed here, but only
+    # when the caller hasn't named its own amount and only when a statement
+    # actually qualifies (see statements.choose_anchor_statement — it rejects
+    # any statement the mirror cannot reproduce). `source` rides through to the
+    # entry's remark so an operator reviewing the Draft can see which it was.
+    source = 'estimate' if amount is not None else 'plaid_balance'
+    anchor = None
+    if prefer_statement and amount is None:
+        anchor = statement_anchor(account)
+    if anchor is not None:
+        amount, anchored_date, statement = anchor[0], anchor[1], anchor[2]
+        source = 'statement'
+        if posting_date is None:
+            posting_date = anchored_date
+        log.info('opening balance for %s anchored on bank statement %s '
+                 '(period starting %s): %.2f', account.account_id,
+                 statement.statement_id, anchored_date, amount)
 
     value = float(account.balance_current or 0.0) if amount is None \
         else float(amount)
@@ -412,7 +479,8 @@ def book_opening_balance(client, account: PlaidAccount, *,
             f'“{equity_account_name()}” under — check its Chart of Accounts')
 
     doc = build_opening_balance_document(account, gl_account, equity, company,
-                                         value, when)
+                                         value, when,
+                                         statement=(anchor[2] if anchor else None))
     try:
         created = client.create_doc(JOURNAL_ENTRY_DT, doc)
     except (ERPNextAPIError, ERPNextError) as e:
@@ -436,15 +504,20 @@ def book_opening_balance(client, account: PlaidAccount, *,
                         'journal_entry': je_name, 'amount': entry.amount,
                         'debit_account': doc['accounts'][0]['account'],
                         'credit_account': doc['accounts'][1]['account'],
-                        'posting_date': doc.get('posting_date')},
+                        'posting_date': doc.get('posting_date'),
+                        'source': source,
+                        'statement_id': (anchor[2].statement_id
+                                         if anchor else None)},
                  notes=f'opening balance {entry.amount:.2f} for '
                        f'{account.name or account.account_id}', commit=False)
     db.session.commit()
-    log.info('opening balance %s booked for %s as %s',
-             entry.amount, account.account_id, je_name)
+    log.info('opening balance %s booked for %s as %s (source: %s)',
+             entry.amount, account.account_id, je_name, source)
+    detail = (f' from bank statement {anchor[2].period_label()}'
+              if anchor else '')
     return _result('booked',
-                   f'Opening balance {entry.amount:.2f} booked as {je_name} — '
-                   f'pending review', entry)
+                   f'Opening balance {entry.amount:.2f}{detail} booked as '
+                   f'{je_name} — pending review', entry)
 
 
 def book_if_enabled(client, account: PlaidAccount) -> dict | None:

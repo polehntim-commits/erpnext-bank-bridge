@@ -23,3 +23,14 @@ plaid-python==40.1.0
 # In-process scheduler for the transactions/sync poll (daily by default; see
 # SYNC_INTERVAL_HOURS).
 APScheduler==3.10.4
+# v0.4.9 — reads bank-statement PDFs pulled from Plaid /statements so the
+# opening and closing balances printed inside them can be recovered as numbers
+# (see app/statements.py). Plaid returns those balances ONLY in the PDF, never
+# as structured fields, so a PDF reader is the only way to get at them.
+#
+# Pure Python, no C extension — verified against this image's python:3.11-slim
+# base, and it would install from source on Alpine too. Imported lazily inside
+# statements.extract_text, so the app still boots and the suite still runs if
+# the wheel is ever missing; a parse then just returns "no balance found" and
+# every caller falls back to the v0.4.4 estimate.
+pypdf==5.1.0

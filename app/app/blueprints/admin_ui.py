@@ -13,6 +13,8 @@ Pages:
                           grouping and "create a rule from this" shortcuts
   /admin/erpnext_settings — ERPNext connection (URL + API key/secret)
   /admin/intercompany   — review transfers detected between two owned Companies
+  /admin/statements     — bank statement PDFs + per-period reconciliation
+                          against the mirrored transactions (v0.4.9)
   /admin/counterparties — unified Customer + Supplier identity, ledger, reports
   /admin/sync_log       — recent PlaidSyncLog rows
 """
@@ -43,7 +45,8 @@ from ..erpnext_client import ERPNextConfigError, ERPNextError
 from ..plaid_client import PlaidConfigError, PlaidError
 from ..models import (AuditEvent, BankTransaction, CategorizationRule,
                       GeneratedJournalEntry, IntercompanyTransferPair,
-                      PlaidAccount, PlaidItem, PlaidSyncLog, Supplier)
+                      PlaidAccount, PlaidItem, PlaidStatement, PlaidSyncLog,
+                      Supplier)
 
 log = logging.getLogger('bankbridge.admin_ui')
 
@@ -155,6 +158,7 @@ NAV_HTML = """
   <a href="/admin/counterparties" class="{{ 'active' if page == 'counterparties' else '' }}">Counterparties</a>
   <a href="/admin/generated_entries" class="{{ 'active' if page == 'generated_entries' else '' }}">Generated JEs</a>
   <a href="/admin/intercompany" class="{{ 'active' if page == 'intercompany' else '' }}">Intercompany</a>
+  <a href="/admin/statements" class="{{ 'active' if page == 'statements' else '' }}">Statements</a>
   <a href="/admin/audit" class="{{ 'active' if page == 'audit' else '' }}">Audit</a>
   <a href="/admin/sync_log" class="{{ 'active' if page == 'sync_log' else '' }}">Sync Log</a>
   <a href="/admin/plaid_settings" class="{{ 'active' if page == 'plaid_settings' else '' }}">Plaid</a>
@@ -4307,6 +4311,196 @@ def sync_log_page():
     return _page(SYNC_LOG_BODY, page='sync_log', rows=rows,
                  cur_direction=cur_direction, cur_status=cur_status,
                  flash_msg=request.args.get('flash', ''))
+
+
+# ── v0.4.9 · bank statements + reconciliation ────────────────────
+#
+# The one screen that answers "do my books agree with my bank?" without opening
+# ERPNext. Each row is a statement the institution issued; the verdict beside it
+# is that statement's own opening balance plus the movement Bank Bridge mirrored
+# in the period, measured against the bank's closing balance. A delta is a gap in
+# the mirror, in dollars, for a named month.
+
+
+STATEMENTS_BODY = """
+<h2>Bank statements</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+{% if not enabled %}
+<div class="banner-warn">
+  <h3>Statements are turned off</h3>
+  <p style="font-size:14px;margin:0">
+    <code>STATEMENTS_ENABLED</code> is false, so no statements are pulled and
+    opening balances fall back to the v0.4.4 estimate.
+  </p>
+</div>
+{% endif %}
+<p style="font-size:14px;color:#555">
+  Statement PDFs pulled from Plaid, with each period reconciled against the
+  transactions Bank Bridge mirrored. <b>Expected</b> is the statement's own
+  opening balance plus that movement; when it doesn't land on the bank's
+  <b>closing</b> balance, the difference is transactions the mirror is missing
+  for that month.
+</p>
+{% if not rows %}
+<div class="banner-warn">
+  <h3>No statements yet</h3>
+  <p style="font-size:14px;margin:0">
+    Statements need the <code>statements</code> product enabled on your Plaid
+    application, requested when the bank was linked, and supported by the
+    institution. If you enabled it after linking, re-link the bank — or run
+    <code>python -m scripts.backfill_statements</code> to pull statements for
+    accounts already linked.
+  </p>
+</div>
+{% endif %}
+{% for group in rows %}
+<h3 style="margin-bottom:4px">{{ group.account_label }}</h3>
+<div style="font-size:13px;color:#666">
+  {{ group.company or 'no Company resolved' }}
+  {% if group.mismatches %}
+  &middot; <span class="warn">&#9888; {{ group.mismatches }} period(s) don't
+  reconcile</span>
+  {% elif group.reconciled %}
+  &middot; <span style="color:#1b5e20">&#10003; {{ group.reconciled }}
+  period(s) reconcile</span>
+  {% endif %}
+</div>
+<table>
+  <tr><th>Period</th><th class="num">Opening</th><th class="num">Movement</th>
+      <th class="num">Expected</th><th class="num">Bank closing</th>
+      <th class="num">Delta</th><th>Status</th><th>PDF</th></tr>
+  {% for r in group.statements %}
+  <tr>
+    <td>{{ r.row.period_label or '—' }}</td>
+    <td class="num">{{ '%.2f'|format(r.row.opening_balance)
+                       if r.row.opening_balance is not none else '—' }}</td>
+    <td class="num">{{ '%.2f'|format(r.movement) }}</td>
+    <td class="num">{{ '%.2f'|format(r.expected_closing)
+                       if r.expected_closing is not none else '—' }}</td>
+    <td class="num">{{ '%.2f'|format(r.closing)
+                       if r.closing is not none else '—' }}</td>
+    <td class="num">{{ '%+.2f'|format(r.delta) if r.delta is not none else '—' }}</td>
+    <td>
+      {% if r.status == 'ok' %}
+        <span class="pill pill-ok">reconciled</span>
+      {% elif r.status == 'mismatch' %}
+        <span class="pill pill-err" title="Off by {{ '%.2f'|format(r.delta) }}">
+          &#9888; off by {{ '%.2f'|format(r.delta|abs) }}</span>
+      {% else %}
+        <span class="pill pill-muted"
+              title="Balances could not be read from this PDF">no balances</span>
+      {% endif %}
+    </td>
+    <td>
+      {% if r.has_pdf %}
+      <a href="/admin/statements/{{ r.row.statement_id|urlencode }}/view"
+         target="_blank">view</a>
+      {% else %}<span style="color:#999">not stored</span>{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endfor %}
+<form method="post" action="/admin/statements/pull" class="card">
+  <b>Pull statements now</b>
+  <p style="font-size:13px;color:#666;margin:6px 0">
+    Checks every connected bank for statements not already stored. Runs
+    automatically every {{ interval_days or '—' }} days.
+  </p>
+  <button type="submit">Pull statements</button>
+</form>
+"""
+
+
+def _statement_groups() -> list:
+    """One group per Plaid account that has statements, each carrying its
+    reconciled rows. Accounts with no statements are omitted — an empty section
+    per unlinked account would bury the ones that have something to say."""
+    from .. import statements as stmts
+    companies = _resolve_account_companies()
+    scope = _current_company()
+    groups = []
+    for account in PlaidAccount.query.order_by(PlaidAccount.name).all():
+        company = companies.get(account.account_id, '')
+        if scope and company != scope:
+            continue
+        rows = stmts.reconcile(account)
+        if not rows:
+            continue
+        for r in rows:
+            r['has_pdf'] = stmts.pdf_exists(r['statement'])
+        label = (account.name or account.official_name
+                 or account.mask or account.account_id)
+        if account.mask:
+            label = f'{label} ••{account.mask}'
+        groups.append({
+            'account_label': label, 'company': company, 'statements': rows,
+            'mismatches': sum(1 for r in rows if r['status'] == 'mismatch'),
+            'reconciled': sum(1 for r in rows if r['status'] == 'ok'),
+        })
+    return groups
+
+
+@bp.get('/admin/statements')
+def statements_page():
+    """Statement PDFs + per-period reconciliation, grouped by account."""
+    from .. import statements as stmts
+    return _page(STATEMENTS_BODY, page='statements',
+                 rows=_statement_groups(), enabled=stmts.is_enabled(),
+                 interval_days=stmts.pull_interval_days(),
+                 flash_msg=request.args.get('flash', ''))
+
+
+@bp.get('/admin/statements/<path:statement_id>/view')
+def statement_pdf(statement_id: str):
+    """Serve one statement's PDF inline.
+
+    Looks the statement up BY ID and serves only the path that row stored, then
+    re-checks that the path really sits under the statement root (see
+    statements.resolve_pdf_path). A file-serving route reached from a URL
+    segment is exactly where a traversal would be attempted, and the stored path
+    round-trips through the database — so neither the URL nor the column is
+    trusted on its own."""
+    from .. import statements as stmts
+    row = PlaidStatement.query.filter_by(statement_id=statement_id).first()
+    if row is None:
+        return Response('No such statement.', 404, {'Content-Type': 'text/plain'})
+    path = stmts.resolve_pdf_path(row)
+    if path is None:
+        return Response(
+            'The PDF for that statement is not on disk. Pull statements again '
+            'to re-download it.', 404, {'Content-Type': 'text/plain'})
+    with open(path, 'rb') as fh:
+        data = fh.read()
+    filename = f'statement-{row.period_label() or row.statement_id}.pdf'
+    return Response(data, 200, {
+        'Content-Type': 'application/pdf',
+        'Content-Disposition': f'inline; filename="{filename}"',
+        'Content-Length': str(len(data)),
+        # These PDFs are the operator's own bank records; keep them out of any
+        # shared cache sitting between the browser and the app.
+        'Cache-Control': 'private, no-store',
+        'X-Content-Type-Options': 'nosniff',
+    })
+
+
+@bp.post('/admin/statements/pull')
+def statements_pull():
+    """Operator-triggered statement pull — the same work the monthly job does."""
+    from .. import statements as stmts
+    if not stmts.is_enabled():
+        return redirect('/admin/statements?flash=' + quote_plus(
+            'Statements are disabled (STATEMENTS_ENABLED).'))
+    try:
+        result = stmts.fetch_all()
+    except Exception as e:
+        return redirect('/admin/statements?flash=' + quote_plus(
+            f'Statement pull failed: {e}'))
+    msg = (f"Listed {result['listed']}, stored {result['stored']}, "
+           f"already had {result['skipped_existing']}.")
+    if result['failed']:
+        msg += f" {result['failed']} could not be downloaded."
+    return redirect('/admin/statements?flash=' + quote_plus(msg))
 
 
 # ── v0.4.5 · Counterparty overlay ────────────────────────────────
