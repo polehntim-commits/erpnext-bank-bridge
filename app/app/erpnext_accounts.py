@@ -127,7 +127,7 @@ def _is_missing_doctype_error(e: ERPNextAPIError) -> bool:
 # 'Investment' joins these in v0.4.12. Before it, every investment account was
 # typed 'Current' — describing a 401k as a current/chequing-class account, which
 # is the same coarse-bucket problem v0.3.9 fixed for subtypes.
-DEFAULT_BANK_ACCOUNT_TYPES = ('Current', 'Credit', 'Investment')
+DEFAULT_BANK_ACCOUNT_TYPES = ('Current', 'Credit', 'Investment', 'Loan')
 
 # The Bank Account Subtype records `Bank Account.account_subtype` links to. That
 # field is a Link (ERPNext v15: options "Bank Account Subtype"), so a Bank Account
@@ -147,6 +147,9 @@ DEFAULT_ACCOUNT_SUBTYPES = (
     # whole question a reader has.
     'Brokerage', 'Ira', 'Roth', '401K', 'Retirement', 'Hsa',
     'Mutual Fund', 'Stock', 'Bond', 'Crypto Exchange',
+    # v0.4.14 — the loan subtypes.
+    'Mortgage', 'Student', 'Auto', 'Home Equity', 'Construction',
+    'Consumer', 'Commercial', 'Business', 'Overdraft', 'Loan',
 )
 
 # ── Plaid subtype → ERPNext support / typing ───────────────────────────────
@@ -159,13 +162,38 @@ _CURRENT_SUBTYPES = {
 _CREDIT_SUBTYPES = {'credit card', 'line of credit'}
 SUPPORTED_SUBTYPES = _CURRENT_SUBTYPES | _CREDIT_SUBTYPES
 
-# Types / subtypes we explicitly never offer a button for — not Bank Accounts
-# in ERPNext's model. Loans (and the catch-all 'other') stay out. Investment /
-# brokerage / retirement accounts USED to be here too, but v0.4.0 brings them in
-# as *balance-only* accounts (see the investment section below), so they're no
-# longer unsupported — is_investment() short-circuits is_supported() before this.
-_UNSUPPORTED_TYPES = {'loan', 'other'}
-_UNSUPPORTED_SUBTYPES = {'mortgage', 'student', 'auto'}
+# Types / subtypes we explicitly never offer a button for. Only the catch-all
+# 'other' remains: it is, by definition, an account Plaid could not classify, so
+# there is no honest GL home to put it in.
+#
+# LOANS used to be here, and their exclusion is what left a mortgage invisible
+# to the books — see the v0.4.14 section below. Investment / brokerage /
+# retirement accounts were here too until v0.4.0 brought them in balance-only.
+# Both now short-circuit is_supported() ahead of this set.
+_UNSUPPORTED_TYPES = {'other'}
+_UNSUPPORTED_SUBTYPES: set = set()
+
+# ── v0.4.14: loans as liabilities ───────────────────────────────────────────
+#
+# A loan is not a Bank Account in the sense a chequing account is, but it IS a
+# balance the books must carry: leaving a mortgage out overstates net worth by
+# the entire outstanding principal. So loans come in the same way investments
+# did in v0.4.0 — a Bank Account + a GL leaf (under Liabilities → Loans, via
+# ensure_loan_group) whose balance is tracked — and, like investments, they are
+# BALANCE-ONLY.
+#
+# Balance-only matters more here than it does for investments, because Plaid
+# genuinely returns transactions for loan accounts. Posting them would
+# double-count every payment: the money leaving the chequing account is already
+# mirrored on the chequing side, and that is the side the payment is booked
+# from. The loan's own copy of the same event must never generate a second
+# entry. See app/loans.py for how the two halves are actually booked.
+_LOAN_TYPES = {'loan'}
+_LOAN_SUBTYPES = {
+    'mortgage', 'student', 'auto', 'home equity', 'line of credit',
+    'construction', 'consumer', 'commercial', 'business', 'overdraft',
+    'home', 'loan',
+}
 
 # ── v0.4.0: balance-only investment support ─────────────────────────────────
 #
@@ -214,6 +242,30 @@ def is_investment(account: PlaidAccount) -> bool:
     return is_investment_type(account.type, account.subtype)
 
 
+def is_loan_type(type_str: str, subtype: str) -> bool:
+    """True when a (type, subtype) pair is a loan: a loan type, or a known loan
+    subtype under any type (v0.4.14).
+
+    The subtype alone qualifies because institutions do misfile — a mortgage
+    served from a bank's deposit platform can arrive as type='depository',
+    subtype='mortgage', and booking that as a chequing ASSET would flip the sign
+    of the largest number on the balance sheet."""
+    t = (type_str or '').strip().lower()
+    s = _norm_subtype(subtype)
+    if t in _LOAN_TYPES:
+        return True
+    # A credit-type 'line of credit' is a card-like liability, already handled
+    # as 'credit'; only claim it for loans when the type says loan.
+    if s == 'line of credit':
+        return t in _LOAN_TYPES
+    return s in _LOAN_SUBTYPES
+
+
+def is_loan(account: PlaidAccount) -> bool:
+    """`is_loan_type` for a PlaidAccount."""
+    return is_loan_type(account.type, account.subtype)
+
+
 def investment_subgroup(account: PlaidAccount) -> str:
     """The Investments subgroup for an investment account: Retirement /
     Marketable Securities / Digital Assets, else Other. A crypto subtype always
@@ -246,7 +298,7 @@ def is_supported(account: PlaidAccount) -> bool:
     gets a 'Create in ERPNext' button). Depository/credit subtypes are supported
     for full transaction sync; investment accounts are supported balance-only
     (v0.4.0). Loans and the catch-all 'other' remain unsupported."""
-    if is_investment(account):
+    if is_investment(account) or is_loan(account):
         return True
     t = (account.type or '').strip().lower()
     s = (account.subtype or '').strip().lower()
@@ -263,6 +315,11 @@ def erpnext_account_type(account: PlaidAccount) -> str:
     if override:
         return override
     s = (account.subtype or '').strip().lower()
+    # Checked before the credit branch, and via is_loan, so this function and
+    # _gl_side can never disagree about a loan-type line of credit or a
+    # misfiled mortgage.
+    if is_loan(account):
+        return 'Loan'
     if s in _CREDIT_SUBTYPES or (account.type or '').strip().lower() == 'credit':
         return 'Credit'
     # v0.4.12 · investments are their own class. Typing a brokerage or a 401k
@@ -300,6 +357,19 @@ _SUBTYPE_MAP = {
     'stock': 'Stock',
     'bond': 'Bond',
     'crypto exchange': 'Crypto Exchange',
+    # v0.4.14 · loan subtypes. 'line of credit' is deliberately absent — it
+    # already maps to 'Line Of Credit' above, and a loan-type credit line wants
+    # that same master.
+    'mortgage': 'Mortgage',
+    'student': 'Student',
+    'auto': 'Auto',
+    'home equity': 'Home Equity',
+    'construction': 'Construction',
+    'consumer': 'Consumer',
+    'commercial': 'Commercial',
+    'business': 'Business',
+    'overdraft': 'Overdraft',
+    'loan': 'Loan',
 }
 
 
@@ -574,12 +644,22 @@ def _gl_side(account: PlaidAccount) -> str:
     Bank Reconciliation Tool still operates on it."""
     t = (account.type or '').strip().lower()
     s = (account.subtype or '').strip().lower()
+    # v0.4.14 · loans are decided FIRST, and by is_loan rather than by the type
+    # string alone. Two cases depend on it:
+    #
+    #   * a mortgage served from a bank's deposit platform can arrive as
+    #     type='depository', subtype='mortgage'. Falling through to 'depository'
+    #     would book the largest liability on the balance sheet as a chequing
+    #     ASSET — a sign flip on six figures.
+    #   * 'line of credit' exists under both type='credit' (a revolving,
+    #     card-like line → Credit Cards) and type='loan' (a term facility →
+    #     Loans). is_loan claims it only for the latter, so each lands right.
+    if is_loan(account):
+        return 'loan'
     if t == 'credit' or s in _CREDIT_SUBTYPES:
         return 'credit'
     if is_investment(account):
         return 'investment'
-    if t == 'loan':
-        return 'loan'
     return 'depository'
 
 

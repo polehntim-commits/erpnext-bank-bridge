@@ -103,7 +103,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.13 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.14 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -312,6 +312,63 @@ Company-agnostic logical-name list too) and reports how many accounts came back.
 Create an account in ERPNext, reload the Rules editor, and it's selectable — no
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
+
+**v0.4.14** — **the mortgage joins the books.**
+Until now `is_supported` refused every loan account, so a farm with a $200,000
+orchard mortgage had a balance sheet overstating its net worth by exactly that,
+and the payments leaving the chequing account had nowhere honest to go. The
+obvious workaround is wrong twice over: categorize the whole $2,000 payment as
+an expense and you overstate expenses by the principal portion **and** still
+leave the debt off the balance sheet. Principal repayment isn't an expense — it
+settles a liability.
+
+Loans now import as liabilities (GL leaf under Liabilities → Loans, Bank Account
+Type `Loan`, subtypes Mortgage / Student / Auto / Home Equity / Construction /
+Commercial / …), and their opening balance books on the credit side.
+
+**The payment is booked as two entries, not one.** The textbook entry is three
+lines — `Dr Loan / Dr Interest / Cr Bank` — and nothing here can emit three
+lines: every Journal Entry builder in this app produces exactly two, and a rule
+has a single offset account. It would also be the wrong shape, because a
+mortgage's principal/interest split **changes every month**, so any ratio stored
+on a rule is wrong from month two. So it decomposes:
+
+```
+payment    Dr Loan Liability      Cr Bank              ← an ordinary rule
+accrual    Dr Interest Expense    Cr Loan Liability    ← generated automatically
+```
+
+Net effect is identical, and it's more faithful to what actually happens:
+interest accrues against the loan, payments settle the balance. Nothing stores a
+split, so a changing ratio needs no special handling at all. The payment half
+needs no new machinery — once the loan has a GL account it appears in the rules
+editor's dropdown like any other account.
+
+**Exact figures only, never an estimate.** Interest comes from the lender's own
+year-to-date total, differenced against what was last booked. An amortization
+estimate (balance × rate ÷ 12) was considered and rejected for the same reason
+statements refuse to guess an unparseable balance: it diverges silently on an
+extra payment, an escrow adjustment, a fee or a rate change, and nobody
+reconciles a number they were never told was approximate. A lender that reports
+no year-to-date interest gets no accrual, and the Accounts page says **manual**
+rather than leaving a silent gap.
+
+Two subtleties that would each be a real bug:
+
+- **Loans are balance-only.** Plaid *does* return transactions for loan
+  accounts, and posting them would double-count every payment — the money
+  leaving chequing is already mirrored on the chequing side, which is where it's
+  booked from. Balance-only accounts are now excluded from the push outright.
+- **A misfiled mortgage is still a liability.** An institution can serve a
+  mortgage from its deposit platform, so it arrives as `type='depository'`.
+  Trusting the type would book six figures of debt as a chequing **asset** — a
+  sign flip on the largest number on the balance sheet. Classification keys off
+  the subtype too.
+
+The `liabilities` product is requested at link time and degrades independently:
+an application approved for `statements` but not `liabilities` still gets
+statements, and a loan without liability data still imports and still tracks its
+balance.
 
 **v0.4.13** — **transactions that can never post stop costing something.**
 A Plaid Item can carry accounts ERPNext has no home for. The realistic case is a
@@ -1196,6 +1253,94 @@ The boot log says which of these happened, with ERPNext's own reason attached:
 
 Every failure is fail-open: statements stay local, nothing is lost, and the next
 scheduler tick retries.
+
+## Loans (v0.4.14)
+
+A loan is not a Bank Account in ERPNext's sense, which is why loans were refused
+outright until v0.4.14. The consequence wasn't that they were handled badly —
+they were **absent**, and a farm carrying an orchard mortgage had a balance sheet
+overstating its net worth by the whole outstanding principal.
+
+### What gets created
+
+| | Value |
+|---|---|
+| Bank Account Type | `Loan` |
+| Bank Account Subtype | `Mortgage`, `Student`, `Auto`, `Home Equity`, `Construction`, `Consumer`, `Commercial`, `Business`, `Overdraft`, `Line Of Credit` |
+| GL parent | Liabilities → (Long-term Liabilities) → Loans |
+| Opening balance | credit side — it's what you **owe** |
+
+Loans are **balance-only**: their own transactions are mirrored but never
+posted. That's the double-count guard — the money leaving your chequing account
+is already mirrored on the chequing side, and that is where the payment is
+booked from. Posting the loan's copy of the same event would book every payment
+twice.
+
+### Booking a payment: two entries, not one
+
+A $2,000 mortgage payment is really two things — interest (a cost) and principal
+(settling debt):
+
+```
+payment    Dr Loan Liability      Cr Bank              ← your rule
+accrual    Dr Interest Expense    Cr Loan Liability    ← generated automatically
+```
+
+Bank Bridge generates the **accrual**. You create the **payment** rule: on the
+Rules page, match the payment leaving your chequing account and point
+`offset_account` at the loan's GL account. It appears in the dropdown like any
+other account once the loan is imported.
+
+Why not one three-line entry? Two reasons. Nothing in this app can emit a
+three-line Journal Entry — every builder here produces exactly two, and a rule
+has a single offset account. And a mortgage's principal/interest split **changes
+every month**, so a ratio stored on a rule would be wrong from month two. The
+decomposition sidesteps both: nothing stores a split, and the accrual is
+computed fresh from live lender figures each time.
+
+### Interest: exact, or nothing
+
+Interest comes from the lender's own `ytd_interest_paid`, differenced against
+what was last booked. No amortization estimate — for the same reason statements
+refuse to guess an unparseable balance. An estimate diverges silently on an
+extra payment, an escrow adjustment, a fee or a rate change, and nobody
+reconciles a figure they weren't told was approximate.
+
+The Accounts page shows a **Loans** panel with each loan's balance, rate, next
+payment, year-to-date interest, and one honest label:
+
+- **automatic** — the lender reports year-to-date interest; accruals are
+  generated
+- **manual** — it doesn't; book interest yourself from the lender's statement
+- **not imported** — create it in ERPNext first
+
+Accruals land as `pending_review` Drafts labelled *Loan interest*. The
+year-to-date counter resets each January; that rollover is detected, so it never
+posts a negative accrual wiping out the year's interest.
+
+On upgrade the first pass **seeds** and posts nothing, so a year of
+already-accrued interest can't arrive as one entry.
+
+### The misfiled-mortgage case
+
+An institution can serve a mortgage from its deposit platform, so Plaid reports
+`type='depository'`, `subtype='mortgage'`. Trusting the type would book six
+figures of debt as a chequing **asset**. Classification keys off the subtype as
+well, so it still lands as a liability.
+
+### The `liabilities` product
+
+Requested at link time and **billable on your Plaid plan** — worth checking your
+dashboard before enabling. It degrades independently of `statements`: an
+application approved for one but not the other still gets the one it holds, and
+a loan without liability data still imports and still tracks its balance.
+
+Turn the whole feature off with `LOANS_ENABLED=false`.
+
+### What is not covered
+
+No amortization schedule, no escrow accounting, no payoff projection. Interest
+is booked from what the lender reports, not modelled.
 
 ## Investment accounts (v0.4.0, mark-to-market v0.4.12)
 
@@ -2224,6 +2369,10 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `INVESTMENT_REVALUATION_ENABLED` | `true` | v0.4.12 · mark balance-only investment accounts to market by posting the change in value as a Journal Entry. Off → the GL leaf keeps its opening value, as in v0.4.0–v0.4.11 |
 | `UNREALIZED_GAIN_ACCOUNT_NAME` | `Unrealized Gain/Loss on Investments` | v0.4.12 · the account revaluations post against, auto-created under the company's **Equity** branch. Point it at an income account if your accountant wants unrealized movement in the P&L |
 | `INVESTMENT_REVALUATION_MIN_DELTA` | `1.00` | v0.4.12 · the smallest movement worth a Journal Entry. Skipped amounts aren't lost — the next entry measures against the ledger and absorbs them |
+| `LOANS_ENABLED` | `true` | v0.4.14 · import loan accounts as liabilities and request Plaid's `liabilities` product. Off restores the pre-v0.4.14 behaviour: loans are unsupported and nothing is created or stored for them |
+| `LOAN_INTEREST_ACCRUAL_ENABLED` | `true` | v0.4.14 · generate interest accrual entries from the lender's year-to-date figures. Off still imports the loan and tracks its balance — right when you book interest by hand from the lender's statement |
+| `LOAN_INTEREST_ACCOUNT_NAME` | `Interest Expense` | v0.4.14 · the expense leaf accruals debit. An existing account of this name in your chart is adopted, not duplicated |
+| `LOAN_MIN_ACCRUAL` | `1.00` | v0.4.14 · the smallest interest movement worth a Journal Entry |
 | `FERNET_KEY` | "" | blank → autogenerated + persisted to `{DATA_DIR}/fernet.key` |
 | `SYNC_INTERVAL_HOURS` | `24` | v0.3.6 · background poll cadence in hours (**daily by default**). `0` or negative = **manual only** (no auto-poll; use "Sync now"). Editable in the admin UI, which persists a value that wins over this seed |
 | `PLAID_MAX_CALLS_PER_DAY` | `0` | v0.3.6 · optional per-Item safety brake — max Plaid pull calls per Item per UTC day (`0` = no limit). A pull that would exceed it is skipped with a logged warning |

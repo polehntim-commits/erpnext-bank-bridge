@@ -10,7 +10,12 @@ class FakePlaidClient:
     `self.pages`). `accounts` is what get_accounts returns."""
     def __init__(self, accounts=None, pages=None, statements=None,
                  statement_pdfs=None, statements_error=None,
-                 download_failures=0):
+                 download_failures=0, liabilities=None,
+                 liabilities_error=None):
+        # v0.4.14 · account_id -> the normalized liability dict
+        # plaid_client._normalize_liability produces.
+        self.liabilities = dict(liabilities or {})
+        self.liabilities_error = liabilities_error
         self.accounts = accounts or []
         self.pages = list(pages or [])
         self.calls = []
@@ -35,6 +40,17 @@ class FakePlaidClient:
                           statements=False, statements_months=24):
         self.calls.append(('create_link_token', user_id, bool(statements)))
         return 'link-sandbox-test-token'
+
+    def liabilities_get(self, access_token):
+        """v0.4.14 · /liabilities/get, keyed by account_id. Default {} models the
+        common case: an application without the `liabilities` product, or an
+        institution that doesn't offer it. The real wrapper swallows its own
+        errors and returns {} too, so a loan still imports and tracks its
+        balance — only the interest split goes missing."""
+        self.calls.append(('liabilities_get', access_token))
+        if getattr(self, 'liabilities_error', None) is not None:
+            raise self.liabilities_error
+        return {k: dict(v) for k, v in (self.liabilities or {}).items()}
 
     def statements_list(self, access_token):
         self.calls.append(('statements_list', access_token))

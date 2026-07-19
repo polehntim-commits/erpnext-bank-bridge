@@ -185,6 +185,26 @@ class PlaidAccount(db.Model):
     # the baseline is seeded (see revaluation.baseline_for) rather than posted.
     last_revalued_balance = db.Column(db.Float, nullable=True)
     last_revalued_at = db.Column(db.DateTime, nullable=True)
+    # v0.4.14 · Plaid /liabilities/get detail for a loan account, stored as the
+    # JSON Plaid sent plus the two figures that drive accounting.
+    #
+    # ONE JSON COLUMN rather than fifteen promoted ones, deliberately. The three
+    # liability shapes (mortgage / student / credit) each carry fields the others
+    # don't — escrow balance, PMI, PSLF status, loan term, property address —
+    # and promoting the union would be a wide, mostly-NULL table for data only a
+    # human reads. Postgres can query into the JSON if a real use appears. That
+    # is "maximal data science, avoid table sprawl" applied to a column, not
+    # just to a table.
+    liability_detail = db.Column(db.Text, nullable=True)
+    liability_refreshed_at = db.Column(db.DateTime, nullable=True)
+    # The year-to-date interest and principal figures already BOOKED, not the
+    # latest ones Plaid reported. Same distinction as last_revalued_balance:
+    # each accrual posts only the gap between the two, so entries compose
+    # instead of re-posting the whole year every sync. NULL = never accrued,
+    # which is when the baseline is seeded rather than posted (see
+    # loans.accrue_interest).
+    loan_ytd_interest_booked = db.Column(db.Float, nullable=True)
+    loan_ytd_principal_seen = db.Column(db.Float, nullable=True)
     # One-click-import lifecycle (see app/erpnext_accounts.py):
     #   pending     — never auto-imported (the default / freshly linked)
     #   imported    — a matching ERPNext Bank Account was created/found + linked

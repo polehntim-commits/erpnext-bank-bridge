@@ -85,6 +85,11 @@ def create_link_token():
         link_token = client.create_link_token(
             user_id='erpnext-bank-bridge',
             statements=current_app.config.get('STATEMENTS_ENABLED', True),
+            # v0.4.14 · also request `liabilities`, so a linked mortgage or
+            # student loan can report its own interest and principal figures.
+            # Degrades the same way statements does: an application without the
+            # product still links banks, and still gets statements.
+            liabilities=current_app.config.get('LOANS_ENABLED', True),
             access_token=access_token)
     except (PlaidError, PlaidConfigError) as e:
         return jsonify({'error': str(e)}), 502

@@ -137,6 +137,14 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # whole account value booked as a fictional one-off gain.
     ('plaid_accounts', 'last_revalued_balance', 'DOUBLE PRECISION'),
     ('plaid_accounts', 'last_revalued_at', 'TIMESTAMP'),
+    # v0.4.14 — loans as liabilities. All backfill to NULL: an existing install
+    # has no loan accounts imported at all (they were refused until now), and a
+    # NULL ytd baseline means "seed, don't post" — so the first sync after the
+    # upgrade cannot book a year of interest as one entry.
+    ('plaid_accounts', 'liability_detail', 'TEXT'),
+    ('plaid_accounts', 'liability_refreshed_at', 'TIMESTAMP'),
+    ('plaid_accounts', 'loan_ytd_interest_booked', 'DOUBLE PRECISION'),
+    ('plaid_accounts', 'loan_ytd_principal_seen', 'DOUBLE PRECISION'),
 ]
 
 

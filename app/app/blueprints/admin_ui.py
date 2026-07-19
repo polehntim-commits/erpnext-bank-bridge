@@ -36,6 +36,7 @@ from .. import erpnext_accounts
 from .. import erpnext_bank
 from .. import erpnext_settings as erps
 from .. import intercompany
+from .. import loans
 from .. import opening_balance as obal
 from .. import plaid_settings as ps
 from .. import reconnect
@@ -820,6 +821,53 @@ ACCOUNTS_BODY = """
     </div>
   </div>
 </div>
+{% if loan_summaries %}
+<!-- v0.4.14 · loans. Their own transactions are never posted (the payment is
+     booked from the account the money left), so the balance and the lender's
+     figures ARE the account, and they need somewhere to be visible. -->
+<h2 style="margin-top:28px">Loans</h2>
+<p style="font-size:14px;color:#555">
+  A loan payment is two things at once: interest (a cost) and principal
+  (settling debt). Bank Bridge books the <b>interest</b> automatically from the
+  lender's own year-to-date figures. Book the <b>payment</b> itself with a rule
+  on the account the money leaves, pointing at the loan's GL account — that
+  debits the loan and credits your bank, which is the other half.
+</p>
+<table>
+  <tr><th>Loan</th><th class="num">Balance</th><th class="num">Rate</th>
+      <th>Next payment</th><th class="num">YTD interest</th>
+      <th>Interest split</th></tr>
+  {% for ln in loan_summaries %}
+  <tr>
+    <td>{{ ln.label }}{% if ln.liability_type %}
+        <span style="color:#888;font-size:12px">· {{ ln.liability_type }}</span>{% endif %}</td>
+    <td class="num">{% if ln.balance is not none %}{{ '%.2f'|format(ln.balance) }}{% else %}—{% endif %}</td>
+    <td class="num">{% if ln.interest_rate is not none %}{{ '%.3f'|format(ln.interest_rate) }}%{% else %}—{% endif %}</td>
+    <td>{% if ln.next_payment_due_date %}{{ ln.next_payment_due_date }}
+        {% if ln.minimum_payment_amount is not none %}
+        · {{ '%.2f'|format(ln.minimum_payment_amount) }}{% endif %}
+        {% else %}—{% endif %}</td>
+    <td class="num">{% if ln.ytd_interest_paid is not none %}{{ '%.2f'|format(ln.ytd_interest_paid) }}{% else %}—{% endif %}</td>
+    <td>
+      {% if not ln.gl_account %}
+      <span class="pill pill-muted" title="Import this loan to ERPNext first">not imported</span>
+      {% elif ln.interest_split_available %}
+      <span class="pill pill-ok" title="Interest is booked automatically from the lender's year-to-date figures">automatic</span>
+      {% else %}
+      <span class="pill pill-warn"
+            title="This lender does not report year-to-date interest through Plaid, so Bank Bridge will not guess. Book interest by hand from the lender's statement.">manual</span>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<p style="font-size:13px;color:#555">
+  Loan transactions are mirrored but never posted — the payment is booked from
+  the account the money left, and posting the loan's own copy of the same event
+  would double-count it.
+</p>
+{% endif %}
+
 {% if any_needs_reauth %}
 <!-- v0.4.11 · Plaid Link, for the Reconnect button only. Loaded conditionally
      so an accounts page with nothing to reconnect — the normal case — fetches
@@ -966,6 +1014,7 @@ def accounts_page():
                  opening_cell=_opening_balance_cell,
                  erpnext_ok=erps.is_configured(), companies=companies,
                  any_needs_reauth=any_needs_reauth,
+                 loan_summaries=loans.all_summaries(),
                  bootstrap_unavailable=sorted(
                      erpnext_accounts.unavailable_doctypes()),
                  erp_error=erp_error, flash_msg=request.args.get('flash', ''))

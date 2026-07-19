@@ -35,6 +35,19 @@ When you link a bank through Plaid, the app pulls and stores:
   files (not exposed to unauthenticated URLs), and permissions are granted to
   System Manager, Accounts Manager and Accounts User. Set
   `ERPNEXT_STATEMENTS_ENABLED=false` to keep statements in Bank Bridge only.
+- **Loan detail** (v0.4.14, only for linked loan accounts) — for a mortgage,
+  student loan or other credit line, Plaid's `/liabilities/get` data: interest
+  rate, year-to-date interest and principal, next payment due, origination and
+  maturity dates. Bank Bridge stores Plaid's response **verbatim** so nothing is
+  lost, which means it can also include fields the app itself never reads —
+  notably, for a mortgage, the **property address**, and for some lenders a
+  loan or servicer account number. This is stored **unencrypted** alongside the
+  rest of the local database.
+
+  Only the interest and principal figures are used (to book interest accruals);
+  nothing else is sent to ERPNext. Set `LOANS_ENABLED=false` to never request
+  the `liabilities` product or store any of it.
+
 - **A Plaid access token** — the credential Plaid issues so the app can fetch
   your data. It is stored **encrypted at rest** (Fernet symmetric encryption) and
   is never written to logs or shown in the UI.

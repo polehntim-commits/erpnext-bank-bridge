@@ -269,7 +269,8 @@ class ReconnectEndpointTests(ReconnectBase):
         class Cap(FakePlaidClient):
             def create_link_token(self, user_id, redirect_uri=None,
                                   webhook=None, statements=False,
-                                  statements_months=24, access_token=None):
+                                  statements_months=24, access_token=None,
+                                  liabilities=False):
                 captured['access_token'] = access_token
                 return 'tok'
 
@@ -289,7 +290,8 @@ class ReconnectEndpointTests(ReconnectBase):
         class Cap(FakePlaidClient):
             def create_link_token(self, user_id, redirect_uri=None,
                                   webhook=None, statements=False,
-                                  statements_months=24, access_token=None):
+                                  statements_months=24, access_token=None,
+                                  liabilities=False):
                 captured['access_token'] = access_token
                 return 'tok'
 

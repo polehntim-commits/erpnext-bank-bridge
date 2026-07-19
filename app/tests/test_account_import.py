@@ -87,19 +87,22 @@ class TestSupportFilter(ImportBase):
             self.assertTrue(erpnext_accounts.is_supported(a), st)
 
     def test_unsupported_types_and_subtypes(self):
-        # Loans + the catch-all 'other' stay unsupported. (Investment accounts
-        # are now supported balance-only — see TestInvestmentSupport in
-        # test_investments.py.)
+        # Only the catch-all 'other' is unsupported now: by definition Plaid
+        # could not classify it, so there is no honest GL home for it.
+        #
+        # v0.4.14 moved LOANS out of this set — see test_loans.py. Their
+        # exclusion was what left a mortgage off the balance sheet entirely.
+        # (Investment accounts left in v0.4.0, balance-only.)
         self._item()
-        cases = [
-            ('mortgage', 'loan'),
-            ('student', 'loan'),
-            ('auto', 'loan'),
-            ('', 'other'),
-        ]
-        for i, (st, ty) in enumerate(cases):
-            a = self._account(f'un-{i}', subtype=st, type_=ty)
-            self.assertFalse(erpnext_accounts.is_supported(a), f'{ty}/{st}')
+        a = self._account('un-other', subtype='', type_='other')
+        self.assertFalse(erpnext_accounts.is_supported(a))
+
+    def test_loans_are_supported_as_liabilities(self):
+        self._item()
+        for i, subtype in enumerate(('mortgage', 'student', 'auto')):
+            a = self._account(f'loan-{i}', subtype=subtype, type_='loan')
+            self.assertTrue(erpnext_accounts.is_supported(a), subtype)
+            self.assertEqual(erpnext_accounts._gl_side(a), 'loan')
 
     def test_account_type_inference(self):
         self._item()
@@ -151,14 +154,16 @@ class TestSingleImport(ImportBase):
         self.assertEqual(ba_doc['account_type'], 'Credit')
 
     def test_unsupported_marks_status_no_erpnext_writes(self):
+        # 'other' is the only unsupported type since v0.4.14; loans import as
+        # liabilities now.
         self._item()
-        self._account('acct-mort', subtype='mortgage', type_='loan')
+        self._account('acct-other', subtype='', type_='other')
         erp = FakeERPClient()
         result = erpnext_accounts.import_plaid_account_to_erpnext(
-            'acct-mort', client=erp)
+            'acct-other', client=erp)
         self.assertEqual(result['status'], 'unsupported')
         self.assertEqual(len(erp.creates_of('Bank Account')), 0)
-        a = PlaidAccount.query.filter_by(account_id='acct-mort').first()
+        a = PlaidAccount.query.filter_by(account_id='acct-other').first()
         self.assertEqual(a.import_status, 'unsupported')
         self.assertIsNone(a.erpnext_bank_account_name)
 
@@ -310,10 +315,11 @@ class TestBulkImport(ImportBase):
         self._item()
         for i in range(5):
             self._account(f'sup-{i}', subtype='checking', mask=f'{i}{i}{i}{i}')
-        # 3 genuinely-unsupported accounts (loans + other). Investment accounts
-        # are supported balance-only now, so they no longer belong here.
-        self._account('un-0', subtype='mortgage', type_='loan')
-        self._account('un-1', subtype='student', type_='loan')
+        # Only 'other' is genuinely unsupported now. Investments went
+        # balance-only in v0.4.0 and loans became liabilities in v0.4.14, so
+        # neither belongs here any more.
+        self._account('un-0', subtype='', type_='other')
+        self._account('un-1', subtype='', type_='other')
         self._account('un-2', subtype='', type_='other')
         erp = FakeERPClient()
         stats = erpnext_accounts.import_all_supported_accounts(client=erp)
@@ -395,7 +401,7 @@ class TestEndpoints(ImportBase):
     def test_accounts_page_shows_create_and_unsupported(self):
         self._item()
         self._account('acct-1', subtype='checking')
-        self._account('acct-2', subtype='mortgage', type_='loan')
+        self._account('acct-2', subtype='', type_='other')
         # Don't hit the (unreachable) ERPNext for the dropdown's Bank Account
         # list — that's the transaction bridge's concern, not this page's logic.
         with mock.patch('app.erpnext_bank.list_bank_accounts', return_value=[]):

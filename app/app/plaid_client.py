@@ -88,7 +88,8 @@ class PlaidClient:
     def create_link_token(self, user_id: str, *, redirect_uri: str = None,
                           webhook: str = None, statements: bool = False,
                           statements_months: int = 24,
-                          access_token: str = None) -> str:
+                          access_token: str = None,
+                          liabilities: bool = False) -> str:
         """Create a short-lived link_token for Plaid Link. `redirect_uri` is
         required for OAuth-only banks (Wells Fargo) and must be registered in
         the Plaid dashboard. Returns the link_token string.
@@ -134,19 +135,64 @@ class PlaidClient:
             return self._link_token_create(
                 api, self._update_mode_kwargs(user_id, redirect_uri, webhook,
                                               access_token))
-        kwargs = self._link_token_kwargs(user_id, redirect_uri, webhook)
+        base = self._link_token_kwargs(user_id, redirect_uri, webhook)
+
+        # The optional products, each independently subject to approval on the
+        # Plaid application. Asking for one the application doesn't hold is a
+        # hard 400 that would otherwise make "Link a bank" stop working
+        # entirely, so we degrade through progressively smaller sets rather
+        # than all-or-nothing: an install approved for `statements` but not
+        # `liabilities` still gets statements.
+        wanted = []
         if statements:
-            with_statements = self._with_statements(dict(kwargs),
-                                                    statements_months)
+            wanted.append('statements')
+        if liabilities:
+            wanted.append('liabilities')
+        for attempt in self._product_ladder(wanted):
+            kwargs = dict(base)
+            if 'statements' in attempt:
+                kwargs = self._with_statements(kwargs, statements_months)
+            if 'liabilities' in attempt:
+                kwargs = self._with_liabilities(kwargs)
             try:
-                return self._link_token_create(api, with_statements)
+                return self._link_token_create(api, kwargs)
             except PlaidError as e:
+                if not attempt:
+                    raise       # even transactions-only failed — a real error
                 log.warning(
-                    'create_link_token with the `statements` product failed '
-                    '(%s) — retrying without it. Statements stay unavailable '
-                    'for this Item until `statements` is enabled on the Plaid '
-                    'application and the bank is re-linked.', e)
-        return self._link_token_create(api, kwargs)
+                    'create_link_token with %s failed (%s) — retrying with a '
+                    'smaller product set. Those products stay unavailable for '
+                    'this Item until they are enabled on the Plaid application '
+                    'and the bank is re-linked.', ' + '.join(attempt) or 'none',
+                    e)
+        raise PlaidError('create_link_token exhausted every product '
+                         'combination')  # pragma: no cover - ladder ends at []
+
+    @staticmethod
+    def _product_ladder(wanted: list) -> list:
+        """Product sets to try, richest first, always ending at the empty set
+        (transactions only — the pre-v0.4.9 token that must always work).
+
+        For two optional products that is [both] → [a] → [b] → [], so exactly
+        one unapproved product costs one extra call and still yields the other.
+        Ordinary (fully-approved) links succeed on the first attempt and pay
+        nothing for this."""
+        if not wanted:
+            return [[]]
+        if len(wanted) == 1:
+            return [list(wanted), []]
+        return [list(wanted)] + [[p] for p in wanted] + [[]]
+
+    @staticmethod
+    def _with_liabilities(kwargs: dict) -> dict:
+        """Add the `liabilities` product (v0.4.14). Unlike `statements` it needs
+        no configuration block — the product alone is what lets
+        /liabilities/get answer for the Item."""
+        from plaid.model.products import Products
+        kwargs = dict(kwargs)
+        kwargs['products'] = list(kwargs.get('products') or []) + \
+            [Products('liabilities')]
+        return kwargs
 
     def _link_token_kwargs(self, user_id, redirect_uri, webhook) -> dict:
         """The LinkTokenCreateRequest kwargs common to both attempts."""
@@ -333,6 +379,44 @@ class PlaidClient:
             'has_more': bool(_resp_get(resp, 'has_more')),
         }
 
+    # ── liabilities (v0.4.14) ────────────────────────────────────────
+
+    def liabilities_get(self, access_token: str) -> dict:
+        """Plaid's liability detail for this Item, keyed by account_id:
+        {account_id: {'liability_type', 'interest_rate', 'ytd_interest_paid',
+        'ytd_principal_paid', 'next_payment_due_date', 'last_payment_amount',
+        'last_payment_date', 'origination_principal_amount', 'maturity_date',
+        'minimum_payment_amount', 'raw': {...}}}.
+
+        `raw` carries Plaid's whole object verbatim, because the three liability
+        shapes (mortgage / student / credit) each field things the others don't
+        — escrow balance, PSLF status, loan term — and promoting all of them
+        would be a column sprawl for data only a human reads. Postgres can query
+        into the stored JSON if a real use ever appears.
+
+        Returns {} — never raises — when the Item can't serve Liabilities. That
+        is the COMMON case, not an edge one: the product must be approved on the
+        Plaid application AND requested at Link time AND offered by the
+        institution. Same deliberate asymmetry as statements_list: a missing
+        optional product is a fact about the install, not an error, and every
+        consumer degrades to 'no liability detail' (see app/loans.py)."""
+        from plaid.model.liabilities_get_request import LiabilitiesGetRequest
+        api = self._get_api()
+        try:
+            resp = api.liabilities_get(
+                LiabilitiesGetRequest(access_token=access_token))
+        except Exception as e:
+            log.info('liabilities unavailable for this item: %s', e)
+            return {}
+        payload = _to_dict(_get(_to_dict(resp), 'liabilities', {})) or {}
+        out: dict = {}
+        for kind in ('mortgage', 'student', 'credit'):
+            for entry in (_get(payload, kind, []) or []):
+                row = _normalize_liability(entry, kind)
+                if row.get('account_id'):
+                    out[row['account_id']] = row
+        return out
+
     # ── statements (v0.4.9) ──────────────────────────────────────────
 
     def statements_list(self, access_token: str) -> list[dict]:
@@ -495,6 +579,61 @@ def _normalize_account(a) -> dict:
         'balance_available': _get(balances, 'available'),
         'balance_current': _get(balances, 'current'),
         'iso_currency_code': _get(balances, 'iso_currency_code', 'USD') or 'USD',
+    }
+
+
+def _as_float(value):
+    """A float, or None. Plaid returns Decimals and occasional strings."""
+    if value is None or value == '':
+        return None
+    try:
+        return round(float(value), 4)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_iso(value) -> str:
+    """'YYYY-MM-DD', or ''. Plaid hands dates back as date objects or strings
+    depending on the SDK path."""
+    if value is None:
+        return ''
+    if hasattr(value, 'isoformat'):
+        return value.isoformat()[:10]
+    return str(value)[:10]
+
+
+def _normalize_liability(entry, kind: str) -> dict:
+    """One /liabilities/get object, flattened to the fields loan accounting
+    needs, with the original kept under `raw`.
+
+    The three shapes differ, and the differences matter: a mortgage carries
+    `interest_rate` as an OBJECT ({percentage, type}) while a student loan
+    carries `interest_rate_percentage` as a bare number, and only mortgage and
+    student report year-to-date interest and principal at all. Reconciling that
+    here means app/loans.py never has to know which kind it is holding."""
+    d = _to_dict(entry)
+    rate = _get(d, 'interest_rate_percentage')
+    if rate is None:
+        rate_obj = _to_dict(_get(d, 'interest_rate', {})) or {}
+        rate = _get(rate_obj, 'percentage')
+    return {
+        'account_id': _get(d, 'account_id'),
+        'liability_type': kind,
+        'interest_rate': _as_float(rate),
+        'ytd_interest_paid': _as_float(_get(d, 'ytd_interest_paid')),
+        'ytd_principal_paid': _as_float(_get(d, 'ytd_principal_paid')),
+        'next_payment_due_date': _as_iso(_get(d, 'next_payment_due_date')),
+        'last_payment_amount': _as_float(_get(d, 'last_payment_amount')),
+        'last_payment_date': _as_iso(_get(d, 'last_payment_date')),
+        'origination_principal_amount': _as_float(
+            _get(d, 'origination_principal_amount')),
+        'origination_date': _as_iso(_get(d, 'origination_date')),
+        'maturity_date': _as_iso(_get(d, 'maturity_date') or
+                                 _get(d, 'expected_payoff_date')),
+        'minimum_payment_amount': _as_float(
+            _get(d, 'minimum_payment_amount') or
+            _get(d, 'next_monthly_payment')),
+        'raw': _to_dict(d),
     }
 
 

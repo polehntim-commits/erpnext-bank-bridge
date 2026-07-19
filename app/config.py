@@ -500,6 +500,29 @@ class Config:
     except ValueError:
         INVESTMENT_REVALUATION_MIN_DELTA = 1.00
 
+    # ── v0.4.14 · loans as liabilities (see app/loans.py) ────────────────
+    #   * whether loan accounts (mortgage, student, auto, equipment notes) are
+    #     imported at all. Off restores the pre-v0.4.14 behaviour exactly:
+    #     loans are unsupported and nothing is created for them.
+    LOANS_ENABLED = _bool('LOANS_ENABLED', True)
+    #   * whether Bank Bridge generates interest accrual entries
+    #     (Dr Interest Expense / Cr Loan Liability) from the lender's own
+    #     year-to-date figures. Off still imports the loan and tracks its
+    #     balance — for an operator who books interest by hand from the
+    #     lender's statement, which is the right call when the lender doesn't
+    #     report year-to-date interest through Plaid.
+    LOAN_INTEREST_ACCRUAL_ENABLED = _bool('LOAN_INTEREST_ACCRUAL_ENABLED', True)
+    #   * the expense leaf accruals debit. An existing 'Interest Expense' in
+    #     your chart is adopted rather than duplicated.
+    LOAN_INTEREST_ACCOUNT_NAME = os.environ.get(
+        'LOAN_INTEREST_ACCOUNT_NAME', 'Interest Expense').strip() or \
+        'Interest Expense'
+    #   * the smallest interest movement worth a Journal Entry.
+    try:
+        LOAN_MIN_ACCRUAL = abs(float(os.environ.get('LOAN_MIN_ACCRUAL', '1.00')))
+    except ValueError:
+        LOAN_MIN_ACCRUAL = 1.00
+
     # Set false to disable the in-process scheduler entirely (e.g. drive syncs by
     # cron hitting /api/sync/plaid_now instead). Distinct from MANUAL-ONLY above:
     # this stops the scheduler process; MANUAL-ONLY runs it with no poll job.

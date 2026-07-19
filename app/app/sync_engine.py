@@ -42,6 +42,7 @@ from . import erpnext_accounts
 from . import erpnext_bank
 from . import erpnext_settings
 from . import intercompany
+from . import loans
 from . import plaid_settings
 from . import reconnect
 from . import revaluation
@@ -197,8 +198,14 @@ def refresh_accounts(item: PlaidItem, plaid_client: PlaidClient,
         acct.currency = cur
         # v0.4.0: re-derive balance-only (investment) each refresh from the live
         # type/subtype, so a reclassification flips the flag either way.
-        acct.balance_only = erpnext_accounts.is_investment_type(
-            acct.type, acct.subtype)
+        # v0.4.14 · loans join investments as balance-only. The reason differs
+        # and matters: an investment has no transactions to fetch, whereas a
+        # loan HAS them and they must not be posted — the payment is booked from
+        # the chequing side where the money actually moved, and posting the
+        # loan's own copy of the same event would double-count every payment.
+        acct.balance_only = (
+            erpnext_accounts.is_investment_type(acct.type, acct.subtype)
+            or erpnext_accounts.is_loan_type(acct.type, acct.subtype))
         acct.updated_at = _now()
         # v0.4.11 · a newly-seen account at a bank we have linked BEFORE is
         # usually the same real account under a new Plaid id — a re-link, not a
@@ -282,6 +289,17 @@ def pull_item(item: PlaidItem, plaid_client: PlaidClient) -> dict:
             stats['accounts'] = refresh_accounts(item, plaid_client, access_token)
         except PlaidError as e:
             log.warning('account refresh failed for %s: %s', item.item_id, e)
+        # v0.4.14 · pull the lender's own loan figures alongside the balance.
+        # Only spends a call when this Item actually has a loan account, and
+        # answers {} when the `liabilities` product isn't approved — in which
+        # case the loan still imports and its balance is still tracked, only
+        # the interest split is unavailable. Never raises.
+        try:
+            loans.refresh_liabilities(item, plaid_client, access_token)
+        except Exception:  # pragma: no cover - refresh already swallows
+            db.session.rollback()
+            log.warning('liability refresh failed for %s', item.item_id,
+                        exc_info=True)
 
     # v0.4.0: an Item whose every account is balance-only (e.g. a 401k-only
     # institution) has no transactions to fetch — Plaid returns none without the
@@ -356,12 +374,34 @@ def pull_item(item: PlaidItem, plaid_client: PlaidClient) -> dict:
 # ── ERPNext push ───────────────────────────────────────────────────────
 
 def _eligible_account_map() -> dict:
-    """account_id → PlaidAccount for accounts that are mapped + sync-enabled."""
+    """account_id → PlaidAccount for accounts whose transactions should be
+    posted to ERPNext: mapped, sync-enabled, and not balance-only.
+
+    v0.4.14 adds the balance-only exclusion, and it is load-bearing rather than
+    tidy. Investments never returned transactions, so their presence here was
+    harmless; LOANS do return them. A mortgage payment is booked from the
+    chequing side, where the money actually left — posting the loan account's
+    own copy of the same event would double-count every payment. Balance-only
+    accounts carry their position through their balance (see app/loans.py and
+    app/revaluation.py), never through their transactions."""
     out = {}
     for a in PlaidAccount.query.all():
-        if a.erpnext_bank_account_name and a.sync_enabled:
+        if a.erpnext_bank_account_name and a.sync_enabled and not a.balance_only:
             out[a.account_id] = a
     return out
+
+
+def _never_posts_account_ids() -> list:
+    """Accounts whose transactions are mirrored but INTENTIONALLY never posted:
+    the balance-only ones (investments, and loans since v0.4.14).
+
+    Held apart from "waiting on the operator" because the two look identical in
+    the data and mean opposite things. A loan's transactions are not stuck —
+    the payment is booked from the chequing side by design — and telling an
+    operator that 40 mortgage rows are "waiting" would send them looking for a
+    problem that isn't there."""
+    return [a.account_id for a in
+            PlaidAccount.query.filter(PlaidAccount.balance_only.is_(True)).all()]
 
 
 def unpostable_pending_count() -> int:
@@ -383,6 +423,11 @@ def unpostable_pending_count() -> int:
                                      BankTransaction.removed.is_(False))
     if eligible:
         q = q.filter(BankTransaction.account_id.notin_(eligible))
+    # v0.4.14 · balance-only accounts are excluded: their rows are not waiting
+    # on anything (see _never_posts_account_ids).
+    never = _never_posts_account_ids()
+    if never:
+        q = q.filter(BankTransaction.account_id.notin_(never))
     return q.count()
 
 
@@ -398,6 +443,9 @@ def unpostable_by_account() -> dict:
                  BankTransaction.removed.is_(False)))
     if eligible:
         q = q.filter(BankTransaction.account_id.notin_(eligible))
+    never = _never_posts_account_ids()
+    if never:
+        q = q.filter(BankTransaction.account_id.notin_(never))
     return {account_id: count
             for account_id, count in q.group_by(BankTransaction.account_id).all()}
 
@@ -654,6 +702,15 @@ def sync_item(item: PlaidItem, plaid_client: PlaidClient = None,
             revaluation.revalue_all(erp_client)
         except Exception:  # pragma: no cover - revalue_all is already total
             log.warning('investment revaluation failed for %s', item.item_id,
+                        exc_info=True)
+        # v0.4.14 · book the interest each loan has accrued since last time.
+        # The other half of a loan payment — the principal — is booked from the
+        # chequing side by an ordinary categorization rule; see app/loans.py for
+        # why the two halves are separate entries.
+        try:
+            loans.accrue_all(erp_client)
+        except Exception:  # pragma: no cover - accrue_all is already total
+            log.warning('loan interest accrual failed for %s', item.item_id,
                         exc_info=True)
     return {'item_id': item.item_id, 'pull': pull_stats, 'push': push_stats}
 
