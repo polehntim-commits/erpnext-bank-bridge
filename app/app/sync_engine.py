@@ -364,6 +364,44 @@ def _eligible_account_map() -> dict:
     return out
 
 
+def unpostable_pending_count() -> int:
+    """How many mirrored transactions cannot post because their account isn't
+    mapped + sync-enabled (v0.4.13).
+
+    A COUNT, never a load. These rows are legitimate data — the transactions
+    really happened, and they post the moment the account is mapped — but they
+    can accumulate without bound, and before this release the push path LOADED
+    every one of them on every run just to skip it.
+
+    Reported so the situation is visible rather than silent. The realistic
+    source is an account Plaid returns but ERPNext has no home for: a mortgage
+    or student loan sharing an Item with a checking account, where `is_supported`
+    refuses the loan (it is not a Bank Account in ERPNext's model) while
+    /transactions/sync keeps returning its payments."""
+    eligible = list(_eligible_account_map().keys())
+    q = BankTransaction.query.filter(BankTransaction.posted_at.is_(None),
+                                     BankTransaction.removed.is_(False))
+    if eligible:
+        q = q.filter(BankTransaction.account_id.notin_(eligible))
+    return q.count()
+
+
+def unpostable_by_account() -> dict:
+    """account_id → count of mirrored-but-unpostable transactions, in ONE
+    grouped query. Feeds the Accounts page hint, so an operator can see that a
+    linked-but-unmapped account has history waiting rather than wondering where
+    its transactions went."""
+    eligible = list(_eligible_account_map().keys())
+    q = (db.session.query(BankTransaction.account_id,
+                          db.func.count(BankTransaction.id))
+         .filter(BankTransaction.posted_at.is_(None),
+                 BankTransaction.removed.is_(False)))
+    if eligible:
+        q = q.filter(BankTransaction.account_id.notin_(eligible))
+    return {account_id: count
+            for account_id, count in q.group_by(BankTransaction.account_id).all()}
+
+
 def _push_row(erp_client, row: BankTransaction, account: PlaidAccount) -> bool:
     """Bring one local row's ERPNext doc to its intended state. Returns True if
     an ERPNext operation was performed (and posted_at stamped)."""
@@ -392,11 +430,30 @@ def push_pending(erp_client, item_id: str = '') -> dict:
     + enabled. Rows for unmapped accounts are left pending (no error). Logs one
     erpnext_push row. `item_id` scopes the log line (optional)."""
     stats = {'posted': 0, 'cancelled': 0, 'failed': 0, 'skipped': 0, 'drift': 0,
-             'paired': 0, 'pairs_booked': 0}
+             'paired': 0, 'pairs_booked': 0, 'unpostable': 0}
     if erp_client is None:
         return stats
     eligible = _eligible_account_map()
     q = BankTransaction.query.filter(BankTransaction.posted_at.is_(None))
+    # v0.4.13 · restrict the scan to accounts that can actually receive a
+    # posting. This used to load EVERY pending row and skip the ineligible ones
+    # in Python, which quietly got more expensive forever: a Plaid Item carrying
+    # a mortgage alongside a checking account keeps returning loan transactions,
+    # `is_supported` refuses to give a loan an ERPNext Bank Account, and so those
+    # rows could never post — yet every push re-loaded all of them, fed their ids
+    # into the intercompany pair detector, and incremented `skipped`.
+    #
+    # Filtering here rather than flagging the rows keeps the behaviour
+    # SELF-HEALING: map the account (or re-enable sync) and its backlog becomes
+    # eligible on the very next push, with no migration and no state to unwind.
+    # The rows themselves are untouched — they are real mirrored transactions,
+    # and dropping them would lose history the account's own import would want.
+    if eligible:
+        q = q.filter(BankTransaction.account_id.in_(list(eligible.keys())))
+    else:
+        # Nothing is mapped yet: there is provably nothing to post, and an
+        # unbounded `IN ()` is not worth constructing.
+        q = q.filter(db.false())
     pending = q.order_by(BankTransaction.date.asc()).all()
     # v0.4.1 · pair BEFORE categorizing. A transfer between two Companies the
     # operator owns must not be seen by the ordinary rules engine at all — so the
@@ -464,9 +521,20 @@ def push_pending(erp_client, item_id: str = '') -> dict:
         log.warning('intercompany JE generation failed after push', exc_info=True)
     handled = stats['posted'] + stats['cancelled']
     status = 'failed' if stats['failed'] and not handled else 'success'
+    # v0.4.13 · say how much is mirrored-but-unpostable. The rows are no longer
+    # scanned (see the query above), so without this the situation would be
+    # invisible instead of merely expensive — and "where did my mortgage
+    # payments go?" deserves an answer in the log rather than silence.
+    stats['unpostable'] = unpostable_pending_count()
+    if stats['unpostable']:
+        log.info('[push] %d mirrored transaction(s) cannot post yet — their '
+                 'Plaid account is not mapped to an ERPNext Bank Account (or '
+                 'has sync disabled). They post automatically once it is; see '
+                 '/admin/accounts.', stats['unpostable'])
     _log(item_id, 'erpnext_push', handled, status,
          f"posted={stats['posted']} cancelled={stats['cancelled']} "
          f"failed={stats['failed']} skipped={stats['skipped']} "
+         f"unpostable={stats['unpostable']} "
          f"drift={stats['drift']} paired={stats['paired']} "
          f"pairs_booked={stats['pairs_booked']}")
     return stats

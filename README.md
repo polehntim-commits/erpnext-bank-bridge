@@ -103,7 +103,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.12 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.13 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -312,6 +312,32 @@ Company-agnostic logical-name list too) and reports how many accounts came back.
 Create an account in ERPNext, reload the Rules editor, and it's selectable — no
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
+
+**v0.4.13** — **transactions that can never post stop costing something.**
+A Plaid Item can carry accounts ERPNext has no home for. The realistic case is a
+**mortgage or student loan sharing an Item with your checking account**: loans
+aren't Bank Accounts in ERPNext's model, so `is_supported` refuses them — but
+`/transactions/sync` keeps returning their payments, which mirror locally and can
+never post.
+
+Keeping those rows is correct; the transactions really happened, and dropping
+them would lose history the account's own import would want. What was wrong is
+that the push path **loaded every one of them on every run just to skip it**, so
+the work grew without bound forever. Their ids were also fed into the
+intercompany pair detector on each pass, and they inflated `skipped` — making
+that number useless for the case it was meant to describe.
+
+The scan is now restricted, in SQL, to accounts that can actually receive a
+posting. Measured over six pushes with a growing loan backlog, rows scanned stays
+**flat** while the backlog grows from 4 to 24. Nothing is flagged on the rows, so
+the behaviour is **self-healing**: map the account (or re-enable sync) and the
+entire backlog posts on the very next push, with no migration and no state to
+unwind.
+
+And it is no longer silent. The count appears in the push stats, in the sync log
+(`unpostable=N`), and per-account on the Accounts page as *"N txns waiting"* —
+because *"where did my mortgage payments go?"* deserves an answer on the page
+rather than nothing at all.
 
 **v0.4.12** — **investments stop lying on the balance sheet.**
 v0.4.0 brought investment accounts in as *balance-only*: Bank Bridge creates the

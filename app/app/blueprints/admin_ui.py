@@ -748,6 +748,16 @@ ACCOUNTS_BODY = """
       {% else %}
         <span class="pill pill-muted" title="Not a Bank Account in ERPNext's model">not supported</span>
       {% endif %}
+      {% if unpostable.get(a.account_id) %}
+      <!-- v0.4.13 · this account's transactions ARE being mirrored, they just
+           have nowhere to post. Saying so beats the operator wondering where a
+           loan's payments went — the realistic case is a mortgage sharing an
+           Item with a checking account. -->
+      <div style="font-size:11px;color:#8a5a00;margin-top:4px"
+           title="Mirrored locally but not posted to ERPNext, because this account is not mapped (or sync is off). They post automatically once it is.">
+        {{ unpostable[a.account_id] }} txn{{ '' if unpostable[a.account_id] == 1 else 's' }} waiting
+      </div>
+      {% endif %}
     </td>
     <td style="white-space:nowrap">{{ opening_cell(a)|safe }}</td>
     <td>
@@ -952,6 +962,7 @@ def accounts_page():
     return _page(ACCOUNTS_BODY, page='accounts', groups=groups,
                  bank_accounts=bank_accounts, bank_account_names=bank_account_names,
                  supported_map=supported_map, any_imported=any_imported,
+                 unpostable=sync_engine.unpostable_by_account(),
                  opening_cell=_opening_balance_cell,
                  erpnext_ok=erps.is_configured(), companies=companies,
                  any_needs_reauth=any_needs_reauth,
