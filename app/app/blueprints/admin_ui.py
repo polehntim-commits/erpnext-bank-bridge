@@ -4409,6 +4409,20 @@ STATEMENTS_BODY = """
   </p>
   <button type="submit">Pull statements</button>
 </form>
+<form method="post" action="/admin/statements/sync_erpnext" class="card">
+  <b>Send statements to ERPNext</b>
+  <p style="font-size:13px;color:#666;margin:6px 0">
+    Creates a <code>Bank Statement</code> record in ERPNext for every statement
+    held here, with the PDF attached, so the bookkeeper can read them without
+    logging in to Bank Bridge. Runs automatically at startup and after each
+    pull; idempotent, so running it again uploads nothing twice.
+  </p>
+  <button type="submit">Sync to ERPNext</button>
+</form>
+<p style="font-size:14px">
+  Reports: <a href="/admin/statements/reports/discrepancies">discrepancies</a>
+  · <a href="/admin/statements/reports/coverage">coverage gaps</a>
+</p>
 """
 
 
@@ -4500,6 +4514,165 @@ def statements_pull():
            f"already had {result['skipped_existing']}.")
     if result['failed']:
         msg += f" {result['failed']} could not be downloaded."
+    return redirect('/admin/statements?flash=' + quote_plus(msg))
+
+
+# ── v0.4.10 · statements inside ERPNext ──────────────────────────
+#
+# Two reports over the Bank Statement records this release uploads. Both read
+# ERPNext first and fall back to Bank Bridge's own rows when it cannot be
+# reached — and say which they used, because an operator reading a report during
+# an ERPNext outage deserves to know whether they are looking at ERPNext.
+
+SOURCE_NOTE = """
+<p style="font-size:13px;color:#555">
+  {% if data_source == 'erpnext' %}
+  Read live from ERPNext's <code>Bank Statement</code> records.
+  {% else %}
+  <b>ERPNext could not be reached</b>, so this is computed from Bank Bridge's
+  own statement rows. Every number is the same one ERPNext would show — Bank
+  Bridge is the source of truth for all of them — but records may not be
+  uploaded yet.
+  {% endif %}
+</p>
+"""
+
+DISCREPANCIES_BODY = """
+<h2>Statement discrepancies</h2>
+""" + SOURCE_NOTE + """
+<p style="font-size:14px;color:#555">
+  Statements whose closing balance disagrees with the mirrored transactions by
+  more than <b>{{ '%.2f'|format(threshold) }}</b>. A discrepancy means the
+  transaction mirror has a gap for that period — not that the bank is wrong.
+  Statements whose PDF could not be parsed are absent: an unreadable statement
+  says nothing about whether the books agree.
+</p>
+<p style="font-size:13px;color:#555">
+  Raise or lower the bar with <code>ERPNEXT_STATEMENT_VARIANCE_THRESHOLD</code>.
+</p>
+{% if not rows %}
+<div class="card">
+  <h3>No discrepancies</h3>
+  <p style="font-size:14px;margin:0">
+    Every statement that could be reconciled lands within
+    {{ '%.2f'|format(threshold) }} of the mirror.
+  </p>
+</div>
+{% else %}
+<table>
+  <tr><th>Bank Account</th><th>Period</th><th class="num">Opening</th>
+      <th class="num">Closing</th><th class="num">Variance</th>
+      <th>Status</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td>{{ r.bank_account or '—' }}</td>
+    <td>{{ r.period_start or '?' }} → {{ r.period_end or '?' }}</td>
+    <td class="num">{{ '%.2f'|format(r.opening_balance) }}</td>
+    <td class="num">{{ '%.2f'|format(r.closing_balance) }}</td>
+    <td class="num"><b>{{ '%+.2f'|format(r.variance) }}</b></td>
+    <td>{{ r.status }}</td>
+  </tr>
+  {% endfor %}
+</table>
+<p style="font-size:13px;color:#555">
+  Variance is <i>expected closing minus the bank's closing</i>: positive means
+  the mirror shows more money than the bank did, negative means less.
+</p>
+{% endif %}
+<p style="font-size:14px"><a href="/admin/statements">← back to statements</a>
+  · <a href="/admin/statements/reports/coverage">coverage report</a></p>
+"""
+
+COVERAGE_BODY = """
+<h2>Statement coverage</h2>
+""" + SOURCE_NOTE + """
+<p style="font-size:14px;color:#555">
+  Months with no statement, over the last {{ months|length }} closed months. A
+  gap here is the failure statements exist to catch: an unparseable statement is
+  visible on <a href="/admin/statements">/admin/statements</a>, but one that was
+  never fetched at all is visible nowhere — and it is the one that leaves a
+  quarter unreconciled at tax time.
+</p>
+<p style="font-size:13px;color:#555">
+  Months before an account's first statement are not counted: an account linked
+  in May cannot be missing January. The month in progress is excluded too — its
+  statement has not been issued yet.
+</p>
+{% if not rows %}
+<div class="card">
+  <h3>No statements yet</h3>
+  <p style="font-size:14px;margin:0">
+    Nothing to measure coverage over. Pull statements on
+    <a href="/admin/statements">/admin/statements</a> first.
+  </p>
+</div>
+{% else %}
+<table>
+  <tr><th>Account</th><th class="num">Held</th><th class="num">Expected</th>
+      <th class="num">Gaps</th><th>Missing months</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td>{{ r.label }}</td>
+    <td class="num">{{ r.months_held }}</td>
+    <td class="num">{{ r.months_expected }}</td>
+    <td class="num">{% if r.gap_count %}<b>{{ r.gap_count }}</b>{% else %}0{% endif %}</td>
+    <td>{{ r.missing|join(', ') or '— complete —' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+<p style="font-size:14px"><a href="/admin/statements">← back to statements</a>
+  · <a href="/admin/statements/reports/discrepancies">discrepancy report</a></p>
+"""
+
+
+def _statement_report_client():
+    """The ERPNext client for a statement report, or None. Both reports degrade
+    to Bank Bridge's local rows rather than 500-ing when ERPNext is
+    unconfigured or the doctype was never provisioned."""
+    return sync_engine.get_erp_client_or_none()
+
+
+@bp.get('/admin/statements/reports/discrepancies')
+def statement_discrepancies():
+    """Statements whose reconciliation variance exceeds the threshold."""
+    from .. import erpnext_statements as es
+    report = es.discrepancy_report(_statement_report_client())
+    return _page(DISCREPANCIES_BODY, page='statements', rows=report['rows'],
+                 threshold=report['threshold'], data_source=report['source'])
+
+
+@bp.get('/admin/statements/reports/coverage')
+def statement_coverage():
+    """Accounts with month gaps in their statement coverage."""
+    from .. import erpnext_statements as es
+    report = es.coverage_report(_statement_report_client())
+    return _page(COVERAGE_BODY, page='statements', rows=report['rows'],
+                 months=report['months'], data_source=report['source'])
+
+
+@bp.post('/admin/statements/sync_erpnext')
+def statements_sync_erpnext():
+    """Operator-triggered ERPNext upload — the same work the boot job does."""
+    from .. import erpnext_statements as es
+    if not es.is_enabled():
+        return redirect('/admin/statements?flash=' + quote_plus(
+            'The ERPNext statement overlay is disabled '
+            '(ERPNEXT_STATEMENTS_ENABLED).'))
+    try:
+        result = es.sync_all(_statement_report_client())
+    except Exception as e:  # pragma: no cover - sync_all is already total
+        return redirect('/admin/statements?flash=' + quote_plus(
+            f'ERPNext statement sync failed: {e}'))
+    msg = (f"Created {result['created']}, adopted {result['adopted']}, "
+           f"already synced {result['already_synced']}.")
+    if result['no_account']:
+        msg += (f" {result['no_account']} skipped — their Plaid account has no "
+                f"ERPNext Bank Account yet.")
+    if result['failed']:
+        msg += f" {result['failed']} failed."
+    if result['errors']:
+        msg += f" {result['errors'][0]}"
     return redirect('/admin/statements?flash=' + quote_plus(msg))
 
 

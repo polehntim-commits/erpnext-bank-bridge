@@ -25,6 +25,16 @@ When you link a bank through Plaid, the app pulls and stores:
   balances). They are stored **unencrypted**, the same as the rest of the local
   database, and are readable by anyone with access to the app's data volume or
   its admin interface. Set `STATEMENTS_ENABLED=false` to never fetch them.
+
+  Since **v0.4.10** these PDFs are also **uploaded into your ERPNext**, attached
+  to a `Bank Statement` record, so your bookkeeper can read them there. This is
+  worth being deliberate about: a statement PDF is a complete bank document and
+  routinely contains a full transaction listing and your full account number —
+  more than the Bank Transaction records ERPNext already holds. Anyone who can
+  read that doctype in ERPNext can open the PDF. They are uploaded as **private**
+  files (not exposed to unauthenticated URLs), and permissions are granted to
+  System Manager, Accounts Manager and Accounts User. Set
+  `ERPNEXT_STATEMENTS_ENABLED=false` to keep statements in Bank Bridge only.
 - **A Plaid access token** — the credential Plaid issues so the app can fetch
   your data. It is stored **encrypted at rest** (Fernet symmetric encryption) and
   is never written to logs or shown in the UI.
@@ -42,8 +52,9 @@ telemetry** — the app does not phone home, count installs, or report usage.
 
 The one place your financial data is deliberately copied *to* is your own
 **ERPNext** instance, because that is the entire point of the app: it creates
-Bank Transaction records (and, if you enable it, Suppliers and Journal Entries)
-in the ERPNext you configured. That ERPNext is also yours.
+Bank Transaction records (and, if you enable it, Suppliers, Journal Entries and —
+since v0.4.10 — Bank Statement records with the statement PDF attached) in the
+ERPNext you configured. That ERPNext is also yours.
 
 ## Who has access
 

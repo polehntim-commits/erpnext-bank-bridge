@@ -784,6 +784,18 @@ class PlaidStatement(db.Model):
     # really a file there" without stat-ing every row.
     pdf_bytes = db.Column(db.Integer, default=0)
     fetched_at = db.Column(db.DateTime, default=_now, index=True)
+    # v0.4.10 — the ERPNext Bank Statement record this row was uploaded to, and
+    # when it last synced. NULL/'' means "not in ERPNext yet", which is what the
+    # sync pass selects on, so an install that upgrades mid-life picks up every
+    # statement it already holds on the next scheduler tick.
+    #
+    # This is a CACHE of ERPNext's answer, not the authority: the authority is
+    # the unique `plaid_statement_id` on the ERPNext side. A data volume
+    # restored from a backup taken before an upload has this blank for records
+    # that do exist, and the sync re-adopts them by probing rather than
+    # creating a duplicate (see erpnext_statements.sync_statement).
+    erpnext_docname = db.Column(db.String(255), nullable=True, index=True)
+    erpnext_synced_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -806,6 +818,9 @@ class PlaidStatement(db.Model):
             'pdf_path': self.pdf_path or '',
             'pdf_bytes': int(self.pdf_bytes or 0),
             'fetched_at': self.fetched_at.isoformat() if self.fetched_at else None,
+            'erpnext_docname': self.erpnext_docname or '',
+            'erpnext_synced_at': (self.erpnext_synced_at.isoformat()
+                                  if self.erpnext_synced_at else None),
         }
 
 

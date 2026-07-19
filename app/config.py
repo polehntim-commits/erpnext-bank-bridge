@@ -434,6 +434,33 @@ class Config:
     except ValueError:
         STATEMENTS_RECONCILE_TOLERANCE = 1.00
 
+    # ── v0.4.10 · statements inside ERPNext ──────────────────────────────
+    #   * the master switch for the Bank Statement doctype overlay. Off means
+    #     the doctype is never provisioned and nothing is uploaded; v0.4.9's
+    #     local storage and every opening-balance path behave identically.
+    ERPNEXT_STATEMENTS_ENABLED = _bool('ERPNEXT_STATEMENTS_ENABLED', True)
+    #   * whether statements are pushed to ERPNext automatically (at boot and
+    #     after each pull). Off leaves provisioning in place but makes upload a
+    #     manual step — `python -m scripts.backfill_erpnext_statements` — which
+    #     is what an operator staging a first import wants.
+    ERPNEXT_STATEMENTS_AUTO_SYNC = _bool('ERPNEXT_STATEMENTS_AUTO_SYNC', True)
+    #   * how large a reconciliation variance must be, in currency units, to
+    #     earn a row in the discrepancy report. DISTINCT from
+    #     STATEMENTS_RECONCILE_TOLERANCE above, which decides whether a period
+    #     reconciles at all: a $2 gap is a real mismatch worth recording on the
+    #     ERPNext record and not worth putting in front of a human.
+    try:
+        ERPNEXT_STATEMENT_VARIANCE_THRESHOLD = abs(float(os.environ.get(
+            'ERPNEXT_STATEMENT_VARIANCE_THRESHOLD', '10.00')))
+    except ValueError:
+        ERPNEXT_STATEMENT_VARIANCE_THRESHOLD = 10.00
+    #   * how many months back the statement coverage report looks for gaps.
+    try:
+        ERPNEXT_STATEMENT_COVERAGE_MONTHS = min(120, max(1, int(os.environ.get(
+            'ERPNEXT_STATEMENT_COVERAGE_MONTHS', '12'))))
+    except ValueError:
+        ERPNEXT_STATEMENT_COVERAGE_MONTHS = 12
+
     # Set false to disable the in-process scheduler entirely (e.g. drive syncs by
     # cron hitting /api/sync/plaid_now instead). Distinct from MANUAL-ONLY above:
     # this stops the scheduler process; MANUAL-ONLY runs it with no poll job.

@@ -143,6 +143,64 @@ def _run_counterparty_provision(app) -> None:
             log.exception('[scheduler] counterparty provision crashed')
 
 
+def _run_bank_statement_provision(app) -> None:
+    """Provision the Bank Statement doctype and push any statements ERPNext
+    doesn't hold, once per container shortly after boot (v0.4.10).
+
+    Deliberately the same shape as _run_counterparty_provision, for the same
+    reason it exists: v0.4.5 shipped a doctype whose only provisioning call sat
+    on the account-IMPORT path, so an install that had already imported its
+    accounts never created it. Reaching provisioning from the elected scheduler
+    is what makes "restart the container" a sufficient upgrade step.
+
+    The sync pass rides along rather than getting its own job: it is only worth
+    running once the doctype exists, and pairing them means a fresh v0.4.10 boot
+    has ERPNext populated ~20 seconds in without waiting for the monthly pull.
+
+    Swallows everything: a container must still boot when ERPNext is down."""
+    from ..sync_engine import get_erp_client_or_none
+    from .. import audit
+    from .. import erpnext_statements
+    with app.app_context():
+        audit.set_context('scheduler')
+        try:
+            if not erpnext_statements.is_enabled():
+                log.info('[scheduler] ERPNext statement overlay disabled '
+                         '(ERPNEXT_STATEMENTS_ENABLED=false) — not '
+                         'provisioning')
+                return
+            client = get_erp_client_or_none()
+            report = erpnext_statements.provision_report(client)
+            if report['ok']:
+                log.info('[scheduler] Bank Statement doctype ready (%s)',
+                         report['state'])
+            else:
+                log.warning(
+                    '[scheduler] Bank Statement doctype UNAVAILABLE (%s) — %s',
+                    report['state'],
+                    erpnext_statements.PROVISION_HELP.get(report['state'], ''))
+            audit.record('bank_statement_doctype_provision', subject_type=None,
+                         after=report,
+                         notes=f"startup provision → {report['state']}")
+            if not report['ok']:
+                return
+            if not app.config.get('ERPNEXT_STATEMENTS_AUTO_SYNC', True):
+                log.info('[scheduler] ERPNEXT_STATEMENTS_AUTO_SYNC is off — '
+                         'statements stay local until the backfill script runs')
+                return
+            result = erpnext_statements.sync_all(client)
+            log.info('[scheduler] ERPNext statement sync: %s',
+                     {k: v for k, v in result.items() if k != 'errors'})
+            if result['created'] or result['adopted'] or result['reconciled']:
+                audit.record('erpnext_statements_synced', subject_type=None,
+                             after=result,
+                             notes=(f"created {result['created']}, adopted "
+                                    f"{result['adopted']}, reconciled "
+                                    f"{result['reconciled']}"))
+        except Exception:  # pragma: no cover - never let the job die
+            log.exception('[scheduler] Bank Statement provision crashed')
+
+
 def match_count_rollup_interval_or_none(app) -> int | None:
     """The cadence (hours) for the rule match-count rollup, or None when it is
     disabled. Same shape as the two above, and pure for the same reason."""
@@ -205,21 +263,36 @@ def _run_statements_pull(app) -> None:
     from .. import statements
     with app.app_context():
         audit.set_context('scheduler')
+        if not statements.is_enabled():
+            return
         try:
-            if not statements.is_enabled():
-                return
             if not plaid_settings.is_configured():
                 log.info('[scheduler] Plaid not configured — skipping '
                          'statement pull')
-                return
-            result = statements.fetch_all()
-            audit.record('statements_pulled', subject_type=None, after=result,
-                         notes=(f"listed {result['listed']}, stored "
-                                f"{result['stored']}, skipped "
-                                f"{result['skipped_existing']}"))
-            log.info('[scheduler] statement pull complete: %s', result)
+            else:
+                result = statements.fetch_all()
+                audit.record('statements_pulled', subject_type=None,
+                             after=result,
+                             notes=(f"listed {result['listed']}, stored "
+                                    f"{result['stored']}, skipped "
+                                    f"{result['skipped_existing']}"))
+                log.info('[scheduler] statement pull complete: %s', result)
         except Exception:  # pragma: no cover - never let the job die
             log.exception('[scheduler] statement pull crashed')
+        # v0.4.10 — push whatever we now hold into ERPNext. Its own try block,
+        # and deliberately NOT gated on the pull succeeding: a Plaid outage (or
+        # a Plaid that was never configured) still leaves previously-fetched
+        # statements worth syncing, and an ERPNext outage must not make the
+        # pull look failed.
+        try:
+            from .. import erpnext_statements
+            if (erpnext_statements.is_enabled()
+                    and app.config.get('ERPNEXT_STATEMENTS_AUTO_SYNC', True)):
+                synced = erpnext_statements.sync_all()
+                log.info('[scheduler] ERPNext statement sync: %s',
+                         {k: v for k, v in synced.items() if k != 'errors'})
+        except Exception:  # pragma: no cover - never let the job die
+            log.exception('[scheduler] ERPNext statement sync crashed')
 
 
 def ensure_scheduler_started(app):
@@ -275,6 +348,17 @@ def ensure_scheduler_started(app):
                       id='counterparty_provision',
                       run_date=datetime.utcnow() + timedelta(seconds=15))
         log.info('[scheduler] counterparty doctype provision queued (+15s)')
+        # v0.4.10 — the same treatment for the Bank Statement doctype, ~20s
+        # after boot. Five seconds behind the Counterparty job on purpose: both
+        # POST a DocType, and creating two at once on a Raspberry-Pi-class box
+        # is the kind of thing that makes one of them time out for no reason.
+        # This is the wiring the v0.4.5 → v0.4.6 fix was about — the provision
+        # must be REACHED at startup, not only from an import path an
+        # already-imported install never walks again.
+        sched.add_job(lambda: _run_bank_statement_provision(app), 'date',
+                      id='bank_statement_provision',
+                      run_date=datetime.utcnow() + timedelta(seconds=20))
+        log.info('[scheduler] Bank Statement doctype provision queued (+20s)')
         # v0.4.5 — the Counterparty activity rollup, on its own cadence. Added
         # to the SAME elected scheduler so there is still exactly one background
         # thread per container. Its first run is offset well past the sync's

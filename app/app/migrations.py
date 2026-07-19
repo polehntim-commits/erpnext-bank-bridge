@@ -112,6 +112,15 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # intercompany_transfer_pairs above). An upgrading install therefore gains
     # one empty table and changes no existing row — statements only ever ADD
     # information, so there is nothing to backfill and nothing to undo.
+    #
+    # v0.4.10 — the ERPNext Bank Statement upload. UNLIKE v0.4.9 these DO need a
+    # line each: an install that ran v0.4.9 already has `plaid_statements`, so
+    # create_all() will not touch it and the two new columns would be missing.
+    # Both backfill to NULL, which the sync pass reads as "not uploaded yet" —
+    # so every statement an install already holds is picked up on the next
+    # scheduler tick with no manual step.
+    ('plaid_statements', 'erpnext_docname', 'VARCHAR(255)'),
+    ('plaid_statements', 'erpnext_synced_at', 'TIMESTAMP'),
 ]
 
 

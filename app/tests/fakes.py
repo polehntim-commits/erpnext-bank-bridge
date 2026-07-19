@@ -131,7 +131,12 @@ class FakeERPClient:
                  counterparty_doctype=False, fail_doctype_create=False,
                  doctype_permission_error=False, gl_entries=None,
                  fail_counterparty_create=False,
-                 counterparty_create_race=False):
+                 counterparty_create_race=False,
+                 bank_statement_doctype=False,
+                 foreign_bank_statement_doctype=False,
+                 fail_bank_statement_create=False,
+                 bank_statement_create_race=False,
+                 fail_upload=False, fail_list=None):
         self.docs = {}          # name -> doc
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
@@ -238,12 +243,36 @@ class FakeERPClient:
         # Preset GL Entry rows (dicts with posting_date/party_type/party/
         # debit/credit/…). The ledger, ageing and rollup all read these.
         self.gl_entries = [dict(g) for g in (gl_entries or [])]
+        # v0.4.10 · the Bank Statement overlay, modelled the same way as
+        # Counterparty above. `bank_statement_doctype=True` is an ERPNext that
+        # already has it; False is a fresh instance where provisioning must
+        # create it.
+        self.bank_statement_doctype = bank_statement_doctype
+        # An ERPNext whose 'Bank Statement' doctype is NOT ours — it exists but
+        # has no plaid_statement_id field. Bank Bridge must refuse to write to
+        # it rather than scribble on a stranger's records.
+        self.foreign_bank_statement_doctype = foreign_bank_statement_doctype
+        # Every Bank Statement create fails outright.
+        self.fail_bank_statement_create = fail_bank_statement_create
+        # The concurrency case: the FIRST create raises a duplicate error AND
+        # leaves the document behind, as it would when another worker won the
+        # race on the unique plaid_statement_id.
+        self.bank_statement_create_race = bank_statement_create_race
+        # upload_file raises — the PDF cannot be attached. The record itself
+        # must still be created and reported as a success.
+        self.fail_upload = fail_upload
+        # Doctype name -> (status_code, body) for a list_docs that fails. Models
+        # ERPNext falling over (500) or its auth expiring (401) on a read.
+        self.fail_list = dict(fail_list or {})
+        # Files attached via /api/method/upload_file, newest last.
+        self.uploads = []
         # Records created by the one-click account import, keyed by doctype.
         self.created = {'Bank': {}, 'Bank Account': {}, 'Custom Field': {},
                         'Bank Account Type': {}, 'Bank Account Subtype': {},
                         'Account': {}, 'Supplier': {}, 'Journal Entry': {},
                         'Supplier Group': {}, 'Customer': {},
-                        'Customer Group': {}, 'Counterparty': {}, 'DocType': {}}
+                        'Customer Group': {}, 'Counterparty': {}, 'DocType': {},
+                        'Bank Statement': {}}
 
     def get_logged_user(self):
         return 'admin@example.com'
@@ -293,9 +322,21 @@ class FakeERPClient:
                                   'permitted"}')
             if name == 'Counterparty' and self.counterparty_doctype:
                 return {'name': name, 'module': 'Accounts', 'custom': 1}
+            if name == 'Bank Statement':
+                if self.foreign_bank_statement_doctype:
+                    # Present, but somebody else's: no plaid_statement_id.
+                    return {'name': name, 'module': 'Accounts', 'custom': 0,
+                            'fields': [{'fieldname': 'statement_date'},
+                                       {'fieldname': 'notes'}]}
+                if self.bank_statement_doctype:
+                    return {'name': name, 'module': 'Accounts', 'custom': 1,
+                            'fields': [{'fieldname': 'bank_account'},
+                                       {'fieldname': 'plaid_statement_id'}]}
             return self.created['DocType'].get(name)
         if doctype == 'Counterparty':
             return self.created['Counterparty'].get(name)
+        if doctype == 'Bank Statement':
+            return self.created['Bank Statement'].get(name)
         if doctype == 'Account':
             return ({**self.chart_accounts, **self.created['Account']}).get(name)
         if doctype == 'Bank Account':
@@ -351,6 +392,20 @@ class FakeERPClient:
                   limit_page_length=0, order_by=None):
         self.calls.append(('list_docs', doctype, filters))
         self._maybe_missing(doctype)
+        if doctype in self.fail_list:
+            from app.erpnext_client import ERPNextAPIError
+            status, body = self.fail_list[doctype]
+            raise ERPNextAPIError(f'GET /api/resource/{doctype} -> {status}',
+                                  status_code=status, response_body=body)
+        if doctype == 'Bank Statement':
+            rows = []
+            for name, d in self.created['Bank Statement'].items():
+                doc = {**d, 'name': name}
+                if not self._matches(doc, filters):
+                    continue
+                rows.append({k: doc.get(k) for k in fields} if fields
+                            else {'name': name})
+            return sorted(rows, key=lambda r: str(r.get('period_start') or ''))
         if doctype == 'Company':
             rows = [{'name': c} for c in self.companies]
             if order_by:
@@ -566,6 +621,41 @@ class FakeERPClient:
             self.created['DocType'][name] = dict(doc)
             if name == 'Counterparty':
                 self.counterparty_doctype = True
+            if name == 'Bank Statement':
+                self.bank_statement_doctype = True
+            return {'name': name}
+        if doctype == 'Bank Statement':
+            from app.erpnext_client import ERPNextAPIError
+            plaid_id = doc.get('plaid_statement_id')
+            if self.bank_statement_create_race:
+                # Another worker got there first: the document EXISTS but our
+                # create still errors on the unique index. Recovery is a
+                # re-probe, not a retry.
+                self.bank_statement_create_race = False
+                self._counter += 1
+                self.created['Bank Statement'][f'bs{self._counter:06x}'] = dict(doc)
+                raise ERPNextAPIError(
+                    'bad', status_code=409,
+                    response_body='{"exc_type":"DuplicateEntryError",'
+                                  '"exception":"plaid_statement_id ' +
+                                  str(plaid_id) + ' already exists"}')
+            if self.fail_bank_statement_create:
+                raise ERPNextAPIError(
+                    'bad', status_code=417,
+                    response_body='{"exception": "ValidationError: cannot '
+                                  'create Bank Statement"}')
+            # Enforce the unique plaid_statement_id the real doctype declares.
+            for existing in self.created['Bank Statement'].values():
+                if existing.get('plaid_statement_id') == plaid_id:
+                    raise ERPNextAPIError(
+                        'bad', status_code=409,
+                        response_body='{"exc_type":"DuplicateEntryError",'
+                                      '"exception":"plaid_statement_id ' +
+                                      str(plaid_id) + ' already exists"}')
+            # autoname: hash — an opaque docname, like Frappe's.
+            self._counter += 1
+            name = f'bs{self._counter:06x}'
+            self.created['Bank Statement'][name] = dict(doc)
             return {'name': name}
         if doctype == 'Counterparty':
             from app.erpnext_client import ERPNextAPIError
@@ -610,6 +700,30 @@ class FakeERPClient:
             # account to a Bank Account name without a prior create).
             self.created.setdefault(doctype, {})[name] = dict(doc)
         return {'name': name, **doc}
+
+    def upload_file(self, filename, content_bytes, doctype=None, docname=None,
+                    is_private=1, fieldname=None):
+        """v0.4.10 · /api/method/upload_file. Records the attachment and answers
+        with a File document the way Frappe does. Unlike the real endpoint it
+        does NOT set the target field itself — the caller writes it explicitly,
+        and that path is what needs testing."""
+        self.calls.append(('upload_file', doctype, docname, filename))
+        if self.fail_upload:
+            from app.erpnext_client import ERPNextAPIError
+            raise ERPNextAPIError(
+                'POST /api/method/upload_file -> 413', status_code=413,
+                response_body='{"exception": "FileSizeExceededError"}')
+        entry = {'filename': filename, 'doctype': doctype, 'docname': docname,
+                 'fieldname': fieldname, 'is_private': is_private,
+                 'size': len(content_bytes or b''), 'content': content_bytes}
+        self.uploads.append(entry)
+        file_url = f'/private/files/{filename}'
+        return {'name': f'FILE-{len(self.uploads):04d}', 'file_url': file_url,
+                'file_name': filename}
+
+    def attachments_for(self, docname):
+        """Every upload targeted at one document — the assertion helper."""
+        return [u for u in self.uploads if u['docname'] == docname]
 
     def call_method(self, method, params=None, http_method='GET', json_body=None):
         self.calls.append(('call_method', method, json_body))
