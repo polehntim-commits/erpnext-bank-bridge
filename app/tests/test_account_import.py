@@ -1139,6 +1139,30 @@ class TestFuzzyProbeAndModal(ImportBase):
             {'account_name': 'Bank Accounts', 'is_group': 1, 'account_type': 'Bank'}])
         self.assertIsNone(erpnext_accounts.probe_fuzzy_gl_match('acct-1', client=erp))
 
+    def test_probe_rejects_candidate_with_different_mask(self):
+        """v0.4.24: two accounts of the same subtype at the same bank with
+        DIFFERENT last-4s are NOT duplicates. Stripping the mask before
+        comparing base names produces a 100% match on 'Wells Fargo Brokerage
+        - 9401' vs 'Wells Fargo Brokerage - 6030', and reusing the 6030 leaf
+        for 9401 would post 9401's transactions to a different account's
+        ledger. The mask disagreement is disqualifying."""
+        # Reset the fixture account: a brokerage masked 9401 (default was
+        # checking masked 0000).
+        PlaidAccount.query.filter_by(account_id='acct-1').delete()
+        db.session.commit()
+        self._account('acct-1', subtype='brokerage', mask='9401',
+                      type_='investment')
+        erp = FakeERPClient(chart_accounts=[
+            {'account_name': 'Bank Accounts', 'is_group': 1,
+             'account_type': 'Bank'},
+            # Existing 6030 leaf — different mask, would-otherwise-100%-match
+            # against the incoming 'Wells Fargo Brokerage - 9401'.
+            {'account_name': 'Wells Fargo Brokerage - 6030', 'is_group': 0,
+             'account_type': 'Bank',
+             'parent_account': 'Bank Accounts - EC'}])
+        self.assertIsNone(erpnext_accounts.probe_fuzzy_gl_match(
+            'acct-1', client=erp))
+
     def test_create_endpoint_shows_modal_on_match(self):
         erp = self._erp_with_candidate()
         # Patching get_client covers both the probe and (would-be) import.

@@ -1152,19 +1152,23 @@ FUZZY_MODAL_BODY = """
 <h2>Possible duplicate account</h2>
 <div class="card" style="max-width:640px">
   <p style="font-size:14px;color:#444;margin-top:0">
-    Before creating a new GL Account for
-    <b>{{ intended or 'this Plaid account' }}</b>, we found an existing ERPNext
-    account that looks like a match:
+    You're about to create the GL Account
+    <b>{{ intended or 'this Plaid account' }}</b>. An existing account with a
+    similar name is already in ERPNext:
   </p>
   <div style="background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;
               padding:12px 14px;margin:10px 0">
-    <div style="font-size:15px;font-weight:600">{{ candidate.account_name }}</div>
+    <div style="font-size:12px;color:#666;text-transform:uppercase;letter-spacing:0.04em">Existing match</div>
+    <div style="font-size:15px;font-weight:600;margin-top:4px">{{ candidate.account_name }}</div>
     <div style="font-size:12px;color:#777"><code>{{ candidate.name }}</code>
       · {{ candidate.score }}% similar</div>
   </div>
   <p style="font-size:13px;color:#555">
-    Reuse it to avoid a near-duplicate in your Chart of Accounts, or create a
-    brand-new account anyway.
+    <b>Reuse existing</b> avoids a near-duplicate in your Chart of Accounts —
+    click this only if the existing account IS the same real account.
+    <b>Create new anyway</b> creates a separate GL leaf — click this if the two
+    are different accounts that happen to have similar names (e.g. two
+    brokerages at the same bank with different last-4s).
   </p>
   <div style="display:flex;gap:10px;align-items:center;margin-top:14px">
     <form method="post" action="/admin/accounts/create" style="margin:0">
@@ -1208,9 +1212,18 @@ def create_account_in_erpnext():
         except Exception:  # never block the create on a best-effort probe
             candidate = None
         if candidate:
+            # v0.4.24: `intended` is the NAME OF THE ACCOUNT WE'RE ABOUT TO
+            # CREATE, not the existing candidate. Prior wording ('Before
+            # creating a new GL Account for X' with X = candidate name) read
+            # as if the incoming account matched the candidate exactly, which
+            # made a mask-mismatch dupe (9401 vs 6030) look like it was for
+            # the same account — the exact confusion that led to the wrong-
+            # button-click hazard. Now the incoming name is in bold and the
+            # candidate is shown separately as "the existing match".
+            incoming_name = erpnext_accounts.intended_bank_account_name(
+                account_id) or 'this Plaid account'
             return _page(FUZZY_MODAL_BODY, page='accounts', account_id=account_id,
-                         candidate=candidate,
-                         intended=candidate.get('account_name'))
+                         candidate=candidate, intended=incoming_name)
     if decision == 'create_new' and candidate_name:
         # Record the operator's explicit rejection of the suggested reuse.
         audit.record('fuzzy_match_rejected_by_user', subject_type='Account',

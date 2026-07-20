@@ -1361,7 +1361,16 @@ def _fuzzy_match_gl_account(client: ERPNextClient, company: str,
     """Best existing leaf GL Account in `company` that closely matches
     `account_name` (or shares the last-4 `mask`), for reuse instead of a
     near-duplicate create. Returns {'name', 'account_name', 'score'} at/above the
-    configured threshold, else None. Best-effort — any read error yields None."""
+    configured threshold, else None. Best-effort — any read error yields None.
+
+    v0.4.24 guard: if BOTH the incoming account_name AND the candidate carry a
+    trailing last-4 mask AND those masks are different, the candidate is a
+    different account and cannot qualify — regardless of how similar the
+    stripped base name looks. Without this guard 'Wells Fargo Brokerage -
+    9401' scores 100% against 'Wells Fargo Brokerage - 6030' because the base
+    name strip is identical, which welded one company's 9401 brokerage onto
+    the 6030 GL leaf on Reuse. The mask is the WHOLE POINT of distinguishing
+    two accounts of the same kind at the same bank."""
     threshold = _fuzzy_threshold()
     try:
         existing = client.list_docs(
@@ -1377,6 +1386,13 @@ def _fuzzy_match_gl_account(client: ERPNextClient, company: str,
         if not docname:
             continue
         cand_name = row.get('account_name') or docname
+        # v0.4.24: mask disagreement is disqualifying. Read the candidate's
+        # trailing mask (if any) and refuse if BOTH ends carry a mask and
+        # they don't match — different last-4 means different account.
+        if mask:
+            cand_trailing = _TRAILING_MASK_RE.search(cand_name)
+            if cand_trailing and cand_trailing.group(1).strip() != mask:
+                continue
         score = _similarity(account_name, cand_name)
         # Last-4 mask signal: an existing account carrying this account's mask,
         # with a plausibly-similar base name, qualifies even if the raw ratio is
@@ -2302,6 +2318,20 @@ def _bank_exists(client: ERPNextClient, bank_name: str) -> bool:
         BANK_DT, filters=[['bank_name', '=', bank_name.strip()]],
         fields=['name'], limit_page_length=1)
     return bool(matches)
+
+
+def intended_bank_account_name(plaid_account_id: str) -> str | None:
+    """The account_name a Create-in-ERPNext for this Plaid account WOULD produce
+    (v0.4.24). Powers the fuzzy-match modal's headline so it reads 'creating
+    Wells Fargo Brokerage - 9401' rather than the candidate's name. Returns
+    None when the PlaidAccount doesn't exist — every caller must tolerate that
+    (the modal falls back to a generic label)."""
+    account = PlaidAccount.query.filter_by(account_id=plaid_account_id).first()
+    if account is None:
+        return None
+    item = PlaidItem.query.filter_by(item_id=account.item_id).first()
+    institution = ((item.institution_name if item else '') or '').strip() or 'Bank'
+    return _bank_account_name(account, institution)
 
 
 def probe_fuzzy_gl_match(plaid_account_id: str, *,
