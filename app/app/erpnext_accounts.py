@@ -2359,11 +2359,28 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
                     exc_info=True)
 
     stats = {'created': 0, 'unsupported': 0, 'skipped_mapped': 0,
+             'skipped_disconnected': 0,
              'retried': 0, 'failed': 0, 'considered': 0,
              'opening_balances': 0, 'statements': 0, 'errors': []}
+    # v0.4.18 · never re-import accounts of a disconnected Item. Prior to this
+    # the bulk pass iterated every unmapped PlaidAccount regardless of Item
+    # state, so a disconnected item's unmapped rows (e.g. subtypes that were
+    # unsupported at their original link and only became supported after a
+    # later release added their type) would try to create Bank Accounts long
+    # after the operator explicitly told us to stop pulling from that bank.
+    # Those attempts always collide with the successor Item's mapping in
+    # ERPNext and land at DuplicateEntryError / cross-Company ValidationError.
+    # The disconnect decision already carries the semantic "stop syncing this
+    # bank"; the bulk-import path just needed to honour it.
+    disconnected_item_ids = {it.item_id for it in
+                             PlaidItem.query.filter(
+                                 PlaidItem.disconnected.is_(True)).all()}
     for account in PlaidAccount.query.order_by(PlaidAccount.name).all():
         if account.erpnext_bank_account_name:
             stats['skipped_mapped'] += 1
+            continue
+        if account.item_id in disconnected_item_ids:
+            stats['skipped_disconnected'] += 1
             continue
         stats['considered'] += 1
         if not is_supported(account):
@@ -2398,6 +2415,9 @@ def import_all_supported_accounts(*, client: ERPNextClient | None = None,
     parts = [f"Created {stats['created']}/{total} accounts"]
     if stats['unsupported']:
         parts.append(f"skipped {stats['unsupported']} unsupported")
+    if stats['skipped_disconnected']:
+        parts.append(f"skipped {stats['skipped_disconnected']} on "
+                     f"disconnected bank(s)")
     if stats['retried']:
         parts.append(f"{stats['retried']} retried successfully")
     if stats['opening_balances']:

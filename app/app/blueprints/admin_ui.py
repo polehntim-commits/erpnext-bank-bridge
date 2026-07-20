@@ -323,7 +323,13 @@ DASHBOARD_BODY = """
     <td>{{ it.institution_name or '(unknown)' }}</td>
     <td><code>{{ it.item_id[:14] }}…</code></td>
     <td>
-      {% if it.status == 'active' %}<span class="pill pill-ok">active</span>
+      {# v0.4.18 · disconnected wins over any Plaid webhook status. The status
+         column reflected the raw Plaid state field and left disconnected
+         items showing 'active' because Plaid never sends a status change on
+         /item/remove; here we surface the operator's disconnect explicitly. #}
+      {% if it.disconnected %}<span class="pill pill-muted"
+        title="Disconnected at Plaid on {{ it.disconnected_at.strftime('%Y-%m-%d %H:%M') if it.disconnected_at else 'an earlier date' }} — no new transactions will arrive.">disconnected</span>
+      {% elif it.status == 'active' %}<span class="pill pill-ok">active</span>
       {% elif it.status == 'error' %}<span class="pill pill-err">error</span>
       {% else %}<span class="pill pill-muted">{{ it.status }}</span>{% endif %}
     </td>
