@@ -4617,10 +4617,16 @@ STATEMENTS_BODY = """
 {% endif %}
 <p style="font-size:14px;color:#555">
   Statement PDFs pulled from Plaid, with each period reconciled against the
-  transactions Bank Bridge mirrored. <b>Expected</b> is the statement's own
-  opening balance plus that movement; when it doesn't land on the bank's
-  <b>closing</b> balance, the difference is transactions the mirror is missing
-  for that month.
+  transactions Bank Bridge mirrored. <b>Expected</b> is the period's opening
+  balance plus that movement; when it doesn't land on the <b>closing</b>
+  balance, the difference is transactions the mirror is missing for that
+  month.
+  <br><span style="color:#888;font-size:12px">
+  Balances tagged <b>bank</b> came from the statement PDF; balances tagged
+  <b>computed</b> were derived from the transaction mirror when the PDF was
+  unreadable. A row where both sides are computed reconciles trivially
+  (mirror vs mirror) — it's a balance report, not a bank cross-check.
+  </span>
 </p>
 {% if not rows %}
 <div class="banner-warn">
@@ -4645,21 +4651,42 @@ STATEMENTS_BODY = """
   &middot; <span style="color:#1b5e20">&#10003; {{ group.reconciled }}
   period(s) reconcile</span>
   {% endif %}
+  {% if group.computed %}
+  &middot; <span style="color:#666">{{ group.computed }} from mirror</span>
+  {% endif %}
 </div>
 <table>
   <tr><th>Period</th><th class="num">Opening</th><th class="num">Movement</th>
-      <th class="num">Expected</th><th class="num">Bank closing</th>
+      <th class="num">Expected</th><th class="num">Closing</th>
       <th class="num">Delta</th><th>Status</th><th>PDF</th></tr>
   {% for r in group.statements %}
   <tr>
     <td>{{ r.row.period_label or '—' }}</td>
-    <td class="num">{{ '%.2f'|format(r.row.opening_balance)
-                       if r.row.opening_balance is not none else '—' }}</td>
+    <td class="num">
+      {% if r.opening is not none %}{{ '%.2f'|format(r.opening) }}
+        {% if r.opening_source == 'bank' %}
+          <span class="pill pill-ok" style="font-size:10px"
+                title="Opening balance parsed from the statement PDF">bank</span>
+        {% elif r.opening_source == 'computed' %}
+          <span class="pill pill-muted" style="font-size:10px"
+                title="Opening balance derived from the transaction mirror (PDF was unreadable)">computed</span>
+        {% endif %}
+      {% else %}—{% endif %}
+    </td>
     <td class="num">{{ '%.2f'|format(r.movement) }}</td>
     <td class="num">{{ '%.2f'|format(r.expected_closing)
                        if r.expected_closing is not none else '—' }}</td>
-    <td class="num">{{ '%.2f'|format(r.closing)
-                       if r.closing is not none else '—' }}</td>
+    <td class="num">
+      {% if r.closing is not none %}{{ '%.2f'|format(r.closing) }}
+        {% if r.closing_source == 'bank' %}
+          <span class="pill pill-ok" style="font-size:10px"
+                title="Closing balance parsed from the statement PDF">bank</span>
+        {% elif r.closing_source == 'computed' %}
+          <span class="pill pill-muted" style="font-size:10px"
+                title="Closing balance derived from the transaction mirror (PDF was unreadable)">computed</span>
+        {% endif %}
+      {% else %}—{% endif %}
+    </td>
     <td class="num">{{ '%+.2f'|format(r.delta) if r.delta is not none else '—' }}</td>
     <td>
       {% if r.status == 'ok' %}
@@ -4667,9 +4694,12 @@ STATEMENTS_BODY = """
       {% elif r.status == 'mismatch' %}
         <span class="pill pill-err" title="Off by {{ '%.2f'|format(r.delta) }}">
           &#9888; off by {{ '%.2f'|format(r.delta|abs) }}</span>
+      {% elif r.status == 'computed' %}
+        <span class="pill pill-muted"
+              title="Both opening and closing were derived from the transaction mirror — this is a balance report, not a bank cross-check">from mirror</span>
       {% else %}
         <span class="pill pill-muted"
-              title="Balances could not be read from this PDF">no balances</span>
+              title="Balances could not be read from this PDF and the mirror has no signal for this period">no balances</span>
       {% endif %}
     </td>
     <td>
@@ -4703,7 +4733,73 @@ STATEMENTS_BODY = """
 <p style="font-size:14px">
   Reports: <a href="/admin/statements/reports/discrepancies">discrepancies</a>
   · <a href="/admin/statements/reports/coverage">coverage gaps</a>
+  · <a href="/admin/balance_history">balance history</a>
 </p>
+"""
+
+
+BALANCE_HISTORY_BODY = """
+<h2>Balance history</h2>
+<p style="font-size:14px;color:#555">
+  Month-end balances for every mapped account, computed from the transaction
+  mirror. This is what your books say each account held at the close of each
+  calendar month &mdash; the same arithmetic that fills opening/closing
+  balances on <a href="/admin/statements">/admin/statements</a> when a bank
+  PDF is unreadable, applied to every month whether a statement exists or not.
+  Useful for balance-sheet freezes, year-over-year, and spot-checking a bank
+  statement against a computed peer.
+</p>
+<p style="font-size:13px;color:#888">
+  Months entirely before an account's earliest mirrored transaction are
+  omitted &mdash; the pre-mirror balance is arithmetic without evidence and
+  reporting it would misrepresent what this app actually knows.
+</p>
+<form method="get" style="margin:8px 0">
+  <label style="font-size:13px">Show
+  <select name="months" onchange="this.form.submit()">
+    {% for opt in [3, 6, 12, 24, 36] %}
+    <option value="{{ opt }}" {% if opt == months %}selected{% endif %}>
+      last {{ opt }} months
+    </option>
+    {% endfor %}
+  </select></label>
+</form>
+{% if not groups %}
+<div class="card">
+  <h3>No history to compute</h3>
+  <p style="font-size:14px;margin:0">
+    No mapped account has any mirrored transactions yet. Once transactions
+    start flowing this page will fill in.
+  </p>
+</div>
+{% endif %}
+{% for group in groups %}
+<h3 style="margin-bottom:4px">{{ group.label }}</h3>
+<div style="font-size:13px;color:#666">
+  {{ group.company or 'no Company resolved' }}
+  {% if group.balance_current is not none %}
+    &middot; current balance {{ '%.2f'|format(group.balance_current) }}
+    {{ group.currency }}
+  {% endif %}
+</div>
+<table>
+  <tr><th>Month</th><th class="num">Closing balance</th></tr>
+  {% for row in group.rows %}
+  <tr>
+    <td>
+      {{ row.month_end.strftime('%Y-%m') }}{% if row.partial %}
+      <span style="color:#888;font-size:12px"
+            title="Partial month — this row is the balance AS OF {{ row.month_end.strftime('%Y-%m-%d') }}, not the eventual month-end close. The month is still in progress.">(to {{ row.month_end.strftime('%b %d') }})</span>
+      {% endif %}
+    </td>
+    <td class="num">{{ '%.2f'|format(row.balance) }}{% if row.partial %}
+      <span style="color:#888;font-size:11px">so far</span>
+    {% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endfor %}
+<p style="font-size:14px"><a href="/admin/statements">← back to statements</a></p>
 """
 
 
@@ -4732,6 +4828,10 @@ def _statement_groups() -> list:
             'account_label': label, 'company': company, 'statements': rows,
             'mismatches': sum(1 for r in rows if r['status'] == 'mismatch'),
             'reconciled': sum(1 for r in rows if r['status'] == 'ok'),
+            # v0.4.20: computed rows aren't bank cross-checks; count separately
+            # so the header line can say "3 bank-verified, 5 from mirror" and
+            # not conflate the two into one flattering total.
+            'computed': sum(1 for r in rows if r['status'] == 'computed'),
         })
     return groups
 
@@ -4912,6 +5012,49 @@ def _statement_report_client():
     to Bank Bridge's local rows rather than 500-ing when ERPNext is
     unconfigured or the doctype was never provisioned."""
     return sync_engine.get_erp_client_or_none()
+
+
+@bp.get('/admin/balance_history')
+def balance_history():
+    """Month-end balances per account, computed from the transaction mirror
+    (v0.4.21). See `computed_balances.monthly_closing_balances` for the
+    exact arithmetic; this route is the presentation layer over it,
+    filtered to mapped accounts under the current Company scope and
+    ordered by account name so the balance-sheet columns are stable."""
+    from .. import computed_balances as cb
+    # 3-36 months, defaulting to 12; anything else is silently clamped so a
+    # hand-edited URL can't ask for a five-year window on a large database.
+    try:
+        months = int(request.args.get('months', 12) or 12)
+    except ValueError:
+        months = 12
+    months = max(3, min(months, 36))
+    companies = _resolve_account_companies()
+    scope = _current_company()
+    groups = []
+    for account in PlaidAccount.query.order_by(PlaidAccount.name).all():
+        # Unmapped accounts have no ERPNext ledger to reconcile against, so
+        # a balance history for them is a report about nothing — omit rather
+        # than dilute the page.
+        if not account.erpnext_bank_account_name:
+            continue
+        company = companies.get(account.account_id, '')
+        if scope and company != scope:
+            continue
+        rows = cb.monthly_closing_balances(account, months=months)
+        if not rows:
+            continue
+        label = (account.name or account.official_name
+                 or account.mask or account.account_id)
+        if account.mask:
+            label = f'{label} ••{account.mask}'
+        groups.append({
+            'label': label, 'company': company, 'rows': rows,
+            'balance_current': account.balance_current,
+            'currency': account.iso_currency_code or account.currency or 'USD',
+        })
+    return _page(BALANCE_HISTORY_BODY, page='statements', groups=groups,
+                 months=months)
 
 
 @bp.get('/admin/statements/reports/discrepancies')
