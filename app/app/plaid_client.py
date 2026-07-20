@@ -109,8 +109,12 @@ class PlaidClient:
         starts working on the next link after approval with no code change.
 
         `statements_months` is how far back Link asks the institution to make
-        statements available (Plaid caps this per institution; asking for more
-        than a bank offers just yields fewer).
+        statements available. Plaid also enforces a HARD ceiling of 24 months
+        on the request itself (a 400 with
+        `Statements product only supports a maximum of 2 years of data`), so a
+        wider ask is clamped to 24 in `_with_statements` — a caller that
+        wanted 36 quietly gets 24 rather than the whole link-token creation
+        failing. See v0.4.17.
 
         `access_token` (v0.4.11) switches Link into UPDATE MODE: instead of
         creating a new Item, Link re-authenticates the EXISTING one. This is the
@@ -230,17 +234,34 @@ class PlaidClient:
         kwargs['access_token'] = access_token
         return kwargs
 
+    # Plaid caps the Statements window at 24 months / ~2 years and 400s with
+    # `Statements product only supports a maximum of 2 years of data` on
+    # anything wider. Any month → days conversion has to sit safely UNDER that
+    # ceiling regardless of leap years — 30 * months does; 31 * months does
+    # not (24 months × 31 = 744 days, over the 730-ish cap).
+    STATEMENTS_MAX_MONTHS = 24
+    STATEMENTS_DAYS_PER_MONTH = 30
+
     @staticmethod
     def _with_statements(kwargs: dict, months: int) -> dict:
         """Add the `statements` product + its required date window to a set of
         link-token kwargs. Plaid requires BOTH: the product in the list, and a
-        `statements` config naming the period Link should request."""
+        `statements` config naming the period Link should request.
+
+        Plaid caps the Statements window at 24 months
+        (`STATEMENTS_MAX_MONTHS`); a wider ask is a hard 400 that takes the
+        entire link-token creation with it, so we silently clamp here — a
+        caller asking for 36 months is quietly downgraded to 24, which is
+        strictly better than a Link that won't open at all. See v0.4.17."""
         from datetime import date, timedelta
         from plaid.model.link_token_create_request_statements import \
             LinkTokenCreateRequestStatements
         from plaid.model.products import Products
         end = date.today()
-        start = end - timedelta(days=31 * max(1, int(months or 1)))
+        months_capped = max(1, min(int(months or 1),
+                                   PlaidClient.STATEMENTS_MAX_MONTHS))
+        start = end - timedelta(
+            days=PlaidClient.STATEMENTS_DAYS_PER_MONTH * months_capped)
         kwargs['products'] = list(kwargs.get('products') or []) + \
             [Products('statements')]
         kwargs['statements'] = LinkTokenCreateRequestStatements(
