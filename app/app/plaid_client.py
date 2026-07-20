@@ -189,13 +189,23 @@ class PlaidClient:
 
     @staticmethod
     def _with_liabilities(kwargs: dict) -> dict:
-        """Add the `liabilities` product (v0.4.14). Unlike `statements` it needs
-        no configuration block — the product alone is what lets
-        /liabilities/get answer for the Item."""
+        """Request the `liabilities` product (v0.4.14).
+
+        v0.4.23 · request as OPTIONAL, not required. Putting liabilities in
+        `products` means Plaid Link errors out with "No liability accounts"
+        when the user's institution connection has no eligible accounts —
+        which is the routine case for a business account with checking +
+        savings and no loans or cards. `optional_products` grants liabilities
+        when eligible accounts exist and stays silent otherwise, so linking
+        a deposit-only bank succeeds instead of failing at the account
+        selection screen. Unlike `products` there's no user-facing consent
+        screen for optional products, which is correct for liabilities
+        (there's nothing to gate on when the account can't produce the
+        data anyway)."""
         from plaid.model.products import Products
         kwargs = dict(kwargs)
-        kwargs['products'] = list(kwargs.get('products') or []) + \
-            [Products('liabilities')]
+        kwargs['optional_products'] = list(
+            kwargs.get('optional_products') or []) + [Products('liabilities')]
         return kwargs
 
     def _link_token_kwargs(self, user_id, redirect_uri, webhook) -> dict:
