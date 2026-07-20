@@ -290,7 +290,7 @@ DASHBOARD_BODY = """
   and map accounts.
 </div>
 {% endif %}
-{% if manual_only and counts.items %}
+{% if manual_only and counts.banks %}
 <div class="banner-warn">
   <h3>Auto-sync is off (manual only)</h3>
   Transactions refresh only when you click <b>Sync now</b> below.
@@ -301,7 +301,7 @@ DASHBOARD_BODY = """
 {% endif %}
 
 <div class="kpis">
-  <div class="kpi"><b>{{ counts.items }}</b><br>linked banks</div>
+  <div class="kpi"><b>{{ counts.banks }}</b><br>linked banks</div>
   <div class="kpi"><b>{{ counts.accounts }}</b><br>accounts ({{ counts.mapped }} mapped)</div>
   <div class="kpi"><b>{{ counts.transactions }}</b><br>transactions</div>
   <div class="kpi"><b>{{ counts.posted }}</b><br>posted to ERPNext</div>
@@ -367,8 +367,13 @@ def _counts() -> dict:
         BankTransaction.posted_at.is_(None)).count()
     mapped = PlaidAccount.query.filter(
         PlaidAccount.erpnext_bank_account_name.isnot(None)).count()
+    # v0.4.18 · key is `banks`, not `items`. Jinja's `counts.items` resolves to
+    # dict.items (the METHOD) via getattr, never to `counts['items']` — the
+    # dashboard was rendering "<built-in method items of dict object at 0x…>"
+    # instead of the linked-bank count. Rename to a semantic key that can't
+    # shadow a dict attribute.
     return {
-        'items': PlaidItem.query.count(),
+        'banks': PlaidItem.query.count(),
         'accounts': PlaidAccount.query.count(),
         'mapped': mapped,
         'transactions': total_txn,
