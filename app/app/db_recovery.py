@@ -151,6 +151,36 @@ def _candidate_superusers(app, url):
     return candidates
 
 
+class ForeignClusterError(RuntimeError):
+    """Raised when a superuser connection landed on a Postgres that is not ours.
+
+    v0.4.16 — on Umbrel the `db` hostname resolves to every app's database
+    container (see app/db_host.py), so a recovery connection can genuinely open
+    against a *neighbouring app's* cluster. Rotating a role password there would
+    corrupt that app's credentials, so we refuse and move on."""
+
+
+def cluster_is_ours(conn, dbname: str, target_user: str) -> bool:
+    """True when `conn` is open against our own cluster.
+
+    Two independent markers, both cheap and both requiring no state we have to
+    migrate in:
+
+      * the connection reports the database name we asked for, and
+      * our app role exists in this cluster's `pg_authid`.
+
+    A neighbouring app's Postgres has neither a `bankbridge` database nor a
+    `bankbridge` role, so it fails both. A fresh install passes both, because
+    postgres init creates the database and role before the app ever boots."""
+    with conn.cursor() as cur:
+        cur.execute('SELECT current_database()')
+        row = cur.fetchone()
+        if not row or row[0] != dbname:
+            return False
+        cur.execute('SELECT 1 FROM pg_roles WHERE rolname = %s', (target_user,))
+        return cur.fetchone() is not None
+
+
 def _rotate_with_superuser(db_url: str, superuser: str, superuser_password: str,
                            target_user: str, target_password: str) -> None:
     """Open a superuser psycopg2 connection and `ALTER USER <target_user>` to
@@ -161,39 +191,63 @@ def _rotate_with_superuser(db_url: str, superuser: str, superuser_password: str,
     (covers a db configured with POSTGRES_HOST_AUTH_METHOD=trust). The role name
     is quoted via psycopg2.sql.Identifier and the password is bound as a
     parameter (psycopg2 does client-side literal substitution, so this is safe
-    for the ALTER utility statement)."""
+    for the ALTER utility statement).
+
+    v0.4.16 — the hostname may resolve to several containers, so we try each
+    resolved address and, critically, verify the cluster is OURS before issuing
+    any ALTER. Writing to a neighbour's Postgres is far worse than failing to
+    recover, so an unverified cluster is skipped, never repaired."""
     import psycopg2
     from psycopg2 import sql
+
+    from .db_host import resolve_addresses
 
     url = make_url(db_url)
     host = url.host or 'db'
     port = url.port or 5432
     dbname = url.database or 'postgres'
 
-    candidates = []
+    pw_candidates: list[str | None] = []
     if superuser_password:
-        candidates.append(superuser_password)
-    candidates.append(None)  # trust-auth fallback
+        pw_candidates.append(superuser_password)
+    pw_candidates.append(None)  # trust-auth fallback
+
+    # `None` keeps libpq's own resolution as a last resort when the name does
+    # not resolve here (e.g. a socket path or an already-literal address).
+    addresses: list[str | None] = list(resolve_addresses(host, port)) or [None]
 
     last_exc: BaseException | None = None
-    for pw in candidates:
-        try:
-            conn = psycopg2.connect(host=host, port=port, dbname=dbname,
-                                    user=superuser, password=pw,
-                                    connect_timeout=5)
-        except psycopg2.OperationalError as exc:
-            last_exc = exc
-            continue
-        try:
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                cur.execute(
-                    sql.SQL('ALTER USER {} WITH PASSWORD %s').format(
-                        sql.Identifier(target_user)),
-                    (target_password,))
-            return
-        finally:
-            conn.close()
+    for addr in addresses:
+        for pw in pw_candidates:
+            kwargs = {'host': host, 'port': port, 'dbname': dbname,
+                      'user': superuser, 'password': pw, 'connect_timeout': 5}
+            if addr is not None:
+                kwargs['hostaddr'] = addr
+            try:
+                conn = psycopg2.connect(**kwargs)
+            except psycopg2.OperationalError as exc:
+                last_exc = exc
+                continue
+            try:
+                if not cluster_is_ours(conn, dbname, target_user):
+                    last_exc = ForeignClusterError(
+                        f'{addr or host} answered but is not our cluster — '
+                        'refusing to rotate a password there')
+                    log.warning(
+                        'DB auth recovery: %s hosts a different Postgres (no '
+                        '"%s" database + role); skipping it rather than '
+                        'altering another app\'s credentials.',
+                        addr or host, dbname)
+                    break  # a foreign cluster stays foreign whatever password
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    cur.execute(
+                        sql.SQL('ALTER USER {} WITH PASSWORD %s').format(
+                            sql.Identifier(target_user)),
+                        (target_password,))
+                return
+            finally:
+                conn.close()
     raise last_exc or RuntimeError('no superuser connection candidate available')
 
 
@@ -228,9 +282,19 @@ def ensure_db_auth(app, engine) -> RecoveryResult:
             log.warning('DB probe failed (non-auth); leaving it to normal boot '
                         'retry: %s', _redact(exc, ()))
             return RecoveryResult('probe_failed_other')
-        log.warning('DB probe failed: password authentication failed for the '
-                    'app role. Likely APP_SEED drift from a prior postgres '
-                    'volume init — attempting self-heal.')
+        # v0.4.16 — this message used to assert APP_SEED drift, and that
+        # confident misattribution cost four releases of fixes to a password
+        # that was never wrong. The far more common cause is a shared `db`
+        # network alias resolving to a neighbouring app's Postgres, which
+        # rejects our credentials with this identical error. Name both, and
+        # point at the diagnostic that tells them apart.
+        log.warning(
+            'DB probe failed: password authentication failed for the app role. '
+            'Two causes look identical here — (a) the connection reached '
+            'ANOTHER app\'s postgres via a shared network alias (check the '
+            '"DB host ... is AMBIGUOUS" line logged at boot), or (b) genuine '
+            'APP_SEED drift from a prior volume init. Attempting self-heal; it '
+            'will refuse to touch a cluster that is not ours.')
 
     # 2 · gate
     if not app.config.get('AUTO_RECOVER_DB_AUTH', True):

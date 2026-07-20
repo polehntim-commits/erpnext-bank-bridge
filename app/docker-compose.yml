@@ -1,6 +1,14 @@
 version: "3.8"
 services:
-  db:
+  # v0.4.16 — named `bankbridge-db`, NOT `db`. The service name becomes a Docker
+  # network alias, and on Umbrel every app shares ONE network: when several apps
+  # each call their database `db`, that alias resolves to all of them and libpq
+  # picks whichever the DNS answer happens to list first. A foreign Postgres
+  # then rejects our credentials with "password authentication failed", the
+  # symptom misdiagnosed as APP_SEED drift for five releases. Prefixing with the
+  # app name is the same convention CLAUDE.md mandates for Funnel paths.
+  # Renaming is safe: the data lives on the named volume below, not the service.
+  bankbridge-db:
     image: postgres:16-alpine
     container_name: bankbridge_db
     restart: on-failure
@@ -32,14 +40,14 @@ services:
     build: .
     container_name: bankbridge
     depends_on:
-      db:
+      bankbridge-db:
         condition: service_healthy
     ports:
       - "5202:5202"
     environment:
       DATA_DIR: /data
       SECRET_KEY: ${SECRET_KEY:-dev-not-for-production}
-      DATABASE_URL: postgresql://bankbridge:${POSTGRES_PASSWORD:-dev-postgres-password}@db:5432/bankbridge
+      DATABASE_URL: postgresql://bankbridge:${POSTGRES_PASSWORD:-dev-postgres-password}@bankbridge-db:5432/bankbridge
       # Plaid — blank by default; configure at /admin/plaid_settings (persisted
       # to the data volume, wins over these). Set here only for a headless run.
       PLAID_CLIENT_ID: ${PLAID_CLIENT_ID:-}
