@@ -647,6 +647,32 @@ class ReconcileTest(StatementsBase):
         self.assertEqual(got['status'], 'no_data')
         self.assertIsNone(got['delta'])
 
+    def test_computed_fallback_when_pdf_missed_but_mirror_covers_period(self):
+        """v0.4.20: an unparseable PDF is not the end of the story if the
+        transaction mirror covers the period. The reconciliation still runs on
+        opening/closing DERIVED from the mirror, tagged source='computed' so an
+        operator sees it is not a bank cross-check.
+
+        With the _account default (balance_current=1000) and one -50 txn
+        dated 2026-07-10 inside period [2026-07-01, 2026-07-31]:
+          closing (balance at 2026-07-31) = 1000 + Σ(txns after 07-31) = 1000
+          opening (balance at 2026-06-30) = 1000 + Σ(txns after 06-30) =
+              1000 + (-50) = 950
+        Movement for the period is -50 (the one txn inside it). Reconciliation
+        expected_closing = apply_movement(opening=950, movement=-50) = 950 -
+        (-50) = 1000, which matches the computed closing. Delta is 0 by
+        construction — both sides come from the same mirror."""
+        account = self._account()
+        self._txn('t1', amount=-50.0)
+        st = self._statement(opening=None, closing=None)
+        got = stmts.reconcile_statement(st, account)
+        self.assertEqual(got['status'], 'computed')
+        self.assertEqual(got['opening_source'], 'computed')
+        self.assertEqual(got['closing_source'], 'computed')
+        self.assertEqual(got['opening'], 950.0)
+        self.assertEqual(got['closing'], 1000.0)
+        self.assertEqual(got['delta'], 0.0)
+
 
 # ── anchor safety ────────────────────────────────────────────────────────────
 
@@ -758,6 +784,30 @@ class BookFromStatementTest(StatementsBase):
         self.assertEqual(result['status'], 'booked')
         doc = client.creates_of('Journal Entry')[0][2]
         self.assertEqual(doc['accounts'][0]['debit_in_account_currency'], 999.0)
+
+    def test_computed_anchor_kicks_in_when_no_statement_qualifies(self):
+        """v0.4.21: no bank statement qualifies but the mirror has activity;
+        book the transaction-derived opening dated at the earliest mirrored
+        transaction rather than fall to plaid_balance dated today.
+
+        balance_current=999, one -50 outflow dated 2026-07-10.
+        computed opening (balance at close of 2026-07-09) = 999 + (-50) = 949,
+        posted dated 2026-07-10."""
+        from app.models import AuditEvent
+        account = self._account(balance=999.0)
+        self._txn('t1', amount=-50.0, when=date(2026, 7, 10))
+        # A statement that doesn't reconcile, so statement_anchor returns None
+        # and the computed path is the next fallback.
+        self._statement(opening=17600.0, closing=19999.0)
+        result = obal.book_opening_balance(self._erp(), account,
+                                          prefer_statement=True)
+        self.assertEqual(result['status'], 'booked')
+        event = AuditEvent.query.filter_by(
+            event_type='opening_balance_booked').one()
+        payload = event.to_dict()['payload_after']
+        self.assertEqual(payload['source'], 'computed')
+        self.assertEqual(payload['amount'], 949.0)
+        self.assertEqual(payload['posting_date'], '2026-07-10')
 
     def test_the_audit_event_records_which_source_was_used(self):
         from app.models import AuditEvent

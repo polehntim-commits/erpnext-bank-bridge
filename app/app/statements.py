@@ -615,30 +615,69 @@ def reconcile_statement(statement: PlaidStatement,
     """Measure one statement against the mirror.
 
     Returns {'status', 'expected_closing', 'closing', 'delta', 'movement',
-    'txn_count'}. `status` is one of:
+    'txn_count', 'opening', 'opening_source', 'closing_source'}. `status` is
+    one of:
 
-      * 'ok'        — the mirror's arithmetic lands on the bank's closing
-                      balance, within tolerance
+      * 'ok'        — the mirror's arithmetic lands on the bank's (or
+                      computed) closing balance, within tolerance
       * 'mismatch'  — it doesn't, by `delta`; the mirror has a gap for this
                       period (or the bank's cycle isn't a calendar month)
-      * 'no_data'   — the statement's balances couldn't be parsed, so there is
-                      nothing to measure against
+      * 'computed'  — the PDF was unparseable but the mirror knows the balance
+                      for this period; opening/closing are transaction-derived
+                      and the reconciliation is trivially exact (both sides
+                      come from the same mirror) — the row still surfaces
+                      opening + closing + movement so an operator can eyeball
+                      the period rather than see a blank line
+      * 'no_data'   — no statement fields to work with AND the mirror doesn't
+                      cover this period either; nothing worth reporting
 
-    'no_data' is deliberately NOT a mismatch. An unparseable PDF says nothing
-    about whether the books agree, and flagging it as a discrepancy would train
-    an operator to ignore the one signal on this page that means something."""
+    v0.4.20: when the PDF parser returned None for opening or closing, the
+    computed_balances module fills them from the transaction mirror. Sources
+    are surfaced explicitly (`bank` vs `computed`) so the UI can show which
+    figure came from where — a bank-issued number gets the same authority it
+    always did; a computed one is honest about being derived from the mirror,
+    not asserted by the institution.
+
+    'no_data' is deliberately NOT a mismatch. An unparseable PDF over an
+    unmirrored period says nothing about whether the books agree, and
+    flagging it as a discrepancy would train an operator to ignore the one
+    signal on this page that means something."""
     blank = {'status': 'no_data', 'expected_closing': None, 'closing': None,
-             'delta': None, 'movement': 0.0, 'txn_count': 0}
-    if statement.opening_balance is None or statement.closing_balance is None:
-        return blank
-    account = account or PlaidAccount.query.filter_by(
+             'delta': None, 'movement': 0.0, 'txn_count': 0,
+             'opening': None,
+             'opening_source': None, 'closing_source': None}
+    account = account or (PlaidAccount.query.filter_by(
         account_id=statement.plaid_account_id).first()
+        if statement.plaid_account_id else None)
     if account is None:
         return blank
+
+    # v0.4.20 · fall back to the mirror when the PDF parser missed either
+    # side. The parser is silent-optional by design (see the module
+    # docstring); the mirror is authoritative arithmetic on top of a
+    # transaction feed Plaid guarantees is complete.
+    from . import computed_balances as cb
+    opening = statement.opening_balance
+    opening_source = 'bank' if opening is not None else None
+    closing = statement.closing_balance
+    closing_source = 'bank' if closing is not None else None
+    if opening is None or closing is None:
+        c_open, c_close = cb.opening_and_closing_for_period(
+            account, statement.period_start, statement.period_end)
+        if opening is None and c_open is not None:
+            opening = c_open
+            opening_source = 'computed'
+        if closing is None and c_close is not None:
+            closing = c_close
+            closing_source = 'computed'
+
+    if opening is None or closing is None:
+        return blank
+
     movement = signed_movement(account, statement.period_start,
                                statement.period_end)
-    expected = apply_movement(account, statement.opening_balance, movement)
-    delta = round(expected - float(statement.closing_balance), 2)
+    expected = apply_movement(account, opening, movement)
+    delta = round(expected - float(closing), 2)
     count = (BankTransaction.query
              .filter(BankTransaction.account_id == account.account_id,
                      BankTransaction.date >= statement.period_start,
@@ -646,11 +685,22 @@ def reconcile_statement(statement: PlaidStatement,
                      BankTransaction.pending.is_(False),
                      BankTransaction.removed.is_(False))
              .count()) if statement.period_start and statement.period_end else 0
+
+    # When BOTH sides came from the mirror, the reconciliation identity is
+    # trivial — expected and closing are two ways of computing the same
+    # arithmetic. Report status='computed' so an operator knows the equality
+    # is definitional here, not a bank cross-check.
+    if opening_source == 'computed' and closing_source == 'computed':
+        status = 'computed'
+    else:
+        status = 'ok' if abs(delta) <= reconcile_tolerance() else 'mismatch'
     return {
-        'status': 'ok' if abs(delta) <= reconcile_tolerance() else 'mismatch',
+        'status': status,
         'expected_closing': expected,
-        'closing': round(float(statement.closing_balance), 2),
+        'closing': round(float(closing), 2),
         'delta': delta, 'movement': movement, 'txn_count': count,
+        'opening': round(float(opening), 2),
+        'opening_source': opening_source, 'closing_source': closing_source,
     }
 
 

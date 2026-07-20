@@ -387,6 +387,37 @@ def statement_anchor(account: PlaidAccount):
         return None
 
 
+def computed_anchor(account: PlaidAccount):
+    """(amount, posting_date) from a transaction-mirror-derived opening (v0.4.21).
+
+    Second-best answer when no bank statement qualifies. Computes the balance
+    the account held at the close of the day BEFORE its earliest mirrored
+    transaction — the same figure `estimate_opening_balance` returns, dated
+    at the first day of real mirrored history. Returns None when the mirror
+    is empty (nothing to walk back from) or the account has no cached
+    current balance.
+
+    Not as authoritative as a bank statement (the bank never asserted this
+    number), but strictly better than posting today's balance dated today,
+    because it gives the ledger the correct HISTORICAL shape: the entries
+    that come after this opening are exactly the transactions this app
+    already mirrored."""
+    try:
+        from . import computed_balances as cb
+        from datetime import timedelta
+        earliest = cb.earliest_mirrored_date(account)
+        if earliest is None:
+            return None
+        amount = cb.balance_at(account, earliest - timedelta(days=1))
+        if amount is None:
+            return None
+        return amount, earliest
+    except Exception:  # pragma: no cover - computed must never block booking
+        log.warning('computed anchor lookup failed for %s',
+                    account.account_id, exc_info=True)
+        return None
+
+
 def book_opening_balance(client, account: PlaidAccount, *,
                          amount: float | None = None,
                          posting_date=None, force: bool = False,
@@ -441,6 +472,16 @@ def book_opening_balance(client, account: PlaidAccount, *,
     # actually qualifies (see statements.choose_anchor_statement — it rejects
     # any statement the mirror cannot reproduce). `source` rides through to the
     # entry's remark so an operator reviewing the Draft can see which it was.
+    #
+    # v0.4.21 · when no statement qualifies, fall back to a COMPUTED anchor:
+    # the balance derived from the transaction mirror as of just before the
+    # earliest mirrored transaction, dated at that first transaction. The
+    # figure is the same as `estimate_opening_balance`; the difference is
+    # positional — it is the DEFAULT for `prefer_statement=True` when the
+    # bank hasn't provided a parseable statement, so an operator using the
+    # backfill script no longer has to pre-compute the estimate to escape
+    # `source='plaid_balance'` (which posts today's balance dated today and
+    # is the wrong historical shape for a legacy account).
     source = 'estimate' if amount is not None else 'plaid_balance'
     anchor = None
     if prefer_statement and amount is None:
@@ -453,6 +494,16 @@ def book_opening_balance(client, account: PlaidAccount, *,
         log.info('opening balance for %s anchored on bank statement %s '
                  '(period starting %s): %.2f', account.account_id,
                  statement.statement_id, anchored_date, amount)
+    elif prefer_statement and amount is None:
+        computed = computed_anchor(account)
+        if computed is not None:
+            amount, computed_date = computed
+            source = 'computed'
+            if posting_date is None:
+                posting_date = computed_date
+            log.info('opening balance for %s anchored on transaction mirror '
+                     '(earliest txn %s): %.2f', account.account_id,
+                     computed_date, amount)
 
     value = float(account.balance_current or 0.0) if amount is None \
         else float(amount)
