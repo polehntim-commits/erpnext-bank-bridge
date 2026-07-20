@@ -13,7 +13,7 @@ from flask_sqlalchemy import SQLAlchemy
 
 from config import Config
 
-__version__ = '0.4.15'
+__version__ = '0.4.16'
 db = SQLAlchemy()
 
 
@@ -32,6 +32,34 @@ def _configure_logging() -> None:
     logging.getLogger('bankbridge').setLevel(level)
 
 
+def _install_db_host_pinning(app: Flask) -> None:
+    """Point SQLAlchemy at a creator that only ever returns our own database.
+
+    No-op for a non-Postgres URI or under TESTING, so the unit suite keeps its
+    plain in-process engine. Never raises: if pinning cannot be installed we log
+    it and fall back to libpq's own resolution, which is exactly today's
+    behaviour."""
+    if app.config.get('TESTING'):
+        return
+    uri = app.config.get('SQLALCHEMY_DATABASE_URI') or ''
+    if not uri.startswith('postgresql'):
+        return
+    try:
+        from .db_host import log_host_diagnostics, make_creator
+        log_host_diagnostics(uri)
+        creator, pin = make_creator(uri)
+    except Exception:  # noqa: BLE001 — never block boot on the diagnostics
+        logging.getLogger('bankbridge').warning(
+            'could not install DB host pinning; falling back to plain '
+            'hostname resolution', exc_info=True)
+        return
+    options = dict(app.config.get('SQLALCHEMY_ENGINE_OPTIONS') or {})
+    options['creator'] = creator
+    app.config['SQLALCHEMY_ENGINE_OPTIONS'] = options
+    # Kept for /api/health and the tests to inspect which address we settled on.
+    app.extensions.setdefault('bankbridge', {})['db_host_pin'] = pin
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     _configure_logging()
     app = Flask(__name__)
@@ -46,6 +74,15 @@ def create_app(test_config: dict | None = None) -> Flask:
     # own key rather than a previous app's.
     from . import crypto
     crypto.reset_cache()
+
+    # v0.4.16 — on Umbrel every app shares one Docker network and most name
+    # their database service `db`, so that alias resolves to several apps'
+    # containers at once. Route every pooled connection through a creator that
+    # verifies it reached OUR database (see app/db_host.py); without it roughly
+    # three connections in four hit a neighbour's Postgres and die with
+    # "password authentication failed" — the symptom long misread as APP_SEED
+    # drift. Skipped under TESTING, where the engine is a test double.
+    _install_db_host_pinning(app)
 
     db.init_app(app)
 

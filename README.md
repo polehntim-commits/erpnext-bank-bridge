@@ -103,7 +103,7 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Status
 
-v0.4.15 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
+v0.4.16 — functional pilot. Runs the full Plaid Link → sync → ERPNext push loop
 with a mocked-API test suite, one-click import of Plaid accounts into ERPNext
 Bank / Bank Account records, auto-Supplier creation from merchant names, and a
 rules engine that auto-generates Journal Entries. v0.3.1 polish: auto-created GL
@@ -312,6 +312,69 @@ Company-agnostic logical-name list too) and reports how many accounts came back.
 Create an account in ERPNext, reload the Rules editor, and it's selectable — no
 Company toggle, no restart. Regression-tested against a chart spanning all five
 root types, with group and disabled accounts still correctly excluded.
+
+**v0.4.16** — **the "postgres auth drift" was never a password problem.**
+Five releases chased a bug that reported itself as `password authentication
+failed for user "bankbridge"` and looked exactly like the app role's password
+drifting from the value baked into the postgres volume. v0.3.5 added a rescue
+superuser, v0.4.7 fixed the rotate script, v0.4.11 scoped another pass. It kept
+coming back, and on v0.4.15 it started 500ing the Plaid Settings page.
+
+The password was correct the whole time. The app was connecting to **another
+app's database**.
+
+On Umbrel every app shares one flat Docker network, and nearly every app names
+its postgres service `db`. Docker registers a network alias per service name, so
+on a box running several such apps the name `db` resolves to *all* of them:
+
+```
+db → 10.21.0.73  (ours)
+     10.21.0.66  (another app's postgres — answers, rejects our credentials)
+     10.21.0.70  (another app's postgres — refuses the connection)
+     10.21.0.24  (another app's postgres — refuses the connection)
+```
+
+libpq walks those addresses, and the two failure modes differ in a way that
+makes the bug intermittent: a `Connection refused` falls through to the next
+address, but a `password authentication failed` is **fatal** and stops the
+connect dead. Docker randomizes the answer order per lookup, so whether a
+connection worked came down to where the one *neighbouring* Postgres that
+accepts TCP landed in the list. That is why boot self-heal could report success
+and the same process 500 two hours later, and why every fix aimed at the
+password derivation missed.
+
+Two layers of fix, because they fail independently:
+
+- **The database service is now `bankbridge-db`, not `db`** — a unique alias, so
+  the name is unambiguous in the first place. This is the app-name-prefix
+  convention this project already mandates for Funnel paths, applied to the
+  Docker network namespace.
+- **Connections no longer trust the name.** Bank Bridge resolves the DB host
+  itself, and on an ambiguous name probes the candidates and uses only the one
+  that proves it is our database (it authenticates *and* reports our database
+  name). The winning address is pinned for reuse and re-probed if the container
+  moves. Cost on an unambiguous host: one `getaddrinfo`, no probing.
+
+Boot now logs what the DB host resolves to, and warns loudly when the alias is
+shared — the observability whose absence let this hide for five releases.
+
+**Recovery can no longer damage a neighbouring app.** The self-heal reacts to
+`password authentication failed` by connecting as a superuser and running
+`ALTER USER ... PASSWORD`. It had no check that the cluster it reached was ours,
+so a shared alias put it one credential coincidence away from rewriting another
+app's role password. It now verifies the cluster hosts our database *and* our
+role before altering anything, and skips it otherwise.
+
+> **Migration — nothing to do.** Restart Bank Bridge and the new connection
+> path applies immediately; it fixes the 500s even on the old compose, before
+> the service rename lands. Redeploying the compose renames the db container,
+> which is safe — the data is on the named volume, not the service. No password
+> is changed, no volume is touched, no data moves.
+
+> **If you run other Umbrel apps built from this template** (BucketLog,
+> VolumeVision), they very likely carry the same hazard: a `db` service name on
+> the shared network, plus a recovery path that will `ALTER` whatever Postgres
+> answers. Give each one an app-prefixed alias.
 
 **v0.4.15** — **re-linking a bank stops colliding with your own records.**
 v0.4.11 promised an idempotent reconnect and did not deliver one. Disconnecting
@@ -2452,6 +2515,14 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 > access token. Losing it means re-linking every bank.
 
 ### Self-healing DB auth (v0.3.5)
+
+> **Read this first (v0.4.16).** If you are here because of `password
+> authentication failed for user "bankbridge"`, the cause is *probably not* what
+> this section describes. On Umbrel that error is far more often the connection
+> landing on **another app's postgres** through the shared `db` network alias —
+> see the v0.4.16 entry above. Check the boot log for a `DB host ... is
+> AMBIGUOUS` warning before assuming password drift. Genuine drift, described
+> below, is real but rare.
 
 Postgres persists the `bankbridge` login role's password from the **first** time
 its data volume was initialized. If a later deploy hands the app a *different*
