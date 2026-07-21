@@ -495,6 +495,105 @@ class PlaidClient:
                     out[row['account_id']] = row
         return out
 
+    # ── investments (v0.4.27) ────────────────────────────────────────
+    #
+    # Two endpoints power everything the v0.5.0 lot tracker will consume:
+    # /investments/holdings/get returns the CURRENT positions on an Item's
+    # investment accounts (with security_id, quantity, cost basis, and the
+    # institution_price + as_of stamp Plaid returns without a separate market
+    # data adapter — see the v0.5.0 spec for why we DELIBERATELY skip a
+    # market feed). /investments/transactions/get returns the trade history
+    # (buys, sells, dividends, splits, transfers) with full security detail.
+    #
+    # Both are OPTIONAL like liabilities: an Item that wasn't linked with the
+    # `investments` product (any pre-v0.4.26 Item, or any Item at an
+    # institution without investment accounts) returns {} rather than
+    # raising, so callers can degrade to "no investment detail" the same way
+    # loans.py degrades to "no liability detail" — the failure mode is a
+    # feature-not-available, not an operational error.
+
+    def investments_holdings_get(self, access_token: str) -> dict:
+        """Current investment holdings for this Item:
+        {'holdings': [normalized dicts], 'securities': [normalized dicts],
+        'accounts': [normalized account dicts, so callers can dedupe with
+        their own account list without another /accounts/get roundtrip]}.
+
+        Returns {} — never raises — when the Item can't serve Investments.
+        Symmetric with liabilities_get: a missing product / missing consent
+        is the common case, not an error, and the v0.5.0 lot tracker
+        degrades to 'no positions yet' when this returns empty."""
+        from plaid.model.investments_holdings_get_request import \
+            InvestmentsHoldingsGetRequest
+        api = self._get_api()
+        try:
+            resp = api.investments_holdings_get(
+                InvestmentsHoldingsGetRequest(access_token=access_token))
+        except Exception as e:
+            log.info('investments_holdings unavailable for this item: %s', e)
+            return {}
+        d = _to_dict(resp)
+        return {
+            'accounts': [_normalize_account(a)
+                         for a in (_get(d, 'accounts', []) or [])],
+            'holdings': [_normalize_holding(h)
+                         for h in (_get(d, 'holdings', []) or [])],
+            'securities': [_normalize_security(s)
+                           for s in (_get(d, 'securities', []) or [])],
+        }
+
+    def investments_transactions_get(self, access_token: str,
+                                     start_date, end_date,
+                                     count: int = 500,
+                                     offset: int = 0) -> dict:
+        """One page of investment transactions for this Item:
+        {'investment_transactions': [normalized dicts],
+         'securities': [normalized dicts], 'total_transactions': int,
+         'accounts': [normalized account dicts]}.
+
+        Plaid uses offset-based pagination for investments (not the cursor
+        model transactions_sync uses), so the caller loops with an
+        incrementing `offset` while `offset + len(returned) <
+        total_transactions`. `count` is Plaid's per-page cap and defaults to
+        the maximum (500).
+
+        `start_date` and `end_date` are inclusive and required — Plaid
+        errors if they're missing. Datetime.date OR ISO 8601 strings both
+        work here; the SDK model accepts either. Callers picking a range
+        should mirror TRANSACTIONS_DAYS_REQUESTED for a fresh backfill and
+        use the last-sync date as the floor on subsequent runs.
+
+        Returns {} — never raises — on any product-unavailable failure."""
+        from plaid.model.investments_transactions_get_request import \
+            InvestmentsTransactionsGetRequest
+        from plaid.model.investments_transactions_get_request_options import \
+            InvestmentsTransactionsGetRequestOptions
+        api = self._get_api()
+        kwargs = dict(
+            access_token=access_token,
+            start_date=start_date,
+            end_date=end_date,
+            options=InvestmentsTransactionsGetRequestOptions(
+                count=count, offset=offset))
+        try:
+            resp = api.investments_transactions_get(
+                InvestmentsTransactionsGetRequest(**kwargs))
+        except Exception as e:
+            log.info('investments_transactions unavailable for this item: %s',
+                     e)
+            return {}
+        d = _to_dict(resp)
+        return {
+            'accounts': [_normalize_account(a)
+                         for a in (_get(d, 'accounts', []) or [])],
+            'investment_transactions': [
+                _normalize_investment_txn(t)
+                for t in (_get(d, 'investment_transactions', []) or [])],
+            'securities': [_normalize_security(s)
+                           for s in (_get(d, 'securities', []) or [])],
+            'total_transactions': int(_get(d, 'total_investment_transactions',
+                                           0) or 0),
+        }
+
     # ── statements (v0.4.9) ──────────────────────────────────────────
 
     def statements_list(self, access_token: str) -> list[dict]:
@@ -746,3 +845,111 @@ def _normalize_txn(t) -> dict:
 def _normalize_removed(t) -> dict:
     d = _to_dict(t)
     return {'transaction_id': _get(d, 'transaction_id')}
+
+
+# ── investments normalizers (v0.4.27) ───────────────────────────────────────
+#
+# Three shapes to flatten: Holding (a position at an account), Security (the
+# instrument the position is in), and InvestmentTransaction (a trade / dividend
+# / split / transfer event). All three come back from the same two endpoints
+# (holdings_get + transactions_get), and both endpoints redundantly ship the
+# securities list on every response — Plaid's design lets a Holding reference a
+# Security by security_id without embedding it, so the security detail lives in
+# a separate array. We preserve that split so `Security` rows can be upserted
+# once and `SecurityHolding` rows keyed on just security_id.
+#
+# option_contract fields are pulled out of the Security into flat columns so
+# a query for 'all AAPL puts expiring next month' is a straight index scan
+# rather than a JSON walk. Non-option securities carry None across those
+# fields; the DB layer stores them as NULL.
+
+
+def _normalize_holding(h) -> dict:
+    """One Plaid /investments/holdings/get holding row → a flat dict the
+    SecurityHolding upserter consumes. Negative quantity is legal and
+    meaningful — it's how Plaid encodes a short position (a written call
+    or put)."""
+    d = _to_dict(h)
+    as_of = _get(d, 'institution_price_as_of')
+    return {
+        'account_id': _get(d, 'account_id'),
+        'security_id': _get(d, 'security_id'),
+        'quantity': float(_get(d, 'quantity', 0.0) or 0.0),
+        'cost_basis': (float(_get(d, 'cost_basis')) if _get(d, 'cost_basis')
+                       is not None else None),
+        'institution_price': (float(_get(d, 'institution_price'))
+                              if _get(d, 'institution_price')
+                              is not None else None),
+        'institution_value': (float(_get(d, 'institution_value'))
+                              if _get(d, 'institution_value')
+                              is not None else None),
+        'institution_price_as_of': (str(as_of) if as_of is not None else None),
+        'iso_currency_code': _get(d, 'iso_currency_code', 'USD') or 'USD',
+    }
+
+
+def _normalize_security(s) -> dict:
+    """One Plaid Security → a flat dict, with `option_contract` sub-object
+    unpacked into flat columns so option-specific queries are cheap. Plaid's
+    `type` values include equity, etf, mutual fund, fixed income, cash,
+    derivative, cryptocurrency and others — stored verbatim; the SecurityHolding
+    consumer uses the type + option_contract presence to decide whether to
+    treat the row as an equity or an option (see v0.5.0 spec Phase B)."""
+    d = _to_dict(s)
+    opt = _to_dict(_get(d, 'option_contract', None))
+    is_option = isinstance(opt, dict) and (opt.get('contract_type')
+                                            or opt.get('strike_price')
+                                            or opt.get('expiration_date'))
+    return {
+        'security_id': _get(d, 'security_id'),
+        'ticker_symbol': _get(d, 'ticker_symbol', '') or '',
+        'name': _get(d, 'name', '') or '',
+        'type': str(_get(d, 'type', '') or ''),
+        'iso_currency_code': _get(d, 'iso_currency_code', 'USD') or 'USD',
+        'cusip': _get(d, 'cusip', '') or '',
+        'isin': _get(d, 'isin', '') or '',
+        'sedol': _get(d, 'sedol', '') or '',
+        'close_price': (float(_get(d, 'close_price'))
+                        if _get(d, 'close_price') is not None else None),
+        'close_price_as_of': (str(_get(d, 'close_price_as_of'))
+                              if _get(d, 'close_price_as_of')
+                              is not None else None),
+        'is_option': bool(is_option),
+        'option_contract_type': (str(_get(opt, 'contract_type'))
+                                 if is_option and _get(opt, 'contract_type')
+                                 is not None else None),
+        'option_strike_price': (float(_get(opt, 'strike_price'))
+                                if is_option and _get(opt, 'strike_price')
+                                is not None else None),
+        'option_expiration_date': (str(_get(opt, 'expiration_date'))
+                                   if is_option and _get(opt, 'expiration_date')
+                                   is not None else None),
+        'option_underlying_ticker': (
+            str(_get(opt, 'underlying_security_ticker'))
+            if is_option and _get(opt, 'underlying_security_ticker')
+            is not None else None),
+    }
+
+
+def _normalize_investment_txn(t) -> dict:
+    """One Plaid investment transaction (buy/sell/dividend/split/transfer/etc.)
+    → a flat dict. Plaid's `type` + `subtype` combined name the event
+    ('buy/buy', 'sell/sell', 'cash/dividend', 'transfer/deposit', etc.);
+    both are preserved so the v0.5.0 detector can classify accurately."""
+    d = _to_dict(t)
+    date_val = _get(d, 'date')
+    return {
+        'investment_transaction_id': _get(d, 'investment_transaction_id'),
+        'account_id': _get(d, 'account_id'),
+        'security_id': _get(d, 'security_id'),
+        'date': str(date_val) if date_val is not None else None,
+        'name': _get(d, 'name', '') or '',
+        'quantity': float(_get(d, 'quantity', 0.0) or 0.0),
+        'amount': float(_get(d, 'amount', 0.0) or 0.0),
+        'price': float(_get(d, 'price', 0.0) or 0.0),
+        'fees': (float(_get(d, 'fees'))
+                 if _get(d, 'fees') is not None else None),
+        'type': str(_get(d, 'type', '') or ''),
+        'subtype': str(_get(d, 'subtype', '') or ''),
+        'iso_currency_code': _get(d, 'iso_currency_code', 'USD') or 'USD',
+    }

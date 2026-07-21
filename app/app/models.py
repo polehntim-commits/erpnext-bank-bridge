@@ -913,3 +913,187 @@ class PlaidLinkState(db.Model):
     def to_dict(self):
         return {'id': self.id, 'created_at':
                 self.created_at.isoformat() if self.created_at else None}
+
+
+# ── v0.4.27 · investments (v0.5.0 Phase A) ─────────────────────────────────
+#
+# Three models power the investment portfolio tracker: Security (the
+# instrument), SecurityHolding (a position at a specific Plaid account, snapshot
+# per sync), and SecurityTransaction (a trade/dividend/split/transfer event
+# from Plaid's /investments/transactions/get). Splitting Security from Holding
+# mirrors Plaid's response shape and lets one Security row serve every account
+# holding it — a single AAPL Security backs OM's brokerage and BBT's IRA
+# without duplication.
+#
+# Option contracts are stored inline as flat columns on Security (is_option,
+# option_strike_price, etc.) rather than a JSON blob or a separate options
+# table, because every downstream query touches at least one of those fields
+# and JSON access on Postgres, while capable, is slower and harder to index.
+
+
+class Security(db.Model):
+    """One instrument — an equity, ETF, mutual fund, bond, option contract,
+    etc. — as identified by Plaid's stable security_id. Populated + updated on
+    every /investments/holdings/get and /investments/transactions/get response
+    (both endpoints ship the securities list redundantly).
+
+    Options are stored INLINE via flat columns rather than a separate
+    OptionsContract table because every Phase B / C query filters on the
+    option-specific fields; JSON storage would work but requires GIN indexes
+    for the same queries flat columns handle natively.
+
+    `ticker_symbol` is a string and can be empty for securities where Plaid
+    lacks that field (some mutual funds, some private placements). Downstream
+    code MUST tolerate blank tickers — display code falls back to `name`."""
+    __tablename__ = 'securities'
+    id = db.Column(db.Integer, primary_key=True)
+    security_id = db.Column(db.String(120), unique=True, nullable=False,
+                            index=True)
+    ticker_symbol = db.Column(db.String(50), default='', index=True)
+    name = db.Column(db.String(500), default='')
+    type = db.Column(db.String(60), default='')
+    iso_currency_code = db.Column(db.String(8), default='USD')
+    cusip = db.Column(db.String(30), default='')
+    isin = db.Column(db.String(30), default='')
+    sedol = db.Column(db.String(30), default='')
+    # Plaid's own last-known institutional close price, refreshed on every
+    # holdings pull. TradingView is authoritative for real-time; this field is
+    # the "as-of the last sync" snapshot for balance-sheet purposes.
+    close_price = db.Column(db.Float, nullable=True)
+    close_price_as_of = db.Column(db.Date, nullable=True)
+    # Options metadata, present only when Plaid classifies the security as an
+    # options contract. is_option is denormalized off the presence of the
+    # option fields so the '/admin/holdings' filter is a cheap index lookup.
+    is_option = db.Column(db.Boolean, default=False, index=True)
+    option_contract_type = db.Column(db.String(10), nullable=True)  # call|put
+    option_strike_price = db.Column(db.Float, nullable=True)
+    option_expiration_date = db.Column(db.Date, nullable=True)
+    option_underlying_ticker = db.Column(db.String(50), nullable=True,
+                                         index=True)
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'security_id': self.security_id,
+            'ticker_symbol': self.ticker_symbol, 'name': self.name,
+            'type': self.type,
+            'iso_currency_code': self.iso_currency_code,
+            'cusip': self.cusip, 'isin': self.isin, 'sedol': self.sedol,
+            'close_price': self.close_price,
+            'close_price_as_of': (self.close_price_as_of.isoformat()
+                                  if self.close_price_as_of else None),
+            'is_option': bool(self.is_option),
+            'option_contract_type': self.option_contract_type,
+            'option_strike_price': self.option_strike_price,
+            'option_expiration_date': (self.option_expiration_date.isoformat()
+                                       if self.option_expiration_date
+                                       else None),
+            'option_underlying_ticker': self.option_underlying_ticker,
+        }
+
+
+class SecurityHolding(db.Model):
+    """One position at one Plaid account, from the last
+    /investments/holdings/get response. Snapshot-per-sync: each sync replaces
+    the row for a given (account_id, security_id) pair, so this table always
+    reflects the current state. History lives in SecurityTransaction — this
+    is 'what you have RIGHT NOW'.
+
+    `quantity` can be negative: Plaid encodes short positions (written calls
+    or puts) as negative quantity. The naked-position safety check in Phase B
+    reads this field."""
+    __tablename__ = 'security_holdings'
+    id = db.Column(db.Integer, primary_key=True)
+    account_id = db.Column(db.String(120),
+                           db.ForeignKey('plaid_accounts.account_id'),
+                           nullable=False, index=True)
+    security_id = db.Column(db.String(120),
+                            db.ForeignKey('securities.security_id'),
+                            nullable=False, index=True)
+    quantity = db.Column(db.Float, nullable=False, default=0.0)
+    cost_basis = db.Column(db.Float, nullable=True)
+    # Plaid's most recent price for this security at this institution + the
+    # timestamp of that price. `institution_value` = quantity * price, cached
+    # so the dashboard doesn't recompute per row.
+    institution_price = db.Column(db.Float, nullable=True)
+    institution_price_as_of = db.Column(db.Date, nullable=True)
+    institution_value = db.Column(db.Float, nullable=True)
+    iso_currency_code = db.Column(db.String(8), default='USD')
+    refreshed_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+    __table_args__ = (
+        db.UniqueConstraint('account_id', 'security_id',
+                            name='ux_security_holdings_account_security'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'account_id': self.account_id,
+            'security_id': self.security_id,
+            'quantity': self.quantity, 'cost_basis': self.cost_basis,
+            'institution_price': self.institution_price,
+            'institution_price_as_of': (
+                self.institution_price_as_of.isoformat()
+                if self.institution_price_as_of else None),
+            'institution_value': self.institution_value,
+            'iso_currency_code': self.iso_currency_code,
+            'refreshed_at': (self.refreshed_at.isoformat()
+                             if self.refreshed_at else None),
+        }
+
+
+class SecurityTransaction(db.Model):
+    """One Plaid /investments/transactions/get row — a buy, sell, dividend,
+    split, transfer, assignment, or any other investment event with a full
+    security detail. Unique on `plaid_investment_transaction_id` so a re-pull
+    is idempotent.
+
+    Cash movements (`type='cash', subtype='dividend'` etc.) are stored here
+    too, with `security_id` referencing the paying security. Portfolio cash
+    balance tracking (Fee Account 6030) still runs through the regular
+    BankTransaction mirror — this table adds security-attribution to those
+    events, it doesn't replace them."""
+    __tablename__ = 'security_transactions'
+    id = db.Column(db.Integer, primary_key=True)
+    plaid_investment_transaction_id = db.Column(
+        db.String(120), unique=True, nullable=False, index=True)
+    account_id = db.Column(db.String(120),
+                           db.ForeignKey('plaid_accounts.account_id'),
+                           nullable=False, index=True)
+    security_id = db.Column(db.String(120),
+                            db.ForeignKey('securities.security_id'),
+                            nullable=True, index=True)
+    date = db.Column(db.Date, nullable=True, index=True)
+    name = db.Column(db.String(500), default='')
+    # `quantity` is contracts for options, shares for equities; Plaid uses
+    # positive for buys and negative for sells (consistent with the
+    # transactions_sync convention on BankTransaction.amount).
+    quantity = db.Column(db.Float, nullable=False, default=0.0)
+    # Signed cash impact: positive when money left the account (a buy),
+    # negative when it entered (a sell or dividend received).
+    amount = db.Column(db.Float, nullable=False, default=0.0)
+    price = db.Column(db.Float, nullable=False, default=0.0)
+    fees = db.Column(db.Float, nullable=True)
+    # Plaid's classification. `type` is one of {buy, sell, cash, transfer,
+    # fee, cancel}; `subtype` names the event within that type
+    # ('cash/dividend', 'buy/buy', 'sell/sell', 'transfer/deposit',
+    # 'cash/interest', 'fee/miscellaneous fee', etc.). Both preserved verbatim
+    # for the Phase B 5:4 detector.
+    type = db.Column(db.String(60), default='', index=True)
+    subtype = db.Column(db.String(80), default='')
+    iso_currency_code = db.Column(db.String(8), default='USD')
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'plaid_investment_transaction_id':
+                self.plaid_investment_transaction_id,
+            'account_id': self.account_id, 'security_id': self.security_id,
+            'date': self.date.isoformat() if self.date else None,
+            'name': self.name, 'quantity': self.quantity,
+            'amount': self.amount, 'price': self.price, 'fees': self.fees,
+            'type': self.type, 'subtype': self.subtype,
+            'iso_currency_code': self.iso_currency_code,
+        }
