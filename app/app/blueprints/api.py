@@ -90,6 +90,13 @@ def create_link_token():
             # Degrades the same way statements does: an application without the
             # product still links banks, and still gets statements.
             liabilities=current_app.config.get('LOANS_ENABLED', True),
+            # v0.4.26 · request `investments` optionally so brokerage /
+            # IRA / 401k Items minted from now on can serve
+            # /investments/holdings/get and /investments/transactions/get
+            # when the v0.5.0 lot tracker lands. Optional means silent
+            # skip on Items with no eligible accounts — a deposit-only
+            # bank still links exactly as it did pre-v0.4.26.
+            investments=current_app.config.get('INVESTMENTS_ENABLED', True),
             access_token=access_token)
     except (PlaidError, PlaidConfigError) as e:
         return jsonify({'error': str(e)}), 502

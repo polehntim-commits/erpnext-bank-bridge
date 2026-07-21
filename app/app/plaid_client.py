@@ -89,7 +89,8 @@ class PlaidClient:
                           webhook: str = None, statements: bool = False,
                           statements_months: int = 24,
                           access_token: str = None,
-                          liabilities: bool = False) -> str:
+                          liabilities: bool = False,
+                          investments: bool = False) -> str:
         """Create a short-lived link_token for Plaid Link. `redirect_uri` is
         required for OAuth-only banks (Wells Fargo) and must be registered in
         the Plaid dashboard. Returns the link_token string.
@@ -152,12 +153,16 @@ class PlaidClient:
             wanted.append('statements')
         if liabilities:
             wanted.append('liabilities')
+        if investments:
+            wanted.append('investments')
         for attempt in self._product_ladder(wanted):
             kwargs = dict(base)
             if 'statements' in attempt:
                 kwargs = self._with_statements(kwargs, statements_months)
             if 'liabilities' in attempt:
                 kwargs = self._with_liabilities(kwargs)
+            if 'investments' in attempt:
+                kwargs = self._with_investments(kwargs)
             try:
                 return self._link_token_create(api, kwargs)
             except PlaidError as e:
@@ -206,6 +211,30 @@ class PlaidClient:
         kwargs = dict(kwargs)
         kwargs['optional_products'] = list(
             kwargs.get('optional_products') or []) + [Products('liabilities')]
+        return kwargs
+
+    @staticmethod
+    def _with_investments(kwargs: dict) -> dict:
+        """Request the `investments` product as OPTIONAL (v0.4.26).
+
+        Same reason liabilities is optional (see `_with_liabilities`): an
+        institution connection with no brokerage/IRA/401k accounts would
+        fail the account-selection screen with 'No investment accounts' if
+        the product were required. Optional grants the product on any
+        Item that DOES have investment accounts and stays silent otherwise,
+        so a bank-only user's link keeps succeeding.
+
+        Investments unlocks Plaid's `/investments/holdings/get` (current
+        positions with security_id, ticker, quantity, cost basis, price)
+        and `/investments/transactions/get` (buys, sells, dividends,
+        splits, transfers with full security detail). Bank Bridge's
+        consumer for those endpoints is the v0.5.0 lot-tracking module —
+        this v0.4.26 change opens the pipe so Items minted from now on
+        already carry the product when v0.5.0 lands."""
+        from plaid.model.products import Products
+        kwargs = dict(kwargs)
+        kwargs['optional_products'] = list(
+            kwargs.get('optional_products') or []) + [Products('investments')]
         return kwargs
 
     # v0.4.25 · request the maximum historical window Plaid will grant. Default
