@@ -208,15 +208,33 @@ class PlaidClient:
             kwargs.get('optional_products') or []) + [Products('liabilities')]
         return kwargs
 
+    # v0.4.25 · request the maximum historical window Plaid will grant. Default
+    # if unset is 90 days; the ceiling is 730 (Plaid enforces the cap and rejects
+    # anything higher). This is the value that determines how far back the
+    # initial `/transactions/sync` will reach, and it is FIXED AT LINK TIME —
+    # Plaid explicitly refuses to change it on an existing Item, so this window
+    # is what every subsequent sync will keep filling forward from. For a book-
+    # keeping bridge that wants 'the last two years plus everything since', the
+    # right default is the maximum: bank statements go back that far, and a
+    # backfilled ledger that starts at 730 days is materially better than one
+    # that starts at 90.
+    TRANSACTIONS_DAYS_REQUESTED = 730
+
     def _link_token_kwargs(self, user_id, redirect_uri, webhook) -> dict:
         """The LinkTokenCreateRequest kwargs common to both attempts."""
         from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
         from plaid.model.country_code import CountryCode
         from plaid.model.products import Products
+        from plaid.model.link_token_transactions import LinkTokenTransactions
         kwargs = dict(
             user=LinkTokenCreateRequestUser(client_user_id=str(user_id)),
             client_name='ERPNext Bank Bridge',
             products=[Products('transactions')],
+            # v0.4.25 · ask Plaid to pull the maximum 730 days of history at
+            # link time. Unset defaults to 90 days and cannot be updated after
+            # link — every Item minted without this kwarg is stuck at 90 days.
+            transactions=LinkTokenTransactions(
+                days_requested=PlaidClient.TRANSACTIONS_DAYS_REQUESTED),
             country_codes=[CountryCode('US')],
             language='en')
         ru = redirect_uri if redirect_uri is not None else self.redirect_uri

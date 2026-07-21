@@ -1529,6 +1529,18 @@ TRANSACTIONS_BODY = """
 </p>
 {% endif %}
 
+{# v0.4.25 · show total-vs-shown and offer bigger limits. `rows|length` is
+   what's actually on the page; `total_matching` is what's in the DB for the
+   current filters. #}
+<div style="margin:8px 0;font-size:13px;color:#555">
+  Showing <b>{{ rows|length }}</b>{% if total_matching and total_matching > rows|length %}
+  of <b>{{ total_matching }}</b>{% endif %} matching transactions
+  {% if total_matching and total_matching > rows|length %}
+  · <a href="?{% for k, v in request.args.items() %}{% if k != 'limit' %}{{ k }}={{ v }}&{% endif %}{% endfor %}limit=5000">show 5000</a>
+  · <a href="?{% for k, v in request.args.items() %}{% if k != 'limit' %}{{ k }}={{ v }}&{% endif %}{% endfor %}limit=10000">show 10000 (max)</a>
+  {% endif %}
+</div>
+
 <div style="margin:8px 0">
   <form method="post" action="/admin/transactions/rerun_rules" style="display:inline"
         onsubmit="return confirm('Run the categorization rules against posted transactions that have no Journal Entry yet? This uses your CURRENT rules and is logged.')">
@@ -1694,7 +1706,17 @@ def transactions_page():
     cur_account = (request.args.get('account_id') or '').strip()
     cur_q = (request.args.get('q') or '').strip()
     cur_company = _current_company()
-    limit = 300
+    # v0.4.25 · was hardcoded to 300, which capped the visible history at
+    # ~10 months on an active account and hid ~90% of the mirror on an
+    # account with 2 years of Plaid history behind it. Now defaults to 2000
+    # (comfortable on any reasonable browser) and accepts a `?limit=N` query
+    # param up to 10000 for operators who want to eyeball everything. The
+    # total-row count is passed through so the page can show 'showing X of Y'.
+    try:
+        limit = int(request.args.get('limit') or 2000)
+    except ValueError:
+        limit = 2000
+    limit = max(50, min(limit, 10000))
     q = BankTransaction.query
     if cur_company:
         # Only transactions whose linked account resolves to the scoped Company.
@@ -1725,6 +1747,10 @@ def transactions_page():
     if not rule_stats.is_state_filter(cur_state):
         cur_state = ''
     q = rule_stats.apply_state_filter(q, cur_state)
+    # v0.4.25 · count the FULL matched set before applying the display cap so
+    # the page can say 'showing 2000 of 4728 matching transactions' and the
+    # operator knows there are more.
+    total_matching = q.count()
     rows = q.order_by(BankTransaction.date.desc().nullslast(),
                       BankTransaction.id.desc()).limit(limit).all()
     accounts = PlaidAccount.query.order_by(PlaidAccount.name).all()
@@ -1758,6 +1784,7 @@ def transactions_page():
                 rule_stats.prefill_for_group(g), company)
     return _page(TRANSACTIONS_BODY, page='transactions', rows=rows,
                  accounts=accounts, acct_mask=acct_mask, limit=limit,
+                 total_matching=total_matching,
                  cur_status=cur_status, cur_account=cur_account, cur_q=cur_q,
                  cur_company=cur_company, cur_state=cur_state,
                  state_filters=rule_stats.STATE_FILTERS,
