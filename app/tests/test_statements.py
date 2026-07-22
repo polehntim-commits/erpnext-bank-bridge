@@ -896,6 +896,258 @@ class ManagedBrokerageGroundTruthTest(StatementsBase):
         self.assertEqual(m['total_gainloss']['unrealized'], 34986.61)
 
 
+class StatementAnchorTest(StatementsBase):
+    """Statement-anchored reconciliation (v0.4.43).
+
+    Bank Bridge's own record of what each account held at each statement
+    boundary — deliberately independent of ERPNext, because the accounts this
+    matters most for belong to a second entity whose instance does not exist
+    yet. Posting corrections into the first entity's books today would be work
+    to reverse tomorrow, so this release emits nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.client_ = self.app.test_client()
+        self.cash = self._acct('acct-6030', 'Business Brokerage', '6030')
+        self.managed = self._acct('acct-9401', 'Asset Advisor', '9401')
+
+    def _acct(self, account_id, name, mask):
+        a = PlaidAccount(account_id=account_id, item_id=self.item.item_id,
+                         name=name, mask=mask, type='investment',
+                         subtype='brokerage')
+        db.session.add(a)
+        db.session.commit()
+        return a
+
+    def _anchor(self, account, pdf, statement_id, start, end):
+        st = PlaidStatement(statement_id=statement_id,
+                            plaid_item_id=self.item.item_id,
+                            plaid_account_id=account.account_id,
+                            period_start=start, period_end=end)
+        db.session.add(st)
+        stmts.apply_parse(st, stmts.parse_statement(pdf))
+        db.session.commit()
+        return st
+
+    def _txn(self, account_id, txn_id, amount, when):
+        db.session.add(BankTransaction(
+            plaid_transaction_id=txn_id, account_id=account_id,
+            date=when, amount=amount, name='TXN'))
+        db.session.commit()
+
+    def _only(self, account):
+        rows = stmts.anchors_for_account(account.account_id)
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    # ── the two production statements ───────────────────────────────────────
+
+    def test_the_6030_statement_anchors_to_the_banks_own_figures(self):
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-6030-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        stmts.rebuild_statement_anchors()
+        a = self._only(self.cash)
+        self.assertEqual(a.anchored_opening, 9467.48)
+        self.assertEqual(a.anchored_closing, 7793.51)
+        self.assertEqual(a.parser_version, stmts.PARSER_VERSION)
+
+    def test_the_9401_statement_anchors_to_the_banks_own_figures(self):
+        self._anchor(self.managed, wf_advisors_managed_pdf(), 's-9401-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        stmts.rebuild_statement_anchors()
+        a = self._only(self.managed)
+        self.assertEqual(a.anchored_opening, 3507.75)
+        self.assertEqual(a.anchored_closing, 9702.20)
+
+    def test_the_anchor_takes_cash_not_total_account_value(self):
+        """…9401 closed the month at $1,557,537.86 of total value and
+        $9,702.20 of cash. Only cash can be reconciled against a transaction
+        feed — the mirror has no record of market movement — so anchoring on
+        portfolio value would make every brokerage period fail by six
+        figures."""
+        st = self._anchor(self.managed, wf_advisors_managed_pdf(), 's-9401',
+                          date(2025, 6, 1), date(2025, 6, 30))
+        stmts.rebuild_statement_anchors()
+        a = self._only(self.managed)
+        self.assertEqual(a.anchored_closing, 9702.20)
+        self.assertEqual(st.portfolio_closing_value, 1557537.86)
+        self.assertNotEqual(a.anchored_closing, st.portfolio_closing_value)
+
+    # ── the identity, and the two ways it fails ─────────────────────────────
+
+    def test_a_fully_mirrored_period_has_no_variance(self):
+        """opening 9,467.48 + (-1,673.97) = closing 7,793.51 exactly. Plaid saw
+        everything the bank did."""
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-6030-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        # Plaid's amount is POSITIVE for money leaving, so this is the outflow.
+        self._txn('acct-6030', 't-1', 1673.97, date(2025, 6, 15))
+        stmts.rebuild_statement_anchors()
+        a = self._only(self.cash)
+        self.assertEqual(a.transaction_sum, -1673.97)
+        self.assertEqual(a.computed_closing, 7793.51)
+        self.assertEqual(a.variance, 0.0)
+        self.assertTrue(a.reconciles())
+
+    def test_variance_is_what_the_bank_saw_and_plaid_did_not(self):
+        """THE POINT OF THE FEATURE. With nothing mirrored, the whole month's
+        movement is unexplained — and it is reported as a finding, not an
+        error."""
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-6030-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        stmts.rebuild_statement_anchors()
+        a = self._only(self.cash)
+        self.assertEqual(a.transaction_sum, 0.0)
+        self.assertEqual(a.computed_closing, 9467.48)
+        self.assertEqual(a.variance, -1673.97)
+        self.assertFalse(a.reconciles())
+        self.assertIsNone(a.variance_reason)
+
+    def test_a_missing_statement_breaks_the_chain(self):
+        """The OTHER failure, kept distinct from variance because the fix is
+        different: no transaction data explains it — a PDF is simply missing,
+        and every variance after the gap is measured from the wrong baseline."""
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        # July opens at 9,467.48 rather than June's closing 7,793.51.
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-aug',
+                     date(2025, 8, 1), date(2025, 8, 31))
+        stmts.rebuild_statement_anchors()
+        first, second = stmts.anchors_for_account('acct-6030')
+        self.assertFalse(first.chain_gap_from_prior)
+        self.assertTrue(second.chain_gap_from_prior)
+
+    def test_a_continuous_chain_reports_no_gap(self):
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        july = self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jul',
+                            date(2025, 7, 1), date(2025, 7, 31))
+        july.parsed_metadata = dict(july.parsed_metadata,
+                                    cash_opening=7793.51, cash_closing=7000.00)
+        db.session.commit()
+        stmts.rebuild_statement_anchors()
+        self.assertFalse(
+            stmts.anchors_for_account('acct-6030')[1].chain_gap_from_prior)
+
+    # ── mechanics ───────────────────────────────────────────────────────────
+
+    def test_rebuilding_is_idempotent(self):
+        """Unique on statement_id, so a re-run refreshes rather than appending
+        a second version of the same period's truth. That is what makes it safe
+        to call after every parser upgrade."""
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        first = stmts.rebuild_statement_anchors()
+        again = stmts.rebuild_statement_anchors()
+        self.assertEqual(first['written'], again['written'])
+        self.assertEqual(len(stmts.anchors_for_account('acct-6030')), 1)
+
+    def test_a_reparse_rebuilds_the_chain_behind_it(self):
+        """An anchor built from figures a later recognizer corrected asserts
+        the OLD numbers as this account's balance truth — the v0.4.41 lesson,
+        one layer up."""
+        st = self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                          date(2025, 6, 1), date(2025, 6, 30))
+        path = stmts.pdf_path_for('item-abc', 'acct-6030', '2025-06', 's-jun')
+        stmts.store_pdf(path, wf_advisors_june_2025_pdf())
+        st.pdf_path = path
+        st.parsed_metadata = dict(st.parsed_metadata, parser_version='0.0.1')
+        db.session.commit()
+        result = stmts.reparse_stale()
+        self.assertGreaterEqual(result['anchors'], 1)
+        self.assertEqual(self._only(self.cash).anchored_closing, 7793.51)
+
+    def test_a_statement_with_no_readable_balance_is_skipped(self):
+        """An anchor asserting nothing is worse than an absent one — it makes
+        the chain look continuous where it isn't."""
+        st = PlaidStatement(statement_id='s-blank',
+                            plaid_item_id=self.item.item_id,
+                            plaid_account_id='acct-6030',
+                            period_start=date(2025, 9, 1),
+                            period_end=date(2025, 9, 30))
+        db.session.add(st)
+        db.session.commit()
+        result = stmts.rebuild_statement_anchors()
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(stmts.anchors_for_account('acct-6030'), [])
+
+    def test_anchoring_is_company_agnostic(self):
+        """No ERPNext Company, no ERPNext mapping — still anchored. The whole
+        point is holding history for books that do not exist yet."""
+        self.assertIsNone(self.cash.erpnext_bank_account_name)
+        self.assertIsNone(self.cash.owning_company)
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        self.assertEqual(stmts.rebuild_statement_anchors()['written'], 1)
+
+    def test_nothing_is_pushed_to_erpnext(self):
+        """A property of the release, not an oversight: these accounts move to
+        another instance later, and a correction posted now is work to reverse
+        then."""
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        with unittest.mock.patch('app.sync_engine.get_erp_client_or_none') as erp:
+            stmts.rebuild_statement_anchors()
+        erp.assert_not_called()
+        self.assertEqual(GeneratedJournalEntry.query.count(), 0)
+
+    def test_the_summary_is_the_headline_number(self):
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        stmts.rebuild_statement_anchors()
+        summary = stmts.anchor_summary('acct-6030')
+        self.assertEqual(summary['periods'], 1)
+        self.assertEqual(summary['variance'], -1673.97)
+        self.assertEqual(summary['unexplained'], 1)
+        self.assertEqual(summary['gaps'], 0)
+
+    # ── the pages ───────────────────────────────────────────────────────────
+
+    def test_the_reconciliation_page_renders_the_chain(self):
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        stmts.rebuild_statement_anchors()
+        resp = self.client_.get('/admin/reconciliation/acct-6030')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.data.decode()
+        for text in ('9467.48', '7793.51', '-1673.97', 'Anchored opening',
+                     'Variance', 'Download CSV'):
+            self.assertIn(text, body.replace(',', ''), text)
+
+    def test_the_reconciliation_page_renders_with_no_anchors(self):
+        resp = self.client_.get('/admin/reconciliation')
+        self.assertEqual(resp.status_code, 200)
+
+    def test_the_csv_carries_the_whole_chain(self):
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        stmts.rebuild_statement_anchors()
+        resp = self.client_.get('/admin/reconciliation/acct-6030/csv')
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('text/csv', resp.headers['Content-Type'])
+        self.assertIn('no-store', resp.headers['Cache-Control'])
+        body = resp.data.decode()
+        self.assertIn('anchored_opening', body)
+        self.assertIn('9467.48', body)
+        self.assertIn('-1673.97', body)
+
+    def test_the_rebuild_endpoint_works(self):
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        resp = self.client_.post('/admin/statements/rebuild_anchors',
+                                 data={'account_id': 'acct-6030'})
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(len(stmts.anchors_for_account('acct-6030')), 1)
+
+    def test_the_accounts_page_shows_the_variance(self):
+        self._anchor(self.cash, wf_advisors_june_2025_pdf(), 's-jun',
+                     date(2025, 6, 1), date(2025, 6, 30))
+        stmts.rebuild_statement_anchors()
+        body = self.client_.get('/admin/accounts').data.decode()
+        self.assertIn('unexplained', body)
+        self.assertIn('/admin/reconciliation/acct-6030', body)
+
+
 class FixtureHygieneTest(unittest.TestCase):
     """The fixtures are the one place a real statement's contents could reach
     the repository. This test is the guard.

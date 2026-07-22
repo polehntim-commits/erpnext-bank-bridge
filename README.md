@@ -1374,6 +1374,46 @@ try/except; a pattern that raises costs that one figure, is named in
 `fields_failed`, and is logged with the statement it failed on. A bad regex can
 never take down the metadata for a statement whose balances parsed perfectly.
 
+## Statement-anchored reconciliation (v0.4.43)
+
+Bank Bridge's own durable record of what each account **actually held** at each
+statement boundary, sourced from the bank's PDF — at `/admin/reconciliation`.
+
+**Why it's a table and not a journal entry.** The accounts this matters most
+for belong to an entity that will get its *own* ERPNext instance later. Pushing
+balance corrections into the current farm books today would be work to reverse
+tomorrow. So this release makes Bank Bridge authoritative for statement-boundary
+balances and **emits nothing to ERPNext** — a property of the release, not an
+oversight. When the second instance comes online, the chain replays against it
+and matches by construction. For the same reason anchoring is deliberately
+**company-agnostic**: every account with statements gets a chain, mapped or not.
+
+Each `StatementAnchor` row is one identity plus the two ways it can fail:
+
+```
+anchored_opening + transaction_sum = computed_closing
+anchored_closing − computed_closing = variance
+```
+
+- **`variance`** — money the *bank* saw and *Plaid* never reported: an
+  off-platform wire, a tax payment, a transfer between institutions. A finding,
+  not an error. Tag it with `variance_reason` as the real categories emerge.
+- **`chain_gap_from_prior`** — this period's opening doesn't meet the previous
+  period's closing, so a **statement is missing** between them and every
+  variance after it is measured from the wrong baseline. Kept distinct from
+  variance because the fix differs: one is "find the transaction", the other is
+  "fetch the PDF".
+
+Balances are the **cash-and-sweep** side, never total account value — only cash
+can be reconciled against a transaction feed, since the mirror has no record of
+market movement. `parser_version` is stamped on every row, and
+`rebuild_statement_anchors()` runs automatically after each stale re-parse, so
+a chain can never assert figures a later recognizer already corrected.
+
+`/admin/accounts` shows each account's variance inline — the one-line answer to
+*"is this account's Plaid data telling the whole story?"* — and the chain
+downloads as CSV for a CPA or for diffing against the second instance.
+
 ### Validation — statement vs Plaid vs the mirror
 
 `/admin/statements/<id>` puts three independent accounts of the same month side

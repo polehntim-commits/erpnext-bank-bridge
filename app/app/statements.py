@@ -1183,6 +1183,191 @@ def metadata_figures(metadata: dict) -> list[tuple[str, str, float]]:
     return known + extra
 
 
+# ── statement-anchored reconciliation (v0.4.43) ─────────────────────────────
+#
+# The durable, ERPNext-independent record of what each account actually held at
+# each statement boundary. See StatementAnchor's docstring for why this is a
+# table rather than a journal entry — in short, the accounts it matters most
+# for belong to books that do not exist yet, and posting corrections into the
+# wrong instance today is work to reverse tomorrow.
+#
+# Nothing here writes to ERPNext. That is a property of the release, not an
+# oversight.
+
+def anchor_transaction_sum(account: PlaidAccount, start: date | None,
+                           end: date | None) -> float:
+    """Everything Plaid mirrored in [start, end], normalised so CASH IN IS
+    POSITIVE — the convention that makes `opening + sum = closing` read the way
+    a bank statement does.
+
+    `signed_movement` answers the same question in PLAID's convention, where a
+    positive amount means money LEFT the account, so this is its negation. The
+    flip lives here, once, rather than at each call site: an anchor chain whose
+    sign convention is decided per-caller is a chain that will eventually
+    disagree with itself."""
+    return round(-signed_movement(account, start, end), 2)
+
+
+def _anchor_values(statement: PlaidStatement, account: PlaidAccount) -> dict:
+    """The arithmetic for one statement, before it is compared to its
+    predecessor."""
+    metadata = statement.metadata_dict()
+    # The CASH side, not total account value. On a brokerage statement those
+    # are different numbers and only cash can be reconciled against a
+    # transaction feed — the mirror has no record of market movement. Falls
+    # back to the promoted columns for a row parsed before v0.4.41 named them.
+    opening = metadata.get('cash_opening')
+    if opening is None:
+        opening = statement.opening_balance
+    closing = metadata.get('cash_closing')
+    if closing is None:
+        closing = statement.closing_balance
+    txn_sum = anchor_transaction_sum(account, statement.period_start,
+                                     statement.period_end)
+    computed = (round(float(opening) + txn_sum, 2)
+                if opening is not None else None)
+    variance = (round(float(closing) - computed, 2)
+                if closing is not None and computed is not None else None)
+    return {'anchored_opening': opening, 'anchored_closing': closing,
+            'transaction_sum': txn_sum, 'computed_closing': computed,
+            'variance': variance,
+            'parser_version': statement.parser_version()}
+
+
+def rebuild_statement_anchors(account_id: str | None = None) -> dict:
+    """Build (or refresh) the anchor chain for one account, or every account.
+
+    Idempotent by construction: `StatementAnchor.statement_id` is unique, so a
+    re-run updates the existing row rather than appending a second version of
+    the same period's truth. That is what makes it safe to call after every
+    parser upgrade — and why it IS called there (see reparse_stale), because an
+    anchor built from figures a later recognizer corrected is exactly as stale
+    as the figures were.
+
+    Statements with no readable opening AND no readable closing are skipped
+    rather than anchored to nulls: an anchor that asserts nothing is worse than
+    an absent one, because it makes the chain look continuous where it isn't.
+
+    Company-agnostic on purpose — see StatementAnchor. Never raises; returns
+    {'accounts', 'written', 'skipped', 'gaps', 'variances'}."""
+    from .models import StatementAnchor
+    stats = {'accounts': 0, 'written': 0, 'skipped': 0, 'gaps': 0,
+             'variances': 0}
+    accounts = ([PlaidAccount.query.filter_by(account_id=account_id).first()]
+                if account_id else PlaidAccount.query.all())
+    for account in [a for a in accounts if a is not None]:
+        rows = (PlaidStatement.query
+                .filter(PlaidStatement.plaid_account_id == account.account_id,
+                        PlaidStatement.period_start.isnot(None))
+                .order_by(PlaidStatement.period_start.asc(),
+                          PlaidStatement.id.asc())
+                .all())
+        if not rows:
+            continue
+        stats['accounts'] += 1
+        prior_closing = None
+        for st in rows:
+            values = _anchor_values(st, account)
+            if (values['anchored_opening'] is None
+                    and values['anchored_closing'] is None):
+                stats['skipped'] += 1
+                continue
+            anchor = (StatementAnchor.query
+                      .filter_by(statement_id=st.id).first())
+            if anchor is None:
+                anchor = StatementAnchor(statement_id=st.id)
+                db.session.add(anchor)
+            anchor.account_id = account.account_id
+            anchor.period_start = st.period_start
+            anchor.period_end = st.period_end
+            for key, value in values.items():
+                setattr(anchor, key, value)
+            # The chain test. Compared against the PREVIOUS ANCHORED period
+            # rather than the previous calendar month, because a missing month
+            # is precisely what this is meant to catch — if July's opening
+            # doesn't meet June's closing, the statement in between was never
+            # fetched, and every variance after it is measured from the wrong
+            # baseline.
+            gap = False
+            if prior_closing is not None and values['anchored_opening'] is not None:
+                gap = abs(float(values['anchored_opening'])
+                          - float(prior_closing)) > 0.005
+            anchor.chain_gap_from_prior = gap
+            anchor.updated_at = _now()
+            stats['written'] += 1
+            if gap:
+                stats['gaps'] += 1
+            if values['variance'] is not None and abs(values['variance']) > 0.005:
+                stats['variances'] += 1
+            if values['anchored_closing'] is not None:
+                prior_closing = values['anchored_closing']
+    db.session.commit()
+    return stats
+
+
+def anchors_for_account(account_id: str) -> list:
+    """One account's anchor chain, oldest period first — the order the chain
+    has to be read in for a gap to mean anything."""
+    from .models import StatementAnchor
+    return (StatementAnchor.query
+            .filter(StatementAnchor.account_id == account_id)
+            .order_by(StatementAnchor.period_start.asc().nullslast(),
+                      StatementAnchor.id.asc())
+            .all())
+
+
+def anchor_variance_total(account_id: str, year: int | None = None) -> float:
+    """Σ variance for one account, optionally restricted to a calendar year.
+
+    THE HEADLINE NUMBER: how much money the bank saw over the period that Plaid
+    never reported. Summed rather than averaged because the question it answers
+    — 'is this account's Plaid data telling the whole story?' — is about total
+    unexplained movement, and a +$5,000 month cancelling a -$5,000 month is
+    still two events nobody has accounted for. (Which is why the UI shows the
+    count alongside it.)"""
+    total = 0.0
+    for anchor in anchors_for_account(account_id):
+        if anchor.variance is None:
+            continue
+        if year is not None and (anchor.period_end is None
+                                 or anchor.period_end.year != year):
+            continue
+        total += float(anchor.variance)
+    return round(total, 2)
+
+
+def anchor_summary(account_id: str, year: int | None = None) -> dict:
+    """{'variance', 'unexplained', 'gaps', 'periods', 'year'} — the one-line
+    verdict for an account, as /admin/accounts shows it."""
+    anchors = anchors_for_account(account_id)
+    if year is not None:
+        anchors = [a for a in anchors
+                   if a.period_end is not None and a.period_end.year == year]
+    return {
+        'variance': round(sum(float(a.variance or 0.0) for a in anchors), 2),
+        'unexplained': sum(1 for a in anchors if not a.reconciles()),
+        'gaps': sum(1 for a in anchors if a.chain_gap_from_prior),
+        'periods': len(anchors),
+        'year': year,
+    }
+
+
+def accounts_with_anchors() -> list:
+    """Every account holding at least one statement, newest-named first.
+
+    Deliberately NOT filtered by ERPNext Company: the accounts this feature
+    exists for are the ones whose books do not exist yet."""
+    ids = {s.plaid_account_id for s in
+           PlaidStatement.query.with_entities(
+               PlaidStatement.plaid_account_id).distinct()}
+    ids.discard(None)
+    if not ids:
+        return []
+    return (PlaidAccount.query
+            .filter(PlaidAccount.account_id.in_(tuple(ids)))
+            .order_by(PlaidAccount.name).all())
+
+
 # ── validating a statement against everything else we know ──────────────────
 #
 # WHY THIS EXISTS. Bank Bridge holds three independent accounts of the same
@@ -1536,10 +1721,21 @@ def reparse_stale() -> dict:
     stale = stale_statements()
     if not stale:
         return {'examined': 0, 'changed': 0, 'unreadable': 0, 'suspect': 0,
-                'fields': 0, 'failed_fields': 0}
+                'fields': 0, 'failed_fields': 0, 'anchors': 0}
     log.info('%d statement(s) parsed by an older recognizer — re-reading',
              len(stale))
-    return reparse_stored(only_stale=True)
+    stats = reparse_stored(only_stale=True)
+    # v0.4.43 · anchors are DERIVED from the figures that just changed, so a
+    # chain left standing after a re-parse asserts the old numbers as this
+    # account's balance truth. Rebuilding here is what keeps the two from ever
+    # disagreeing — the same lesson as reparse_stale itself, one layer up.
+    try:
+        stats['anchors'] = rebuild_statement_anchors()['written']
+    except Exception:  # pragma: no cover - a report must not break a re-parse
+        db.session.rollback()
+        log.warning('anchor rebuild after re-parse failed', exc_info=True)
+        stats['anchors'] = 0
+    return stats
 
 
 def reparse_stored(account_id: str = '', *, only_stale: bool = False) -> dict:

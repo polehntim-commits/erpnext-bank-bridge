@@ -969,6 +969,102 @@ class PlaidStatement(db.Model):
         }
 
 
+class StatementAnchor(db.Model):
+    """One statement period's balance truth, as the BANK stated it (v0.4.43).
+
+    WHY THIS IS A TABLE AND NOT A JOURNAL ENTRY. Bank Bridge already knows how
+    to post a correction into ERPNext, and for some accounts that is exactly
+    the wrong move: the brokerage accounts belong to a second entity, which
+    will get its OWN ERPNext instance. Pushing balance corrections into the
+    first entity's books today creates work to reverse tomorrow. So this makes
+    Bank Bridge the authoritative ledger of what each account actually held at
+    each statement boundary, and emits NOTHING. When the second instance comes
+    online, this chain replays against it and matches by construction.
+
+    That also makes it deliberately COMPANY-AGNOSTIC: every account with
+    statements gets an anchor chain, whether or not it is mapped to an ERPNext
+    Company, because the whole point is to hold the history for books that do
+    not exist yet.
+
+    WHAT EACH NUMBER IS FOR. The row is an arithmetic identity plus the two
+    ways it can fail:
+
+        anchored_opening  + transaction_sum = computed_closing
+        anchored_closing  - computed_closing = variance
+
+    `anchored_opening`/`anchored_closing` are the bank's own cash-and-sweep
+    figures, parsed from the PDF. `transaction_sum` is everything Plaid
+    mirrored in the period, normalised to CASH IN POSITIVE (Plaid's own
+    convention is the opposite; see statements.anchor_transaction_sum).
+    `variance` is therefore the money the BANK saw and PLAID DID NOT — an
+    off-platform wire, a tax payment, a transfer between institutions. It is
+    the number this whole feature exists to surface, and a non-zero one is a
+    finding rather than an error.
+
+    `chain_gap_from_prior` is the OTHER failure: this period's opening balance
+    should equal the previous period's closing. When it doesn't, no amount of
+    transaction data explains the difference — a statement is simply missing
+    between the two, and every variance downstream of the gap is measured
+    against the wrong baseline. Kept distinct from `variance` because the fix
+    is different: one is 'find the transaction', the other is 'fetch the PDF'.
+
+    `parser_version` records which recognizer produced the anchored figures, so
+    a chain built before a parser fix is identifiable as such rather than
+    silently trusted (the v0.4.41 → v0.4.42 lesson; see statements.reparse_stale).
+    """
+    __tablename__ = 'statement_anchors'
+    id = db.Column(db.Integer, primary_key=True)
+    account_id = db.Column(db.String(120),
+                           db.ForeignKey('plaid_accounts.account_id'),
+                           nullable=False, index=True)
+    # UNIQUE: one anchor per statement. This column IS the idempotency guard,
+    # which is what lets rebuild_statement_anchors be re-run after every parser
+    # upgrade without accumulating duplicate history.
+    statement_id = db.Column(db.Integer,
+                             db.ForeignKey('plaid_statements.id'),
+                             unique=True, nullable=False, index=True)
+    period_start = db.Column(db.Date, nullable=True, index=True)
+    period_end = db.Column(db.Date, nullable=True, index=True)
+    anchored_opening = db.Column(db.Float, nullable=True)
+    anchored_closing = db.Column(db.Float, nullable=True)
+    transaction_sum = db.Column(db.Float, nullable=False, default=0.0)
+    computed_closing = db.Column(db.Float, nullable=True)
+    variance = db.Column(db.Float, nullable=True)
+    # Why the bank saw money Plaid didn't. NULL until someone says. The
+    # vocabulary is deliberately small to start ('unknown'); an operator tags
+    # these in the UI as the real categories reveal themselves, and a premature
+    # enum would just be a list of guesses.
+    variance_reason = db.Column(db.String(40), nullable=True)
+    chain_gap_from_prior = db.Column(db.Boolean, default=False, nullable=False)
+    parser_version = db.Column(db.String(40), default='')
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    VARIANCE_REASONS = ('unknown', 'off_plaid_deposit', 'off_plaid_withdrawal',
+                        'mom_tax_payment')
+
+    def reconciles(self, tolerance: float = 0.005) -> bool:
+        """Whether the bank's closing balance and the mirror's arithmetic agree.
+        A period with no variance needs no explanation."""
+        return self.variance is not None and abs(self.variance) <= tolerance
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'account_id': self.account_id,
+            'statement_id': self.statement_id,
+            'period_start': self.period_start.isoformat() if self.period_start else None,
+            'period_end': self.period_end.isoformat() if self.period_end else None,
+            'anchored_opening': self.anchored_opening,
+            'anchored_closing': self.anchored_closing,
+            'transaction_sum': self.transaction_sum,
+            'computed_closing': self.computed_closing,
+            'variance': self.variance,
+            'variance_reason': self.variance_reason or '',
+            'chain_gap_from_prior': bool(self.chain_gap_from_prior),
+            'parser_version': self.parser_version or '',
+        }
+
+
 class StatementAdjustment(db.Model):
     """One manual attribution of an unreconciled statement delta to a
     specific offset account (v0.4.39).

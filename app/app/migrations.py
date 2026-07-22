@@ -166,6 +166,14 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # recognizer hasn't reached. Backfills to NULL = "parsed before v0.4.41
     # recorded anything about how", which is exactly true.
     ('plaid_statements', 'parsed_metadata', 'JSONB'),
+    # v0.4.43 — statement-anchored reconciliation. The `statement_anchors`
+    # TABLE needs no line here: create_all() builds a missing table, and this
+    # release adds no column to a table that already exists (the same situation
+    # as v0.4.1's intercompany_transfer_pairs and v0.4.9's plaid_statements).
+    # An upgrading install gains one empty table and changes no existing row —
+    # anchors are DERIVED from statements that are already held, so the first
+    # run of rebuild_statement_anchors fills the whole history with nothing to
+    # backfill and nothing to undo.
 ]
 
 

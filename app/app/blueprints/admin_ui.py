@@ -165,6 +165,7 @@ NAV_HTML = """
   <a href="/admin/generated_entries" class="{{ 'active' if page == 'generated_entries' else '' }}">Generated JEs</a>
   <a href="/admin/intercompany" class="{{ 'active' if page == 'intercompany' else '' }}">Intercompany</a>
   <a href="/admin/statements" class="{{ 'active' if page == 'statements' else '' }}">Statements</a>
+  <a href="/admin/reconciliation" class="{{ 'active' if page == 'reconciliation' else '' }}">Reconciliation</a>
   <a href="/admin/strategy" class="{{ 'active' if page == 'investments' else '' }}">Strategy</a>
   <a href="/admin/audit" class="{{ 'active' if page == 'audit' else '' }}">Audit</a>
   <a href="/admin/data_hygiene" class="{{ 'active' if page == 'hygiene' else '' }}" style="color:#8fbfa5">Hygiene</a>
@@ -737,7 +738,26 @@ ACCOUNTS_BODY = """
     <td>{{ a.type }}{% if a.subtype %} / {{ a.subtype }}{% endif %}
       {% if a.balance_only %}<br><span class="pill pill-muted"
         title="Plaid doesn't return investment transactions without the investments product — only the balance is mirrored">balance-only, no transactions</span>{% endif %}</td>
-    <td class="num">{{ '%.2f'|format(a.balance_current) if a.balance_current is not none else '—' }} {{ a.iso_currency_code }}</td>
+    <td class="num">{{ '%.2f'|format(a.balance_current) if a.balance_current is not none else '—' }} {{ a.iso_currency_code }}
+      {# v0.4.43 · the one-line answer to "is this account's Plaid data telling
+         the whole story?" — Σ of what the BANK saw and Plaid never reported,
+         across every anchored statement period. Shown here because this is the
+         page an operator is already on when they wonder. #}
+      {% set anc = anchor_map.get(a.account_id) %}
+      {% if anc and anc.periods %}
+      <br><a href="/admin/reconciliation/{{ a.account_id }}"
+             style="font-size:11px;text-decoration:none"
+             title="Statement-anchored variance across {{ anc.periods }} period(s): money the bank recorded that Plaid never reported. Click for the full chain.">
+        {% if anc.variance|abs > 0.005 or anc.gaps %}
+        <span class="pill pill-err" style="font-size:10px">&#9888;
+          {{ '%+.2f'|format(anc.variance) }} unexplained</span>
+        {% else %}
+        <span class="pill pill-ok" style="font-size:10px">&#10003; statements
+          reconcile</span>
+        {% endif %}
+      </a>
+      {% endif %}
+    </td>
     <td>
       <form method="post" action="/admin/accounts/map" style="display:flex;gap:8px;align-items:center;margin:0">
         <input type="hidden" name="account_id" value="{{ a.account_id }}">
@@ -1030,7 +1050,23 @@ def accounts_page():
         except (ERPNextConfigError, ERPNextError):
             companies = []
     bank_account_names = {ba['name'] for ba in bank_accounts}
+    # v0.4.43 · statement-anchored variance per account. Company-agnostic by
+    # design — the accounts this matters most for are the ones whose ERPNext
+    # instance does not exist yet (see models.StatementAnchor).
+    from .. import statements as stmts
+    anchor_map = {}
+    try:
+        for grp in groups:
+            for a in grp['accounts']:
+                summary = stmts.anchor_summary(a.account_id)
+                if summary['periods']:
+                    anchor_map[a.account_id] = summary
+    except Exception:  # pragma: no cover - a summary must not 500 the page
+        log.warning('anchor summary unavailable for /admin/accounts',
+                    exc_info=True)
+        anchor_map = {}
     return _page(ACCOUNTS_BODY, page='accounts', groups=groups,
+                 anchor_map=anchor_map,
                  bank_accounts=bank_accounts, bank_account_names=bank_account_names,
                  supported_map=supported_map, any_imported=any_imported,
                  unpostable=sync_engine.unpostable_by_account(),
@@ -5196,6 +5232,126 @@ def balance_history():
                  months=months)
 
 
+RECONCILIATION_BODY = """
+<h2>Statement-anchored reconciliation</h2>
+<p style="font-size:14px;color:#555;max-width:1000px">
+  What each account <b>actually held</b> at every statement boundary, according
+  to the bank's own PDF — held here, in Bank Bridge, independent of ERPNext.
+  Each row is one identity and the two ways it can fail:
+  <br><code>anchored opening + transactions = computed closing</code>, and
+  <code>anchored closing − computed closing = variance</code>.
+  <br><b>Variance</b> is money the <i>bank</i> saw and <i>Plaid</i> did not — an
+  off-platform wire, a tax payment, a transfer between institutions. It is a
+  finding, not an error. A <b>chain gap</b> is the other failure: this period's
+  opening doesn't meet the previous period's closing, so a statement is missing
+  between them and every variance after it is measured from the wrong baseline.
+</p>
+<p style="font-size:13px;color:#666">
+  Nothing on this page is posted to ERPNext. It is the durable record these
+  accounts need until their own instance exists.
+</p>
+
+<form method="get" action="" style="margin:12px 0">
+  <label style="font-size:14px">Account
+    <select name="account_id" onchange="this.form.submit()"
+            style="padding:6px;font-size:14px;margin-left:6px">
+      {% for a in accounts %}
+      <option value="{{ a.account_id }}"
+        {{ 'selected' if a.account_id == account.account_id else '' }}>
+        {{ a.name or a.account_id }}{% if a.mask %} ••{{ a.mask }}{% endif %}
+      </option>
+      {% endfor %}
+    </select>
+  </label>
+</form>
+
+{% if not anchors %}
+<div class="banner-warn">
+  <h3>No anchors for this account yet</h3>
+  Anchors are built from statements that have been parsed. Pull and re-parse
+  statements on <a href="/admin/statements">/admin/statements</a>, then
+  rebuild below.
+</div>
+{% else %}
+<div class="kpis" style="margin:12px 0">
+  <div class="kpi"><b>{{ summary.periods }}</b><br>
+    <span style="font-size:12px;color:#666">periods anchored</span></div>
+  <div class="kpi">
+    <b style="color:{{ '#b71c1c' if summary.variance|abs > 0.005 else '#1b5e20' }}">
+      {{ '%+.2f'|format(summary.variance) }}</b><br>
+    <span style="font-size:12px;color:#666">total variance</span></div>
+  <div class="kpi">
+    <b style="color:{{ '#b71c1c' if summary.unexplained else '#1b5e20' }}">
+      {{ summary.unexplained }}</b><br>
+    <span style="font-size:12px;color:#666">periods unexplained</span></div>
+  <div class="kpi">
+    <b style="color:{{ '#b71c1c' if summary.gaps else '#1b5e20' }}">
+      {{ summary.gaps }}</b><br>
+    <span style="font-size:12px;color:#666">chain gaps</span></div>
+</div>
+
+<table>
+  <tr><th>Period</th><th class="num">Anchored opening</th>
+      <th class="num">Transactions</th><th class="num">Computed closing</th>
+      <th class="num">Anchored closing</th><th class="num">Variance</th>
+      <th>Reason</th><th>Parser</th></tr>
+  {% for a in anchors %}
+  <tr {% if a.chain_gap_from_prior %}style="border-top:3px solid #f5a623"{% endif %}>
+    <td>
+      {{ a.period_start or '—' }}
+      {% if a.chain_gap_from_prior %}
+      <br><span class="pill pill-err" style="font-size:10px"
+            title="This period's opening balance does not meet the previous period's closing balance — a statement is missing between them.">&#9888; chain gap</span>
+      {% endif %}
+    </td>
+    <td class="num">{{ '%.2f'|format(a.anchored_opening)
+                       if a.anchored_opening is not none else '—' }}</td>
+    <td class="num">{{ '%+.2f'|format(a.transaction_sum) }}</td>
+    <td class="num">{{ '%.2f'|format(a.computed_closing)
+                       if a.computed_closing is not none else '—' }}</td>
+    <td class="num">{{ '%.2f'|format(a.anchored_closing)
+                       if a.anchored_closing is not none else '—' }}</td>
+    <td class="num">
+      {% if a.variance is none %}—
+      {% elif a.reconciles() %}
+        <span style="color:#1b5e20">0.00</span>
+      {% else %}
+        <span style="color:#b71c1c;font-weight:600">{{ '%+.2f'|format(a.variance) }}</span>
+      {% endif %}
+    </td>
+    <td style="font-size:12px">{{ a.variance_reason or
+        ('—' if a.reconciles() else 'untagged') }}</td>
+    <td style="font-size:11px;color:#666">{{ a.parser_version or '—' }}</td>
+  </tr>
+  {% endfor %}
+  <tr style="background:#f4f4f4;font-weight:600">
+    <td>Total ({{ summary.periods }} periods)</td>
+    <td class="num">—</td>
+    <td class="num">{{ '%+.2f'|format(total_transactions) }}</td>
+    <td class="num">—</td><td class="num">—</td>
+    <td class="num" style="color:{{ '#b71c1c' if summary.variance|abs > 0.005 else '#1b5e20' }}">
+      {{ '%+.2f'|format(summary.variance) }}</td>
+    <td colspan="2"></td>
+  </tr>
+</table>
+{% endif %}
+
+<div style="display:flex;gap:10px;align-items:center;margin:16px 0">
+  <a href="/admin/reconciliation/{{ account.account_id }}/csv"
+     style="padding:8px 16px;background:#2e9e5b;color:#fff;border-radius:4px;
+            text-decoration:none;font-weight:600;font-size:14px">Download CSV</a>
+  <form method="post" action="/admin/statements/rebuild_anchors" style="margin:0">
+    <input type="hidden" name="account_id" value="{{ account.account_id }}">
+    <button type="submit" class="secondary">Rebuild this account's anchors</button>
+  </form>
+  <form method="post" action="/admin/statements/rebuild_anchors" style="margin:0">
+    <button type="submit" class="secondary">Rebuild all accounts</button>
+  </form>
+</div>
+<p style="font-size:13px"><a href="/admin/statements">&larr; statements</a></p>
+"""
+
+
 STATEMENT_DETAIL_BODY = """
 <h2>Statement {{ statement.period_label() or '—' }} · {{ account_label }}</h2>
 
@@ -5373,6 +5529,102 @@ STATEMENT_ADJUST_BODY = """
   </form>
 </div>
 """
+
+
+@bp.get('/admin/reconciliation')
+@bp.get('/admin/reconciliation/<path:account_id>')
+def reconciliation_page(account_id: str = ''):
+    """Statement-anchored reconciliation for one account (v0.4.43).
+
+    NOT filtered by ERPNext Company — see StatementAnchor. The accounts this
+    page matters most for are the ones whose books do not exist yet."""
+    from .. import statements as stmts
+    accounts = stmts.accounts_with_anchors()
+    if not accounts:
+        return _page(RECONCILIATION_BODY, page='reconciliation', accounts=[],
+                     account=PlaidAccount(account_id=''), anchors=[],
+                     summary=stmts.anchor_summary(''), total_transactions=0.0)
+    account_id = account_id or request.args.get('account_id', '')
+    account = next((a for a in accounts if a.account_id == account_id),
+                   accounts[0])
+    anchors = stmts.anchors_for_account(account.account_id)
+    return _page(RECONCILIATION_BODY, page='reconciliation', accounts=accounts,
+                 account=account, anchors=anchors,
+                 summary=stmts.anchor_summary(account.account_id),
+                 total_transactions=round(
+                     sum(float(a.transaction_sum or 0.0) for a in anchors), 2))
+
+
+@bp.get('/admin/reconciliation/<path:account_id>/csv')
+def reconciliation_csv(account_id: str):
+    """The same chain as a CSV — what gets handed to a CPA, or diffed against
+    the second ERPNext instance once it exists."""
+    import csv
+    import io
+    from .. import statements as stmts
+    anchors = stmts.anchors_for_account(account_id)
+    account = PlaidAccount.query.filter_by(account_id=account_id).first()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(['period_start', 'period_end', 'anchored_opening',
+                     'transaction_sum', 'computed_closing', 'anchored_closing',
+                     'variance', 'variance_reason', 'chain_gap_from_prior',
+                     'parser_version'])
+    for a in anchors:
+        writer.writerow([
+            a.period_start or '', a.period_end or '',
+            '' if a.anchored_opening is None else f'{a.anchored_opening:.2f}',
+            f'{float(a.transaction_sum or 0.0):.2f}',
+            '' if a.computed_closing is None else f'{a.computed_closing:.2f}',
+            '' if a.anchored_closing is None else f'{a.anchored_closing:.2f}',
+            '' if a.variance is None else f'{a.variance:.2f}',
+            a.variance_reason or '', 'yes' if a.chain_gap_from_prior else '',
+            a.parser_version or ''])
+    # Reuse the statement store's own path sanitiser rather than a second
+    # opinion on what a safe filename is — this value reaches a
+    # Content-Disposition header.
+    label = stmts._safe((account.mask or account.account_id)
+                        if account else account_id)
+    return Response(buf.getvalue(), 200, {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition':
+            f'attachment; filename="reconciliation-{label}.csv"',
+        # The account holder's own balance history; keep it out of any shared
+        # cache between the browser and the app, exactly as the PDFs are.
+        'Cache-Control': 'private, no-store',
+        'X-Content-Type-Options': 'nosniff',
+    })
+
+
+@bp.post('/admin/statements/rebuild_anchors')
+def rebuild_anchors():
+    """Rebuild the anchor chain — one account, or all of them.
+
+    Also runs automatically after every stale re-parse (see
+    statements.reparse_stale); this is the manual trigger for when you don't
+    want to wait for the schedule."""
+    from .. import statements as stmts
+    account_id = (request.form.get('account_id') or '').strip()
+    try:
+        result = stmts.rebuild_statement_anchors(account_id or None)
+    except Exception as e:
+        db.session.rollback()
+        return redirect('/admin/reconciliation?flash=' + quote_plus(
+            f'Anchor rebuild failed: {e}'))
+    msg = (f"Anchored {result['written']} period(s) across "
+           f"{result['accounts']} account(s).")
+    if result['variances']:
+        msg += (f" {result['variances']} period(s) show a variance the "
+                "transaction feed doesn't explain.")
+    if result['gaps']:
+        msg += f" {result['gaps']} chain gap(s) — a statement is missing."
+    if result['skipped']:
+        msg += f" {result['skipped']} statement(s) had no readable balance."
+    audit.record('statement_anchors_rebuilt', after=result, notes=msg)
+    db.session.commit()
+    target = f'/admin/reconciliation/{account_id}' if account_id \
+        else '/admin/reconciliation'
+    return redirect(target + '?flash=' + quote_plus(msg))
 
 
 @bp.get('/admin/statements/<int:statement_id>')
