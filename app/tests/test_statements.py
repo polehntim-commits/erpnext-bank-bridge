@@ -48,6 +48,7 @@ os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 from app import create_app, crypto, db  # noqa: E402
 from app import erpnext_accounts, erpnext_settings, plaid_settings  # noqa: E402
 from app import opening_balance as obal  # noqa: E402
+from app import account_visibility as av  # noqa: E402
 from app import statements as stmts  # noqa: E402
 from app.models import (BankTransaction, GeneratedJournalEntry,  # noqa: E402
                         PlaidAccount, PlaidItem, PlaidStatement)
@@ -1146,6 +1147,334 @@ class StatementAnchorTest(StatementsBase):
         body = self.client_.get('/admin/accounts').data.decode()
         self.assertIn('unexplained', body)
         self.assertIn('/admin/reconciliation/acct-6030', body)
+
+
+class AccountPairingTest(StatementsBase):
+    """Pairing a WF Advisors brokerage account with its cash-services
+    companion (v0.4.44).
+
+    Wells Fargo splits one economic account across two Plaid accounts, and the
+    split is invisible until you reconcile: the brokerage side holds the
+    statements and the securities activity but ZERO BankTransactions, while the
+    companion checking account holds every cash movement and no statements at
+    all. Anchoring the brokerage account alone measures the bank's closing
+    balance against a feed that is structurally empty, so every period comes
+    back unexplained for a reason that has nothing to do with the books."""
+
+    def setUp(self):
+        super().setUp()
+        self.client_ = self.app.test_client()
+        self.brokerage = self._acct('acct-brk', 'BUSINESS BROKERAGE ...6030',
+                                    '6030', 'investment', 'brokerage')
+        # The fixture prints 'Brokerage Cash Services number: 1234567890',
+        # whose last four digits are this account's Plaid mask.
+        self.cash = self._acct('acct-cash', 'BUSINESS BROKERAGE CASH ...7890',
+                               '7890', 'depository', 'checking')
+
+    def _acct(self, account_id, name, mask, type_, subtype):
+        a = PlaidAccount(account_id=account_id, item_id=self.item.item_id,
+                         name=name, mask=mask, type=type_, subtype=subtype)
+        db.session.add(a)
+        db.session.commit()
+        return a
+
+    def _statement(self, pdf=None, statement_id='s-jun'):
+        st = PlaidStatement(statement_id=statement_id,
+                            plaid_item_id=self.item.item_id,
+                            plaid_account_id=self.brokerage.account_id,
+                            period_start=date(2025, 6, 1),
+                            period_end=date(2025, 6, 30))
+        db.session.add(st)
+        stmts.apply_parse(st, stmts.parse_statement(
+            pdf if pdf is not None else wf_advisors_june_2025_pdf()))
+        db.session.commit()
+        return st
+
+    def _txn(self, account_id, txn_id, amount):
+        db.session.add(BankTransaction(
+            plaid_transaction_id=txn_id, account_id=account_id,
+            date=date(2025, 6, 15), amount=amount, name='TXN'))
+        db.session.commit()
+
+    # ── capturing the key ───────────────────────────────────────────────────
+
+    def test_the_statement_names_its_cash_services_account(self):
+        st = self._statement()
+        self.assertEqual(st.cash_services_account_number, '1234567890')
+        self.assertEqual(st.parsed_metadata['cash_services_number'],
+                         '1234567890')
+
+    def test_the_managed_fixture_names_a_different_companion(self):
+        st = PlaidStatement(statement_id='s-managed',
+                            plaid_item_id=self.item.item_id,
+                            plaid_account_id=self.brokerage.account_id)
+        db.session.add(st)
+        stmts.apply_parse(st, stmts.parse_statement(wf_advisors_managed_pdf()))
+        db.session.commit()
+        self.assertEqual(st.cash_services_account_number, '9876504321')
+
+    def test_the_account_number_is_not_treated_as_a_figure(self):
+        """It is an identifier — leading zeros matter and it is not money."""
+        m = stmts.parse_statement(wf_advisors_june_2025_pdf())['metadata']
+        keys = {k for k, _, _ in stmts.metadata_figures(m)}
+        self.assertNotIn('cash_services_number', keys)
+
+    # ── auto-detection ──────────────────────────────────────────────────────
+
+    def test_the_last_four_digits_pair_the_accounts(self):
+        self._statement()
+        result = stmts.autolink_cash_services()
+        self.assertEqual(result['paired'], 1)
+        db.session.refresh(self.brokerage)
+        self.assertEqual(self.brokerage.paired_account_id, 'acct-cash')
+
+    def test_an_existing_pairing_is_never_overwritten(self):
+        """A manual pairing wins — the operator can see things the PDF can't."""
+        self.brokerage.paired_account_id = 'acct-manual'
+        db.session.commit()
+        self._statement()
+        result = stmts.autolink_cash_services()
+        self.assertEqual(result['paired'], 0)
+        self.assertEqual(result['already'], 1)
+        self.assertEqual(self.brokerage.paired_account_id, 'acct-manual')
+
+    def test_two_candidates_sharing_a_mask_are_left_unpaired(self):
+        """Pairing the WRONG cash account silently folds another account's
+        transactions into this reconciliation — worse than a visible gap."""
+        self._acct('acct-dupe', 'OTHER CASH ...7890', '7890', 'depository',
+                   'checking')
+        self._statement()
+        result = stmts.autolink_cash_services()
+        self.assertEqual(result['paired'], 0)
+        self.assertEqual(result['ambiguous'], 1)
+        self.assertIsNone(self.brokerage.paired_account_id)
+
+    def test_pairing_never_crosses_a_company(self):
+        """Folding one entity's cash into another's reconciliation is never
+        right."""
+        self.cash.owning_company = 'Some Other Entity, LLC'
+        db.session.commit()
+        self._statement()
+        self.assertEqual(stmts.autolink_cash_services()['paired'], 0)
+
+    def test_the_name_pattern_is_the_fallback_when_no_number_is_printed(self):
+        """A name is a convention; the statement is a fact. So this only runs
+        when the statement is silent."""
+        self.cash.mask = '9999'          # last-4 no longer matches
+        db.session.commit()
+        st = self._statement()
+        st.cash_services_account_number = None
+        st.parsed_metadata = {k: v for k, v in st.parsed_metadata.items()
+                              if k != 'cash_services_number'}
+        db.session.commit()
+        self.assertEqual(stmts.autolink_cash_services()['paired'], 1)
+        self.assertEqual(self.brokerage.paired_account_id, 'acct-cash')
+
+    def test_detection_is_idempotent(self):
+        self._statement()
+        stmts.autolink_cash_services()
+        self.assertEqual(stmts.autolink_cash_services()['paired'], 0)
+
+    # ── what pairing does to the anchor chain ───────────────────────────────
+
+    def test_an_unpaired_brokerage_account_reports_the_month_unexplained(self):
+        """Prior behaviour, preserved: with no pairing the cash feed is empty
+        and the whole month is variance."""
+        self._statement()
+        self._txn('acct-cash', 't-cash', 1673.97)
+        stmts.rebuild_statement_anchors()
+        anchor = stmts.anchors_for_account('acct-brk')[0]
+        self.assertEqual(anchor.transaction_sum, 0.0)
+        self.assertEqual(anchor.variance, -1673.97)
+
+    def test_pairing_counts_the_companions_transactions(self):
+        """THE POINT. The same transactions were always there — on the other
+        account."""
+        self._statement()
+        self._txn('acct-cash', 't-cash', 1673.97)
+        self.brokerage.paired_account_id = 'acct-cash'
+        db.session.commit()
+        stmts.rebuild_statement_anchors()
+        anchor = stmts.anchors_for_account('acct-brk')[0]
+        self.assertEqual(anchor.transaction_sum, -1673.97)
+        self.assertEqual(anchor.computed_closing, 7793.51)
+        self.assertEqual(anchor.variance, 0.0)
+        self.assertTrue(anchor.reconciles())
+
+    def test_both_sides_are_summed_not_just_the_companion(self):
+        self._statement()
+        self._txn('acct-brk', 't-own', 673.97)
+        self._txn('acct-cash', 't-cash', 1000.00)
+        self.brokerage.paired_account_id = 'acct-cash'
+        db.session.commit()
+        stmts.rebuild_statement_anchors()
+        self.assertEqual(stmts.anchors_for_account('acct-brk')[0]
+                         .transaction_sum, -1673.97)
+
+    def test_security_transactions_are_not_double_counted(self):
+        """signed_movement already sums them for the brokerage account; adding
+        the companion's SecurityTransactions too would replace one wrong answer
+        with another."""
+        from app.models import SecurityTransaction
+        self._statement()
+        db.session.add(SecurityTransaction(
+            plaid_investment_transaction_id='iv-1', account_id='acct-cash',
+            date=date(2025, 6, 15), amount=500.00, type='buy'))
+        self._txn('acct-cash', 't-cash', 1673.97)
+        self.brokerage.paired_account_id = 'acct-cash'
+        db.session.commit()
+        stmts.rebuild_statement_anchors()
+        self.assertEqual(stmts.anchors_for_account('acct-brk')[0]
+                         .transaction_sum, -1673.97)
+
+    def test_a_reparse_pairs_then_rebuilds_in_that_order(self):
+        """Ordering is load-bearing: the key is recovered by the re-parse, and
+        the sums depend on the pairing being set."""
+        st = self._statement()
+        path = stmts.pdf_path_for('item-abc', 'acct-brk', '2025-06', 's-jun')
+        stmts.store_pdf(path, wf_advisors_june_2025_pdf())
+        st.pdf_path = path
+        st.parsed_metadata = dict(st.parsed_metadata, parser_version='0.0.1')
+        db.session.commit()
+        self._txn('acct-cash', 't-cash', 1673.97)
+        result = stmts.reparse_stale()
+        self.assertEqual(result['paired'], 1)
+        self.assertEqual(stmts.anchors_for_account('acct-brk')[0].variance, 0.0)
+
+    # ── the control ─────────────────────────────────────────────────────────
+
+    def test_the_pairing_form_sets_and_clears(self):
+        self._statement()
+        resp = self.client_.post('/admin/accounts/pair', data={
+            'account_id': 'acct-brk', 'paired_account_id': 'acct-cash'})
+        self.assertEqual(resp.status_code, 302)
+        db.session.refresh(self.brokerage)
+        self.assertEqual(self.brokerage.paired_account_id, 'acct-cash')
+        self.client_.post('/admin/accounts/pair', data={
+            'account_id': 'acct-brk', 'paired_account_id': ''})
+        db.session.refresh(self.brokerage)
+        self.assertIsNone(self.brokerage.paired_account_id)
+
+    def test_an_account_cannot_be_paired_with_itself(self):
+        self.client_.post('/admin/accounts/pair', data={
+            'account_id': 'acct-brk', 'paired_account_id': 'acct-brk'})
+        db.session.refresh(self.brokerage)
+        self.assertIsNone(self.brokerage.paired_account_id)
+
+    def test_the_accounts_page_offers_the_pairing_control(self):
+        body = self.client_.get('/admin/accounts').data.decode()
+        self.assertIn('/admin/accounts/pair', body)
+
+
+class SandboxVisibilityTest(StatementsBase):
+    """Hiding the Plaid Sandbox test accounts (v0.4.44).
+
+    They are not junk — they are the only accounts with a transaction history
+    varied enough to exercise the parser and the reconciliation engine — so
+    they are hidden, never deleted."""
+
+    SANDBOX = 'Bank Bridge Test'
+
+    def setUp(self):
+        super().setUp()
+        self.client_ = self.app.test_client()
+        self.real = PlaidAccount(
+            account_id='acct-real', item_id=self.item.item_id,
+            name='BUSINESS BROKERAGE', mask='6030', type='investment',
+            subtype='brokerage', owning_company='Orchard Example, LLC')
+        self.fake = PlaidAccount(
+            account_id='acct-sandbox', item_id=self.item.item_id,
+            name='Plaid Checking', mask='0000', type='depository',
+            subtype='checking', owning_company=self.SANDBOX)
+        db.session.add_all([self.real, self.fake])
+        db.session.commit()
+
+    def test_sandbox_accounts_are_hidden_by_default(self):
+        """The default changes behaviour on upgrade, deliberately: a sandbox
+        row silently inside a reconciliation total is worse than a missing row
+        with a toggle that explains it."""
+        self.assertFalse(av.include_sandbox())
+        visible = {a.account_id for a in av.visible_accounts()}
+        self.assertIn('acct-real', visible)
+        self.assertNotIn('acct-sandbox', visible)
+
+    def test_the_toggle_brings_them_back(self):
+        av.save({'include_sandbox_accounts': True})
+        visible = {a.account_id for a in av.visible_accounts()}
+        self.assertIn('acct-sandbox', visible)
+        av.save({'include_sandbox_accounts': False})
+        self.assertNotIn('acct-sandbox',
+                         {a.account_id for a in av.visible_accounts()})
+
+    def test_nothing_is_deleted(self):
+        av.save({'include_sandbox_accounts': False})
+        av.visible_accounts()
+        self.assertIsNotNone(
+            PlaidAccount.query.filter_by(account_id='acct-sandbox').first())
+        self.assertEqual(PlaidAccount.query.count(), 2)
+
+    def test_the_company_that_marks_a_sandbox_account_is_configurable(self):
+        av.save({'sandbox_company': 'Some Other Scratch Entity'})
+        self.assertIn('acct-sandbox',
+                      {a.account_id for a in av.visible_accounts()})
+        av.save({'sandbox_company': self.SANDBOX})
+        self.assertNotIn('acct-sandbox',
+                         {a.account_id for a in av.visible_accounts()})
+
+    def test_an_item_level_company_marks_its_accounts_too(self):
+        """Company resolution is per-account override → Item, the same order
+        every other feature uses."""
+        self.fake.owning_company = None
+        self.item.owning_company = self.SANDBOX
+        db.session.commit()
+        self.assertNotIn('acct-sandbox',
+                         {a.account_id for a in av.visible_accounts()})
+
+    def test_the_summary_explains_the_toggle_before_it_is_flipped(self):
+        summary = av.summary()
+        self.assertEqual(summary['total_sandbox'], 1)
+        self.assertEqual(summary['hidden'], 1)
+        self.assertFalse(summary['showing'])
+        self.assertEqual(summary['company'], self.SANDBOX)
+
+    def test_settings_survive_a_missing_or_broken_file(self):
+        """Migrate-on-read: a stale or unreadable data volume still yields
+        correct values."""
+        path = os.path.join(self._datadir, 'ui_settings.json')
+        with open(path, 'w') as fh:
+            fh.write('{not json')
+        self.assertFalse(av.include_sandbox())
+        self.assertEqual(av.sandbox_company(), self.SANDBOX)
+
+    # ── the pages ───────────────────────────────────────────────────────────
+
+    def test_the_accounts_page_hides_them_and_offers_the_toggle(self):
+        body = self.client_.get('/admin/accounts').data.decode()
+        self.assertNotIn('Plaid Checking', body)
+        self.assertIn('/admin/settings/sandbox_visibility', body)
+        self.assertIn('sandbox', body.lower())
+
+    def test_the_accounts_page_tags_them_when_shown(self):
+        av.save({'include_sandbox_accounts': True})
+        body = self.client_.get('/admin/accounts').data.decode()
+        self.assertIn('Plaid Checking', body)
+        self.assertIn('SANDBOX', body)
+
+    def test_the_toggle_endpoint_flips_it(self):
+        resp = self.client_.post('/admin/settings/sandbox_visibility',
+                                 data={'include_sandbox_accounts': '1'})
+        self.assertEqual(resp.status_code, 302)
+        self.assertTrue(av.include_sandbox())
+        self.client_.post('/admin/settings/sandbox_visibility', data={})
+        self.assertFalse(av.include_sandbox())
+
+    def test_other_pages_agree_with_the_filter(self):
+        for url in ('/admin/accounts', '/admin/statements',
+                    '/admin/transactions', '/admin/holdings',
+                    '/admin/investment_transactions', '/admin/reconciliation'):
+            resp = self.client_.get(url)
+            self.assertEqual(resp.status_code, 200, url)
+            self.assertNotIn('Plaid Checking', resp.data.decode(), url)
 
 
 class FixtureHygieneTest(unittest.TestCase):

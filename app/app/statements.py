@@ -277,7 +277,7 @@ def resolve_pdf_path(statement: PlaidStatement) -> str | None:
 # Stored on every row (`parsed_metadata['parser_version']`), which is what lets
 # an operator tell a stale parse from a current one and re-parse only what is
 # behind — see reparse_stored.
-PARSER_VERSION = '0.4.42'
+PARSER_VERSION = '0.4.44'
 
 # Ordered most- to least-specific. 'previous balance' must be tried before a
 # bare 'balance', and the credit-card wording ('previous balance', 'new
@@ -887,17 +887,30 @@ def _extract_electronic_transfers(lines) -> dict:
 # what distinguishes a managed account from one the operator trades themselves.
 _ADVISORY_PROGRAM = re.compile(
     r'your advisory program:\s*([a-z0-9 &/.\'-]{2,60})', re.IGNORECASE)
+# 'Brokerage Cash Services number: 1234567890' — the bank's own statement of
+# which checking account carries this brokerage account's cash. Its last four
+# digits are that account's Plaid mask, which makes this the one authoritative
+# pairing key a statement offers (see statements.autolink_cash_services).
+_CASH_SERVICES = re.compile(
+    r'brokerage cash services number:?\s*(\d{6,20})', re.IGNORECASE)
 _FEE_RATE = re.compile(
     r'your effective fee rate:?\**\s*(\d{1,3}(?:\.\d{1,3})?\s*%)',
     re.IGNORECASE)
 
 
 def _extract_advisory(lines) -> dict:
-    """{'advisory_program', 'advisory_fee_rate'} where the statement names
-    them. Strings, deliberately: '1.00%' is a disclosed rate to reproduce
-    verbatim on a report, not a number to compute with."""
+    """{'advisory_program', 'advisory_fee_rate', 'cash_services_number'}
+    where the statement names them.
+
+    Strings, deliberately: '1.00%' is a disclosed rate to reproduce verbatim on
+    a report, not a number to compute with, and an account number is an
+    identifier whose leading zeros matter."""
     out = {}
     for line in lines:
+        if 'cash_services_number' not in out:
+            m = _CASH_SERVICES.search(line)
+            if m:
+                out['cash_services_number'] = m.group(1)
         if 'advisory_program' not in out:
             m = _ADVISORY_PROGRAM.search(line)
             if m:
@@ -1070,7 +1083,7 @@ def parse_balances(pdf_bytes: bytes) -> dict:
 _META_HOUSEKEEPING = frozenset({
     'parser_version', 'layout', 'verified', 'fields_failed',
     'period_start', 'period_end', 'payment_due_date', 'pages',
-    'advisory_program', 'advisory_fee_rate',
+    'advisory_program', 'advisory_fee_rate', 'cash_services_number',
 })
 
 # How a gain/loss column reads in a table of figures.
@@ -1204,8 +1217,177 @@ def anchor_transaction_sum(account: PlaidAccount, start: date | None,
     positive amount means money LEFT the account, so this is its negation. The
     flip lives here, once, rather than at each call site: an anchor chain whose
     sign convention is decided per-caller is a chain that will eventually
-    disagree with itself."""
-    return round(-signed_movement(account, start, end), 2)
+    disagree with itself.
+
+    v0.4.44 · A PAIRED ACCOUNT'S CASH SIDE IS INCLUDED. Wells Fargo Advisors
+    splits one economic account across two Plaid accounts: the brokerage side
+    holds the statements and the securities activity but ZERO
+    BankTransactions, while its "Brokerage Cash Services" companion holds every
+    cash movement and no statements at all. Anchoring the brokerage account
+    alone therefore compares the bank's closing balance against a transaction
+    feed that is structurally empty, and reports the entire month as
+    unexplained — a variance that says nothing about the books.
+
+    Only the companion's BANK transactions are added. Its SecurityTransactions
+    are not, because `signed_movement` already sums those for the brokerage
+    account itself and counting them twice would replace one wrong answer with
+    another."""
+    total = -signed_movement(account, start, end)
+    partner_id = (account.paired_account_id or '').strip()
+    if partner_id and start is not None and end is not None:
+        rows = (BankTransaction.query
+                .filter(BankTransaction.account_id == partner_id,
+                        BankTransaction.date >= start,
+                        BankTransaction.date <= end,
+                        BankTransaction.pending.is_(False),
+                        BankTransaction.removed.is_(False))
+                .all())
+        total += -sum(float(t.amount or 0.0) for t in rows)
+    return round(total, 2)
+
+
+# ── pairing a brokerage account with its cash-services companion ────────────
+
+def _mask_of(number: str) -> str:
+    """The last four digits of a cash-services account number — which is
+    exactly what Plaid reports as the companion account's `mask`."""
+    digits = re.sub(r'\D', '', number or '')
+    return digits[-4:] if len(digits) >= 4 else ''
+
+
+def cash_services_numbers(account_id: str) -> list:
+    """Every distinct cash-services number this account's statements printed.
+
+    A list rather than one value because disagreement is meaningful: if the
+    statements name two different companions, the account was re-numbered
+    mid-history and guessing which one is current would be worse than
+    declining to pair."""
+    seen = []
+    for st in (PlaidStatement.query
+               .filter(PlaidStatement.plaid_account_id == account_id,
+                       PlaidStatement.cash_services_account_number.isnot(None))
+               .order_by(PlaidStatement.period_start.desc().nullslast())
+               .all()):
+        number = (st.cash_services_account_number or '').strip()
+        if number and number not in seen:
+            seen.append(number)
+    return seen
+
+
+def _same_company(a: PlaidAccount, b: PlaidAccount, items: dict) -> bool:
+    """Whether two accounts resolve to the same owning Company (per-account
+    override → Item). Pairing across entities is never right — it would fold
+    one company's cash into another's reconciliation."""
+    def owner(acct):
+        return ((acct.owning_company or '').strip()
+                or items.get(acct.item_id, ''))
+    return owner(a) == owner(b)
+
+
+def _candidate_partners(account: PlaidAccount, accounts: list,
+                        items: dict) -> list:
+    """Depository accounts that could be this brokerage account's cash side."""
+    return [c for c in accounts
+            if c.account_id != account.account_id
+            and (c.type or '').lower() == 'depository'
+            and _same_company(account, c, items)]
+
+
+def autolink_cash_services() -> dict:
+    """Pair each brokerage account with its cash-services companion.
+
+    Two strategies, strongest first:
+
+      1. THE STATEMENT SAYS SO. A Wells Fargo Advisors statement prints
+         'Brokerage Cash Services number: 1234567890', whose last four digits
+         are the companion's Plaid mask. This is the bank's own assertion of
+         the relationship and needs no inference.
+      2. THE NAMES SAY SO. Failing that, an account named '… BROKERAGE …6030'
+         alongside exactly one '… BROKERAGE CASH …' under the same Company is
+         the same relationship spelled differently. Weaker, so it only runs
+         when the statement is silent.
+
+    A pairing is only made when EXACTLY ONE candidate matches. Two candidates
+    is ambiguity, and pairing the wrong cash account would silently move
+    another account's transactions into this one's reconciliation — much worse
+    than leaving it unpaired and visibly unexplained.
+
+    NEVER overwrites an existing pairing: a value already set was either put
+    there by an operator who can see things the PDF does not say, or by a
+    previous run that reached the same conclusion. Returns
+    {'paired', 'already', 'ambiguous', 'unmatched'}."""
+    stats = {'paired': 0, 'already': 0, 'ambiguous': 0, 'unmatched': 0}
+    accounts = PlaidAccount.query.all()
+    items = {it.item_id: (it.owning_company or '').strip()
+             for it in PlaidItem.query.all()}
+    for account in accounts:
+        if (account.type or '').lower() != 'investment':
+            continue
+        if (account.paired_account_id or '').strip():
+            stats['already'] += 1
+            continue
+        candidates = _candidate_partners(account, accounts, items)
+        if not candidates:
+            stats['unmatched'] += 1
+            continue
+
+        partner = None
+        for number in cash_services_numbers(account.account_id):
+            mask = _mask_of(number)
+            if not mask:
+                continue
+            matches = [c for c in candidates if (c.mask or '') == mask]
+            if len(matches) == 1:
+                partner = matches[0]
+                break
+            if len(matches) > 1:
+                log.info('account %s names cash-services mask %s, but %d '
+                         'accounts share it — declining to pair',
+                         account.account_id, mask, len(matches))
+                stats['ambiguous'] += 1
+                partner = None
+                break
+
+        if partner is None and not cash_services_numbers(account.account_id):
+            partner = _partner_by_name(account, candidates)
+            if partner is False:                      # ambiguous by name
+                stats['ambiguous'] += 1
+                continue
+
+        if not partner:
+            stats['unmatched'] += 1
+            continue
+        account.paired_account_id = partner.account_id
+        stats['paired'] += 1
+        log.info('paired brokerage %s (••%s) with cash-services %s (••%s)',
+                 account.account_id, account.mask or '????',
+                 partner.account_id, partner.mask or '????')
+    if stats['paired']:
+        db.session.commit()
+    return stats
+
+
+_BROKERAGE_CASH = re.compile(r'brokerage\s+cash', re.IGNORECASE)
+_BROKERAGE = re.compile(r'brokerage', re.IGNORECASE)
+
+
+def _partner_by_name(account: PlaidAccount, candidates: list):
+    """The name-pattern fallback: exactly one '… BROKERAGE CASH …' companion,
+    or None (no match) / False (ambiguous).
+
+    Only consulted when no statement named a cash-services number, because a
+    name is a convention and the statement is a fact."""
+    if not _BROKERAGE.search(account.name or ''):
+        return None
+    named = [c for c in candidates
+             if _BROKERAGE_CASH.search(f'{c.name or ""} {c.official_name or ""}')]
+    if len(named) == 1:
+        return named[0]
+    if len(named) > 1:
+        log.info('account %s has %d "brokerage cash" candidates — declining '
+                 'to pair by name', account.account_id, len(named))
+        return False
+    return None
 
 
 def _anchor_values(statement: PlaidStatement, account: PlaidAccount) -> dict:
@@ -1620,7 +1802,9 @@ def apply_parse(record: PlaidStatement, parsed: dict) -> dict:
     record.portfolio_opening_value = parsed.get('portfolio_opening')
     record.portfolio_closing_value = parsed.get('portfolio_closing')
     record.parse_method = parsed.get('method') or ''
-    record.parsed_metadata = parsed.get('metadata') or {}
+    metadata = parsed.get('metadata') or {}
+    record.parsed_metadata = metadata
+    record.cash_services_account_number = metadata.get('cash_services_number')
     record.updated_at = _now()
     return parsed
 
@@ -1721,7 +1905,7 @@ def reparse_stale() -> dict:
     stale = stale_statements()
     if not stale:
         return {'examined': 0, 'changed': 0, 'unreadable': 0, 'suspect': 0,
-                'fields': 0, 'failed_fields': 0, 'anchors': 0}
+                'fields': 0, 'failed_fields': 0, 'anchors': 0, 'paired': 0}
     log.info('%d statement(s) parsed by an older recognizer — re-reading',
              len(stale))
     stats = reparse_stored(only_stale=True)
@@ -1729,6 +1913,17 @@ def reparse_stale() -> dict:
     # chain left standing after a re-parse asserts the old numbers as this
     # account's balance truth. Rebuilding here is what keeps the two from ever
     # disagreeing — the same lesson as reparse_stale itself, one layer up.
+    # v0.4.44 · pairing runs BEFORE the rebuild and after the re-parse, which
+    # is the only order that works: the cash-services number it keys on was
+    # just recovered by the re-parse, and the anchor sums it feeds depend on
+    # the pairing being set.
+    try:
+        stats['paired'] = autolink_cash_services()['paired']
+    except Exception:  # pragma: no cover - detection must not break a re-parse
+        db.session.rollback()
+        log.warning('cash-services autolink after re-parse failed',
+                    exc_info=True)
+        stats['paired'] = 0
     try:
         stats['anchors'] = rebuild_statement_anchors()['written']
     except Exception:  # pragma: no cover - a report must not break a re-parse

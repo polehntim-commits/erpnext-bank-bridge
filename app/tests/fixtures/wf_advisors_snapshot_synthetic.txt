@@ -78,6 +78,7 @@ Total $0.00 $0.00 $0.00
 Page 3 of 9SNAPSHOT
 ORCHARD EXAMPLE LLC
 Account type: Brokerage Cash Services Brokerage account number: 0000-0000
+Brokerage Cash Services number: 1234567890 Go paperless.
 Money market and sweep funds 7,793.51 Statements: X
 Your total available funds $7,793.51
 June 1, 2025 - June 30, 2025

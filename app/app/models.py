@@ -182,6 +182,25 @@ class PlaidAccount(db.Model):
     # operation, and this is the audit trail of where its identity went.
     superseded_by_account_id = db.Column(db.String(120), nullable=True,
                                          index=True)
+    # v0.4.44 · ACCOUNT PAIRING. Set on a BROKERAGE account, pointing at the
+    # depository "Brokerage Cash Services" account that carries its cash side.
+    #
+    # Wells Fargo Advisors splits one economic account across two Plaid
+    # accounts, and the split is invisible until you try to reconcile: the
+    # brokerage account holds the statements and the securities activity but
+    # ZERO BankTransactions, while its companion checking account holds every
+    # cash movement and NO statements. Anchoring the brokerage account on its
+    # own therefore measures the bank's closing balance against a transaction
+    # feed that is structurally empty, and every period comes back "unexplained"
+    # for a reason that has nothing to do with the books being wrong.
+    #
+    # NULL means "not paired", which is correct for an ordinary account and is
+    # what every account starts as. Auto-detected from the statement's own
+    # "Brokerage Cash Services number" line where present (see
+    # statements.autolink_cash_services), and overridable by hand on
+    # /admin/accounts — a manual pairing is never overwritten by detection,
+    # because the operator can see things the PDF does not say.
+    paired_account_id = db.Column(db.String(120), nullable=True, index=True)
     # v0.4.12 · mark-to-market for balance-only investment accounts. The GL leaf
     # only ever held the OPENING value — refreshed balances went to an
     # informational custom field on the Bank Account, never to a posting — so a
@@ -922,6 +941,14 @@ class PlaidStatement(db.Model):
     # restored from a backup taken before an upload has this blank for records
     # that do exist, and the sync re-adopts them by probing rather than
     # creating a duplicate (see erpnext_statements.sync_statement).
+    # v0.4.44 · the "Brokerage Cash Services number" the statement prints, e.g.
+    # 'Brokerage Cash Services number: 1234567890'. It is the bank's OWN
+    # statement of which checking account carries this brokerage account's cash,
+    # and its last four digits are the companion account's Plaid mask — which
+    # makes it the one authoritative pairing key available (see
+    # PlaidAccount.paired_account_id). NULL on any statement that doesn't print
+    # one, which is every non-brokerage statement.
+    cash_services_account_number = db.Column(db.String(40), nullable=True)
     erpnext_docname = db.Column(db.String(255), nullable=True, index=True)
     erpnext_synced_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=_now)

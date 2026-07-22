@@ -31,6 +31,7 @@ from flask import (Blueprint, Response, current_app, jsonify, redirect,
 from werkzeug.security import check_password_hash
 
 from .. import account_cleanup
+from .. import account_visibility as av
 from .. import audit
 from .. import categorization
 from .. import counterparty
@@ -377,7 +378,7 @@ def _counts() -> dict:
     # shadow a dict attribute.
     return {
         'banks': PlaidItem.query.count(),
-        'accounts': PlaidAccount.query.count(),
+        'accounts': av.visible_accounts_query().count(),
         'mapped': mapped,
         'transactions': total_txn,
         'posted': posted,
@@ -655,6 +656,28 @@ ACCOUNTS_BODY = """
   {% if erp_error %}<br><span class="warn">Couldn't load ERPNext Bank Accounts: {{ erp_error }}</span>{% endif %}
 </p>
 
+{# v0.4.44 · sandbox visibility. Discoverable HERE, on the page whose contents
+   it changes, because 'where did my account go' is the failure mode of hiding
+   and a toggle buried on a settings page does not answer it. #}
+{% if visibility.total_sandbox %}
+<form method="post" action="/admin/settings/sandbox_visibility"
+      style="margin:8px 0;font-size:13px;color:#555">
+  <input type="hidden" name="next" value="/admin/accounts">
+  <input type="hidden" name="include_sandbox_accounts"
+         value="{{ '' if visibility.showing else '1' }}">
+  {% if visibility.showing %}
+    Showing <b>{{ visibility.total_sandbox }}</b> Plaid Sandbox test account(s)
+    (Company <code>{{ visibility.company }}</code>).
+    <button type="submit" class="secondary"
+            style="padding:3px 10px;font-size:12px">Hide sandbox accounts</button>
+  {% else %}
+    <b>{{ visibility.hidden }}</b> Plaid Sandbox test account(s) are hidden
+    (Company <code>{{ visibility.company }}</code>). Nothing was deleted.
+    <button type="submit" class="secondary"
+            style="padding:3px 10px;font-size:12px">Show sandbox accounts</button>
+  {% endif %}
+</form>
+{% endif %}
 {% if groups and not any_imported %}
 <div class="banner-warn"><h3>Nothing imported yet</h3>
   Click <b>Import all supported accounts</b> above to bring your Plaid accounts
@@ -734,7 +757,40 @@ ACCOUNTS_BODY = """
   {% for a in grp.accounts %}
   <tr>
     <td>{{ a.name or a.official_name or '(unnamed)' }}</td>
-    <td><code>••{{ a.mask or '??' }}</code></td>
+    <td><code>••{{ a.mask or '??' }}</code>
+      {% if a.account_id in sandbox_ids %}
+      <br><span class="pill pill-warn" style="font-size:10px"
+            title="A Plaid Sandbox test account, shown because 'Show sandbox accounts' is on. Not real money.">SANDBOX</span>
+      {% endif %}
+      {# v0.4.44 · pairing. A WF Advisors brokerage account and its Brokerage
+         Cash Services companion are one economic account: the brokerage side
+         holds the statements and securities activity, the companion holds
+         every cash movement. Reconciliation needs both. #}
+      {% set options = pair_options.get(a.account_id, []) %}
+      {% if a.paired_account_id %}
+      <br><span style="font-size:11px;color:#1b5e20" title="Cash-side transactions from this account are counted in {{ a.name or a.account_id }}'s reconciliation.">
+        &#128279; ••{{ pair_masks.get(a.paired_account_id, '????') }}</span>
+      {% endif %}
+      {% if options %}
+      <br><a href="#" style="font-size:11px"
+         onclick="document.getElementById('pair-{{ a.account_id }}').style.display='block';this.style.display='none';return false">[{{ 'change pair' if a.paired_account_id else 'pair' }}]</a>
+      <form id="pair-{{ a.account_id }}" method="post"
+            action="/admin/accounts/pair" style="display:none;margin-top:4px">
+        <input type="hidden" name="account_id" value="{{ a.account_id }}">
+        <select name="paired_account_id" style="font-size:11px;padding:3px;width:100%">
+          <option value="">— unpaired —</option>
+          {% for o in options %}
+          <option value="{{ o.account_id }}"
+            {{ 'selected' if o.account_id == a.paired_account_id else '' }}>
+            ••{{ o.mask or '????' }} {{ o.name or o.account_id }}
+          </option>
+          {% endfor %}
+        </select>
+        <button type="submit" class="secondary"
+                style="padding:3px 8px;font-size:11px;margin-top:3px">Save pair</button>
+      </form>
+      {% endif %}
+    </td>
     <td>{{ a.type }}{% if a.subtype %} / {{ a.subtype }}{% endif %}
       {% if a.balance_only %}<br><span class="pill pill-muted"
         title="Plaid doesn't return investment transactions without the investments product — only the balance is mirrored">balance-only, no transactions</span>{% endif %}</td>
@@ -1023,8 +1079,12 @@ def accounts_page():
     supported_map = {}
     any_imported = False
     for it in items:
-        accts = (PlaidAccount.query.filter_by(item_id=it.item_id)
-                 .order_by(PlaidAccount.name).all())
+        # v0.4.44 · sandbox accounts are hidden unless the operator asked for
+        # them. Filtered here rather than in the template so every count and
+        # aggregate downstream sees the same set.
+        accts = av.visible_accounts(
+            PlaidAccount.query.filter_by(item_id=it.item_id)
+            .order_by(PlaidAccount.name))
         for a in accts:
             supported_map[a.account_id] = erpnext_accounts.is_supported(a)
             if a.erpnext_bank_account_name:
@@ -1050,6 +1110,23 @@ def accounts_page():
         except (ERPNextConfigError, ERPNextError):
             companies = []
     bank_account_names = {ba['name'] for ba in bank_accounts}
+    # v0.4.44 · pairing. `pair_options` is the set an account may be paired
+    # WITH: other visible accounts under the same Company. `sandbox_ids` lets
+    # the template tag a sandbox row when the toggle is on, so a test account
+    # can never be mistaken for a real one.
+    companies_by_account = _resolve_account_companies()
+    visible = [a for g in groups for a in g['accounts']]
+    pair_options = {}
+    for a in visible:
+        mine = companies_by_account.get(a.account_id, '')
+        pair_options[a.account_id] = [
+            o for o in visible
+            if o.account_id != a.account_id
+            and companies_by_account.get(o.account_id, '') == mine]
+    pair_names = {a.account_id: (a.name or a.account_id) for a in visible}
+    pair_masks = {a.account_id: (a.mask or '????') for a in visible}
+    sandbox_ids = av.sandbox_account_ids()
+    visibility = av.summary()
     # v0.4.43 · statement-anchored variance per account. Company-agnostic by
     # design — the accounts this matters most for are the ones whose ERPNext
     # instance does not exist yet (see models.StatementAnchor).
@@ -1066,7 +1143,9 @@ def accounts_page():
                     exc_info=True)
         anchor_map = {}
     return _page(ACCOUNTS_BODY, page='accounts', groups=groups,
-                 anchor_map=anchor_map,
+                 anchor_map=anchor_map, pair_options=pair_options,
+                 pair_names=pair_names, pair_masks=pair_masks,
+                 sandbox_ids=sandbox_ids, visibility=visibility,
                  bank_accounts=bank_accounts, bank_account_names=bank_account_names,
                  supported_map=supported_map, any_imported=any_imported,
                  unpostable=sync_engine.unpostable_by_account(),
@@ -1791,7 +1870,8 @@ def transactions_page():
     total_matching = q.count()
     rows = q.order_by(BankTransaction.date.desc().nullslast(),
                       BankTransaction.id.desc()).limit(limit).all()
-    accounts = PlaidAccount.query.order_by(PlaidAccount.name).all()
+    accounts = av.visible_accounts(
+        PlaidAccount.query.order_by(PlaidAccount.name))
     acct_mask = {a.account_id: (a.mask or '??') for a in accounts}
     # "+ Rule" is offered per row only where a rule is the right answer: an
     # ELIGIBLE transaction (posted, not removed) that no rule caught. On any
@@ -4448,7 +4528,7 @@ def plaid_settings_page():
     return _page(PLAID_SETTINGS_BODY, page='plaid_settings', s=ps.load(),
                  masked=ps.masked(), configured=ps.is_configured(),
                  sync_presets=sync_config.PRESETS,
-                 account_count=(PlaidAccount.query.count() or 1),
+                 account_count=(av.visible_accounts_query().count() or 1),
                  price_per_call=current_app.config.get(
                      'PLAID_PRICE_PER_CALL', sync_config.DEFAULT_PRICE_PER_CALL),
                  flash_msg=request.args.get('flash', ''))
@@ -4948,7 +5028,8 @@ def _statement_groups() -> list:
     companies = _resolve_account_companies()
     scope = _current_company()
     groups = []
-    for account in PlaidAccount.query.order_by(PlaidAccount.name).all():
+    for account in av.visible_accounts(
+            PlaidAccount.query.order_by(PlaidAccount.name)):
         company = companies.get(account.account_id, '')
         if scope and company != scope:
             continue
@@ -5207,7 +5288,8 @@ def balance_history():
     companies = _resolve_account_companies()
     scope = _current_company()
     groups = []
-    for account in PlaidAccount.query.order_by(PlaidAccount.name).all():
+    for account in av.visible_accounts(
+            PlaidAccount.query.order_by(PlaidAccount.name)):
         # Unmapped accounts have no ERPNext ledger to reconcile against, so
         # a balance history for them is a report about nothing — omit rather
         # than dilute the page.
@@ -5531,6 +5613,73 @@ STATEMENT_ADJUST_BODY = """
 """
 
 
+@bp.post('/admin/accounts/pair')
+def set_account_pair():
+    """Pair a brokerage account with its cash-services companion, or unpair.
+
+    A MANUAL PAIRING WINS. Auto-detection reads the statement's own
+    'Brokerage Cash Services number' and never overwrites a value that is
+    already set — so once an operator says which account carries the cash,
+    that answer stands, including the answer 'none'. The operator can see
+    things the PDF does not say."""
+    from .. import statements as stmts
+    account_id = (request.form.get('account_id') or '').strip()
+    partner_id = (request.form.get('paired_account_id') or '').strip()
+    account = PlaidAccount.query.filter_by(account_id=account_id).first()
+    if account is None:
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'No such account.'))
+    if partner_id and partner_id == account_id:
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'An account cannot be paired with itself.'))
+    if partner_id and PlaidAccount.query.filter_by(
+            account_id=partner_id).first() is None:
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'No such partner account.'))
+    before = account.paired_account_id
+    account.paired_account_id = partner_id or None
+    audit.record('account_pair_changed', subject_type='PlaidAccount',
+                 subject_id=account_id,
+                 before={'paired_account_id': before},
+                 after={'paired_account_id': account.paired_account_id},
+                 notes='manual pairing via /admin/accounts')
+    db.session.commit()
+    # The pairing changes what every anchor sum for this account includes, so
+    # the chain is stale the moment it is set. Rebuild rather than leave a
+    # reconciliation on screen that the new pairing already contradicts.
+    try:
+        stmts.rebuild_statement_anchors(account_id)
+    except Exception:  # pragma: no cover
+        db.session.rollback()
+        log.warning('anchor rebuild after pairing failed', exc_info=True)
+    msg = (f'Paired ••{account.mask or "????"} with its cash account.'
+           if partner_id else f'Unpaired ••{account.mask or "????"}.')
+    return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
+@bp.post('/admin/settings/sandbox_visibility')
+def set_sandbox_visibility():
+    """Show or hide the Plaid Sandbox test accounts.
+
+    Hiding NEVER deletes: those accounts are the only ones with a transaction
+    history varied enough to exercise the parser and the reconciliation engine
+    against, so they stay in the database and one click brings them back."""
+    show = bool(request.form.get('include_sandbox_accounts'))
+    company = (request.form.get('sandbox_company') or '').strip()
+    updates = {'include_sandbox_accounts': show}
+    if company:
+        updates['sandbox_company'] = company
+    av.save(updates)
+    summary = av.summary()
+    msg = (f"Showing {summary['total_sandbox']} sandbox account(s)." if show
+           else f"Hiding {summary['hidden']} sandbox account(s) "
+                f"(Company '{summary['company']}'). Nothing was deleted.")
+    audit.record('sandbox_visibility_changed', after=updates, notes=msg)
+    db.session.commit()
+    return redirect(request.form.get('next') or
+                    '/admin/accounts?flash=' + quote_plus(msg))
+
+
 @bp.get('/admin/reconciliation')
 @bp.get('/admin/reconciliation/<path:account_id>')
 def reconciliation_page(account_id: str = ''):
@@ -5539,7 +5688,7 @@ def reconciliation_page(account_id: str = ''):
     NOT filtered by ERPNext Company — see StatementAnchor. The accounts this
     page matters most for are the ones whose books do not exist yet."""
     from .. import statements as stmts
-    accounts = stmts.accounts_with_anchors()
+    accounts = av.filter_accounts(stmts.accounts_with_anchors())
     if not accounts:
         return _page(RECONCILIATION_BODY, page='reconciliation', accounts=[],
                      account=PlaidAccount(account_id=''), anchors=[],
@@ -6643,10 +6792,10 @@ def holdings_page():
     from ..models import (PlaidAccount, PlaidItem, Security, SecurityHolding)
     scope = _current_company()
     companies_by_account = _resolve_account_companies()
-    invest_accounts = (
+    invest_accounts = av.visible_accounts(
         PlaidAccount.query
         .filter(PlaidAccount.type.in_(('investment', 'brokerage')))
-        .order_by(PlaidAccount.name).all())
+        .order_by(PlaidAccount.name))
     enabled_items = (
         db.session.query(PlaidItem.item_id)
         .filter(PlaidItem.investments_synced_at.isnot(None),
@@ -6720,6 +6869,11 @@ def investment_transactions_page():
         scoped_ids = [aid for aid, c in _resolve_account_companies().items()
                       if c == scope]
         q = q.filter(SecurityTransaction.account_id.in_(scoped_ids))
+    # v0.4.44 · a sandbox account's investment activity is test data; excluded
+    # here for the same reason the account itself is excluded from every list.
+    hidden = av.hidden_account_ids()
+    if hidden:
+        q = q.filter(SecurityTransaction.account_id.notin_(tuple(hidden)))
     if cur_type:
         q = q.filter(SecurityTransaction.type == cur_type)
     if cur_ticker:

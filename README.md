@@ -1374,6 +1374,58 @@ try/except; a pattern that raises costs that one figure, is named in
 `fields_failed`, and is logged with the statement it failed on. A bad regex can
 never take down the metadata for a statement whose balances parsed perfectly.
 
+## Account pairing (v0.4.44)
+
+Wells Fargo Advisors splits **one economic account across two Plaid accounts**,
+and the split is invisible until you try to reconcile:
+
+| | statements | BankTransactions | SecurityTransactions |
+|---|---|---|---|
+| brokerage ••6030 | 13 | **0** | 377 |
+| its Brokerage Cash Services companion | **0** | 299 | 0 |
+
+Anchoring the brokerage account alone measures the bank's closing balance
+against a transaction feed that is *structurally empty*, so every period comes
+back "unexplained" for a reason that has nothing to do with the books being
+wrong. `PlaidAccount.paired_account_id` fixes that: when set,
+`anchor_transaction_sum` counts the companion's BankTransactions too (not its
+SecurityTransactions — those are already summed for the brokerage side, and
+double-counting replaces one wrong answer with another).
+
+**Detection, strongest evidence first.** The statement prints
+`Brokerage Cash Services number: 1234567890`, whose last four digits are the
+companion's Plaid mask — the bank's own assertion of the relationship, captured
+into `PlaidStatement.cash_services_account_number`. Failing that, a
+`… BROKERAGE …` account beside exactly one `… BROKERAGE CASH …` under the same
+Company is the same relationship spelled differently. A pairing is made only
+when **exactly one** candidate matches and never across Companies — pairing the
+wrong cash account would silently fold another account's transactions into this
+reconciliation, which is worse than a visible gap. Runs after each re-parse
+(before the anchor rebuild — the key is recovered by the re-parse and the sums
+depend on the pairing). **A manual pairing on `/admin/accounts` always wins.**
+
+## Sandbox account hiding (v0.4.44)
+
+An install set up against Plaid's Sandbox keeps those test accounts forever —
+a dozen `Plaid Checking ••0000` rows beside the real ones in every list and
+count. They are **hidden, never deleted**: they are the only accounts with a
+transaction history varied enough to exercise the parser and the reconciliation
+engine against.
+
+The filter is by **ERPNext Company** (`Bank Bridge Test` by default,
+configurable) because a sandbox account is otherwise indistinguishable from a
+production one — that is the point of a sandbox — while the Company assignment
+is a human statement of intent. Hidden by default, which is the one behaviour
+change on upgrade: the failure mode of hiding is "where did my account go" (one
+toggle, on the page whose contents it changes), while the failure mode of
+showing is a sandbox row silently inside a reconciliation total. When shown,
+each carries a **SANDBOX** tag so it can never be mistaken for real money.
+
+Applied consistently to `/admin/accounts`, `/admin/statements`,
+`/admin/transactions`, `/admin/reconciliation`, `/admin/holdings`,
+`/admin/investment_transactions`, the dashboard account count, and the Plaid
+cost estimate.
+
 ## Statement-anchored reconciliation (v0.4.43)
 
 Bank Bridge's own durable record of what each account **actually held** at each

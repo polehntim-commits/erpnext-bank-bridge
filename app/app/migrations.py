@@ -174,6 +174,13 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # anchors are DERIVED from statements that are already held, so the first
     # run of rebuild_statement_anchors fills the whole history with nothing to
     # backfill and nothing to undo.
+    #
+    # v0.4.44 — account pairing. Both backfill to NULL, which reads as "not
+    # paired" and "this statement printed no cash-services number" — true of
+    # every row on an existing install, so an upgrade changes no reconciliation
+    # until the next re-parse detects a pair and rebuilds the anchors.
+    ('plaid_accounts', 'paired_account_id', 'VARCHAR(120)'),
+    ('plaid_statements', 'cash_services_account_number', 'VARCHAR(40)'),
 ]
 
 
