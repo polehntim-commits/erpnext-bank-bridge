@@ -267,10 +267,11 @@ class ReconnectEndpointTests(ReconnectBase):
         captured = {}
 
         class Cap(FakePlaidClient):
-            def create_link_token(self, user_id, redirect_uri=None,
-                                  webhook=None, statements=False,
-                                  statements_months=24, access_token=None,
-                                  liabilities=False):
+            # **kwargs, not a copy of the real signature: this fake only
+            # cares about access_token, and spelling out every product flag
+            # meant it broke on each new one (v0.4.26 added `investments`).
+            def create_link_token(self, user_id, *, access_token=None,
+                                  **kwargs):
                 captured['access_token'] = access_token
                 return 'tok'
 
@@ -288,10 +289,11 @@ class ReconnectEndpointTests(ReconnectBase):
         captured = {}
 
         class Cap(FakePlaidClient):
-            def create_link_token(self, user_id, redirect_uri=None,
-                                  webhook=None, statements=False,
-                                  statements_months=24, access_token=None,
-                                  liabilities=False):
+            # **kwargs, not a copy of the real signature: this fake only
+            # cares about access_token, and spelling out every product flag
+            # meant it broke on each new one (v0.4.26 added `investments`).
+            def create_link_token(self, user_id, *, access_token=None,
+                                  **kwargs):
                 captured['access_token'] = access_token
                 return 'tok'
 

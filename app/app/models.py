@@ -8,6 +8,10 @@ The Plaid access_token is the only real secret here; it is stored ENCRYPTED
 memory by the sync engine (see app/crypto.py, app/plaid_client.py). Nothing
 in to_dict() ever emits it."""
 from datetime import datetime, timezone
+
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.mutable import MutableDict
+
 from . import db
 
 
@@ -75,6 +79,12 @@ class PlaidItem(db.Model):
     reauth_detected_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=_now)
     last_synced_at = db.Column(db.DateTime, nullable=True)
+    # v0.4.28 · timestamp of the most recent successful /investments/*
+    # sync. Kept separate from last_synced_at because the investments pull
+    # is optional (feature-not-available Items skip it silently) and its
+    # cadence differs from the transactions_sync loop. Nullable — a fresh
+    # Item's investments_synced_at is NULL until Phase A step 2 runs.
+    investments_synced_at = db.Column(db.DateTime, nullable=True)
     last_error = db.Column(db.Text, nullable=True)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -850,8 +860,52 @@ class PlaidStatement(db.Model):
     period_start = db.Column(db.Date, nullable=True, index=True)
     period_end = db.Column(db.Date, nullable=True, index=True)
     # Bank-asserted balances, parsed out of the PDF text. NULL = not parseable.
+    # On a brokerage statement these are the CASH side (cash and sweep
+    # balances), not total account value — that is the only figure the mirror
+    # can reconcile against, since signed_movement sums cash events and has no
+    # record of market appreciation. See statements._parse_wf_advisors.
     opening_balance = db.Column(db.Float, nullable=True)
     closing_balance = db.Column(db.Float, nullable=True)
+    # v0.4.41 — total account value (cash plus securities at market) where the
+    # statement states it. NULL on a depository/credit statement, which has no
+    # such figure, and on any brokerage layout we couldn't read. Never anchored
+    # on and never reconciled against; it is what an operator recognises from
+    # the statement's front page, and the figure mark-to-market (v0.4.12) moves.
+    portfolio_opening_value = db.Column(db.Float, nullable=True)
+    portfolio_closing_value = db.Column(db.Float, nullable=True)
+    # Which recognizer produced the balances above — 'wf_advisors', 'labels',
+    # 'labels_flat', or '' for none. A surprising figure is only auditable if
+    # the rule that found it is recorded next to it.
+    parse_method = db.Column(db.String(40), default='')
+    # Set when this statement's opening balance does NOT equal the previous
+    # month's closing (see statements.flag_parse_continuity). A statement is a
+    # chain — one month's close is the next month's open — so a break is either
+    # a misparse or a real gap in the documents, and either way the number
+    # should not be anchored on without a human looking. Never blocks anything
+    # by itself; choose_anchor_statement's own reconciliation check still rules.
+    parse_suspect = db.Column(db.Boolean, default=False)
+    # EVERYTHING the parser recovered, as JSONB: every summary figure the
+    # statement states (deposits, withdrawals, dividends, interest, fees,
+    # realized/unrealized gains, securities bought and sold, minimum payment
+    # due …) plus the parse's own provenance — `parser_version`, `layout`,
+    # `verified`, `fields_failed`, and the period the document states for
+    # itself. See statements.parse_statement for the full contract.
+    #
+    # ONE COLUMN, NOT A TABLE, and not thirty columns. The fields differ per
+    # institution and per account type and will keep growing; modelling them
+    # relationally would be table sprawl in exchange for nothing, since no
+    # query joins on "dividends in March". The handful that ARE queried
+    # (opening/closing balance, portfolio value) are promoted to real columns
+    # above and written from this blob in statements.apply_parse, so the two
+    # can never disagree.
+    #
+    # `parser_version` is what makes a re-parse safe to defer: an operator can
+    # see which rows a newer recognizer has not reached yet, and re-read those
+    # PDFs without re-downloading a thing.
+    parsed_metadata = db.Column(
+        MutableDict.as_mutable(
+            db.JSON().with_variant(JSONB, 'postgresql')),
+        nullable=True)
     # Absolute path of the stored PDF; '' when the download never succeeded.
     pdf_path = db.Column(db.Text, default='')
     # Size of the stored PDF in bytes — lets the admin list show "is there
@@ -879,6 +933,18 @@ class PlaidStatement(db.Model):
             return f'{self.period_start.year:04d}-{self.period_start.month:02d}'
         return ''
 
+    def metadata_dict(self) -> dict:
+        """`parsed_metadata` as a plain dict, {} when absent or malformed.
+        Never raises: this feeds a template, and a row written by a future
+        version (or edited by hand) must not be able to 500 a page."""
+        value = self.parsed_metadata
+        return dict(value) if isinstance(value, dict) else {}
+
+    def parser_version(self) -> str:
+        """Which build of the parser produced this row's figures, '' if it
+        predates versioning. What tells a stale parse from a current one."""
+        return str(self.metadata_dict().get('parser_version') or '')
+
     def to_dict(self):
         return {
             'id': self.id, 'statement_id': self.statement_id,
@@ -889,12 +955,61 @@ class PlaidStatement(db.Model):
             'period_label': self.period_label(),
             'opening_balance': self.opening_balance,
             'closing_balance': self.closing_balance,
+            'portfolio_opening_value': self.portfolio_opening_value,
+            'portfolio_closing_value': self.portfolio_closing_value,
+            'parse_method': self.parse_method or '',
+            'parse_suspect': bool(self.parse_suspect),
+            'parsed_metadata': self.parsed_metadata or {},
             'pdf_path': self.pdf_path or '',
             'pdf_bytes': int(self.pdf_bytes or 0),
             'fetched_at': self.fetched_at.isoformat() if self.fetched_at else None,
             'erpnext_docname': self.erpnext_docname or '',
             'erpnext_synced_at': (self.erpnext_synced_at.isoformat()
                                   if self.erpnext_synced_at else None),
+        }
+
+
+class StatementAdjustment(db.Model):
+    """One manual attribution of an unreconciled statement delta to a
+    specific offset account (v0.4.39).
+
+    A statement often shows a reconciliation delta ("off by $X") because
+    Plaid didn't ship a transaction for something that DID move the bank
+    balance — a wire transfer to a tax authority, a member distribution,
+    a fee not captured in /transactions/sync, an inter-brokerage transfer,
+    etc. This model lets the operator attribute portions of that delta to
+    specific accounts + descriptions so the statement's residual delta
+    approaches zero as adjustments are recorded.
+
+    Multiple adjustments per statement are allowed — a single month's
+    unreconciled amount might be composed of several distinct events (a
+    tax payment PLUS a rebalance PLUS a fee).
+
+    erpnext_je_name is optional: an adjustment can be recorded here as
+    documentation-only (Tim knows what the delta was for) OR it can be
+    tied to an actual ERPNext Journal Entry once created. The dashboard
+    treats attributed-but-not-posted the same as posted for the delta
+    math — the reconciliation reflects the operator's stated intent."""
+    __tablename__ = 'statement_adjustments'
+    id = db.Column(db.Integer, primary_key=True)
+    statement_id = db.Column(db.Integer,
+                             db.ForeignKey('plaid_statements.id'),
+                             nullable=False, index=True)
+    amount = db.Column(db.Float, nullable=False)
+    offset_account = db.Column(db.String(255), nullable=False, default='')
+    description = db.Column(db.Text, default='')
+    erpnext_je_name = db.Column(db.String(255), nullable=True)
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'statement_id': self.statement_id,
+            'amount': self.amount, 'offset_account': self.offset_account,
+            'description': self.description,
+            'erpnext_je_name': self.erpnext_je_name,
+            'created_at': (self.created_at.isoformat()
+                           if self.created_at else None),
         }
 
 
@@ -1096,4 +1211,266 @@ class SecurityTransaction(db.Model):
             'amount': self.amount, 'price': self.price, 'fees': self.fees,
             'type': self.type, 'subtype': self.subtype,
             'iso_currency_code': self.iso_currency_code,
+        }
+
+
+# ── v0.4.31 · v0.5.0 Phase B: 5:4 lot tracker + options overlay ─────────────
+#
+# Four models power the strategy tracker:
+#
+#   RetainedLot     — a lot the user intends to hold. The 20% of every 5:4
+#                     cycle that stays after the sell, PLUS anything manually
+#                     tagged as retained (a bought position with no matching
+#                     sell yet, or an explicit "coffee can" purchase).
+#   TradedCycle     — a matched buy/sell pair. Records the strategy at work:
+#                     bought N, sold ~0.8N at ~25% profit, kept ~0.2N.
+#   OptionsPosition — a written or held option contract with coverage tracking
+#                     (covered_by_shares for short calls, covered_by_cash for
+#                     short puts, is_naked flag when either is insufficient).
+#   OptionsIncomeEntry — every premium-generating or -consuming option event
+#                        (sell_to_open, buy_to_close, expired, assigned).
+#
+# All four are DERIVED from SecurityTransaction rows by the detector. The
+# raw transactions are the ground truth; these tables are inferred state
+# that can always be rebuilt from scratch by re-running detection.
+
+
+class StrategyTracker(db.Model):
+    """A saved detection run. Records when the detector ran, what settings it
+    used (frozen JSON snapshot), and what it produced (counts + summary). One
+    row per run. Prior runs are kept — the detector is idempotent-ish (same
+    inputs + same settings = same outputs), so a re-run replaces derived rows
+    but adds a new StrategyTracker for the audit trail."""
+    __tablename__ = 'strategy_tracker_runs'
+    id = db.Column(db.Integer, primary_key=True)
+    ran_at = db.Column(db.DateTime, default=_now, index=True)
+    # Frozen strategy config used for this run — JSON of the settings dict.
+    # Kept even when config later changes, so an old TradedCycle's
+    # classification is reproducible from the settings it was made under.
+    config_snapshot = db.Column(db.Text, nullable=True)
+    transactions_scanned = db.Column(db.Integer, default=0)
+    cycles_created = db.Column(db.Integer, default=0)
+    retained_lots_created = db.Column(db.Integer, default=0)
+    options_positions_touched = db.Column(db.Integer, default=0)
+    naked_positions_flagged = db.Column(db.Integer, default=0)
+    notes = db.Column(db.Text, default='')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'ran_at': self.ran_at.isoformat() if self.ran_at else None,
+            'transactions_scanned': self.transactions_scanned,
+            'cycles_created': self.cycles_created,
+            'retained_lots_created': self.retained_lots_created,
+            'options_positions_touched': self.options_positions_touched,
+            'naked_positions_flagged': self.naked_positions_flagged,
+            'notes': self.notes,
+        }
+
+
+class RetainedLot(db.Model):
+    """A lot the user intends to hold long-term. Created by the 5:4 detector
+    when a matched cycle completes (the 20% left over), OR manually tagged
+    by the operator on a bought-but-not-sold position.
+
+    `shares_remaining` decrements as the retained shares are eventually sold
+    (via the 400% diversification trigger, an assignment on a covered call,
+    or a manual liquidation). `strategy_tag` distinguishes '5_4' (auto-
+    classified from a cycle) from 'manual' (operator-tagged) so a report
+    can partition the portfolio by intent."""
+    __tablename__ = 'retained_lots'
+    id = db.Column(db.Integer, primary_key=True)
+    security_id = db.Column(db.String(120),
+                            db.ForeignKey('securities.security_id'),
+                            nullable=False, index=True)
+    account_id = db.Column(db.String(120),
+                           db.ForeignKey('plaid_accounts.account_id'),
+                           nullable=False, index=True)
+    purchase_date = db.Column(db.Date, nullable=False, index=True)
+    cost_basis_per_share = db.Column(db.Float, nullable=False)
+    shares_original = db.Column(db.Float, nullable=False)
+    shares_remaining = db.Column(db.Float, nullable=False)
+    # Link back to the TradedCycle that produced this lot, when applicable.
+    # NULL = manual tag with no cycle context (e.g. a coffee-can buy).
+    source_cycle_id = db.Column(db.Integer,
+                                db.ForeignKey('traded_cycles.id'),
+                                nullable=True, index=True)
+    strategy_tag = db.Column(db.String(40), default='5_4', index=True)
+    notes = db.Column(db.Text, default='')
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'security_id': self.security_id,
+            'account_id': self.account_id,
+            'purchase_date': self.purchase_date.isoformat()
+            if self.purchase_date else None,
+            'cost_basis_per_share': self.cost_basis_per_share,
+            'shares_original': self.shares_original,
+            'shares_remaining': self.shares_remaining,
+            'source_cycle_id': self.source_cycle_id,
+            'strategy_tag': self.strategy_tag,
+            'notes': self.notes,
+        }
+
+
+class TradedCycle(db.Model):
+    """A matched buy/sell pair. The 5:4 detector creates one when it finds a
+    sell of ~0.8× a buy quantity at ~1.25× the buy price within the matching
+    window. The 20% not sold becomes a RetainedLot.
+
+    `cycle_status` is 'open' when the buy has no matching sell yet (a lot
+    waiting for the 25% profit target), 'complete' when the matching sell
+    landed, 'partial' when the sell qty was outside the 5:4 tolerance
+    (operator sold different fraction than the rule)."""
+    __tablename__ = 'traded_cycles'
+    id = db.Column(db.Integer, primary_key=True)
+    security_id = db.Column(db.String(120),
+                            db.ForeignKey('securities.security_id'),
+                            nullable=False, index=True)
+    buy_transaction_id = db.Column(
+        db.String(120),
+        db.ForeignKey('security_transactions.plaid_investment_transaction_id'),
+        nullable=False, index=True)
+    sell_transaction_id = db.Column(
+        db.String(120),
+        db.ForeignKey('security_transactions.plaid_investment_transaction_id'),
+        nullable=True, index=True)
+    buy_date = db.Column(db.Date, nullable=False, index=True)
+    buy_qty = db.Column(db.Float, nullable=False)
+    buy_price = db.Column(db.Float, nullable=False)
+    sell_date = db.Column(db.Date, nullable=True)
+    sell_qty = db.Column(db.Float, nullable=True)
+    sell_price = db.Column(db.Float, nullable=True)
+    realized_pnl = db.Column(db.Float, nullable=True)
+    # Retain ratio actually observed on this cycle (not the config default).
+    # 0.20 = kept 20% of the buy quantity; 0.30 = kept 30%; and so on. Lets
+    # a report show how strictly the strategy was followed.
+    retain_ratio_actual = db.Column(db.Float, nullable=True)
+    cycle_status = db.Column(db.String(20), default='open', index=True)
+    detected_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'security_id': self.security_id,
+            'buy_transaction_id': self.buy_transaction_id,
+            'sell_transaction_id': self.sell_transaction_id,
+            'buy_date': self.buy_date.isoformat() if self.buy_date else None,
+            'buy_qty': self.buy_qty, 'buy_price': self.buy_price,
+            'sell_date': self.sell_date.isoformat() if self.sell_date else None,
+            'sell_qty': self.sell_qty, 'sell_price': self.sell_price,
+            'realized_pnl': self.realized_pnl,
+            'retain_ratio_actual': self.retain_ratio_actual,
+            'cycle_status': self.cycle_status,
+        }
+
+
+class OptionsPosition(db.Model):
+    """One open (or historically-closed) option contract position at a Plaid
+    account. Positive `contracts_open` = long option (owner of the contract);
+    negative = short option (writer of the contract). Coverage tracking
+    (`covered_by_shares` for short calls, `covered_by_cash` for short puts)
+    powers the naked-position guard, which enforces the user's stated 'no
+    margin, no naked options' rule.
+
+    Unique on (account_id, security_id) so a re-run of the detector updates
+    the position rather than duplicating it. Closing (buy_to_close, expired,
+    assigned, exercised) sets contracts_open to 0 and stamps `closed_at`."""
+    __tablename__ = 'options_positions'
+    id = db.Column(db.Integer, primary_key=True)
+    security_id = db.Column(db.String(120),
+                            db.ForeignKey('securities.security_id'),
+                            nullable=False, index=True)
+    account_id = db.Column(db.String(120),
+                           db.ForeignKey('plaid_accounts.account_id'),
+                           nullable=False, index=True)
+    contract_type = db.Column(db.String(10), nullable=True)  # call | put
+    # Denormalized from Security for query cheapness on strategy dashboard.
+    underlying_ticker = db.Column(db.String(50), nullable=True, index=True)
+    strike_price = db.Column(db.Float, nullable=True)
+    expiration_date = db.Column(db.Date, nullable=True, index=True)
+    contracts_open = db.Column(db.Float, nullable=False, default=0.0)
+    premium_received_total = db.Column(db.Float, default=0.0)
+    premium_paid_total = db.Column(db.Float, default=0.0)
+    net_premium = db.Column(db.Float, default=0.0)
+    covered_by_shares = db.Column(db.Integer, default=0)
+    covered_by_cash = db.Column(db.Float, default=0.0)
+    is_naked = db.Column(db.Boolean, default=False, index=True)
+    # open | closed | expired | assigned | exercised
+    status = db.Column(db.String(20), default='open', index=True)
+    opened_at = db.Column(db.Date, nullable=True)
+    closed_at = db.Column(db.Date, nullable=True)
+    notes = db.Column(db.Text, default='')
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+    __table_args__ = (
+        db.UniqueConstraint('account_id', 'security_id',
+                            name='ux_options_positions_account_security'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'security_id': self.security_id,
+            'account_id': self.account_id,
+            'contract_type': self.contract_type,
+            'underlying_ticker': self.underlying_ticker,
+            'strike_price': self.strike_price,
+            'expiration_date': self.expiration_date.isoformat()
+            if self.expiration_date else None,
+            'contracts_open': self.contracts_open,
+            'premium_received_total': self.premium_received_total,
+            'premium_paid_total': self.premium_paid_total,
+            'net_premium': self.net_premium,
+            'covered_by_shares': self.covered_by_shares,
+            'covered_by_cash': self.covered_by_cash,
+            'is_naked': bool(self.is_naked), 'status': self.status,
+            'opened_at': self.opened_at.isoformat()
+            if self.opened_at else None,
+            'closed_at': self.closed_at.isoformat()
+            if self.closed_at else None,
+            'notes': self.notes,
+        }
+
+
+class OptionsIncomeEntry(db.Model):
+    """One premium-generating or -consuming event on an option position.
+    Rows accumulate over the life of the position — a sell_to_open + a
+    buy_to_close is two rows on the same OptionsPosition, netting to a
+    realized P&L when the position closes.
+
+    `plaid_investment_transaction_id` is the source SecurityTransaction so
+    the entry can be reconciled back to Plaid's raw event."""
+    __tablename__ = 'options_income_entries'
+    id = db.Column(db.Integer, primary_key=True)
+    options_position_id = db.Column(db.Integer,
+                                    db.ForeignKey('options_positions.id'),
+                                    nullable=False, index=True)
+    plaid_investment_transaction_id = db.Column(
+        db.String(120),
+        db.ForeignKey('security_transactions.plaid_investment_transaction_id'),
+        nullable=True, index=True)
+    date = db.Column(db.Date, nullable=False, index=True)
+    # sell_to_open | buy_to_close | expired_worthless | assigned | exercised
+    action = db.Column(db.String(30), nullable=False)
+    contracts = db.Column(db.Float, nullable=False)
+    premium_per_contract = db.Column(db.Float, nullable=True)
+    # contracts × premium × 100 for standard equity options.
+    total_premium = db.Column(db.Float, nullable=True)
+    # True once the position is fully closed/expired — until then, this
+    # premium is unrealized (waiting on the contract to expire or close).
+    realized = db.Column(db.Boolean, default=False, index=True)
+    created_at = db.Column(db.DateTime, default=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'options_position_id': self.options_position_id,
+            'plaid_investment_transaction_id':
+                self.plaid_investment_transaction_id,
+            'date': self.date.isoformat() if self.date else None,
+            'action': self.action, 'contracts': self.contracts,
+            'premium_per_contract': self.premium_per_contract,
+            'total_premium': self.total_premium,
+            'realized': bool(self.realized),
         }

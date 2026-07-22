@@ -395,8 +395,13 @@ def find_by_plaid_id(client: ERPNextClient, statement_id: str) -> dict | None:
         rows = client.list_docs(
             BANK_STATEMENT_DT,
             filters=[[MARKER_FIELD, '=', statement_id]],
+            # opening/closing_balance are read (v0.4.41) because
+            # push_reconciliation now diffs them too — a probe that omitted
+            # them would read every record as having 0.00 and rewrite it on
+            # every pass, which is exactly the churn the diff exists to avoid.
             fields=['name', MARKER_FIELD, 'reconciliation_status',
-                    'variance_amount', PDF_FIELDNAME],
+                    'variance_amount', 'opening_balance', 'closing_balance',
+                    PDF_FIELDNAME],
             limit_page_length=1)
     except (ERPNextAPIError, ERPNextError) as e:
         log.warning('could not probe %s for %s: %s', BANK_STATEMENT_DT,
@@ -513,12 +518,27 @@ def push_reconciliation(client: ERPNextClient | None,
         if not docname:
             return 'missing'
     wanted = verdict_fields(statement)
+    # v0.4.41 — the balances travel with the verdict on a refresh, not only on
+    # the initial create. A re-parse (statements.reparse_stored) can correct a
+    # figure on a statement ERPNext already holds, and until this was here the
+    # correction stayed local: the Bank Statement record kept the number a
+    # weaker parser recovered, which is precisely the record a bookkeeper opens
+    # as support for an opening-balance entry. Only stated figures are sent —
+    # an unparseable balance leaves ERPNext's field alone rather than zeroing a
+    # value someone may have keyed in by hand.
+    if statement.opening_balance is not None:
+        wanted['opening_balance'] = round(float(statement.opening_balance), 2)
+    if statement.closing_balance is not None:
+        wanted['closing_balance'] = round(float(statement.closing_balance), 2)
     if existing is not None:
         current = {
             'reconciliation_status': (existing.get('reconciliation_status')
                                       or STATUS_NOT_CHECKED),
             'variance_amount': _num(existing.get('variance_amount')),
         }
+        for field in ('opening_balance', 'closing_balance'):
+            if field in wanted:
+                current[field] = _num(existing.get(field))
         if current == wanted:
             return 'unchanged'
     try:

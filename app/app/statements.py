@@ -230,13 +230,54 @@ def resolve_pdf_path(statement: PlaidStatement) -> str | None:
     return real
 
 
-# ── PDF text → balances ─────────────────────────────────────────────────────
+# ── PDF text → structured statement metadata ────────────────────────────────
 #
 # The bank's layout is the bank's business, so this is deliberately a
-# recognizer, not a parser: it looks for the handful of labels US institutions
-# actually print and takes the first currency amount that follows one. Anything
-# it doesn't recognize yields None, which every caller reads as "no bank-issued
-# figure" and falls back on.
+# RECOGNIZER, not a parser: it looks for labels institutions actually print and
+# takes the amount each one owns. Anything it doesn't recognize yields None,
+# which every caller reads as "no bank-issued figure" and falls back on.
+#
+# v0.4.41 · TWO LESSONS FROM REAL STATEMENTS.
+#
+# 1. LINE STRUCTURE IS EVIDENCE. Up to v0.4.40 this worked on one flat,
+#    whitespace-collapsed string and took the first amount within 120
+#    characters of a label. That is safe on a one-column consumer statement and
+#    actively WRONG on a Wells Fargo Advisors brokerage statement, whose "Cash
+#    sweep activity" table extracts as
+#
+#      TRANSFER TO BANK DEPOSIT SWEEP ENDING BALANCE06/16 100,000.00 06/30 39,751.95
+#
+#    — so 'ending balance' claimed 100,000.00, a single sweep transfer, as the
+#    month's closing balance. Every one of the 26 real statements on the live
+#    install parsed a wrong closing figure that way, and a wrong bank-asserted
+#    number is worse than none: it is the input to reconciliation AND to
+#    choose_anchor_statement, i.e. to a posted opening balance. Matching is now
+#    per LINE, and the run between a label and its amount must contain no
+#    digits and stay short (see _amounts_on_line).
+#
+# 2. LABELS ONLY MEAN SOMETHING INSIDE THEIR SECTION. 'Interest', 'Total' and
+#    'Other additions' appear many times in a 35-page brokerage statement, and
+#    the one that matters is the one under a particular summary heading. Fields
+#    are therefore looked up inside a named SECTION (see _section), which is
+#    also what stops the twelve-page holdings table — whose every row begins
+#    'Total …' — from answering a question about realized gains.
+#
+# WHAT IS AND IS NOT VERIFIED AGAINST REAL DOCUMENTS. The `wf_advisors` field
+# table below was written against 26 production Wells Fargo Advisors statements
+# and every field in it was checked on at least two of them. The `wf_deposit`
+# and `wf_card` tables were written from the standard Wells Fargo consumer
+# layouts and have NOT been checked against a real document, because the live
+# install holds none — its deposit and card "statements" are Plaid sandbox
+# mocks ('First Platypus Bank', 'Balance on XX/XX:') with no labelled totals at
+# all. They are safe in the sense every recognizer here is safe — an
+# unrecognized layout yields None, never a guess — but treat a figure they
+# produce as unconfirmed until a real statement has been eyeballed against it.
+
+# Bump when a change here could produce DIFFERENT numbers from the same PDF.
+# Stored on every row (`parsed_metadata['parser_version']`), which is what lets
+# an operator tell a stale parse from a current one and re-parse only what is
+# behind — see reparse_stored.
+PARSER_VERSION = '0.4.41'
 
 # Ordered most- to least-specific. 'previous balance' must be tried before a
 # bare 'balance', and the credit-card wording ('previous balance', 'new
@@ -245,11 +286,12 @@ def resolve_pdf_path(statement: PlaidStatement) -> str | None:
 _OPENING_LABELS = (
     'beginning balance', 'opening balance', 'previous balance',
     'balance forward', 'previous statement balance', 'starting balance',
-    'beginning balance on', 'balance last statement',
+    'balance last statement', 'opening value',
 )
 _CLOSING_LABELS = (
     'ending balance', 'closing balance', 'new balance', 'ending daily balance',
     'statement balance', 'new balance total', 'balance this statement',
+    'closing value',
 )
 
 # A US-format currency amount: optional leading '-' or '(', optional '$',
@@ -259,80 +301,1039 @@ _CLOSING_LABELS = (
 _AMOUNT = r'\(?-?\s*\$?\s*(\d{1,3}(?:,\d{3})*|\d+)\.(\d{2})\s*\)?'
 _AMOUNT_RE = re.compile(_AMOUNT)
 
+# 'Beginning balance on 6/1', 'Ending balance on June 30, 2026' — the one thing
+# banks routinely print BETWEEN a balance label and its amount. Stripped before
+# the digit-free-gap rule below, which would otherwise reject the very layout
+# (Wells Fargo's own consumer checking statement) it is meant to read.
+_ON_DATE = re.compile(
+    r'^\s*(?:as\s+of\s+|on\s+|through\s+|for\s+)'
+    r'(?:\d{1,2}/\d{1,2}(?:/\d{2,4})?'
+    r'|[a-z]{3,9}\.?\s+\d{1,2}(?:\s*,\s*\d{4})?)\s*[:.\-]?\s*',
+    re.IGNORECASE)
 
-def extract_text(pdf_bytes: bytes) -> str:
-    """All text in the PDF, lowercased and whitespace-collapsed, or '' when it
-    can't be read.
+# A line that OPENS with a MM/DD (optionally MM/DD/YY) is a transaction row.
+# Wells Fargo's cash-sweep table prints '06/01 BEGINNING BALANCE $0.00' there —
+# a per-day running total of a sub-account, never the statement's own figure.
+_ROW_PREFIX = re.compile(r'^\d{1,2}/\d{1,2}(?:/\d{2,4})?\b')
 
-    '' is a first-class outcome, not an error: a scanned/image-only statement
+# How much unlabelled text may sit between a label and the amount it owns.
+# Generous enough for a dotted leader or a column header fragment, far too
+# small to reach the next labelled figure.
+_MAX_GAP = 60
+
+
+def extract_pages(pdf_bytes: bytes) -> list[str]:
+    """Per-page text, in page order, or [] when the PDF can't be read.
+
+    [] is a first-class outcome, not an error: a scanned/image-only statement
     has no text layer at all, and a PDF that pypdf refuses is common enough in
     the wild that raising here would turn a routine parse miss into a failed
     fetch. The bytes are still stored either way — an operator can always open
     the document even when we can't read it."""
     if not pdf_bytes:
-        return ''
+        return []
     try:
         import io
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        parts = []
-        for pageno, page in enumerate(reader.pages):
-            try:
-                parts.append(page.extract_text() or '')
-            except Exception:
-                log.debug('unreadable page %d in statement PDF', pageno)
-        text = ' '.join(parts)
     except Exception as e:
         log.info('could not extract text from statement PDF: %s', e)
+        return []
+    pages = []
+    for pageno, page in enumerate(reader.pages):
+        try:
+            pages.append(page.extract_text() or '')
+        except Exception:
+            log.debug('unreadable page %d in statement PDF', pageno)
+            pages.append('')
+    return pages
+
+
+def extract_lines(pdf_bytes: bytes) -> list[str]:
+    """Every non-blank line of the PDF, lowercased, inner whitespace collapsed,
+    in document order.
+
+    Line structure is the whole point (see this section's header): it is what
+    separates 'Closing value $7,196.73' — a summary the bank asserts — from a
+    sweep-table row that merely happens to contain the word 'balance'."""
+    out = []
+    for page in extract_pages(pdf_bytes):
+        for raw in page.splitlines():
+            line = re.sub(r'\s+', ' ', raw).strip().lower()
+            if line:
+                out.append(line)
+    return out
+
+
+def extract_text(pdf_bytes: bytes) -> str:
+    """All text in the PDF, lowercased and whitespace-collapsed, or '' when it
+    can't be read. Retained as the flat-text fallback for layouts whose label
+    and amount pypdf does not place on one line."""
+    pages = extract_pages(pdf_bytes)
+    if not pages:
         return ''
-    return re.sub(r'\s+', ' ', text).strip().lower()
+    return re.sub(r'\s+', ' ', ' '.join(pages)).strip().lower()
 
 
-def _amount_after(text: str, label: str) -> float | None:
-    """The first currency amount printed after `label`, or None.
+# ── amounts ─────────────────────────────────────────────────────────────────
 
-    Bounded to a 120-character window because statements are laid out in columns
-    and the extracted text runs them together: without a bound, 'ending balance'
-    on one line could pick up an amount belonging to a table three rows down.
-    120 comfortably covers 'Beginning balance on July 1 ... $1,234.56' while
-    stopping well short of the next labelled figure."""
-    idx = text.find(label)
-    if idx < 0:
-        return None
-    window = text[idx + len(label): idx + len(label) + 120]
-    m = _AMOUNT_RE.search(window)
-    if not m:
-        return None
-    whole = m.group(1).replace(',', '')
-    try:
-        value = float(f'{whole}.{m.group(2)}')
-    except ValueError:  # pragma: no cover - the regex guarantees the shape
-        return None
-    matched = m.group(0)
+def _to_float(match) -> float:
+    """One _AMOUNT_RE match as a signed float. '(1,234.56)' and '-1,234.56' are
+    the two ways a statement prints the same negative."""
+    value = float(f"{match.group(1).replace(',', '')}.{match.group(2)}")
+    matched = match.group(0)
     if matched.lstrip().startswith('(') or '-' in matched.split('$')[0]:
         value = -value
     return round(value, 2)
 
 
-def _first_label_amount(text: str, labels) -> float | None:
+def _amounts_on_line(line: str, label: str) -> list[float]:
+    """Every amount `label` owns on this already-lowercased line, left to right.
+
+    Ownership of the FIRST amount is decided by what sits between it and the
+    label, which is the only signal available once a PDF's columns have been
+    flattened into text. Three rules, each of which a real statement taught us:
+
+      * a line that opens with a MM/DD is a transaction row, never a summary
+      * the gap may carry an 'on <date>' clause ('Beginning balance on 6/1'),
+        which is stripped before the next rule
+      * whatever is left must contain NO digits and stay under _MAX_GAP. A digit
+        in the gap means another column intervened — 'ending balance06/16
+        100,000.00' is a sweep transfer, not a closing balance — and a long gap
+        means the label and the figure are simply not related.
+
+    Once the first amount qualifies, the rest of the line follows it: statement
+    summaries are printed as THIS PERIOD then THIS YEAR then sometimes a chart
+    label, and a caller asks for the column it wants by index. [] is the safe
+    answer and the common one."""
+    if _ROW_PREFIX.match(line):
+        return []
+    idx = line.find(label)
+    if idx < 0:
+        return []
+    rest = line[idx + len(label):]
+    matches = list(_AMOUNT_RE.finditer(rest))
+    if not matches:
+        return []
+    gap = _ON_DATE.sub('', rest[:matches[0].start()])
+    if len(gap) > _MAX_GAP or any(c.isdigit() for c in gap):
+        return []
+    return [_to_float(m) for m in matches]
+
+
+def _find_amounts(lines, labels, exclude: tuple = ()) -> list[float]:
+    """The amounts owned by the first of `labels` that any line answers to,
+    scanning labels most-specific first and, for each, the document top-down.
+
+    `exclude` names substrings that disqualify a line for this lookup — it is
+    what keeps the bare label 'opening value' from claiming the figure on
+    'Opening value of cash and sweep balances', a DIFFERENT number on the same
+    Wells Fargo statement."""
     for label in labels:
-        value = _amount_after(text, label)
-        if value is not None:
-            return value
+        for line in lines:
+            if any(bad in line for bad in exclude):
+                continue
+            found = _amounts_on_line(line, label)
+            if found:
+                return found
+    return []
+
+
+def _find_label_amount(lines, labels, exclude: tuple = ()) -> float | None:
+    """The first (this-period) amount any of `labels` owns, or None."""
+    found = _find_amounts(lines, labels, exclude=exclude)
+    return found[0] if found else None
+
+
+# ── sections ────────────────────────────────────────────────────────────────
+#
+# A summary heading and the handful of lines beneath it. Scoping a lookup to a
+# section is what makes generic words usable: 'Interest' means the income line
+# under "Income summary" and nothing else, and 'Total' means the gain/loss
+# roll-up rather than any of the ~90 holdings rows that also start with it.
+
+# How many lines after a heading still count as part of its block. Every real
+# Wells Fargo summary block fits inside 14; a larger window would start
+# swallowing the block below it.
+_SECTION_SPAN = 14
+
+
+def _is_section_heading(line: str, header: str) -> bool:
+    """Whether `line` is the HEADING of section `header` rather than prose that
+    happens to mention it.
+
+    Real statements print disclosure text like "Income summary: The Income
+    summary displays all income as recorded in the tax system…", and a naive
+    substring match would scope every income lookup to that paragraph. A real
+    heading either carries its column headers ('… THIS PERIOD THIS YEAR') or is
+    short — a table heading is a few words, an explanatory sentence is not."""
+    if header not in line:
+        return False
+    return 'this period' in line or len(line) <= 60
+
+
+def _section(lines, header: str, span: int = _SECTION_SPAN) -> list[str]:
+    """The lines under every occurrence of section `header`, concatenated.
+
+    Every occurrence, because a statement can restate a summary per sub-account
+    and the first one is not always the one carrying the figure. Callers still
+    take the first answering line, so an earlier section wins where both have
+    the field."""
+    out = []
+    for i, line in enumerate(lines):
+        if _is_section_heading(line, header):
+            out.extend(lines[i + 1: i + 1 + span])
+    return out
+
+
+# ── field tables ────────────────────────────────────────────────────────────
+#
+# One row per extracted figure: (key, section, labels, column, exclude).
+#
+#   section  — the summary heading the label must sit under, '' for anywhere
+#   labels   — tried in order, most specific first
+#   column   — which amount on the line: 0 = THIS PERIOD, 1 = THIS YEAR, …
+#   exclude  — substrings that disqualify a line
+#
+# SIGNS ARE THE BANK'S, NOT OURS. A field holds exactly what the statement
+# printed: 'Cash withdrawn -20,047.16' is stored as -20047.16 and 'Cash
+# deposited 10,000.00' as 10000.00. Normalising here would bury the one thing
+# an audit wants — what the document says — under our own convention. The
+# validation view does the normalising, once, where it is visible.
+
+# Wells Fargo Advisors (brokerage). VERIFIED against 26 production statements.
+#
+# Two blocks carry balances and they are DIFFERENT NUMBERS: the Progress
+# summary's 'Opening/Closing value' is total account value (cash plus
+# securities at market), while the Cash flow summary's 'Opening/Closing value
+# of cash and sweep balances' is the cash side alone. `opening_balance` and
+# `closing_balance` take the CASH figure, because that is the one
+# reconciliation can test — signed_movement sums cash events and has no record
+# of market movement, so anchoring on total value would make every brokerage
+# period fail its own reconciliation and never qualify in
+# choose_anchor_statement.
+_WF_ADVISORS_FIELDS = (
+    # Progress summary — the account as a whole
+    ('portfolio_opening', 'progress summary', ('opening value',), 0,
+     ('of cash and sweep',)),
+    ('portfolio_closing', 'progress summary', ('closing value',), 0,
+     ('of cash and sweep',)),
+    ('deposits_total', 'progress summary', ('cash deposited',), 0, ()),
+    ('withdrawals_total', 'progress summary', ('cash withdrawn',), 0, ()),
+    ('securities_deposited', 'progress summary', ('securities deposited',), 0, ()),
+    ('securities_withdrawn', 'progress summary', ('securities withdrawn',), 0, ()),
+    ('change_in_value', 'progress summary', ('change in value',), 0, ()),
+    # Cash flow summary — the cash side, line by line
+    ('cash_opening', 'cash flow summary',
+     ('opening value of cash and sweep balances',), 0, ()),
+    ('cash_closing', 'cash flow summary',
+     ('closing value of cash and sweep balances',), 0, ()),
+    ('income_and_distributions', 'cash flow summary',
+     ('income and distributions',), 0, ()),
+    ('securities_sold_total', 'cash flow summary',
+     ('securities sold and redeemed',), 0, ()),
+    ('securities_bought_total', 'cash flow summary',
+     ('securities purchased',), 0, ()),
+    ('other_additions', 'cash flow summary', ('other additions',), 0, ()),
+    ('other_subtractions', 'cash flow summary',
+     ('other subtractions, transfers & charges', 'other subtractions'), 0, ()),
+    ('fees_total', 'cash flow summary',
+     ('advisory, manager and platform fees',), 0, ()),
+    ('net_additions_to_cash', 'cash flow summary',
+     ('net additions to cash',), 0, ()),
+    ('net_subtractions_from_cash', 'cash flow summary',
+     ('net subtractions from cash',), 0, ()),
+    ('checks_written_total', 'cash flow summary',
+     ('withdrawals by check',), 0, ()),
+    ('card_activity_total', 'cash flow summary',
+     ('atm and checkcard activity',), 0, ()),
+    # Income summary
+    ('interest_total', 'income summary', ('interest',), 0, ()),
+    ('sweep_income', 'income summary',
+     ('taxable money market/sweep funds',), 0, ()),
+    ('dividends_ordinary', 'income summary',
+     ('ordinary dividends and st capital gains',), 0, ()),
+    ('dividends_qualified', 'income summary', ('qualified dividends',), 0, ()),
+    ('taxable_income', 'income summary', ('total taxable income',), 0, ()),
+    ('tax_exempt_income', 'income summary',
+     ('total federally tax-exempt income',), 0, ()),
+    ('total_income', 'income summary', ('total income',), 0, ()),
+    # Gain/loss summary. The roll-up line is literally 'Total', which is why
+    # this MUST be section-scoped — the holdings tables further on print ~90
+    # more lines beginning with the same word. Columns, per the heading
+    # 'UNREALIZED | THIS PERIOD REALIZED | THIS YEAR REALIZED'.
+    ('unrealized_gains', 'gain/loss summary', ('total',), 0, ()),
+    ('realized_gains', 'gain/loss summary', ('total',), 1, ()),
+    ('realized_gains_ytd', 'gain/loss summary', ('total',), 2, ()),
+    ('gains_short_term_unrealized', 'gain/loss summary',
+     ('short term (s)', 'short term'), 0, ()),
+    ('gains_long_term_unrealized', 'gain/loss summary',
+     ('long term (l)', 'long term'), 0, ()),
+    # Anywhere
+    ('available_funds', '', ('your total available funds',), 0, ()),
+)
+
+# Wells Fargo deposit (checking / savings / money market).
+# UNVERIFIED — see this section's header. Written from the standard Wells Fargo
+# "Activity summary" layout; the live install holds no real deposit statement
+# to check it against.
+_WF_DEPOSIT_FIELDS = (
+    ('opening_balance', '',
+     ('beginning balance on', 'beginning balance', 'previous balance'), 0, ()),
+    ('closing_balance', '',
+     ('ending balance on', 'ending balance', 'closing balance'), 0, ()),
+    ('deposits_total', '',
+     ('total deposits and other credits', 'deposits and other credits',
+      'deposits/additions', 'deposits/credits'), 0, ()),
+    ('withdrawals_total', '',
+     ('total withdrawals and other debits', 'withdrawals and other debits',
+      'withdrawals/subtractions', 'withdrawals/debits'), 0, ()),
+    ('checks_written_total', '', ('checks paid', 'total checks'), 0, ()),
+    ('interest_earned', '',
+     ('interest earned this statement period', 'interest paid this period',
+      'interest earned', 'interest paid'), 0, ()),
+    ('service_fees', '',
+     ('total service fees', 'monthly service fee', 'service charges',
+      'service fee'), 0, ()),
+    ('average_ledger_balance', '',
+     ('average ledger balance', 'average daily ledger balance'), 0, ()),
+    ('average_collected_balance', '', ('average collected balance',), 0, ()),
+)
+
+# Wells Fargo credit card.
+# UNVERIFIED — see this section's header.
+_WF_CARD_FIELDS = (
+    ('previous_balance', '', ('previous balance',), 0, ()),
+    ('new_balance', '', ('new balance total', 'new balance'), 0, ()),
+    ('payments_total', '',
+     ('total payments and credits', 'payments and credits', 'payments'), 0, ()),
+    ('purchases_total', '',
+     ('total purchases and adjustments', 'purchases and adjustments',
+      'total purchases', 'purchases'), 0, ()),
+    ('cash_advances_total', '',
+     ('total cash advances', 'cash advances'), 0, ()),
+    ('fees_total', '',
+     ('total fees charged for this period', 'total fees charged',
+      'fees charged', 'total fees'), 0, ()),
+    ('interest_charged', '',
+     ('total interest charged for this period', 'total interest charged',
+      'interest charged', 'total interest'), 0, ()),
+    ('minimum_payment_due', '',
+     ('minimum payment due', 'minimum payment'), 0, ()),
+    ('credit_limit', '', ('total credit limit', 'credit limit'), 0, ()),
+    ('available_credit', '', ('available credit',), 0, ()),
+)
+
+# Which figures become the top-level opening_balance / closing_balance columns,
+# per layout. Those two columns are what reconciliation, anchoring and the
+# ERPNext Bank Statement record read, so the mapping is stated once, here,
+# rather than implied by whatever the parser happened to fill in.
+_HEADLINE_FIELDS = {
+    'wf_advisors': ('cash_opening', 'cash_closing'),
+    'wf_deposit': ('opening_balance', 'closing_balance'),
+    'wf_card': ('previous_balance', 'new_balance'),
+}
+
+_LAYOUT_FIELDS = {
+    'wf_advisors': _WF_ADVISORS_FIELDS,
+    'wf_deposit': _WF_DEPOSIT_FIELDS,
+    'wf_card': _WF_CARD_FIELDS,
+}
+
+# Layouts whose field table has been checked against a real document. Surfaced
+# in the metadata so a validation screen can say so rather than implying every
+# number carries the same weight.
+_VERIFIED_LAYOUTS = frozenset({'wf_advisors'})
+
+
+# ── statement period ────────────────────────────────────────────────────────
+
+_MONTHS = {m: i for i, m in enumerate(
+    ('january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
+     'september', 'october', 'november', 'december'), start=1)}
+_MONTHS.update({m[:3]: i for m, i in list(_MONTHS.items())})
+
+_MONTH_NAME = r'(' + '|'.join(sorted(_MONTHS, key=len, reverse=True)) + r')'
+# 'june 1, 2026 - june 30, 2026' — what Wells Fargo Advisors prints in the
+# page footer, and the only place either bound appears in full.
+_RANGE_WORDS = re.compile(
+    _MONTH_NAME + r'\.?\s+(\d{1,2}),?\s+(\d{4})\s*(?:-|–|through|to)\s*'
+    + _MONTH_NAME + r'\.?\s+(\d{1,2}),?\s+(\d{4})')
+_RANGE_SLASH = re.compile(
+    r'(\d{1,2})/(\d{1,2})/(\d{2,4})\s*(?:-|–|through|to)\s*'
+    r'(\d{1,2})/(\d{1,2})/(\d{2,4})')
+
+
+def _year(text: str) -> int:
+    value = int(text)
+    return value + 2000 if value < 100 else value
+
+
+def parse_period(lines) -> tuple[date | None, date | None]:
+    """(start, end) the statement states for itself, or (None, None).
+
+    Worth recovering even though `period_bounds` already derives a period from
+    Plaid's month + year: those are the CALENDAR month, and a bank whose cycle
+    does not align to one has a real period this is the only record of. A
+    mismatch between the two is itself a finding, which is why this is stored
+    beside the derived bounds rather than overwriting them."""
+    for line in lines:
+        m = _RANGE_WORDS.search(line)
+        if m:
+            try:
+                return (date(_year(m.group(3)), _MONTHS[m.group(1)],
+                             int(m.group(2))),
+                        date(_year(m.group(6)), _MONTHS[m.group(4)],
+                             int(m.group(5))))
+            except ValueError:
+                continue
+        m = _RANGE_SLASH.search(line)
+        if m:
+            try:
+                return (date(_year(m.group(3)), int(m.group(1)),
+                             int(m.group(2))),
+                        date(_year(m.group(6)), int(m.group(4)),
+                             int(m.group(5))))
+            except ValueError:
+                continue
+    return None, None
+
+
+_DUE_DATE = re.compile(
+    r'payment due date[^0-9a-z]*(?:' + _MONTH_NAME
+    + r'\.?\s+(\d{1,2}),?\s+(\d{4})|(\d{1,2})/(\d{1,2})/(\d{2,4}))')
+
+
+def parse_due_date(lines) -> date | None:
+    """A credit card's payment due date, or None. Card-only; no other statement
+    prints one."""
+    for line in lines:
+        m = _DUE_DATE.search(line)
+        if not m:
+            continue
+        try:
+            if m.group(1):
+                return date(_year(m.group(3)), _MONTHS[m.group(1)],
+                            int(m.group(2)))
+            return date(_year(m.group(6)), int(m.group(4)), int(m.group(5)))
+        except (ValueError, TypeError):
+            continue
     return None
 
 
+# ── layout detection ────────────────────────────────────────────────────────
+
+def detect_layout(lines) -> str:
+    """Which field table to use: 'wf_advisors', 'wf_card', 'wf_deposit',
+    'generic', or '' when there is no text at all.
+
+    Keyed on the blocks a layout prints rather than on the institution name,
+    because it is the block — not the brand — that the field tables know how to
+    read. Ordered most- to least-distinctive: a brokerage statement also
+    contains the word 'balance', and a card statement also contains 'previous
+    balance', so the cheap generic tests have to come last."""
+    if not lines:
+        return ''
+    joined = ' '.join(lines)
+    if ('of cash and sweep balances' in joined
+            or 'wells fargo advisors' in joined):
+        return 'wf_advisors'
+    if ('minimum payment due' in joined
+            or ('previous balance' in joined and 'new balance' in joined)):
+        return 'wf_card'
+    if any(label in joined for label in
+           ('beginning balance', 'ending balance', 'deposits and other credits',
+            'withdrawals and other debits')):
+        return 'wf_deposit'
+    return 'generic'
+
+
+# ── extraction ──────────────────────────────────────────────────────────────
+
+def _extract_fields(lines, specs) -> tuple[dict, list[str]]:
+    """Run one field table over the document.
+
+    Each field is extracted INSIDE ITS OWN try/except and a failure records the
+    key rather than propagating. That is deliberate and load-bearing: these
+    tables will grow, most of them describe layouts nobody here has seen, and a
+    single bad pattern must cost one figure — not the whole metadata blob for a
+    statement whose balances parsed perfectly. Returns (values, failed_keys),
+    and `failed` is stored so an operator can see WHICH field went wrong on
+    WHICH statement instead of inferring it from a hole."""
+    values, failed = {}, []
+    for key, section, labels, column, exclude in specs:
+        try:
+            scope = _section(lines, section) if section else lines
+            found = _find_amounts(scope, labels, exclude=exclude)
+            if len(found) > column:
+                values[key] = found[column]
+        except Exception:
+            log.warning('statement field %r failed to extract', key,
+                        exc_info=True)
+            failed.append(key)
+    return values, failed
+
+
+def _derive(values: dict) -> None:
+    """Figures the statement implies but doesn't print on a line of their own.
+
+    Only sums of fields already recovered — nothing here reads the PDF again,
+    so a derived value can never be more speculative than its inputs."""
+    ordinary = values.get('dividends_ordinary')
+    qualified = values.get('dividends_qualified')
+    if ordinary is not None or qualified is not None:
+        values['dividends_total'] = round((ordinary or 0.0)
+                                          + (qualified or 0.0), 2)
+
+
+def _blank_parse() -> dict:
+    return {'opening': None, 'closing': None, 'portfolio_opening': None,
+            'portfolio_closing': None, 'has_text': False, 'method': '',
+            'metadata': {}}
+
+
+def parse_statement(pdf_bytes: bytes) -> dict:
+    """Everything one statement PDF asserts.
+
+        {'opening', 'closing',                      # the reconcilable balances
+         'portfolio_opening', 'portfolio_closing',  # total value, if stated
+         'has_text', 'method', 'metadata'}
+
+    `metadata` is the full blob persisted to `PlaidStatement.parsed_metadata`:
+    every recovered field under its own key, plus
+
+        parser_version  which build of this module produced it
+        layout          which field table was used
+        verified        whether that table has been checked against a real
+                        document of this kind
+        fields_failed   keys whose extraction raised (see _extract_fields)
+        period_start / period_end   the period the STATEMENT states, ISO, when
+                        it prints one — kept beside the bounds derived from
+                        Plaid's month+year rather than replacing them
+
+    Every balance is float-or-None and all-None is an ordinary result rather
+    than a failure — see this module's docstring. Never raises."""
+    lines = extract_lines(pdf_bytes)
+    if not lines:
+        return _blank_parse()
+
+    layout = detect_layout(lines)
+    values, failed = _extract_fields(lines, _LAYOUT_FIELDS.get(layout, ()))
+    _derive(values)
+
+    open_key, close_key = _HEADLINE_FIELDS.get(layout, ('', ''))
+    opening = values.get(open_key)
+    closing = values.get(close_key)
+
+    if opening is None and closing is None:
+        # No field table matched, or the one that did found no balance. Fall
+        # back to the generic label search, then — only if THAT finds nothing —
+        # to treating the document as a single long line, for a layout whose
+        # label and amount pypdf did not place together. The gap rules apply
+        # throughout, so each step relaxes WHERE a figure may sit, never how
+        # convincingly it has to sit there.
+        opening = _find_label_amount(lines, _OPENING_LABELS)
+        closing = _find_label_amount(lines, _CLOSING_LABELS)
+        layout = 'labels' if (opening is not None or closing is not None) \
+            else layout
+        if opening is None and closing is None:
+            flat = ' '.join(lines)
+            opening = _find_label_amount([flat], _OPENING_LABELS)
+            closing = _find_label_amount([flat], _CLOSING_LABELS)
+            layout = 'labels_flat' if (opening is not None
+                                       or closing is not None) else ''
+        if opening is not None:
+            values.setdefault('opening_balance', opening)
+        if closing is not None:
+            values.setdefault('closing_balance', closing)
+
+    start, end = parse_period(lines)
+    due = parse_due_date(lines) if layout == 'wf_card' else None
+
+    metadata = dict(values)
+    metadata.update({
+        'parser_version': PARSER_VERSION,
+        'layout': layout,
+        'verified': layout in _VERIFIED_LAYOUTS,
+        'fields_failed': failed,
+        'period_start': start.isoformat() if start else None,
+        'period_end': end.isoformat() if end else None,
+    })
+    if due is not None:
+        metadata['payment_due_date'] = due.isoformat()
+    if failed:
+        log.warning('statement parse: %d field(s) failed on a %s layout: %s',
+                    len(failed), layout or 'unknown', ', '.join(failed))
+
+    return {'opening': opening, 'closing': closing,
+            'portfolio_opening': values.get('portfolio_opening'),
+            'portfolio_closing': values.get('portfolio_closing'),
+            'has_text': True, 'method': layout, 'metadata': metadata}
+
+
 def parse_balances(pdf_bytes: bytes) -> dict:
-    """{'opening': float|None, 'closing': float|None, 'has_text': bool} for one
-    statement PDF. Both None is an ordinary result, not a failure."""
-    text = extract_text(pdf_bytes)
-    if not text:
-        return {'opening': None, 'closing': None, 'has_text': False}
-    return {
-        'opening': _first_label_amount(text, _OPENING_LABELS),
-        'closing': _first_label_amount(text, _CLOSING_LABELS),
-        'has_text': True,
-    }
+    """The two balances alone — `parse_statement` without the metadata.
+
+    Kept because it is what every pre-v0.4.41 caller asks for and what the
+    module's contract has always been: two numbers, either of which may be
+    None."""
+    return parse_statement(pdf_bytes)
+
+
+# ── reading the metadata blob ───────────────────────────────────────────────
+
+# Keys that are bookkeeping about the parse rather than figures the bank
+# asserted. Separated so a UI can show "what the statement says" without
+# 'parser_version' and 'fields_failed' sitting in the middle of the money.
+_META_HOUSEKEEPING = frozenset({
+    'parser_version', 'layout', 'verified', 'fields_failed',
+    'period_start', 'period_end', 'payment_due_date',
+})
+
+# Presentation order and labels for the figures. A dict is unordered and
+# alphabetical is meaningless here — 'Available funds' before 'Cash opening'
+# tells a reader nothing — so the sequence a statement itself uses is
+# reproduced: balances, then what moved, then income, then gains.
+FIGURE_LABELS = (
+    ('opening_balance', 'Opening balance'),
+    ('closing_balance', 'Closing balance'),
+    ('cash_opening', 'Cash & sweep — opening'),
+    ('cash_closing', 'Cash & sweep — closing'),
+    ('portfolio_opening', 'Total account value — opening'),
+    ('portfolio_closing', 'Total account value — closing'),
+    ('previous_balance', 'Previous balance'),
+    ('new_balance', 'New balance'),
+    ('available_funds', 'Available funds'),
+    ('available_credit', 'Available credit'),
+    ('credit_limit', 'Credit limit'),
+    ('minimum_payment_due', 'Minimum payment due'),
+    ('deposits_total', 'Deposits / cash in'),
+    ('withdrawals_total', 'Withdrawals / cash out'),
+    ('payments_total', 'Payments and credits'),
+    ('purchases_total', 'Purchases'),
+    ('cash_advances_total', 'Cash advances'),
+    ('checks_written_total', 'Checks written'),
+    ('card_activity_total', 'ATM and card activity'),
+    ('other_additions', 'Other additions'),
+    ('other_subtractions', 'Other subtractions and transfers'),
+    ('net_additions_to_cash', 'Net additions to cash'),
+    ('net_subtractions_from_cash', 'Net subtractions from cash'),
+    ('securities_bought_total', 'Securities purchased'),
+    ('securities_sold_total', 'Securities sold and redeemed'),
+    ('securities_deposited', 'Securities deposited'),
+    ('securities_withdrawn', 'Securities withdrawn'),
+    ('change_in_value', 'Change in market value'),
+    ('income_and_distributions', 'Income and distributions'),
+    ('interest_total', 'Interest'),
+    ('interest_earned', 'Interest earned'),
+    ('interest_charged', 'Interest charged'),
+    ('sweep_income', 'Sweep / money-market income'),
+    ('dividends_ordinary', 'Dividends — ordinary and short-term gains'),
+    ('dividends_qualified', 'Dividends — qualified'),
+    ('dividends_total', 'Dividends — total'),
+    ('taxable_income', 'Taxable income'),
+    ('tax_exempt_income', 'Tax-exempt income'),
+    ('total_income', 'Total income'),
+    ('fees_total', 'Fees'),
+    ('service_fees', 'Service fees'),
+    ('unrealized_gains', 'Unrealized gain/loss'),
+    ('realized_gains', 'Realized gain/loss — this period'),
+    ('realized_gains_ytd', 'Realized gain/loss — year to date'),
+    ('gains_short_term_unrealized', 'Unrealized — short term'),
+    ('gains_long_term_unrealized', 'Unrealized — long term'),
+    ('average_ledger_balance', 'Average ledger balance'),
+    ('average_collected_balance', 'Average collected balance'),
+)
+
+_FIGURE_LABEL = dict(FIGURE_LABELS)
+
+
+def metadata_figures(metadata: dict) -> list[tuple[str, str, float]]:
+    """[(key, label, value)] for the money in one metadata blob, in the order
+    FIGURE_LABELS declares. Unknown keys sort last under a humanised name
+    rather than being dropped — a field added by a newer parser must still be
+    visible on a page rendered by an older template."""
+    metadata = metadata or {}
+    known = [(k, _FIGURE_LABEL[k], metadata[k]) for k, _ in FIGURE_LABELS
+             if isinstance(metadata.get(k), (int, float))
+             and not isinstance(metadata.get(k), bool)]
+    seen = {k for k, _, _ in known}
+    extra = [(k, k.replace('_', ' ').capitalize(), v)
+             for k, v in sorted(metadata.items())
+             if k not in seen and k not in _META_HOUSEKEEPING
+             and isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return known + extra
+
+
+# ── validating a statement against everything else we know ──────────────────
+#
+# WHY THIS EXISTS. Bank Bridge holds three independent accounts of the same
+# month, and until now nothing put them next to each other:
+#
+#   STATEMENT  what the institution wrote down and mailed. Authoritative, but
+#              recovered by regex from a PDF, so it can be MISREAD.
+#   PLAID      what the API reports for the account right now. Live, but it is
+#              a current snapshot, so it only speaks to the newest period.
+#   MIRROR     what Bank Bridge computes from the transactions it stored.
+#              Complete arithmetic over a feed that may itself have gaps.
+#
+# Any two agreeing is ordinary. Any two DISAGREEING is the finding: a misparse,
+# a gap in the transaction feed, or something that moved the real balance and
+# never reached Plaid. Each has a different fix, and none of them is visible
+# from one column alone.
+#
+# Nothing here writes anything or gates anything. It is a report — its whole
+# job is to put the three numbers in one row so the disagreement is impossible
+# to miss.
+
+def variance_thresholds() -> tuple[float, float]:
+    """(absolute dollars, fractional) beyond which a difference is flagged.
+    A row must exceed BOTH to flag, so neither a rounding cent on a large
+    balance nor a fixed percentage of a tiny one raises noise."""
+    try:
+        dollars = abs(float(current_app.config.get(
+            'STATEMENTS_VARIANCE_DOLLARS', 1.00)))
+    except (TypeError, ValueError):
+        dollars = 1.00
+    try:
+        pct = abs(float(current_app.config.get(
+            'STATEMENTS_VARIANCE_PCT', 0.001)))
+    except (TypeError, ValueError):
+        pct = 0.001
+    return dollars, pct
+
+
+def _flagged(a, b) -> tuple[float | None, float | None, bool]:
+    """(delta, fraction, flagged) for one pair, or (None, None, False) when
+    either side is absent. `fraction` is relative to the larger magnitude, so
+    the answer does not change depending on which column is called the
+    baseline."""
+    if a is None or b is None:
+        return None, None, False
+    delta = round(float(a) - float(b), 2)
+    scale = max(abs(float(a)), abs(float(b)))
+    fraction = (abs(delta) / scale) if scale else 0.0
+    dollars, pct = variance_thresholds()
+    return delta, fraction, (abs(delta) > dollars and fraction > pct)
+
+
+def _movement_totals(account, start, end) -> dict:
+    """What the transaction mirror says moved in [start, end], normalised so
+    that CASH IN IS POSITIVE.
+
+    Plaid's own convention is the opposite — its `amount` is positive when
+    money LEAVES the account — and a statement prints deposits positive and
+    withdrawals negative. Flipping once, here, is what lets a validation row
+    subtract one column from the other and have the answer mean something."""
+    out = {'deposits_total': 0.0, 'withdrawals_total': 0.0,
+           'dividends_total': 0.0, 'interest_total': 0.0, 'fees_total': 0.0,
+           'securities_bought_total': 0.0, 'securities_sold_total': 0.0}
+    if account is None or start is None or end is None:
+        return out
+    rows = (BankTransaction.query
+            .filter(BankTransaction.account_id == account.account_id,
+                    BankTransaction.date >= start,
+                    BankTransaction.date <= end,
+                    BankTransaction.pending.is_(False),
+                    BankTransaction.removed.is_(False))
+            .all())
+    for t in rows:
+        cash = -float(t.amount or 0.0)
+        if cash >= 0:
+            out['deposits_total'] += cash
+        else:
+            out['withdrawals_total'] += cash
+
+    if (account.type or '').lower() in ('investment', 'brokerage'):
+        from .models import SecurityTransaction
+        sec = (SecurityTransaction.query
+               .filter(SecurityTransaction.account_id == account.account_id,
+                       SecurityTransaction.date >= start,
+                       SecurityTransaction.date <= end)
+               .all())
+        for t in sec:
+            cash = -float(t.amount or 0.0)
+            kind = (t.type or '').lower()
+            sub = (t.subtype or '').lower()
+            if 'dividend' in sub:
+                out['dividends_total'] += cash
+            elif 'interest' in sub:
+                out['interest_total'] += cash
+            elif kind == 'fee' or 'fee' in sub:
+                out['fees_total'] += cash
+            elif kind == 'buy':
+                out['securities_bought_total'] += cash
+            elif kind == 'sell':
+                out['securities_sold_total'] += cash
+    return {k: round(v, 2) for k, v in out.items()}
+
+
+# Which statement figures the mirror can be asked the same question about.
+# Both sides are already cash-in-positive — Wells Fargo prints withdrawals and
+# purchases negative, which is the convention _movement_totals normalises to —
+# so these compare directly with no per-field sign handling.
+_COMPARABLE = (
+    'deposits_total', 'withdrawals_total', 'dividends_total',
+    'interest_total', 'fees_total',
+    'securities_bought_total', 'securities_sold_total',
+)
+
+
+def validate_statement(statement: PlaidStatement,
+                       account: PlaidAccount | None = None) -> dict:
+    """Every figure this statement asserts, beside the other accounts of the
+    same month.
+
+    Returns {'rows', 'flagged', 'thresholds', 'layout', 'verified',
+    'fields_failed', 'period_matches'} where each row is
+
+        {'key', 'label', 'statement', 'plaid', 'computed',
+         'delta', 'pct', 'flagged', 'note'}
+
+    `plaid` is populated only where Plaid actually reports something
+    comparable, which in practice means the CURRENT balance on the most recent
+    statement — Plaid's balance is a snapshot of today, and lining it up
+    against a period that closed four months ago would manufacture a variance
+    that means nothing. Every other cell is an honest None.
+
+    Never raises: this is a report, and a report that 500s on a surprising row
+    is worse than one that omits it."""
+    account = account or (PlaidAccount.query.filter_by(
+        account_id=statement.plaid_account_id).first()
+        if statement.plaid_account_id else None)
+    metadata = statement.parsed_metadata or {}
+    dollars, pct = variance_thresholds()
+    out = {'rows': [], 'flagged': 0, 'thresholds': (dollars, pct),
+           'layout': metadata.get('layout') or (statement.parse_method or ''),
+           'verified': bool(metadata.get('verified')),
+           'fields_failed': list(metadata.get('fields_failed') or []),
+           'period_matches': None}
+
+    # Does the period the STATEMENT prints agree with the one derived from
+    # Plaid's month + year? A bank whose cycle isn't a calendar month makes
+    # every reconciliation in that period suspect, and this is the only place
+    # that discrepancy is visible.
+    stated_start = metadata.get('period_start')
+    stated_end = metadata.get('period_end')
+    if stated_start and stated_end and statement.period_start \
+            and statement.period_end:
+        out['period_matches'] = (
+            stated_start == statement.period_start.isoformat()
+            and stated_end == statement.period_end.isoformat())
+    out['stated_period'] = (stated_start, stated_end)
+
+    from . import computed_balances as cb
+    try:
+        computed_open, computed_close = cb.opening_and_closing_for_period(
+            account, statement.period_start, statement.period_end)
+    except Exception:  # pragma: no cover - computed_balances is already total
+        log.warning('computed balances failed for statement %s',
+                    statement.statement_id, exc_info=True)
+        computed_open = computed_close = None
+
+    # Plaid's live balance speaks only to the newest period — see the docstring.
+    plaid_close = None
+    if account is not None and _is_latest_statement(statement):
+        plaid_close = account.balance_current
+
+    def _row(key, label, stmt_value, plaid_value, computed_value, note=''):
+        # Prefer statement-vs-mirror for the headline delta (both describe the
+        # same closed period); fall back to statement-vs-Plaid when the mirror
+        # has nothing to say.
+        delta, fraction, flag = _flagged(stmt_value, computed_value)
+        if delta is None:
+            delta, fraction, flag = _flagged(stmt_value, plaid_value)
+        if flag:
+            out['flagged'] += 1
+        out['rows'].append({
+            'key': key, 'label': label, 'statement': stmt_value,
+            'plaid': plaid_value, 'computed': computed_value,
+            'delta': delta, 'pct': fraction, 'flagged': flag, 'note': note})
+
+    _row('opening_balance', 'Opening balance', statement.opening_balance,
+         None, computed_open)
+    _row('closing_balance', 'Closing balance', statement.closing_balance,
+         plaid_close, computed_close,
+         'Plaid reports a live balance, compared here only on the newest '
+         'statement' if plaid_close is not None else '')
+
+    if statement.portfolio_closing_value is not None:
+        _row('portfolio_closing', 'Total account value — closing',
+             statement.portfolio_closing_value,
+             plaid_close if (account is not None
+                             and (account.type or '').lower() == 'investment')
+             else None, None,
+             'Cash plus securities at market. The mirror cannot reproduce it — '
+             'it has no record of market movement — so there is no computed '
+             'column to compare.')
+
+    movement = _movement_totals(account, statement.period_start,
+                                statement.period_end)
+    for key in _COMPARABLE:
+        stmt_value = metadata.get(key)
+        if stmt_value is None:
+            continue
+        _row(key, _FIGURE_LABEL.get(key, key), stmt_value, None,
+             movement.get(key))
+
+    # Everything else the statement stated, with no counterpart to check it
+    # against. Shown anyway: an unmatched figure is still the bank's own
+    # assertion, and it is what a journal entry cites.
+    compared = {r['key'] for r in out['rows']}
+    for key, label, value in metadata_figures(metadata):
+        if key in compared:
+            continue
+        _row(key, label, value, None, None)
+    return out
+
+
+def _is_latest_statement(statement: PlaidStatement) -> bool:
+    """Whether this is the newest period held for its account — the only one
+    Plaid's current balance can fairly be compared against."""
+    if not statement.period_end:
+        return False
+    newer = (PlaidStatement.query
+             .filter(PlaidStatement.plaid_account_id == statement.plaid_account_id,
+                     PlaidStatement.period_end > statement.period_end)
+             .first())
+    return newer is None
+
+
+# ── persisting a parse ──────────────────────────────────────────────────────
+
+def apply_parse(record: PlaidStatement, parsed: dict) -> dict:
+    """Copy one `parse_statement` result onto a row (no commit). Returns the
+    parse, so a caller can go on inspecting it.
+
+    `parsed_metadata` is the whole blob; the scalar columns beside it are
+    PROMOTIONS of fields inside it, not independent values. Keeping them is
+    what lets SQL ask "which months don't reconcile" without unpacking JSON on
+    every row, and deriving them here — in one place — is what stops the two
+    representations from ever disagreeing."""
+    record.opening_balance = parsed['opening']
+    record.closing_balance = parsed['closing']
+    record.portfolio_opening_value = parsed.get('portfolio_opening')
+    record.portfolio_closing_value = parsed.get('portfolio_closing')
+    record.parse_method = parsed.get('method') or ''
+    record.parsed_metadata = parsed.get('metadata') or {}
+    record.updated_at = _now()
+    return parsed
+
+
+def previous_statement(statement: PlaidStatement) -> PlaidStatement | None:
+    """The statement covering the month immediately before this one, for the
+    same account, or None.
+
+    IMMEDIATELY before is the point — a statement two months back says nothing
+    about whether this one's opening balance is right, because a whole month of
+    unseen movement sits between them."""
+    if not statement.period_start:
+        return None
+    prior = (PlaidStatement.query
+             .filter(PlaidStatement.plaid_account_id == statement.plaid_account_id,
+                     PlaidStatement.id != statement.id,
+                     PlaidStatement.period_end.isnot(None),
+                     PlaidStatement.period_end < statement.period_start)
+             .order_by(PlaidStatement.period_end.desc())
+             .first())
+    if prior is None or prior.period_end is None:
+        return None
+    gap = (statement.period_start - prior.period_end).days
+    return prior if gap == 1 else None
+
+
+def flag_parse_continuity(statement: PlaidStatement) -> bool:
+    """Set (or clear) `parse_suspect` by testing this statement against the one
+    before it. Returns the flag. No commit.
+
+    THE CHECK: statements are a chain. Whatever an account closed at on June 30
+    is what it opened at on July 1, so `opening == previous.closing` is a test
+    the bank's own documents have to pass — and one that costs nothing, needs no
+    ERPNext round trip, and does not care whether Bank Bridge mirrored a single
+    transaction in between. It is the cheapest available evidence that a
+    recognizer read the right number off the page rather than a plausible one
+    printed near it, which is precisely the failure v0.4.41 was written to fix
+    (the v0.4.40 parser read a sweep-table transfer as a closing balance, and
+    every consecutive pair of the 26 real statements on the live install
+    disagreed by hundreds of thousands of dollars without anything noticing).
+
+    Deliberately SILENT when it cannot run — no prior month held, or either side
+    unparsed. An unknown is not a suspicion, and flagging every first-ever
+    statement would make the flag mean nothing.
+
+    A flag is advisory. It is surfaced on /admin/statements and nothing else
+    consults it: choose_anchor_statement's reconciliation test is the check that
+    actually gates a posted number, and it is strictly stronger."""
+    prior = previous_statement(statement)
+    suspect = False
+    if (prior is not None and prior.closing_balance is not None
+            and statement.opening_balance is not None):
+        drift = abs(float(statement.opening_balance)
+                    - float(prior.closing_balance))
+        suspect = drift > reconcile_tolerance()
+        if suspect:
+            log.info('statement %s opens at %.2f but %s closed at %.2f — '
+                     'flagging the parse as suspect',
+                     statement.statement_id, statement.opening_balance,
+                     prior.statement_id, prior.closing_balance)
+    statement.parse_suspect = suspect
+    return suspect
+
+
+def reparse_stored(account_id: str = '') -> dict:
+    """Re-run the parser over PDFs already on disk, without re-downloading.
+
+    This is how an install picks up a parser improvement. `_store_one` skips any
+    statement whose PDF it already holds — correctly, since re-downloading an
+    unchanged document is pure waste — which means a better recognizer reaches
+    NOTHING already stored until something re-reads those bytes. That is what
+    this does, and it is the reason /admin/statements has a "Re-parse stored
+    PDFs" button: on the install this was written for, all 26 real Wells Fargo
+    statements were on disk with wrong closing balances recovered by v0.4.40.
+
+    Rows whose PDF has gone missing are left exactly as they are — a statement
+    we can no longer read is not evidence that its recorded figures are wrong.
+    Never raises; returns {'examined', 'changed', 'unreadable', 'suspect',
+    'fields', 'failed_fields'}."""
+    stats = {'examined': 0, 'changed': 0, 'unreadable': 0, 'suspect': 0,
+             'fields': 0, 'failed_fields': 0}
+    q = PlaidStatement.query
+    if account_id:
+        q = q.filter(PlaidStatement.plaid_account_id == account_id)
+    rows = q.order_by(PlaidStatement.plaid_account_id,
+                      PlaidStatement.period_start.asc().nullsfirst()).all()
+    for row in rows:
+        path = resolve_pdf_path(row)
+        if not path:
+            stats['unreadable'] += 1
+            continue
+        stats['examined'] += 1
+        before = (row.opening_balance, row.closing_balance,
+                  row.portfolio_opening_value, row.portfolio_closing_value)
+        try:
+            with open(path, 'rb') as fh:
+                parsed = parse_statement(fh.read())
+        except OSError as e:
+            log.info('could not re-read %s: %s', path, e)
+            stats['unreadable'] += 1
+            continue
+        apply_parse(row, parsed)
+        after = (row.opening_balance, row.closing_balance,
+                 row.portfolio_opening_value, row.portfolio_closing_value)
+        if before != after:
+            stats['changed'] += 1
+        meta = parsed.get('metadata') or {}
+        stats['fields'] += len(metadata_figures(meta))
+        stats['failed_fields'] += len(meta.get('fields_failed') or [])
+    # Continuity runs in a second pass, after every row has its new figures:
+    # a statement is checked against the month before it, and that month may
+    # itself have been re-parsed a moment ago.
+    db.session.flush()
+    for row in rows:
+        if flag_parse_continuity(row):
+            stats['suspect'] += 1
+    db.session.commit()
+    return stats
 
 
 # ── download, with backoff ──────────────────────────────────────────────────
@@ -520,9 +1521,9 @@ def _store_one(item: PlaidItem, row: dict, client, access_token: str) -> str:
     path = pdf_path_for(item.item_id, account_id, label, statement_id)
     record.pdf_bytes = store_pdf(path, data)
     record.pdf_path = path
-    balances = parse_balances(data)
-    record.opening_balance = balances['opening']
-    record.closing_balance = balances['closing']
+    balances = apply_parse(record, parse_balances(data))
+    db.session.commit()
+    flag_parse_continuity(record)
     db.session.commit()
 
     if balances['opening'] is None and balances['closing'] is None:
@@ -580,7 +1581,17 @@ def signed_movement(account: PlaidAccount, start: date | None,
     Pending rows are provisional and may be restated; removed rows Plaid took
     back. Counting either would move the number by its full value and produce a
     reconciliation delta that reflects our bookkeeping rather than the bank's —
-    the same exclusion, for the same reason, as estimate_opening_balance."""
+    the same exclusion, for the same reason, as estimate_opening_balance.
+
+    v0.4.38 · investment/brokerage accounts include SecurityTransaction cash
+    flows too. /transactions/sync only ships plain bank cash events; the
+    investment side (buys, sells, dividends, options premium, transfers) lives
+    in SecurityTransaction from /investments/transactions/get. Before this
+    fix, brokerage-account reconciliation always showed movement=0 because
+    BankTransaction was empty for those accounts, producing massive spurious
+    deltas whenever the statement's actual closing reflected investment
+    activity. Both models use the same Plaid sign convention (positive =
+    money out of account) so the sums combine directly."""
     if start is None or end is None:
         return 0.0
     rows = (BankTransaction.query
@@ -590,7 +1601,21 @@ def signed_movement(account: PlaidAccount, start: date | None,
                     BankTransaction.pending.is_(False),
                     BankTransaction.removed.is_(False))
             .all())
-    return round(sum(float(t.amount or 0.0) for t in rows), 2)
+    bank_total = sum(float(t.amount or 0.0) for t in rows)
+    # v0.4.38: brokerage/investment accounts have SecurityTransaction rows
+    # that also move cash. Include them so reconciliation reflects the
+    # complete picture (buys reduce cash, sells add cash, dividends add
+    # cash, etc.).
+    if (account.type or '').lower() in ('investment', 'brokerage'):
+        from .models import SecurityTransaction
+        sec_rows = (SecurityTransaction.query
+                    .filter(SecurityTransaction.account_id == account.account_id,
+                            SecurityTransaction.date >= start,
+                            SecurityTransaction.date <= end)
+                    .all())
+        sec_total = sum(float(t.amount or 0.0) for t in sec_rows)
+        return round(bank_total + sec_total, 2)
+    return round(bank_total, 2)
 
 
 def apply_movement(account: PlaidAccount, opening: float,
@@ -686,14 +1711,27 @@ def reconcile_statement(statement: PlaidStatement,
                      BankTransaction.removed.is_(False))
              .count()) if statement.period_start and statement.period_end else 0
 
+    # v0.4.39 · manual reconciliation adjustments. When the operator has
+    # attributed portions of the delta to specific offset accounts (tax
+    # payment, member distribution, off-platform wire, etc.), the residual
+    # delta is what's LEFT after adjustments. A statement whose delta is
+    # fully explained by adjustments reconciles cleanly at status='reconciled'.
+    from .models import StatementAdjustment
+    adjustments = (StatementAdjustment.query
+                   .filter_by(statement_id=statement.id).all())
+    adjustment_total = round(sum(a.amount for a in adjustments), 2)
+    adjusted_delta = round(delta - adjustment_total, 2)
+
     # When BOTH sides came from the mirror, the reconciliation identity is
     # trivial — expected and closing are two ways of computing the same
     # arithmetic. Report status='computed' so an operator knows the equality
     # is definitional here, not a bank cross-check.
     if opening_source == 'computed' and closing_source == 'computed':
         status = 'computed'
+    elif abs(adjusted_delta) <= reconcile_tolerance():
+        status = 'reconciled' if adjustment_total else 'ok'
     else:
-        status = 'ok' if abs(delta) <= reconcile_tolerance() else 'mismatch'
+        status = 'mismatch'
     return {
         'status': status,
         'expected_closing': expected,
@@ -701,6 +1739,9 @@ def reconcile_statement(statement: PlaidStatement,
         'delta': delta, 'movement': movement, 'txn_count': count,
         'opening': round(float(opening), 2),
         'opening_source': opening_source, 'closing_source': closing_source,
+        'adjustment_total': adjustment_total,
+        'adjusted_delta': adjusted_delta,
+        'adjustments': [a.to_dict() for a in adjustments],
     }
 
 

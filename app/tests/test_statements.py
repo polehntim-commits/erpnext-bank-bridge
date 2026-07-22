@@ -109,6 +109,159 @@ def checking_pdf(opening='17,600.00', closing='17,650.00') -> bytes:
     ])
 
 
+def wf_advisors_pdf(cash_open='255,038.26', cash_close='39,751.95',
+                    port_open='1,360,707.12', port_close='1,313,136.16',
+                    with_sweep_table=True, with_holdings=False,
+                    with_prose=False) -> bytes:
+    """A Wells Fargo Advisors brokerage statement, anonymised.
+
+    Every line here is transcribed from a real statement on the live install
+    (account numbers, names and addresses removed), because the layout is the
+    whole point of the v0.4.41 parser and a plausible-looking invention would
+    not have caught the bugs that motivated it. Note in particular:
+
+      * 'Opening value' appears TWICE with different numbers — once in the
+        Progress summary as total account value, once in the Cash flow summary
+        qualified by 'of cash and sweep balances'
+      * every summary line carries a SECOND column (this-year-to-date) that
+        must not be mistaken for the period figure, and the gain/loss roll-up
+        carries THREE
+      * the Cash sweep activity table is one trap: pypdf flattens it into text
+        where 'ENDING BALANCE' is immediately followed by a sweep transfer's
+        amount, which v0.4.40 read as the month's closing balance
+      * `with_holdings` adds the second trap — the holdings tables, whose ~90
+        rows each begin with the word 'Total', same as the gain/loss roll-up
+      * `with_prose` adds the third — page 2's disclosure paragraph, which
+        opens with the words 'Income summary:'
+    """
+    lines = [
+        'SNAPSHOT',
+        'Current period ending June 30, 2026',
+        'ACCOUNT NAME: EXAMPLE COMPANY LLC',
+        'Wells Fargo Advisors is a trade name used by Wells Fargo Clearing '
+        'Services, LLC',
+    ]
+    if with_prose:
+        lines += [
+            'Income summary: The Income summary displays all income as '
+            'recorded in the tax system as of period end date. Available '
+            'without charge upon request. Totals may not match 1,234.56 due '
+            'to reclassifications made in the tax system.',
+            'Gain/loss summary: This statement presents estimated unrealized '
+            'or realized gains or losses for your information only, 9,999.99, '
+            'and should not be relied upon for tax reporting purposes.',
+        ]
+    lines += [
+        'Progress summary Value over time',
+        'THIS PERIOD THIS YEAR 1,748,000',
+        f'Opening value ${port_open} $1,576,555.19',
+        'Cash deposited 10,000.00 40,000.00 1,311,000Securities deposited '
+        '0.00 0.00',
+        'Cash withdrawn -20,047.16 -327,309.02',
+        'Securities withdrawn 0.00 0.00 874,000Change in value -37,523.80 '
+        '23,889.99',
+        f'Closing value ${port_close} ${port_close} 437,000',
+        'Portfolio summary',
+        'CURRENT ASSET TYPE VALUE ON MAY 31 % VALUE ON JUN 30 % ANN. INCOME',
+        f'Asset value ${port_open} 100% ${port_close} 100% $20,804',
+        'Cash flow summary THIS PERIOD THIS YEAR',
+        f'Opening value of cash and sweep balances ${cash_open}',
+        'Income and distributions 1,656.03 6,956.44',
+        'Securities sold and redeemed 131,931.66 1,533,107.85',
+        'Other additions 10,000.00 40,000.00',
+        'Net additions to cash $143,587.69 $1,580,064.29',
+        'Securities purchased -338,826.84 -1,222,655.62',
+        'Advisory, manager and platform fees 0.00 -7,181.51',
+        'Other subtractions, transfers & charges -20,047.16 -320,127.51',
+        'Net subtractions from cash -$358,874.00 -$1,549,964.64',
+        f'Closing value of cash and sweep balances ${cash_close}',
+        'Income summary * THIS PERIOD THIS YEAR',
+        'Taxable money market/sweep funds 75.78 616.13',
+        'Interest 980.73 11,714.50',
+        'Ordinary dividends and ST capital gains 434.29 1,879.58',
+        'Qualified dividends 1,145.96 4,301.70',
+        'Other 0.00 19.88',
+        'Total taxable income $2,636.76 $18,531.79',
+        'Total federally tax-exempt income $0.00 $0.00',
+        'Total income $2,636.76 $18,531.79',
+        'Gain/loss summary UNREALIZED THIS PERIOD REALIZED THIS YEAR REALIZED',
+        'Short term (S) -4,180.15 -3,968.19 -5,053.13',
+        'Long term (L) 48,792.11 1,039.76 2,389.26',
+        'Total $44,611.96 -$2,928.43 -$2,663.87',
+        f'Your total available funds ${cash_close}',
+        'ORCHARD EXAMPLE LLC',
+        'June 1, 2026 - June 30, 2026',
+    ]
+    if with_holdings:
+        lines += ['Stocks and exchange-traded products',
+                  'DESCRIPTION % QUANTITY PRICE COST BASIS VALUE GAIN/LOSS']
+        lines += [f'Total 0.8{n} 750 $14.15 $10,611.53 14.1300 $10,597.50 '
+                  f'-$14.03 n/a n/a' for n in range(9)]
+    if with_sweep_table:
+        lines += [
+            'Cash sweep activity',
+            'BEGINNING BALANCE TRANSFER FROM BANK DEPOSIT SWEEP06/01 '
+            '255,038.26 06/18 -75,594.81',
+            'TRANSFER TO BANK DEPOSIT SWEEP ENDING BALANCE06/16 100,000.00 '
+            f'06/30 {cash_close}',
+            'DATE TRANSACTION DESCRIPTION AMOUNT BANK BALANCE',
+            '06/01 BEGINNING BALANCE $0.00',
+            '06/30 ENDING BALANCE $0.00',
+        ]
+    return make_pdf(lines)
+
+
+def wf_deposit_pdf() -> bytes:
+    """A Wells Fargo business checking statement.
+
+    UNLIKE `wf_advisors_pdf` this is NOT transcribed from a real document — the
+    live install holds no real deposit statement, only Plaid sandbox mocks
+    ('First Platypus Bank', 'Balance on XX/XX:') with no labelled totals at
+    all. It follows the standard Wells Fargo Activity summary layout, and the
+    parser marks figures from it `verified: False` for that reason."""
+    return make_pdf([
+        'WELLS FARGO BUSINESS CHOICE CHECKING',
+        'Account number: ****1234',
+        'Statement period July 1, 2026 - July 31, 2026',
+        'Activity summary',
+        'Beginning balance on July 1 $17,600.00',
+        'Deposits and other credits 1,200.00',
+        'Withdrawals and other debits -1,138.00',
+        'Checks paid -450.00',
+        'Ending balance on July 31 $17,650.00',
+        'Average ledger balance $17,412.88',
+        'Average collected balance $17,388.10',
+        'Interest earned this statement period 0.42',
+        'Total service fees -12.00',
+        'Transaction history',
+        '07/03 Deposit Cherry sale 1,200.00 18,800.00',
+        '07/09 Check No. 1042 -450.00 18,350.00',
+    ])
+
+
+def wf_card_pdf() -> bytes:
+    """A Wells Fargo business credit card statement.
+
+    Also NOT transcribed from a real document — see `wf_deposit_pdf`."""
+    return make_pdf([
+        'WELLS FARGO BUSINESS ELITE SIGNATURE CARD',
+        'Account ending in 9999',
+        'Statement period 07/01/2026 - 07/31/2026',
+        'Account summary',
+        'Previous balance $2,400.00',
+        'Payments and credits -1,200.00',
+        'Purchases and adjustments 1,425.50',
+        'Cash advances 0.00',
+        'Fees charged 12.00',
+        'Interest charged 12.50',
+        'New balance total $2,650.00',
+        'Total credit limit $25,000.00',
+        'Available credit $22,350.00',
+        'Minimum payment due $53.00',
+        'Payment due date August 22, 2026',
+    ])
+
+
 def card_pdf(opening='2,400.00', closing='2,650.00') -> bytes:
     """A credit-card statement, which uses an entirely different vocabulary —
     'previous balance' / 'new balance' rather than beginning/ending."""
@@ -389,6 +542,537 @@ class ParseBalancesTest(StatementsBase):
         far = 'x' * 200
         got = stmts.parse_balances(make_pdf([f'Beginning balance {far} 5,000.00']))
         self.assertIsNone(got['opening'])
+
+
+# ── the layout the live install actually receives (v0.4.41) ──────────────────
+
+class WellsFargoAdvisorsParseTest(StatementsBase):
+    """A real brokerage statement, and the misparse that motivated v0.4.41.
+
+    Up to v0.4.40 the parser worked on one flat string and took the first
+    amount within 120 characters of a label, which read a cash-sweep TRANSFER
+    as the month's closing balance on all 26 Wells Fargo statements the live
+    install holds. A wrong bank-asserted figure is worse than a missing one —
+    it is the input to reconciliation and to choose_anchor_statement, i.e. to a
+    posted opening balance — so these tests pin both what is now recovered and
+    what is now refused."""
+
+    def test_cash_and_sweep_balances_are_the_reconcilable_figures(self):
+        """opening/closing take the CASH side, not total account value: the
+        mirror sums cash events and has no record of market movement, so cash
+        is the only figure reconciliation can reproduce."""
+        got = stmts.parse_balances(wf_advisors_pdf())
+        self.assertEqual(got['opening'], 255038.26)
+        self.assertEqual(got['closing'], 39751.95)
+        self.assertEqual(got['method'], 'wf_advisors')
+
+    def test_portfolio_value_is_kept_apart_from_the_cash_balance(self):
+        """'Opening value' and 'Opening value of cash and sweep balances' are
+        two different numbers on the same page. Confusing them would book a
+        $1.3M opening balance for an account holding $40k of cash."""
+        got = stmts.parse_balances(wf_advisors_pdf())
+        self.assertEqual(got['portfolio_opening'], 1360707.12)
+        self.assertEqual(got['portfolio_closing'], 1313136.16)
+
+    def test_sweep_activity_table_cannot_claim_the_closing_balance(self):
+        """THE v0.4.40 BUG. pypdf flattens the sweep table so that 'ENDING
+        BALANCE' is followed immediately by '06/16 100,000.00' — a single
+        transfer. The digits in the gap are what disqualify it."""
+        got = stmts.parse_balances(wf_advisors_pdf())
+        self.assertNotEqual(got['closing'], 100000.00)
+        self.assertNotEqual(got['opening'], 255038.26 * 0 + 15434.91)
+        # …and the sweep table's own $0.00 rows, which open with a MM/DD and
+        # are therefore transaction rows rather than summary lines.
+        self.assertNotEqual(got['closing'], 0.00)
+
+    def test_second_column_is_year_to_date_not_this_period(self):
+        """Both summary lines carry a this-year column after the period one.
+        The first amount on the line is the period figure."""
+        got = stmts.parse_balances(wf_advisors_pdf(port_open='9,467.48'))
+        self.assertEqual(got['portfolio_opening'], 9467.48)
+        self.assertNotEqual(got['portfolio_opening'], 1576555.19)
+
+    def test_every_brokerage_figure_is_captured_as_documentation(self):
+        """The v0.4.41 point: a statement can stand on its own as support for a
+        journal entry only if everything it asserts was recovered, not just the
+        two balances. Each of these is transcribed from a production PDF."""
+        m = stmts.parse_statement(wf_advisors_pdf())['metadata']
+        expected = {
+            'cash_opening': 255038.26, 'cash_closing': 39751.95,
+            'portfolio_opening': 1360707.12, 'portfolio_closing': 1313136.16,
+            'deposits_total': 10000.00, 'withdrawals_total': -20047.16,
+            'change_in_value': -37523.80,
+            'securities_bought_total': -338826.84,
+            'securities_sold_total': 131931.66,
+            'income_and_distributions': 1656.03,
+            'net_additions_to_cash': 143587.69,
+            'net_subtractions_from_cash': -358874.00,
+            'other_additions': 10000.00, 'other_subtractions': -20047.16,
+            'fees_total': 0.00,
+            'interest_total': 980.73, 'sweep_income': 75.78,
+            'dividends_ordinary': 434.29, 'dividends_qualified': 1145.96,
+            'dividends_total': 1580.25,
+            'taxable_income': 2636.76, 'tax_exempt_income': 0.00,
+            'total_income': 2636.76,
+            'unrealized_gains': 44611.96, 'realized_gains': -2928.43,
+            'realized_gains_ytd': -2663.87,
+            'gains_short_term_unrealized': -4180.15,
+            'gains_long_term_unrealized': 48792.11,
+            'available_funds': 39751.95,
+        }
+        for key, want in expected.items():
+            self.assertEqual(m.get(key), want, key)
+        self.assertEqual(m['fields_failed'], [])
+
+    def test_the_gain_loss_columns_are_read_by_position(self):
+        """The roll-up line is literally 'Total' and carries three columns —
+        unrealized, realized this period, realized year to date."""
+        m = stmts.parse_statement(wf_advisors_pdf())['metadata']
+        self.assertEqual(m['unrealized_gains'], 44611.96)
+        self.assertEqual(m['realized_gains'], -2928.43)
+        self.assertEqual(m['realized_gains_ytd'], -2663.87)
+
+    def test_a_holdings_table_cannot_answer_for_the_gain_loss_summary(self):
+        """~90 holdings rows also begin with 'Total'. Section scoping is what
+        stops one of them being read as the account's realized gain."""
+        m = stmts.parse_statement(wf_advisors_pdf(with_holdings=True))['metadata']
+        self.assertEqual(m['unrealized_gains'], 44611.96)
+        self.assertEqual(m['realized_gains'], -2928.43)
+
+    def test_prose_mentioning_a_section_is_not_that_section(self):
+        """Page 2 of every WF statement carries 'Income summary: The Income
+        summary displays all income as recorded in the tax system…'. Scoping to
+        that paragraph would make every income figure wrong."""
+        m = stmts.parse_statement(wf_advisors_pdf(with_prose=True))['metadata']
+        self.assertEqual(m['total_income'], 2636.76)
+        self.assertEqual(m['interest_total'], 980.73)
+
+    def test_the_period_the_statement_states_is_recovered(self):
+        """Plaid gives only month+year, i.e. the CALENDAR month. What the
+        document says about its own period is the only record of a cycle that
+        doesn't align to one."""
+        m = stmts.parse_statement(wf_advisors_pdf())['metadata']
+        self.assertEqual(m['period_start'], '2026-06-01')
+        self.assertEqual(m['period_end'], '2026-06-30')
+
+    def test_the_parse_records_its_own_provenance(self):
+        m = stmts.parse_statement(wf_advisors_pdf())['metadata']
+        self.assertEqual(m['parser_version'], stmts.PARSER_VERSION)
+        self.assertEqual(m['layout'], 'wf_advisors')
+        self.assertTrue(m['verified'])
+
+    def test_one_bad_field_costs_one_figure_not_the_whole_blob(self):
+        """Defensive extraction, per Tim's requirement: these tables will grow
+        and most describe layouts nobody here has seen, so a pattern that
+        raises must cost its own figure and be NAMED — not silently take the
+        statement's balances down with it."""
+        broken = (('boom', '', ('x',), 0, ()),) + stmts._WF_ADVISORS_FIELDS
+
+        def explode(lines, labels, exclude=()):
+            if labels == ('x',):
+                raise RuntimeError('bad pattern')
+            return real(lines, labels, exclude=exclude)
+
+        real = stmts._find_amounts
+        with unittest.mock.patch.dict(stmts._LAYOUT_FIELDS,
+                                      {'wf_advisors': broken}), \
+             unittest.mock.patch.object(stmts, '_find_amounts', explode):
+            got = stmts.parse_statement(wf_advisors_pdf())
+        self.assertEqual(got['opening'], 255038.26)
+        self.assertEqual(got['closing'], 39751.95)
+        self.assertEqual(got['metadata']['fields_failed'], ['boom'])
+
+
+class DepositAndCardParseTest(StatementsBase):
+    """The two layouts the live install holds no real sample of.
+
+    Their field tables were written from the standard Wells Fargo consumer
+    layouts and are marked `verified: False` in the metadata for exactly that
+    reason — these tests pin the intended behaviour, not a confirmed reading of
+    a real document."""
+
+    def test_deposit_activity_summary(self):
+        m = stmts.parse_statement(wf_deposit_pdf())['metadata']
+        self.assertEqual(m['layout'], 'wf_deposit')
+        self.assertFalse(m['verified'])
+        self.assertEqual(m['opening_balance'], 17600.00)
+        self.assertEqual(m['closing_balance'], 17650.00)
+        self.assertEqual(m['deposits_total'], 1200.00)
+        self.assertEqual(m['withdrawals_total'], -1138.00)
+        self.assertEqual(m['interest_earned'], 0.42)
+        self.assertEqual(m['service_fees'], -12.00)
+        self.assertEqual(m['average_ledger_balance'], 17_412.88)
+        self.assertEqual(m['period_start'], '2026-07-01')
+        self.assertEqual(m['period_end'], '2026-07-31')
+        self.assertEqual(m['fields_failed'], [])
+
+    def test_credit_card_summary(self):
+        m = stmts.parse_statement(wf_card_pdf())['metadata']
+        self.assertEqual(m['layout'], 'wf_card')
+        self.assertFalse(m['verified'])
+        self.assertEqual(m['previous_balance'], 2400.00)
+        self.assertEqual(m['new_balance'], 2650.00)
+        self.assertEqual(m['payments_total'], -1200.00)
+        self.assertEqual(m['purchases_total'], 1425.50)
+        self.assertEqual(m['fees_total'], 12.00)
+        self.assertEqual(m['interest_charged'], 12.50)
+        self.assertEqual(m['minimum_payment_due'], 53.00)
+        self.assertEqual(m['credit_limit'], 25000.00)
+        self.assertEqual(m['payment_due_date'], '2026-08-22')
+        self.assertEqual(m['fields_failed'], [])
+
+    def test_the_headline_balances_come_from_the_layouts_own_vocabulary(self):
+        """opening/closing must be filled from whichever field the layout calls
+        them — 'previous balance' on a card, 'cash and sweep' on a brokerage —
+        so reconciliation and anchoring read one consistent pair."""
+        card = stmts.parse_statement(wf_card_pdf())
+        self.assertEqual((card['opening'], card['closing']), (2400.00, 2650.00))
+        dep = stmts.parse_statement(wf_deposit_pdf())
+        self.assertEqual((dep['opening'], dep['closing']), (17600.00, 17650.00))
+
+    def test_depository_vocabulary_still_reads_its_dated_labels(self):
+        """The gap rule rejects digits between a label and its amount — but
+        'Beginning balance on July 1 $17,600.00' is exactly that, and is the
+        wording Wells Fargo's own checking statement uses. The date clause is
+        stripped before the rule applies."""
+        got = stmts.parse_balances(checking_pdf())
+        self.assertEqual(got['opening'], 17600.00)
+        self.assertEqual(got['closing'], 17650.00)
+
+    def test_a_brokerage_layout_without_the_summary_yields_nothing(self):
+        """Only the sweep table, no summary blocks: the honest answer is None,
+        not the first plausible amount on the page."""
+        got = stmts.parse_balances(make_pdf([
+            'Cash sweep activity',
+            'BEGINNING BALANCE TRANSFER FROM BANK DEPOSIT SWEEP06/01 '
+            '255,038.26 06/18 -75,594.81',
+            'TRANSFER TO BANK DEPOSIT SWEEP ENDING BALANCE06/16 100,000.00 '
+            '06/30 39,751.95',
+        ]))
+        self.assertIsNone(got['opening'])
+        self.assertIsNone(got['closing'])
+
+
+class ParseContinuityTest(StatementsBase):
+    """`parse_suspect` — one month's closing balance IS the next month's
+    opening, so a break in that chain is evidence the parser (or the set of
+    documents) is wrong, available without ERPNext and without a mirrored
+    transaction."""
+
+    def _statement(self, label, start, end, opening, closing):
+        row = PlaidStatement(statement_id=label,
+                             plaid_item_id='item-1',
+                             plaid_account_id='acct-1',
+                             period_start=start, period_end=end,
+                             opening_balance=opening, closing_balance=closing)
+        db.session.add(row)
+        db.session.commit()
+        return row
+
+    def test_a_chained_pair_is_not_suspect(self):
+        self._statement('s-jun', date(2026, 6, 1), date(2026, 6, 30),
+                        15434.91, 7196.73)
+        jul = self._statement('s-jul', date(2026, 7, 1), date(2026, 7, 31),
+                              7196.73, 5000.00)
+        self.assertFalse(stmts.flag_parse_continuity(jul))
+
+    def test_a_break_in_the_chain_is_flagged(self):
+        self._statement('s-jun', date(2026, 6, 1), date(2026, 6, 30),
+                        15434.91, 7196.73)
+        jul = self._statement('s-jul', date(2026, 7, 1), date(2026, 7, 31),
+                              -2289.04, 5000.00)
+        self.assertTrue(stmts.flag_parse_continuity(jul))
+        self.assertTrue(jul.parse_suspect)
+
+    def test_a_missing_month_is_not_a_suspicion(self):
+        """A gap between statements says nothing about either one's figures —
+        a whole month of unseen movement sits in between."""
+        self._statement('s-jun', date(2026, 6, 1), date(2026, 6, 30),
+                        15434.91, 7196.73)
+        aug = self._statement('s-aug', date(2026, 8, 1), date(2026, 8, 31),
+                              999999.00, 5000.00)
+        self.assertFalse(stmts.flag_parse_continuity(aug))
+
+    def test_the_first_statement_ever_held_is_not_suspect(self):
+        first = self._statement('s-jun', date(2026, 6, 1), date(2026, 6, 30),
+                                15434.91, 7196.73)
+        self.assertFalse(stmts.flag_parse_continuity(first))
+
+    def test_an_unparsed_neighbour_yields_no_verdict(self):
+        self._statement('s-jun', date(2026, 6, 1), date(2026, 6, 30),
+                        15434.91, None)
+        jul = self._statement('s-jul', date(2026, 7, 1), date(2026, 7, 31),
+                              7196.73, 5000.00)
+        self.assertFalse(stmts.flag_parse_continuity(jul))
+
+
+class ReparseStoredTest(StatementsBase):
+    """Re-reading PDFs already on disk — how an install picks up a parser
+    improvement, since a pull skips every statement it already holds."""
+
+    def _stored(self, statement_id, label, data, start, end):
+        path = stmts.pdf_path_for('item-1', 'acct-1', label, statement_id)
+        stmts.store_pdf(path, data)
+        row = PlaidStatement(statement_id=statement_id,
+                             plaid_item_id='item-1',
+                             plaid_account_id='acct-1',
+                             period_start=start, period_end=end,
+                             pdf_path=path, pdf_bytes=len(data),
+                             opening_balance=1.0, closing_balance=2.0)
+        db.session.add(row)
+        db.session.commit()
+        return row
+
+    def test_stale_rows_are_re_read_without_a_download(self):
+        row = self._stored('s-jun', '2026-06', wf_advisors_pdf(),
+                           date(2026, 6, 1), date(2026, 6, 30))
+        stats = stmts.reparse_stored()
+        self.assertEqual(stats['examined'], 1)
+        self.assertEqual(stats['changed'], 1)
+        self.assertEqual(row.opening_balance, 255038.26)
+        self.assertEqual(row.closing_balance, 39751.95)
+        self.assertEqual(row.portfolio_closing_value, 1313136.16)
+        self.assertEqual(row.parse_method, 'wf_advisors')
+
+    def test_a_row_whose_pdf_is_gone_is_left_exactly_as_it_was(self):
+        """A statement we can no longer read is not evidence that the figures
+        already recorded from it are wrong."""
+        row = PlaidStatement(statement_id='s-gone', plaid_item_id='item-1',
+                             plaid_account_id='acct-1', pdf_path='',
+                             opening_balance=100.0, closing_balance=200.0)
+        db.session.add(row)
+        db.session.commit()
+        stats = stmts.reparse_stored()
+        self.assertEqual(stats['unreadable'], 1)
+        self.assertEqual(row.opening_balance, 100.0)
+        self.assertEqual(row.closing_balance, 200.0)
+
+    def test_continuity_is_judged_on_the_re_parsed_figures(self):
+        """The flag pass runs after every row has been re-read — a statement is
+        checked against a neighbour that may itself have just changed."""
+        self._stored('s-may', '2026-05',
+                     wf_advisors_pdf(cash_open='43,962.19',
+                                     cash_close='255,038.26'),
+                     date(2026, 5, 1), date(2026, 5, 31))
+        jun = self._stored('s-jun', '2026-06', wf_advisors_pdf(),
+                           date(2026, 6, 1), date(2026, 6, 30))
+        stats = stmts.reparse_stored()
+        self.assertEqual(stats['suspect'], 0)
+        self.assertFalse(jun.parse_suspect)
+
+    def test_the_whole_metadata_blob_is_rewritten_not_just_the_balances(self):
+        row = self._stored('s-jun', '2026-06', wf_advisors_pdf(),
+                           date(2026, 6, 1), date(2026, 6, 30))
+        stats = stmts.reparse_stored()
+        self.assertEqual(row.parsed_metadata['dividends_total'], 1580.25)
+        self.assertEqual(row.parsed_metadata['realized_gains'], -2928.43)
+        self.assertEqual(row.parser_version(), stmts.PARSER_VERSION)
+        self.assertGreater(stats['fields'], 20)
+        self.assertEqual(stats['failed_fields'], 0)
+
+
+class ValidationTest(StatementsBase):
+    """The three-way comparison — statement vs Plaid vs the mirror.
+
+    This is what makes a statement usable as supporting documentation: not that
+    a number was recovered, but that anything disagreeing with it is visible in
+    the same row."""
+
+    def setUp(self):
+        super().setUp()
+        self.account = PlaidAccount(
+            account_id='acct-1', item_id=self.item.item_id,
+            name='Business Brokerage', mask='6030', type='investment',
+            subtype='brokerage', balance_current=39751.95)
+        db.session.add(self.account)
+        db.session.commit()
+
+    def _statement(self, **kwargs):
+        row = PlaidStatement(
+            statement_id='s-jun', plaid_item_id=self.item.item_id,
+            plaid_account_id='acct-1', period_start=date(2026, 6, 1),
+            period_end=date(2026, 6, 30), **kwargs)
+        db.session.add(row)
+        stmts.apply_parse(row, stmts.parse_statement(wf_advisors_pdf()))
+        db.session.commit()
+        return row
+
+    def _rows(self, verdict):
+        return {r['key']: r for r in verdict['rows']}
+
+    def test_plaids_live_balance_is_compared_only_on_the_newest_statement(self):
+        """Plaid reports today's balance. Lining it up against a period that
+        closed months ago would manufacture a variance meaning nothing."""
+        newest = self._statement()
+        rows = self._rows(stmts.validate_statement(newest, self.account))
+        self.assertEqual(rows['closing_balance']['plaid'], 39751.95)
+
+        older = PlaidStatement(
+            statement_id='s-may', plaid_item_id=self.item.item_id,
+            plaid_account_id='acct-1', period_start=date(2026, 5, 1),
+            period_end=date(2026, 5, 31), closing_balance=255038.26)
+        db.session.add(older)
+        db.session.commit()
+        rows = self._rows(stmts.validate_statement(older, self.account))
+        self.assertIsNone(rows['closing_balance']['plaid'])
+
+    def test_a_matching_mirror_is_not_flagged(self):
+        st = self._statement()
+        db.session.add(BankTransaction(
+            plaid_transaction_id='t-in', account_id='acct-1',
+            date=date(2026, 6, 5), amount=-10000.00, name='deposit'))
+        db.session.commit()
+        rows = self._rows(stmts.validate_statement(st, self.account))
+        self.assertEqual(rows['deposits_total']['statement'], 10000.00)
+        self.assertEqual(rows['deposits_total']['computed'], 10000.00)
+        self.assertFalse(rows['deposits_total']['flagged'])
+
+    def test_a_mirror_gap_is_flagged_with_its_delta(self):
+        """The finding this whole view exists for: the bank says $10,000 came
+        in and Bank Bridge mirrored nothing."""
+        st = self._statement()
+        rows = self._rows(stmts.validate_statement(st, self.account))
+        row = rows['deposits_total']
+        self.assertEqual(row['statement'], 10000.00)
+        self.assertEqual(row['computed'], 0.0)
+        self.assertEqual(row['delta'], 10000.00)
+        self.assertTrue(row['flagged'])
+
+    def test_a_rounding_cent_on_a_large_balance_is_not_a_finding(self):
+        """Flagging needs BOTH thresholds — a penny on $1.3M is not news."""
+        st = self._statement()
+        st.closing_balance = 39752.45
+        db.session.commit()
+        rows = self._rows(stmts.validate_statement(st, self.account))
+        self.assertFalse(rows['closing_balance']['flagged'])
+
+    def test_plaid_sign_convention_is_normalised_once(self):
+        """Plaid's amount is positive when money LEAVES; a statement prints
+        withdrawals negative. Both are normalised to cash-in-positive so a
+        subtraction between the columns means something."""
+        st = self._statement()
+        db.session.add(BankTransaction(
+            plaid_transaction_id='t-out', account_id='acct-1',
+            date=date(2026, 6, 9), amount=20047.16, name='wire out'))
+        db.session.commit()
+        rows = self._rows(stmts.validate_statement(st, self.account))
+        self.assertEqual(rows['withdrawals_total']['statement'], -20047.16)
+        self.assertEqual(rows['withdrawals_total']['computed'], -20047.16)
+        self.assertFalse(rows['withdrawals_total']['flagged'])
+
+    def test_investment_income_is_matched_against_security_transactions(self):
+        from app.models import SecurityTransaction
+        st = self._statement()
+        db.session.add(SecurityTransaction(
+            plaid_investment_transaction_id='iv-1', account_id='acct-1',
+            date=date(2026, 6, 30), amount=-1580.25, type='cash',
+            subtype='cash/dividend', name='dividend'))
+        db.session.commit()
+        rows = self._rows(stmts.validate_statement(st, self.account))
+        self.assertEqual(rows['dividends_total']['statement'], 1580.25)
+        self.assertEqual(rows['dividends_total']['computed'], 1580.25)
+        self.assertFalse(rows['dividends_total']['flagged'])
+
+    def test_portfolio_value_has_no_computed_column_and_says_why(self):
+        st = self._statement()
+        rows = self._rows(stmts.validate_statement(st, self.account))
+        row = rows['portfolio_closing']
+        self.assertEqual(row['statement'], 1313136.16)
+        self.assertIsNone(row['computed'])
+        self.assertIn('market movement', row['note'])
+
+    def test_an_unmatched_figure_is_still_shown(self):
+        """A statement's assertion is worth surfacing even when nothing here
+        can check it — it is what a journal entry cites."""
+        st = self._statement()
+        rows = self._rows(stmts.validate_statement(st, self.account))
+        self.assertEqual(rows['unrealized_gains']['statement'], 44611.96)
+        self.assertIsNone(rows['unrealized_gains']['computed'])
+
+    def test_a_cycle_that_is_not_the_calendar_month_is_surfaced(self):
+        st = self._statement()
+        self.assertTrue(stmts.validate_statement(st, self.account)
+                        ['period_matches'])
+        st.period_start = date(2026, 6, 5)
+        db.session.commit()
+        self.assertFalse(stmts.validate_statement(st, self.account)
+                         ['period_matches'])
+
+
+class StatementPagesRenderTest(StatementsBase):
+    """The v0.4.41 additions RENDERED, not just computed.
+
+    A module-level test proves the parser found $1,313,136.16; it says nothing
+    about whether the page that shows it to an operator returns 200. This
+    codebase has shipped a statements report that 500'd on every request while
+    every module test passed (`render_template_string`'s first parameter is
+    named `source`, so a context key of that name raised TypeError), so any new
+    template context gets a real GET."""
+
+    def setUp(self):
+        super().setUp()
+        self.client_ = self.app.test_client()
+        self.account = PlaidAccount(
+            account_id='acct-1', item_id=self.item.item_id,
+            name='Business Brokerage', mask='6030',
+            type='investment', subtype='brokerage')
+        db.session.add(self.account)
+        db.session.commit()
+        path = stmts.pdf_path_for('item-abc', 'acct-1', '2026-06', 's-jun')
+        data = wf_advisors_pdf()
+        stmts.store_pdf(path, data)
+        self.statement = PlaidStatement(
+            statement_id='s-jun', plaid_item_id=self.item.item_id,
+            plaid_account_id='acct-1', period_start=date(2026, 6, 1),
+            period_end=date(2026, 6, 30), pdf_path=path, pdf_bytes=len(data))
+        db.session.add(self.statement)
+        stmts.apply_parse(self.statement, stmts.parse_balances(data))
+        db.session.commit()
+
+    def test_the_statements_page_shows_the_portfolio_value(self):
+        resp = self.client_.get('/admin/statements')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.data.decode()
+        self.assertIn('Portfolio value', body)
+        self.assertIn('1313136.16', body.replace(',', ''))
+        self.assertIn('/admin/statements/reparse', body)
+
+    def test_the_detail_page_renders_the_three_way_validation(self):
+        resp = self.client_.get(f'/admin/statements/{self.statement.id}')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.data.decode()
+        self.assertIn('Validation', body)
+        self.assertIn('wf_advisors', body)
+        self.assertIn('39751.95', body.replace(',', ''))
+        # every column header, and figures from across the metadata blob
+        for text in ('Statement', 'Plaid', 'Mirror', 'Delta', 'Variance',
+                     'Dividends — total', 'Realized gain/loss — this period',
+                     'Securities purchased'):
+            self.assertIn(text, body, text)
+
+    def test_the_adjust_page_still_renders_and_links_to_the_detail(self):
+        resp = self.client_.get(
+            f'/admin/statements/{self.statement.id}/adjust')
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(f'/admin/statements/{self.statement.id}"',
+                      resp.data.decode())
+
+    def test_a_statement_with_no_metadata_still_renders(self):
+        """A row parsed by an older build has parsed_metadata NULL. The page
+        that shows what a statement asserts must not 500 on one that asserts
+        nothing."""
+        self.statement.parsed_metadata = None
+        db.session.commit()
+        resp = self.client_.get(f'/admin/statements/{self.statement.id}')
+        self.assertEqual(resp.status_code, 200)
+
+    def test_the_reparse_button_works_end_to_end(self):
+        self.statement.closing_balance = 0.0
+        db.session.commit()
+        resp = self.client_.post('/admin/statements/reparse')
+        self.assertEqual(resp.status_code, 302)
+        db.session.refresh(self.statement)
+        self.assertEqual(self.statement.closing_balance, 39751.95)
 
 
 # ── storage ──────────────────────────────────────────────────────────────────

@@ -145,6 +145,27 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     ('plaid_accounts', 'liability_refreshed_at', 'TIMESTAMP'),
     ('plaid_accounts', 'loan_ytd_interest_booked', 'DOUBLE PRECISION'),
     ('plaid_accounts', 'loan_ytd_principal_seen', 'DOUBLE PRECISION'),
+    # v0.4.28 — investments sync timestamp. Backfills to NULL = "never
+    # pulled investments for this Item", which lets sync_investments_for_item
+    # take the initial-backfill branch (730-day window) rather than a delta
+    # window on an upgrading install where the column didn't exist yet.
+    ('plaid_items', 'investments_synced_at', 'TIMESTAMP'),
+    # v0.4.41 — richer statement parsing. All five backfill to NULL/''/false,
+    # i.e. "this row was parsed by an older recognizer and says nothing about
+    # portfolio value or its own trustworthiness" — which is exactly true. The
+    # v0.4.40 balances stay put until an operator re-parses from
+    # /admin/statements, so an upgrade cannot silently move a number that a
+    # posted opening balance was anchored on.
+    ('plaid_statements', 'portfolio_opening_value', 'DOUBLE PRECISION'),
+    ('plaid_statements', 'portfolio_closing_value', 'DOUBLE PRECISION'),
+    ('plaid_statements', 'parse_method', "VARCHAR(40) DEFAULT ''"),
+    ('plaid_statements', 'parse_suspect', 'BOOLEAN DEFAULT false'),
+    # JSONB, not TEXT: the blob is queryable (`parsed_metadata->>'layout'`,
+    # `parsed_metadata->>'parser_version'`) without unpacking it in Python,
+    # which is the whole reason a re-parse can target only the rows a newer
+    # recognizer hasn't reached. Backfills to NULL = "parsed before v0.4.41
+    # recorded anything about how", which is exactly true.
+    ('plaid_statements', 'parsed_metadata', 'JSONB'),
 ]
 
 

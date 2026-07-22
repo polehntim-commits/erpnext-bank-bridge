@@ -512,6 +512,25 @@ class ProductLadderTests(LoanBase):
         for wanted in ([], ['statements'], ['statements', 'liabilities']):
             self.assertEqual(PlaidClient._product_ladder(wanted)[-1], [])
 
+    # WHERE A REQUESTED PRODUCT ACTUALLY LANDS, which these tests have to read
+    # from both keys rather than just `products`:
+    #
+    #   products           transactions (always) + statements
+    #   optional_products  liabilities (v0.4.23) + investments (v0.4.26)
+    #
+    # Both moved OUT of `products` because a required product Link cannot fill
+    # is a hard failure at the account-selection screen — 'No liability
+    # accounts' on a deposit-only bank, 'No investment accounts' on a bank-only
+    # user — while an optional one is granted where eligible and silent
+    # otherwise. The LADDER still matters either way: an optional product the
+    # Plaid application has not been approved for is still rejected when the
+    # token is minted, which is what it degrades through.
+    @staticmethod
+    def _requested(kwargs) -> list:
+        """Every product a link-token call asked for, required or optional."""
+        return [str(p) for p in (list(kwargs.get('products') or [])
+                                 + list(kwargs.get('optional_products') or []))]
+
     def test_a_fully_approved_link_makes_one_call(self):
         client = PlaidClient(client_id='c', secret='s', api=object())
         calls = []
@@ -523,19 +542,31 @@ class ProductLadderTests(LoanBase):
         with unittest.mock.patch.object(client, '_get_api', lambda: object()), \
              unittest.mock.patch.object(PlaidClient, '_link_token_create',
                                         staticmethod(ok)):
-            client.create_link_token('u', statements=True, liabilities=True)
+            client.create_link_token('u', statements=True, liabilities=True,
+                                     investments=True)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(len(calls[0]['products']), 3)   # txn + both
+        asked = self._requested(calls[0])
+        for product in ('transactions', 'statements', 'liabilities',
+                        'investments'):
+            self.assertTrue(any(product in p for p in asked), product)
+        # …and each landed on the side that keeps Link from hard-failing.
+        self.assertTrue(any('statements' in str(p)
+                            for p in calls[0]['products']))
+        optional = [str(p) for p in calls[0]['optional_products']]
+        self.assertTrue(any('liabilities' in p for p in optional))
+        self.assertTrue(any('investments' in p for p in optional))
 
     def test_a_rejected_product_degrades_to_the_next_rung(self):
+        """An unapproved product is rejected at token creation whichever key it
+        sits under, so the ladder still has to drop it and retry."""
         client = PlaidClient(client_id='c', secret='s', api=object())
         from app.plaid_client import PlaidError
         seen = []
 
         def flaky(api, kwargs):
-            names = [str(p) for p in kwargs.get('products', [])]
-            seen.append(names)
-            if any('liabilities' in n for n in names):
+            asked = self._requested(kwargs)
+            seen.append(asked)
+            if any('liabilities' in p for p in asked):
                 raise PlaidError('PRODUCTS_NOT_SUPPORTED: liabilities')
             return 'tok'
 
@@ -546,8 +577,10 @@ class ProductLadderTests(LoanBase):
                                              liabilities=True)
         self.assertEqual(token, 'tok')
         self.assertEqual(len(seen), 2)
-        # The surviving attempt kept statements.
-        self.assertTrue(any('statements' in n for n in seen[-1]))
+        # The surviving attempt kept statements — losing one unapproved product
+        # must not cost an approved one.
+        self.assertTrue(any('statements' in p for p in seen[-1]))
+        self.assertFalse(any('liabilities' in p for p in seen[-1]))
 
 
 # ── the page ────────────────────────────────────────────────────────────────

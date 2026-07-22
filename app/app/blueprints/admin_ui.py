@@ -165,7 +165,9 @@ NAV_HTML = """
   <a href="/admin/generated_entries" class="{{ 'active' if page == 'generated_entries' else '' }}">Generated JEs</a>
   <a href="/admin/intercompany" class="{{ 'active' if page == 'intercompany' else '' }}">Intercompany</a>
   <a href="/admin/statements" class="{{ 'active' if page == 'statements' else '' }}">Statements</a>
+  <a href="/admin/strategy" class="{{ 'active' if page == 'investments' else '' }}">Strategy</a>
   <a href="/admin/audit" class="{{ 'active' if page == 'audit' else '' }}">Audit</a>
+  <a href="/admin/data_hygiene" class="{{ 'active' if page == 'hygiene' else '' }}" style="color:#8fbfa5">Hygiene</a>
   <a href="/admin/sync_log" class="{{ 'active' if page == 'sync_log' else '' }}">Sync Log</a>
   <a href="/admin/plaid_settings" class="{{ 'active' if page == 'plaid_settings' else '' }}">Plaid</a>
   <a href="/admin/erpnext_settings" class="{{ 'active' if page == 'erpnext_settings' else '' }}">ERPNext</a>
@@ -4694,14 +4696,25 @@ STATEMENTS_BODY = """
   {% if group.computed %}
   &middot; <span style="color:#666">{{ group.computed }} from mirror</span>
   {% endif %}
+  {% if group.suspect %}
+  &middot; <span class="warn">&#9888; {{ group.suspect }} period(s) don't chain
+  on from the month before</span>
+  {% endif %}
 </div>
 <table>
   <tr><th>Period</th><th class="num">Opening</th><th class="num">Movement</th>
       <th class="num">Expected</th><th class="num">Closing</th>
+      {% if group.has_portfolio %}<th class="num">Portfolio value</th>{% endif %}
       <th class="num">Delta</th><th>Status</th><th>PDF</th></tr>
   {% for r in group.statements %}
   <tr>
-    <td>{{ r.row.period_label or '—' }}</td>
+    <td><a href="/admin/statements/{{ r.statement.id }}">{{ r.row.period_label
+        or '—' }}</a>
+      {% if r.row.parse_suspect %}
+      <br><span class="pill pill-err" style="font-size:10px"
+            title="This statement's opening balance does not equal the previous month's closing balance — either the PDF was misread or a statement is missing. Check the PDF before relying on these figures.">&#9888; chain</span>
+      {% endif %}
+    </td>
     <td class="num">
       {% if r.opening is not none %}{{ '%.2f'|format(r.opening) }}
         {% if r.opening_source == 'bank' %}
@@ -4727,13 +4740,42 @@ STATEMENTS_BODY = """
         {% endif %}
       {% else %}—{% endif %}
     </td>
-    <td class="num">{{ '%+.2f'|format(r.delta) if r.delta is not none else '—' }}</td>
+    {% if group.has_portfolio %}
+    <td class="num">
+      {# Total account value — cash PLUS securities at market. It is not what
+         the Opening/Closing columns reconcile (those are the cash side, the
+         only figure the transaction mirror can reproduce), so it is shown
+         apart from them rather than folded in. #}
+      {% if r.row.portfolio_closing_value is not none %}
+        {{ '%.2f'|format(r.row.portfolio_closing_value) }}
+        <br><span style="font-size:11px;color:#666"
+              title="Total account value at the start of the period">from
+          {{ '%.2f'|format(r.row.portfolio_opening_value)
+             if r.row.portfolio_opening_value is not none else '—' }}</span>
+      {% else %}—{% endif %}
+    </td>
+    {% endif %}
+    <td class="num">
+      {% if r.delta is not none %}
+        {{ '%+.2f'|format(r.delta) }}
+        {% if r.adjustment_total %}
+        <br><span style="font-size:11px;color:#666">
+          adj: {{ '%+.2f'|format(r.adjustment_total) }}<br>
+          → {{ '%+.2f'|format(r.adjusted_delta) }}
+        </span>
+        {% endif %}
+      {% else %}—{% endif %}
+    </td>
     <td>
       {% if r.status == 'ok' %}
         <span class="pill pill-ok">reconciled</span>
+      {% elif r.status == 'reconciled' %}
+        <span class="pill pill-ok" title="Delta explained by manual adjustments">reconciled (adj)</span>
       {% elif r.status == 'mismatch' %}
-        <span class="pill pill-err" title="Off by {{ '%.2f'|format(r.delta) }}">
-          &#9888; off by {{ '%.2f'|format(r.delta|abs) }}</span>
+        <span class="pill pill-err" title="Off by {{ '%.2f'|format(r.adjusted_delta if r.adjusted_delta is not none else r.delta) }}">
+          &#9888; off by {{ '%.2f'|format((r.adjusted_delta if r.adjusted_delta is not none else r.delta)|abs) }}</span>
+        <br><a href="/admin/statements/{{ r.statement.id }}/adjust"
+              style="font-size:11px">attribute →</a>
       {% elif r.status == 'computed' %}
         <span class="pill pill-muted"
               title="Both opening and closing were derived from the transaction mirror — this is a balance report, not a bank cross-check">from mirror</span>
@@ -4759,6 +4801,17 @@ STATEMENTS_BODY = """
     automatically every {{ interval_days or '—' }} days.
   </p>
   <button type="submit">Pull statements</button>
+</form>
+<form method="post" action="/admin/statements/reparse" class="card">
+  <b>Re-parse stored PDFs</b>
+  <p style="font-size:13px;color:#666;margin:6px 0">
+    Re-reads the balances out of every PDF already on disk, without downloading
+    anything. Run this after an upgrade that improves the parser — a pull skips
+    statements it already holds, so a better reader would otherwise never reach
+    them. Only the parsed figures change; the documents are untouched, and any
+    journal entry already posted stays exactly as posted.
+  </p>
+  <button type="submit">Re-parse stored PDFs</button>
 </form>
 <form method="post" action="/admin/statements/sync_erpnext" class="card">
   <b>Send statements to ERPNext</b>
@@ -4872,6 +4925,13 @@ def _statement_groups() -> list:
             # so the header line can say "3 bank-verified, 5 from mirror" and
             # not conflate the two into one flattering total.
             'computed': sum(1 for r in rows if r['status'] == 'computed'),
+            # v0.4.41: only a brokerage statement states a total account value,
+            # so the column is shown per group rather than site-wide — an empty
+            # "Portfolio" column on every checking account teaches nothing.
+            'has_portfolio': any(
+                r['row'].get('portfolio_closing_value') is not None
+                for r in rows),
+            'suspect': sum(1 for r in rows if r['row'].get('parse_suspect')),
         })
     return groups
 
@@ -4935,6 +4995,36 @@ def statements_pull():
            f"already had {result['skipped_existing']}.")
     if result['failed']:
         msg += f" {result['failed']} could not be downloaded."
+    return redirect('/admin/statements?flash=' + quote_plus(msg))
+
+
+@bp.post('/admin/statements/reparse')
+def statements_reparse():
+    """Re-read balances from PDFs already on disk (v0.4.41).
+
+    Separate from the pull because a pull deliberately skips any statement it
+    already holds — so shipping a better parser reaches nothing already stored
+    until an operator asks for this. Rewrites only the parsed columns; the PDFs
+    and every posted journal entry are untouched."""
+    from .. import statements as stmts
+    try:
+        result = stmts.reparse_stored()
+    except Exception as e:
+        db.session.rollback()
+        return redirect('/admin/statements?flash=' + quote_plus(
+            f'Re-parse failed: {e}'))
+    msg = (f"Re-parsed {result['examined']} PDF(s); "
+           f"{result['changed']} row(s) changed; "
+           f"{result['fields']} figure(s) extracted.")
+    if result['failed_fields']:
+        msg += f" {result['failed_fields']} field(s) failed to extract."
+    if result['suspect']:
+        msg += (f" {result['suspect']} statement(s) don't chain on from the "
+                "month before — check those PDFs.")
+    if result['unreadable']:
+        msg += f" {result['unreadable']} had no PDF on disk."
+    audit.record('statements_reparsed', after=result, notes=msg)
+    db.session.commit()
     return redirect('/admin/statements?flash=' + quote_plus(msg))
 
 
@@ -5097,6 +5187,292 @@ def balance_history():
                  months=months)
 
 
+STATEMENT_DETAIL_BODY = """
+<h2>Statement {{ statement.period_label() or '—' }} · {{ account_label }}</h2>
+
+<div class="card" style="max-width:1100px">
+  <p style="font-size:14px;color:#555;margin:0">
+    <b>Period (from Plaid):</b> {{ statement.period_start or '—' }} to
+    {{ statement.period_end or '—' }}
+    {% if v.stated_period[0] %}
+      · <b>Period (printed on the statement):</b> {{ v.stated_period[0] }} to
+      {{ v.stated_period[1] }}
+      {% if v.period_matches is false %}
+      <span class="pill pill-err" title="The bank's cycle is not the calendar month Plaid reported. Every reconciliation for this period compares transactions from the wrong window.">&#9888; periods disagree</span>
+      {% endif %}
+    {% endif %}
+    <br><b>Read by:</b>
+    <code>{{ v.layout or 'no recognizer — nothing was parsed' }}</code>
+    (parser {{ statement.parser_version() or 'pre-0.4.41' }})
+    {% if v.layout and not v.verified %}
+    <span class="pill pill-muted"
+          title="This layout's field table has not been checked against a real document of this kind. Figures from it are unconfirmed.">unverified layout</span>
+    {% endif %}
+    {% if has_pdf %}
+    · <a href="/admin/statements/{{ statement.statement_id|urlencode }}/view"
+       target="_blank">open the PDF &rarr;</a>
+    {% endif %}
+  </p>
+  {% if statement.parse_suspect %}
+  <p class="warn" style="font-size:13px;margin:10px 0 0">
+    &#9888; This statement's opening balance does not equal the previous
+    month's closing balance. Either a figure was misread or a statement is
+    missing — check the PDF before citing these numbers.
+  </p>
+  {% endif %}
+  {% if v.fields_failed %}
+  <p class="warn" style="font-size:13px;margin:10px 0 0">
+    &#9888; {{ v.fields_failed|length }} field(s) failed to extract:
+    <code>{{ v.fields_failed|join(', ') }}</code>. Everything else on this page
+    parsed normally.
+  </p>
+  {% endif %}
+</div>
+
+<h3>Validation</h3>
+<p style="font-size:13px;color:#555;max-width:1100px">
+  Three independent accounts of the same month. <b>Statement</b> is what the
+  bank wrote down. <b>Plaid</b> is what the API reports live — a snapshot of
+  today, so it is only compared on the newest statement. <b>Mirror</b> is what
+  Bank Bridge computes from the transactions it stored. Two agreeing is
+  ordinary; two <i>disagreeing</i> is the finding, and each cause has a
+  different fix: a misread PDF, a gap in the transaction feed, or something
+  that moved the real balance and never reached Plaid.
+  Flagged when a difference exceeds <b>${{ '%.2f'|format(v.thresholds[0]) }}</b>
+  <i>and</i> <b>{{ '%.2f'|format(v.thresholds[1] * 100) }}%</b>.
+</p>
+{% if v.flagged %}
+<p class="warn" style="font-size:14px">&#9888; {{ v.flagged }} figure(s) differ
+  by more than the threshold.</p>
+{% else %}
+<p style="font-size:14px;color:#1b5e20">&#10003; Nothing on this statement
+  differs from the mirror by more than the threshold.</p>
+{% endif %}
+<table style="max-width:1100px">
+  <tr><th>Figure</th><th class="num">Statement</th><th class="num">Plaid</th>
+      <th class="num">Mirror</th><th class="num">Delta</th>
+      <th class="num">Variance</th></tr>
+  {% for r in v.rows %}
+  <tr {% if r.flagged %}style="background:#fdf0e6"{% endif %}>
+    <td>{{ r.label }}
+      {% if r.note %}<br><span style="font-size:11px;color:#666">{{ r.note }}</span>{% endif %}
+    </td>
+    <td class="num">{{ '%.2f'|format(r.statement)
+                       if r.statement is not none else '—' }}</td>
+    <td class="num">{{ '%.2f'|format(r.plaid)
+                       if r.plaid is not none else '—' }}</td>
+    <td class="num">{{ '%.2f'|format(r.computed)
+                       if r.computed is not none else '—' }}</td>
+    <td class="num">{{ '%+.2f'|format(r.delta)
+                       if r.delta is not none else '—' }}</td>
+    <td class="num">
+      {% if r.pct is not none %}{{ '%.2f'|format(r.pct * 100) }}%
+      {% if r.flagged %}<span class="pill pill-err">&#9888;</span>{% endif %}
+      {% else %}—{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+
+<p style="font-size:14px">
+  <a href="/admin/statements/{{ statement.id }}/adjust">attribute an
+  unreconciled amount &rarr;</a>
+  · <a href="/admin/statements">&larr; back to statements</a>
+</p>
+"""
+
+
+STATEMENT_ADJUST_BODY = """
+<h2>Attribute unreconciled amount</h2>
+<div class="card" style="max-width:800px">
+  <p style="font-size:14px;color:#555">
+    <b>Statement:</b> {{ statement.period_label() or '—' }}
+    · <b>Account:</b> {{ account_label }}
+    · <b>Bank closing:</b> {{ '%.2f'|format(statement.closing_balance)
+                             if statement.closing_balance is not none else '—' }}
+    · <b>Expected closing (per feed):</b> {{ '%.2f'|format(expected)
+                                             if expected is not none else '—' }}
+    · <b>Delta:</b> <span style="color:{{ '#a04000' if delta and delta < 0 else '#1b5e20' }}">{{ '%+.2f'|format(delta) }}</span>
+  </p>
+  <p style="font-size:13px;margin:10px 0 0">
+    <a href="/admin/statements/{{ statement.id }}">&larr; statement detail and
+    validation</a>
+  </p>
+  {% if adjustments %}
+  <h3 style="margin-top:16px">Existing attributions</h3>
+  <table>
+    <tr><th class="num">Amount</th><th>Offset account</th>
+        <th>Description</th><th>JE</th><th></th></tr>
+    {% for adj in adjustments %}
+    <tr>
+      <td class="num">{{ '%+.2f'|format(adj.amount) }}</td>
+      <td>{{ adj.offset_account }}</td>
+      <td>{{ adj.description or '' }}</td>
+      <td>{{ adj.erpnext_je_name or '—' }}</td>
+      <td>
+        <form method="post" action="/admin/statements/{{ statement.id }}/adjust/{{ adj.id }}/delete"
+              style="display:inline"
+              onsubmit="return confirm('Delete this attribution?')">
+          <button type="submit" class="secondary" style="font-size:11px">delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    <tr style="border-top:1px solid #ccc">
+      <td class="num"><b>{{ '%+.2f'|format(adjustment_total) }}</b> total attributed</td>
+      <td colspan="4"><b>Remaining unaccounted: {{ '%+.2f'|format(remaining) }}</b></td>
+    </tr>
+  </table>
+  {% endif %}
+  <h3 style="margin-top:16px">Add attribution</h3>
+  <form method="post" action="/admin/statements/{{ statement.id }}/adjust"
+        style="display:flex;flex-direction:column;gap:8px;max-width:600px">
+    <label>Amount (default = remaining {{ '%+.2f'|format(remaining) }})
+      <input type="text" name="amount" value="{{ '%.2f'|format(remaining) }}"
+             style="width:100%">
+    </label>
+    <label>Offset account (ERPNext account name)
+      <input type="text" name="offset_account"
+             list="account-suggestions"
+             placeholder="e.g. 3201 - Member Distribution - OML"
+             style="width:100%" required>
+      <datalist id="account-suggestions">
+        {% for a in account_suggestions %}
+        <option value="{{ a }}">
+        {% endfor %}
+      </datalist>
+    </label>
+    <label>Description / memo
+      <input type="text" name="description"
+             placeholder="e.g. Federal tax payment for mom, Apr 2026 estimated"
+             style="width:100%">
+    </label>
+    <label>ERPNext Journal Entry name (optional — if you've already booked one)
+      <input type="text" name="erpnext_je_name" style="width:100%">
+    </label>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button type="submit" class="primary">Save attribution</button>
+      <a href="/admin/statements" style="font-size:13px;padding:8px">Cancel</a>
+    </div>
+  </form>
+</div>
+"""
+
+
+@bp.get('/admin/statements/<int:statement_id>')
+def statement_detail(statement_id: int):
+    """One statement, everything parsed out of it, and the three-way check
+    (v0.4.41).
+
+    This is the page the family-office use case needs: a statement is only
+    supporting documentation for a journal entry if someone can see WHAT it
+    says and whether anything else disagrees. `validate_statement` builds the
+    comparison; this route only renders it."""
+    from ..models import PlaidStatement
+    from .. import statements as stmts
+    statement = PlaidStatement.query.get_or_404(statement_id)
+    account = PlaidAccount.query.filter_by(
+        account_id=statement.plaid_account_id).first()
+    label = (account.name or account.mask or account.account_id
+             if account else '—')
+    if account is not None and account.mask:
+        label = f'{label} ••{account.mask}'
+    return _page(STATEMENT_DETAIL_BODY, page='statements',
+                 statement=statement, account_label=label,
+                 v=stmts.validate_statement(statement, account),
+                 has_pdf=stmts.pdf_exists(statement))
+
+
+@bp.get('/admin/statements/<int:statement_id>/adjust')
+def statement_adjust_form(statement_id: int):
+    """Show the manual-attribution form for one statement's delta.
+    Pre-fills with the remaining unaccounted amount so a full attribution
+    is one click, or partial attributions can be added sequentially."""
+    from ..models import (PlaidAccount, PlaidStatement,
+                          StatementAdjustment)
+    from .. import statements as stmts
+    statement = PlaidStatement.query.get_or_404(statement_id)
+    account = PlaidAccount.query.filter_by(
+        account_id=statement.plaid_account_id).first()
+    verdict = stmts.reconcile_statement(statement, account)
+    adjustments = (StatementAdjustment.query
+                   .filter_by(statement_id=statement_id)
+                   .order_by(StatementAdjustment.created_at).all())
+    total = round(sum(a.amount for a in adjustments), 2)
+    delta = verdict.get('delta') or 0.0
+    remaining = round(delta - total, 2)
+    account_label = (account.name or account.mask or account.account_id
+                     if account else '—')
+    # Suggest accounts from the OM chart of accounts for the datalist.
+    account_suggestions = []
+    try:
+        erp = sync_engine.get_erp_client_or_none()
+        if erp is not None:
+            company = _current_company() or ''
+            filters = [['is_group', '=', 0]]
+            if company:
+                filters.append(['company', '=', company])
+            rows = erp.list_docs('Account', filters=filters,
+                                 fields=['name'], limit_page_length=0)
+            account_suggestions = [r['name'] for r in (rows or [])]
+    except Exception:  # pragma: no cover
+        pass
+    return _page(STATEMENT_ADJUST_BODY, page='statements',
+                 statement=statement,
+                 account_label=account_label,
+                 expected=verdict.get('expected_closing'),
+                 delta=delta,
+                 adjustments=adjustments,
+                 adjustment_total=total, remaining=remaining,
+                 account_suggestions=account_suggestions)
+
+
+@bp.post('/admin/statements/<int:statement_id>/adjust')
+def statement_adjust_create(statement_id: int):
+    """Record a manual attribution. Doesn't touch ERPNext directly — the
+    operator can create the JE separately and paste the JE name back in
+    when ready. This keeps the workflow safe: the attribution records
+    intent, the JE records the accounting."""
+    from ..models import PlaidStatement, StatementAdjustment
+    statement = PlaidStatement.query.get_or_404(statement_id)
+    try:
+        amount = float(request.form.get('amount') or 0)
+    except ValueError:
+        amount = 0.0
+    offset_account = (request.form.get('offset_account') or '').strip()
+    description = (request.form.get('description') or '').strip()
+    je_name = (request.form.get('erpnext_je_name') or '').strip() or None
+    if amount == 0 or not offset_account:
+        return redirect(f'/admin/statements/{statement_id}/adjust?flash='
+                        + quote_plus('Amount and offset account are required.'))
+    adj = StatementAdjustment(
+        statement_id=statement.id, amount=amount,
+        offset_account=offset_account, description=description,
+        erpnext_je_name=je_name,
+    )
+    db.session.add(adj)
+    db.session.commit()
+    return redirect(f'/admin/statements/{statement_id}/adjust?flash='
+                    + quote_plus(f'Recorded ${amount:+.2f} to '
+                                 f'{offset_account}.'))
+
+
+@bp.post('/admin/statements/<int:statement_id>/adjust/<int:adjustment_id>/delete')
+def statement_adjust_delete(statement_id: int, adjustment_id: int):
+    """Remove a manual attribution. The residual delta on the statement
+    increases by the removed amount, moving the reconciliation status
+    back toward 'mismatch' if the balance was previously fully explained."""
+    from ..models import StatementAdjustment
+    adj = StatementAdjustment.query.get_or_404(adjustment_id)
+    if adj.statement_id != statement_id:
+        return redirect('/admin/statements?flash=' + quote_plus(
+            'Adjustment does not belong to that statement.'))
+    db.session.delete(adj)
+    db.session.commit()
+    return redirect(f'/admin/statements/{statement_id}/adjust?flash='
+                    + quote_plus('Attribution deleted.'))
+
+
 @bp.get('/admin/statements/reports/discrepancies')
 def statement_discrepancies():
     """Statements whose reconciliation variance exceeds the threshold."""
@@ -5138,6 +5514,964 @@ def statements_sync_erpnext():
     if result['errors']:
         msg += f" {result['errors'][0]}"
     return redirect('/admin/statements?flash=' + quote_plus(msg))
+
+
+# ── v0.4.37 · Strategy dashboard (Phase B step 4) ───────────────
+
+STRATEGY_DASHBOARD_BODY = """
+<h2>Strategy dashboard</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+<p style="font-size:14px;color:#555">
+  Portfolio view through the strategy lens — retained "coffee can" lots
+  with 400% diversification triggers, options positions with coverage
+  status, completed 5:4 cycles with realized P&L, and concentration
+  warnings. All read from the last strategy detection run
+  ({{ last_run.ran_at.strftime('%Y-%m-%d %H:%M') if last_run else 'never' }}).
+</p>
+
+<div style="margin:12px 0">
+  <form method="post" action="/admin/strategy/rerun" style="display:inline"
+        onsubmit="return confirm('Re-run 5:4 + options detection?')">
+    <button type="submit" class="secondary">Re-run detection</button>
+  </form>
+  <a href="/admin/holdings" style="margin-left:12px;font-size:13px">
+    ← holdings</a>
+  <a href="/admin/investment_transactions" style="margin-left:12px;font-size:13px">
+    investment transactions →</a>
+</div>
+
+{# ─ NAKED POSITION WARNINGS (empty state = discipline holding) ─ #}
+{% if naked_positions %}
+<div class="banner-warn" style="border-color:#c53030">
+  <h3 style="color:#c53030">⚠ {{ naked_positions|length }} NAKED POSITION(S)</h3>
+  <p style="font-size:13px;margin:6px 0">
+    You've written short options without full coverage. This violates the
+    stated 'no naked options, no margin' rule.
+  </p>
+  <table>
+    <tr><th>Ticker</th><th>Type</th><th class="num">Strike</th>
+        <th>Expires</th><th class="num">Contracts</th>
+        <th class="num">Required</th><th class="num">Covered</th>
+        <th class="num">Shortfall</th></tr>
+    {% for p in naked_positions %}
+    <tr>
+      <td>{{ p.underlying_ticker }}</td>
+      <td>{{ p.contract_type }}</td>
+      <td class="num">{{ '%.2f'|format(p.strike_price) }}</td>
+      <td>{{ p.expiration_date.isoformat() if p.expiration_date else '—' }}</td>
+      <td class="num">{{ '%.0f'|format(p.contracts_open) }}</td>
+      <td class="num">
+        {% if p.contract_type == 'call' %}{{ (p.contracts_open|abs * 100)|int }} sh{% else %}${{ '%.0f'|format(p.strike_price * (p.contracts_open|abs) * 100) }}{% endif %}
+      </td>
+      <td class="num">
+        {% if p.contract_type == 'call' %}{{ p.covered_by_shares }} sh{% else %}${{ '%.0f'|format(p.covered_by_cash) }}{% endif %}
+      </td>
+      <td class="num" style="color:#c53030">
+        {% if p.contract_type == 'call' %}{{ ((p.contracts_open|abs * 100)|int - p.covered_by_shares) }} sh{% else %}${{ '%.0f'|format((p.strike_price * (p.contracts_open|abs) * 100) - p.covered_by_cash) }}{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+{# ─ 400% DIVERSIFICATION TRIGGERS ─ #}
+{% if triggers_hit %}
+<h3 style="color:#c07000;margin-top:20px">
+  🎯 {{ triggers_hit|length }} lot(s) hit the {{ '%.0f'|format(diversification_trigger_pct) }}% diversification trigger
+</h3>
+<p style="font-size:13px;color:#666">
+  The rule: sell {{ '%.0f'|format(diversification_sell_pct) }}% of the retained
+  shares to trim concentration. Calculated shares to sell are shown below —
+  execution is discretionary (call your advisor first).
+</p>
+<table>
+  <tr>
+    <th>Ticker</th><th>Purchased</th>
+    <th class="num">Cost/share</th><th class="num">Current</th>
+    <th class="num">Gain</th><th class="num">Shares held</th>
+    <th class="num">Sell 10%</th>
+    <th class="num">Proceeds est.</th>
+  </tr>
+  {% for t in triggers_hit %}
+  <tr>
+    <td><b>{{ t.ticker }}</b></td>
+    <td>{{ t.purchase_date.isoformat() }}</td>
+    <td class="num">{{ '%.2f'|format(t.cost_per_share) }}</td>
+    <td class="num">{{ '%.2f'|format(t.current_price) if t.current_price else '—' }}</td>
+    <td class="num" style="color:#1b5e20">
+      <b>{{ '%.0f'|format(t.gain_pct) }}%</b>
+    </td>
+    <td class="num">{{ '%.4f'|format(t.shares_remaining) }}</td>
+    <td class="num">{{ '%.4f'|format(t.sell_qty) }}</td>
+    <td class="num">${{ '%.2f'|format(t.sell_proceeds_est) if t.sell_proceeds_est else '—' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{# ─ APPROACHING TRIGGERS (heads-up) ─ #}
+{% if approaching_triggers %}
+<h3 style="color:#666;margin-top:20px">
+  Approaching triggers ({{ approaching_triggers|length }} at ≥350%)
+</h3>
+<table>
+  <tr><th>Ticker</th><th class="num">Cost/share</th>
+      <th class="num">Current</th><th class="num">Gain</th>
+      <th class="num">Shares</th></tr>
+  {% for t in approaching_triggers %}
+  <tr>
+    <td>{{ t.ticker }}</td>
+    <td class="num">{{ '%.2f'|format(t.cost_per_share) }}</td>
+    <td class="num">{{ '%.2f'|format(t.current_price) if t.current_price else '—' }}</td>
+    <td class="num">{{ '%.0f'|format(t.gain_pct) }}%</td>
+    <td class="num">{{ '%.4f'|format(t.shares_remaining) }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{# ─ RETAINED LOTS (full list, sorted by unrealized gain %) ─ #}
+<h3 style="margin-top:20px">Retained lots ({{ retained_lots|length }})</h3>
+<p style="font-size:13px;color:#666">
+  Every "coffee can" position being held. From completed 5:4 cycles
+  (tag=<code>5_4</code>) or open positions still waiting for the
+  25% profit target (tag=<code>5_4_open</code>).
+</p>
+<table>
+  <tr>
+    <th>Ticker</th><th>Tag</th><th>Purchased</th>
+    <th class="num">Cost/share</th><th class="num">Current</th>
+    <th class="num">Gain %</th><th class="num">Shares</th>
+    <th class="num">Cost basis</th><th class="num">Market value</th>
+    <th class="num">Unrealized</th>
+  </tr>
+  {% for lot in retained_lots %}
+  <tr>
+    <td>
+      {% if lot.gain_pct is not none and lot.gain_pct >= diversification_trigger_pct %}
+      <span style="color:#c07000">🎯</span>
+      {% elif lot.gain_pct is not none and lot.gain_pct >= 350 %}
+      <span style="color:#666">◐</span>
+      {% endif %}
+      <b>{{ lot.ticker }}</b>
+    </td>
+    <td style="font-size:12px;color:#888">{{ lot.strategy_tag }}</td>
+    <td>{{ lot.purchase_date.isoformat() }}</td>
+    <td class="num">{{ '%.2f'|format(lot.cost_per_share) }}</td>
+    <td class="num">{{ '%.2f'|format(lot.current_price) if lot.current_price else '—' }}</td>
+    <td class="num">
+      {% if lot.gain_pct is not none %}
+        <span style="color:{{ '#1b5e20' if lot.gain_pct >= 0 else '#a04000' }}">
+          {{ '%.0f'|format(lot.gain_pct) }}%
+        </span>
+      {% else %}—{% endif %}
+    </td>
+    <td class="num">{{ '%.4f'|format(lot.shares_remaining) }}</td>
+    <td class="num">{{ '%.2f'|format(lot.cost_basis_total) }}</td>
+    <td class="num">{{ '%.2f'|format(lot.market_value) if lot.market_value else '—' }}</td>
+    <td class="num">
+      {% if lot.unrealized is not none %}
+        <span style="color:{{ '#1b5e20' if lot.unrealized >= 0 else '#a04000' }}">
+          {{ '%+.2f'|format(lot.unrealized) }}
+        </span>
+      {% else %}—{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+
+{# ─ COMPLETED 5:4 CYCLES ─ #}
+<h3 style="margin-top:20px">
+  Completed 5:4 cycles ({{ complete_cycles|length }}) — total realized:
+  <span style="color:{{ '#1b5e20' if total_realized >= 0 else '#a04000' }}">
+    ${{ '%+.2f'|format(total_realized) }}
+  </span>
+</h3>
+<table>
+  <tr>
+    <th>Ticker</th><th>Buy</th><th>Sell</th>
+    <th class="num">Buy qty</th><th class="num">Sell qty</th>
+    <th class="num">Buy $</th><th class="num">Sell $</th>
+    <th class="num">Gain %</th><th class="num">P&L</th>
+  </tr>
+  {% for c in complete_cycles %}
+  <tr>
+    <td><b>{{ c.ticker }}</b></td>
+    <td>{{ c.buy_date.isoformat() }}</td>
+    <td>{{ c.sell_date.isoformat() }}</td>
+    <td class="num">{{ '%.0f'|format(c.buy_qty) }}</td>
+    <td class="num">{{ '%.0f'|format(c.sell_qty) }}</td>
+    <td class="num">{{ '%.2f'|format(c.buy_price) }}</td>
+    <td class="num">{{ '%.2f'|format(c.sell_price) }}</td>
+    <td class="num">{{ '%.1f'|format(c.gain_pct) }}%</td>
+    <td class="num">
+      <span style="color:{{ '#1b5e20' if c.realized_pnl >= 0 else '#a04000' }}">
+        ${{ '%+.2f'|format(c.realized_pnl) }}
+      </span>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+
+{# ─ OPTIONS POSITIONS (all open) ─ #}
+{% if options_positions %}
+<h3 style="margin-top:20px">
+  Open options positions ({{ options_positions|length }})
+</h3>
+<p style="font-size:13px;color:#666">
+  Coverage math shown per position. Sorted by expiration ascending —
+  nearest expiry first, so the next action is at the top.
+</p>
+<table>
+  <tr>
+    <th>Ticker</th><th>Type</th><th class="num">Strike</th>
+    <th>Expires</th><th class="num">Days</th><th class="num">Contracts</th>
+    <th>Coverage</th><th>Status</th>
+  </tr>
+  {% for p in options_positions %}
+  <tr>
+    <td><b>{{ p.underlying_ticker }}</b></td>
+    <td>{{ p.contract_type|upper }}</td>
+    <td class="num">{{ '%.2f'|format(p.strike_price) if p.strike_price else '—' }}</td>
+    <td>{{ p.expiration_date.isoformat() if p.expiration_date else '—' }}</td>
+    <td class="num" style="color:{{ '#c53030' if p.days_to_exp is not none and p.days_to_exp < 30 else '#666' }}">
+      {{ p.days_to_exp if p.days_to_exp is not none else '—' }}
+    </td>
+    <td class="num" style="color:{{ '#a04000' if p.contracts_open < 0 else '#1b5e20' }}">
+      {{ '%+.0f'|format(p.contracts_open) }}
+    </td>
+    <td style="font-size:12px">
+      {% if p.contracts_open < 0 %}
+        {% if p.contract_type == 'call' %}
+          {{ p.covered_by_shares }} / {{ ((p.contracts_open|abs) * 100)|int }} sh
+        {% else %}
+          ${{ '%.0f'|format(p.covered_by_cash) }} / ${{ '%.0f'|format((p.strike_price or 0) * (p.contracts_open|abs) * 100) }}
+        {% endif %}
+      {% else %}
+        long
+      {% endif %}
+    </td>
+    <td>
+      {% if p.is_naked %}
+        <span class="pill pill-err">NAKED</span>
+      {% elif p.contracts_open < 0 %}
+        <span class="pill pill-ok">covered</span>
+      {% else %}
+        <span class="pill pill-muted">long</span>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{# ─ PORTFOLIO CONCENTRATION ─ #}
+{% if concentration %}
+<h3 style="margin-top:20px">Portfolio concentration — top {{ concentration|length }} positions</h3>
+<table>
+  <tr><th>Ticker</th><th class="num">Market value</th><th class="num">% of portfolio</th></tr>
+  {% for c in concentration %}
+  <tr>
+    <td><b>{{ c.ticker }}</b></td>
+    <td class="num">${{ '{:,.2f}'.format(c.value) }}</td>
+    <td class="num" style="color:{{ '#c07000' if c.pct >= 20 else '#666' }}">
+      {{ '%.1f'|format(c.pct) }}%
+      {% if c.pct >= 20 %}<span style="font-size:11px">⚠ over 20%</span>{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  <tr style="border-top:2px solid #333">
+    <td colspan="2" style="text-align:right"><b>Total portfolio value:</b></td>
+    <td class="num"><b>${{ '{:,.2f}'.format(total_portfolio_value) }}</b></td>
+  </tr>
+</table>
+{% endif %}
+"""
+
+
+@bp.get('/admin/strategy')
+def strategy_dashboard_page():
+    """Full strategy dashboard: retained lots + triggers + options + cycles.
+    Reads the latest detector output from strategy_tracker tables + joins
+    with current SecurityHolding for market value math."""
+    from ..models import (OptionsPosition, RetainedLot, Security,
+                          SecurityHolding, StrategyTracker, TradedCycle)
+    from .. import strategy_settings
+
+    cfg = strategy_settings.load()
+    trigger_pct = float(cfg['diversification_trigger_pct'])
+    sell_pct = float(cfg['diversification_sell_pct']) / 100.0
+
+    last_run = (StrategyTracker.query
+                .order_by(StrategyTracker.ran_at.desc()).first())
+
+    # Preload securities + holdings for O(1) lookups per lot.
+    secs = {s.security_id: s for s in Security.query.all()}
+    holdings = {h.security_id: h for h in SecurityHolding.query.all()}
+
+    def _lot_metrics(lot):
+        sec = secs.get(lot.security_id)
+        holding = holdings.get(lot.security_id)
+        cost_basis_total = round(
+            (lot.cost_basis_per_share or 0) * lot.shares_remaining, 2)
+        current_price = None
+        market_value = None
+        unrealized = None
+        gain_pct = None
+        if holding and holding.institution_price is not None:
+            current_price = holding.institution_price
+            market_value = round(current_price * lot.shares_remaining, 2)
+            unrealized = round(market_value - cost_basis_total, 2)
+            if cost_basis_total > 0:
+                gain_pct = round(100.0 * unrealized / cost_basis_total, 1)
+        return {
+            'lot': lot, 'ticker': sec.ticker_symbol if sec else '—',
+            'purchase_date': lot.purchase_date,
+            'cost_per_share': lot.cost_basis_per_share,
+            'current_price': current_price,
+            'gain_pct': gain_pct,
+            'shares_remaining': lot.shares_remaining,
+            'cost_basis_total': cost_basis_total,
+            'market_value': market_value,
+            'unrealized': unrealized,
+            'strategy_tag': lot.strategy_tag,
+        }
+
+    all_lots = [_lot_metrics(lot) for lot in
+                RetainedLot.query.order_by(RetainedLot.purchase_date).all()]
+
+    # Sort retained lots by gain_pct descending (biggest winners first),
+    # None gains sink to bottom.
+    all_lots.sort(key=lambda x: (
+        x['gain_pct'] if x['gain_pct'] is not None else -99999.0), reverse=True)
+
+    # 400%+ triggers with sell recommendation math.
+    triggers_hit = []
+    for m in all_lots:
+        if m['gain_pct'] is not None and m['gain_pct'] >= trigger_pct:
+            sell_qty = round(m['shares_remaining'] * sell_pct, 4)
+            proceeds = (round(sell_qty * m['current_price'], 2)
+                        if m['current_price'] else None)
+            triggers_hit.append({**m, 'sell_qty': sell_qty,
+                                 'sell_proceeds_est': proceeds})
+    approaching_triggers = [m for m in all_lots
+                            if m['gain_pct'] is not None
+                            and 350.0 <= m['gain_pct'] < trigger_pct]
+
+    # Complete cycles: only 5:4-matched ones, ordered by sell_date desc.
+    complete_cycles_raw = (TradedCycle.query
+                           .filter_by(cycle_status='complete')
+                           .order_by(TradedCycle.sell_date.desc()).all())
+    complete_cycles = []
+    total_realized = 0.0
+    for c in complete_cycles_raw:
+        sec = secs.get(c.security_id)
+        gain_pct = (100.0 * (c.sell_price - c.buy_price) / c.buy_price
+                    if c.buy_price else 0.0)
+        complete_cycles.append({
+            'ticker': sec.ticker_symbol if sec else '—',
+            'buy_date': c.buy_date, 'sell_date': c.sell_date,
+            'buy_qty': c.buy_qty, 'sell_qty': c.sell_qty,
+            'buy_price': c.buy_price, 'sell_price': c.sell_price,
+            'gain_pct': round(gain_pct, 1),
+            'realized_pnl': c.realized_pnl or 0.0,
+        })
+        total_realized += (c.realized_pnl or 0.0)
+
+    # Options positions ordered by expiration ascending.
+    from datetime import date as _date
+    options_positions_raw = (OptionsPosition.query
+                             .filter(OptionsPosition.status == 'open')
+                             .order_by(OptionsPosition.expiration_date.asc())
+                             .all())
+    options_positions = []
+    for p in options_positions_raw:
+        days_to_exp = None
+        if p.expiration_date:
+            days_to_exp = (p.expiration_date - _date.today()).days
+        options_positions.append({
+            'underlying_ticker': p.underlying_ticker,
+            'contract_type': p.contract_type,
+            'strike_price': p.strike_price,
+            'expiration_date': p.expiration_date,
+            'days_to_exp': days_to_exp,
+            'contracts_open': p.contracts_open,
+            'covered_by_shares': p.covered_by_shares,
+            'covered_by_cash': p.covered_by_cash,
+            'is_naked': p.is_naked,
+        })
+    naked_positions = [p for p in options_positions if p['is_naked']]
+
+    # Concentration: top positions by market_value across all holdings
+    # (long only), scoped to the current Company.
+    scope = _current_company()
+    companies_by_account = _resolve_account_companies()
+    account_values: dict = {}
+    for h in holdings.values():
+        if scope:
+            if companies_by_account.get(h.account_id, '') != scope:
+                continue
+        if h.institution_value is None or h.institution_value <= 0:
+            continue
+        sec = secs.get(h.security_id)
+        if sec is None or sec.is_option:
+            continue
+        ticker = sec.ticker_symbol or '—'
+        account_values[ticker] = account_values.get(ticker, 0) + h.institution_value
+    total_portfolio_value = sum(account_values.values())
+    concentration = []
+    if total_portfolio_value > 0:
+        sorted_positions = sorted(account_values.items(),
+                                  key=lambda x: -x[1])
+        for ticker, value in sorted_positions[:10]:
+            concentration.append({
+                'ticker': ticker, 'value': value,
+                'pct': round(100.0 * value / total_portfolio_value, 1),
+            })
+
+    return _page(STRATEGY_DASHBOARD_BODY, page='investments',
+                 last_run=last_run,
+                 retained_lots=all_lots,
+                 triggers_hit=triggers_hit,
+                 approaching_triggers=approaching_triggers,
+                 diversification_trigger_pct=trigger_pct,
+                 diversification_sell_pct=float(cfg['diversification_sell_pct']),
+                 complete_cycles=complete_cycles,
+                 total_realized=total_realized,
+                 options_positions=options_positions,
+                 naked_positions=naked_positions,
+                 concentration=concentration,
+                 total_portfolio_value=total_portfolio_value,
+                 flash_msg=request.args.get('flash', ''))
+
+
+# ── v0.4.40 · Data hygiene actions ───────────────────────────────
+
+DATA_HYGIENE_BODY = """
+<h2>Data hygiene</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+<p style="font-size:14px;color:#555">
+  Local-database housekeeping. None of these actions touch ERPNext or
+  Plaid — they only clean up Bank Bridge's local mirror. Safe to run
+  repeatedly; each action is idempotent.
+</p>
+
+<h3>Duplicate PlaidAccount rows across items</h3>
+<p style="font-size:13px;color:#666">
+  A re-link creates a NEW PlaidItem with NEW PlaidAccount rows. The old
+  Item's PlaidAccounts stay in the DB (needed for historical transaction
+  attribution). But when an old row isn't marked
+  <code>superseded_by_account_id</code>, it can show up in reconciliation
+  and admin queries alongside the current row, causing double-counting.
+</p>
+
+{% if duplicate_groups %}
+<table>
+  <tr>
+    <th>Bank</th><th>Mask</th><th>Company</th>
+    <th class="num">Rows</th><th>Active row</th>
+    <th>Superseded status</th>
+  </tr>
+  {% for g in duplicate_groups %}
+  <tr>
+    <td>{{ g.bank }}</td>
+    <td><code>{{ g.mask }}</code></td>
+    <td>{{ g.company or '—' }}</td>
+    <td class="num">{{ g.rows|length }}</td>
+    <td><code style="font-size:11px">{{ g.active_id[:14] }}…</code></td>
+    <td>
+      {{ g.superseded_count }} of {{ g.rows|length - 1 }} old row(s)
+      marked superseded
+      {% if g.superseded_count < g.rows|length - 1 %}
+      <span style="color:#c07000">⚠ needs cleanup</span>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+
+<form method="post" action="/admin/data_hygiene/mark_superseded"
+      onsubmit="return confirm('Mark old duplicate PlaidAccounts as superseded by the newest active-item counterparts? This is data-only cleanup; ERPNext isn\\'t touched.')"
+      style="margin:12px 0">
+  <button type="submit" class="primary">Mark duplicates as superseded</button>
+  <span style="font-size:12px;color:#888;margin-left:12px">
+    Runs a fingerprint-based match (bank + mask + company). Older
+    account_ids on disconnected items are pointed at the newest active
+    counterpart via <code>superseded_by_account_id</code>. Sync_enabled
+    is also set to false on superseded rows so they stop pulling data.
+  </span>
+</form>
+{% else %}
+<div class="card">
+  <b>No duplicate account groups detected.</b> All PlaidAccounts appear
+  to be either uniquely fingerprinted or properly marked superseded.
+</div>
+{% endif %}
+
+<h3 style="margin-top:24px">Disconnected items with active PlaidAccounts</h3>
+<p style="font-size:13px;color:#666">
+  When an operator disconnects a bank via
+  <code>/admin/accounts</code>, the PlaidItem is marked disconnected but
+  its PlaidAccounts stay <code>sync_enabled=True</code>. Since v0.4.18
+  the bulk-import path already skips accounts on disconnected items, but
+  sync_enabled being <code>True</code> on retired rows is untidy and
+  triggers per-sync log noise.
+</p>
+
+{% if orphan_active_accounts %}
+<table>
+  <tr>
+    <th>Institution</th><th>Item</th><th>Mask</th>
+    <th>ERPNext Bank Account</th><th class="num">Sync enabled?</th>
+  </tr>
+  {% for a in orphan_active_accounts %}
+  <tr>
+    <td>{{ a.institution or '—' }}</td>
+    <td><code style="font-size:11px">{{ a.item_id[:14] }}…</code></td>
+    <td><code>{{ a.mask or '—' }}</code></td>
+    <td>{{ a.erpnext or '—' }}</td>
+    <td class="num">yes</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<form method="post" action="/admin/data_hygiene/disable_orphan_sync"
+      onsubmit="return confirm('Disable sync on PlaidAccounts whose Item is disconnected? They can be re-enabled per account on /admin/accounts if needed.')"
+      style="margin:12px 0">
+  <button type="submit" class="primary">Disable sync on orphaned accounts</button>
+</form>
+{% else %}
+<div class="card">
+  <b>No orphaned active accounts.</b> Every sync_enabled PlaidAccount
+  belongs to a connected Item.
+</div>
+{% endif %}
+"""
+
+
+def _duplicate_account_groups() -> list:
+    """Group PlaidAccounts by (institution, mask, owning_company). Any
+    group with more than one row is a duplicate — usually from a re-link
+    creating a new Item while the old one still holds the same account.
+    The 'active' row is the one whose PlaidItem is not disconnected;
+    if multiple non-disconnected rows exist (rare), the newest by
+    created_at wins."""
+    from ..models import PlaidAccount, PlaidItem
+    accounts = (db.session.query(PlaidAccount, PlaidItem)
+                .join(PlaidItem, PlaidItem.item_id == PlaidAccount.item_id)
+                .order_by(PlaidAccount.created_at.desc()).all())
+    groups: dict = {}
+    for acct, item in accounts:
+        key = ((item.institution_id or item.institution_name or ''),
+               (acct.mask or ''),
+               (acct.owning_company or ''))
+        groups.setdefault(key, []).append((acct, item))
+    dupes = []
+    for (institution, mask, company), rows in groups.items():
+        if len(rows) < 2 or not mask:
+            continue
+        # Pick the active row: prefer non-disconnected, newest by created_at.
+        active_rows = [r for r in rows if not r[1].disconnected]
+        active = (active_rows[0] if active_rows else rows[0])
+        active_acct = active[0]
+        superseded_count = sum(1 for a, _ in rows
+                               if a.account_id != active_acct.account_id
+                               and (a.superseded_by_account_id ==
+                                    active_acct.account_id))
+        dupes.append({
+            'bank': (rows[0][1].institution_name or institution),
+            'mask': mask, 'company': company,
+            'rows': rows,
+            'active_id': active_acct.account_id,
+            'superseded_count': superseded_count,
+        })
+    return dupes
+
+
+def _orphan_active_accounts() -> list:
+    """PlaidAccounts on disconnected items that still have
+    sync_enabled=True. Deprecation flag not the same as disconnected —
+    a disconnected item should have all its accounts flipped off."""
+    from ..models import PlaidAccount, PlaidItem
+    rows = (db.session.query(PlaidAccount, PlaidItem)
+            .join(PlaidItem, PlaidItem.item_id == PlaidAccount.item_id)
+            .filter(PlaidItem.disconnected.is_(True),
+                    PlaidAccount.sync_enabled.is_(True)).all())
+    return [{
+        'institution': item.institution_name,
+        'item_id': item.item_id, 'mask': acct.mask or '',
+        'erpnext': acct.erpnext_bank_account_name or '',
+    } for acct, item in rows]
+
+
+@bp.get('/admin/data_hygiene')
+def data_hygiene_page():
+    return _page(DATA_HYGIENE_BODY, page='accounts',
+                 duplicate_groups=_duplicate_account_groups(),
+                 orphan_active_accounts=_orphan_active_accounts(),
+                 flash_msg=request.args.get('flash', ''))
+
+
+@bp.post('/admin/data_hygiene/mark_superseded')
+def data_hygiene_mark_superseded():
+    """For every duplicate PlaidAccount group, mark all non-active rows
+    as superseded_by the active row's account_id AND flip their
+    sync_enabled to False. Idempotent — a row already correctly
+    superseded is skipped."""
+    from ..models import PlaidAccount
+    updated = 0
+    for group in _duplicate_account_groups():
+        active_id = group['active_id']
+        for acct, item in group['rows']:
+            if acct.account_id == active_id:
+                continue
+            if acct.superseded_by_account_id == active_id and not acct.sync_enabled:
+                continue
+            acct.superseded_by_account_id = active_id
+            acct.sync_enabled = False
+            updated += 1
+    db.session.commit()
+    return redirect('/admin/data_hygiene?flash=' + quote_plus(
+        f'Marked {updated} duplicate PlaidAccount(s) as superseded.'))
+
+
+@bp.post('/admin/data_hygiene/disable_orphan_sync')
+def data_hygiene_disable_orphan_sync():
+    """Flip sync_enabled=False on every PlaidAccount whose PlaidItem
+    is disconnected. Idempotent."""
+    from ..models import PlaidAccount, PlaidItem
+    disconnected_ids = {row.item_id for row in
+                        PlaidItem.query.filter(
+                            PlaidItem.disconnected.is_(True)).all()}
+    if not disconnected_ids:
+        return redirect('/admin/data_hygiene?flash=' + quote_plus(
+            'No disconnected items — nothing to disable.'))
+    updated = 0
+    for acct in (PlaidAccount.query
+                 .filter(PlaidAccount.item_id.in_(disconnected_ids),
+                         PlaidAccount.sync_enabled.is_(True)).all()):
+        acct.sync_enabled = False
+        updated += 1
+    db.session.commit()
+    return redirect('/admin/data_hygiene?flash=' + quote_plus(
+        f'Disabled sync on {updated} orphaned account(s).'))
+
+
+# ── v0.4.32 · Strategy tracker run trigger ───────────────────────
+
+@bp.post('/admin/strategy/rerun')
+def rerun_strategy_detection():
+    """Manually trigger the 5:4 + options detector. Reads current
+    SecurityTransaction rows, wipes derived state, recomputes cycles /
+    lots / options positions. Logged as a StrategyTracker audit row."""
+    from .. import strategy_tracker
+    try:
+        run = strategy_tracker.run_detection(notes='manual — operator triggered')
+    except Exception as e:  # pragma: no cover
+        return redirect('/admin/strategy?flash=' + quote_plus(
+            f'Detection failed: {e}'))
+    msg = (f"Detection complete. Scanned {run.transactions_scanned} "
+           f"transactions → {run.cycles_created} cycle(s), "
+           f"{run.retained_lots_created} retained lot(s), "
+           f"{run.options_positions_touched} option position(s), "
+           f"{run.naked_positions_flagged} naked flagged.")
+    return redirect('/admin/strategy?flash=' + quote_plus(msg))
+
+
+# ── v0.4.29 · Investments (Phase A step 3) ───────────────────────
+#
+# Two pages surface the data investments.sync_investments_for_item lands in
+# the securities/holdings/security_transactions tables:
+#
+#   /admin/holdings — current positions per mapped investment account, sorted
+#     by market value descending. Shows ticker, name, quantity, cost basis,
+#     current price + as-of stamp, market value, and unrealized gain / gain %.
+#   /admin/investment_transactions — trade history, filterable by security
+#     and account and date range, with the same pagination-with-cap pattern
+#     the /admin/transactions page uses.
+#
+# Both pages read straight from the DB — no live Plaid calls — so a slow or
+# unreachable Plaid doesn't stall the UI.
+
+HOLDINGS_BODY = """
+<h2>Investment holdings</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+<p style="font-size:14px;color:#555">
+  Current positions across investment accounts, from the last
+  <code>/investments/holdings/get</code> Plaid pulled. Prices shown are the
+  institution price Plaid returned with each holding + the timestamp it was
+  as of — this is snapshot data, not real-time; TradingView (or your
+  brokerage app) is authoritative for current market. Balance-sheet math uses
+  the snapshot.
+</p>
+<div style="margin:12px 0">
+  <form method="post" action="/admin/strategy/rerun" style="display:inline"
+        onsubmit="return confirm('Run the 5:4 strategy detector against your current investment transactions? This wipes existing derived cycles and recomputes from the raw data.')">
+    <button type="submit" class="secondary">Run strategy detection</button>
+  </form>
+  <span style="font-size:12px;color:#888;margin-left:8px">
+    v0.4.32 · runs the 5:4 detector: matches buys to sells (~0.8× qty at ~25%
+    profit), records TradedCycles + RetainedLots, prepares data for the
+    strategy dashboard.
+  </span>
+</div>
+{% if last_run %}
+<div class="card" style="max-width:800px">
+  <b>Last detection run:</b> {{ last_run.ran_at.strftime('%Y-%m-%d %H:%M') }}
+  &middot; scanned {{ last_run.transactions_scanned }} transactions
+  &middot; <b>{{ last_run.cycles_created }}</b> cycles
+  &middot; <b>{{ last_run.retained_lots_created }}</b> retained lots
+  {% if last_run.notes %}
+  <div style="font-size:12px;color:#888;margin-top:4px">{{ last_run.notes }}</div>
+  {% endif %}
+</div>
+{% endif %}
+{% if not enabled_items %}
+<div class="banner-warn">
+  <h3>No investment accounts synced yet</h3>
+  <p style="font-size:14px;margin:0">
+    Investment holdings require the <code>investments</code> product to be
+    enabled on your Plaid Production application AND requested at link time
+    (v0.4.26+). Any existing Item minted before v0.4.26 needs a disconnect
+    + re-link to get investments data. New Items link with it by default.
+  </p>
+</div>
+{% endif %}
+{% for group in groups %}
+<h3 style="margin-bottom:4px">{{ group.account_label }}</h3>
+<div style="font-size:13px;color:#666">
+  {{ group.company or 'no Company resolved' }}
+  {% if group.market_value is not none %}
+  &middot; total market value {{ '%.2f'|format(group.market_value) }}
+  {{ group.currency }}
+  {% endif %}
+  {% if group.last_sync %}
+  &middot; last sync {{ group.last_sync.strftime('%Y-%m-%d %H:%M') }}
+  {% endif %}
+</div>
+<table>
+  <tr>
+    <th>Ticker</th><th>Name</th><th>Type</th>
+    <th class="num">Quantity</th>
+    <th class="num">Cost basis</th>
+    <th class="num">Price</th>
+    <th class="num">Market value</th>
+    <th class="num">Unrealized</th>
+    <th>As of</th>
+  </tr>
+  {% for h in group.rows %}
+  <tr>
+    <td>
+      {% if h.security.is_option %}
+        <span title="{{ h.security.option_contract_type|upper }} @{{ h.security.option_strike_price }} exp {{ h.security.option_expiration_date }}">{{ h.security.option_underlying_ticker or h.security.ticker_symbol or '—' }}</span>
+        <span class="pill pill-muted" style="font-size:10px"
+              title="Option contract">opt</span>
+      {% else %}
+        <b>{{ h.security.ticker_symbol or '—' }}</b>
+      {% endif %}
+    </td>
+    <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ h.security.name or '—' }}</td>
+    <td style="color:#888;font-size:12px">{{ h.security.type or '—' }}</td>
+    <td class="num">{{ '%.4f'|format(h.holding.quantity) }}</td>
+    <td class="num">{{ '%.2f'|format(h.holding.cost_basis)
+                       if h.holding.cost_basis is not none else '—' }}</td>
+    <td class="num">{{ '%.2f'|format(h.holding.institution_price)
+                       if h.holding.institution_price is not none else '—' }}</td>
+    <td class="num">{{ '%.2f'|format(h.holding.institution_value)
+                       if h.holding.institution_value is not none else '—' }}</td>
+    <td class="num">
+      {% if h.unrealized is not none %}
+        <span style="color:{{ '#1b5e20' if h.unrealized >= 0 else '#a04000' }}">
+          {{ '%+.2f'|format(h.unrealized) }}
+          {% if h.unrealized_pct is not none %}
+          <span style="font-size:11px">({{ '%+.1f'|format(h.unrealized_pct) }}%)</span>
+          {% endif %}
+        </span>
+      {% else %}—{% endif %}
+    </td>
+    <td style="font-size:12px;color:#888">{{ h.holding.institution_price_as_of.isoformat() if h.holding.institution_price_as_of else '—' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endfor %}
+{% if groups %}
+<p style="font-size:14px">
+  <a href="/admin/investment_transactions">→ investment transactions</a>
+</p>
+{% endif %}
+"""
+
+
+INVESTMENT_TXNS_BODY = """
+<h2>Investment transactions</h2>
+<p style="font-size:14px;color:#555">
+  Trade history from <code>/investments/transactions/get</code>. Includes
+  buys, sells, dividends, splits, transfers, fees, and cancellations — every
+  event Plaid ships against an investment account. The v0.5.0 lot tracker
+  reads these to auto-classify 5:4 cycles.
+</p>
+<div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+<form method="get" action="/admin/investment_transactions" class="card"
+      style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin:0">
+  <label style="margin:0">Type
+    <select name="type">
+      <option value="">(any)</option>
+      {% for t in ['buy', 'sell', 'cash', 'transfer', 'fee', 'cancel'] %}
+      <option value="{{ t }}" {{ 'selected' if t == cur_type else '' }}>{{ t }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label style="margin:0">Ticker
+    <input name="ticker" value="{{ cur_ticker }}" placeholder="AAPL"
+           style="width:120px">
+  </label>
+  <button type="submit" class="primary">Filter</button>
+</form>
+</div>
+<p style="font-size:13px;color:#555;margin:8px 0">
+  Showing <b>{{ rows|length }}</b>{% if total > rows|length %} of
+  <b>{{ total }}</b>{% endif %} matching transactions
+</p>
+<table>
+  <tr>
+    <th>Date</th><th>Ticker</th><th>Type / Subtype</th><th>Name</th>
+    <th class="num">Quantity</th><th class="num">Price</th>
+    <th class="num">Amount</th><th class="num">Fees</th>
+  </tr>
+  {% for r in rows %}
+  <tr>
+    <td style="white-space:nowrap">{{ r.txn.date.isoformat() if r.txn.date else '—' }}</td>
+    <td>
+      {% if r.security and r.security.is_option %}
+        <span>{{ r.security.option_underlying_ticker or r.security.ticker_symbol or '—' }}</span>
+        <span class="pill pill-muted" style="font-size:10px">opt</span>
+      {% else %}
+        <b>{{ r.security.ticker_symbol if r.security else '—' }}</b>
+      {% endif %}
+    </td>
+    <td style="font-size:12px">
+      <b>{{ r.txn.type or '—' }}</b>
+      {% if r.txn.subtype %}<span style="color:#888">/ {{ r.txn.subtype }}</span>{% endif %}
+    </td>
+    <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.txn.name or '—' }}</td>
+    <td class="num">{{ '%.4f'|format(r.txn.quantity) }}</td>
+    <td class="num">{{ '%.2f'|format(r.txn.price) if r.txn.price else '—' }}</td>
+    <td class="num">{{ '%.2f'|format(r.txn.amount) }}</td>
+    <td class="num">{{ '%.2f'|format(r.txn.fees) if r.txn.fees is not none else '—' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+<p style="font-size:14px"><a href="/admin/holdings">← back to holdings</a></p>
+"""
+
+
+@bp.get('/admin/holdings')
+def holdings_page():
+    """Current investment positions per mapped account (v0.4.29). Reads
+    directly from the local securities + security_holdings tables — no
+    live Plaid calls. Grouped by PlaidAccount, ordered by market value
+    descending within each group so the largest position leads."""
+    from ..models import (PlaidAccount, PlaidItem, Security, SecurityHolding)
+    scope = _current_company()
+    companies_by_account = _resolve_account_companies()
+    invest_accounts = (
+        PlaidAccount.query
+        .filter(PlaidAccount.type.in_(('investment', 'brokerage')))
+        .order_by(PlaidAccount.name).all())
+    enabled_items = (
+        db.session.query(PlaidItem.item_id)
+        .filter(PlaidItem.investments_synced_at.isnot(None),
+                PlaidItem.disconnected.isnot(True))
+        .all())
+    groups = []
+    for account in invest_accounts:
+        company = companies_by_account.get(account.account_id, '')
+        if scope and company != scope:
+            continue
+        holdings = (SecurityHolding.query
+                    .filter_by(account_id=account.account_id).all())
+        if not holdings:
+            continue
+        # Enrich with the linked Security row and unrealized gain math.
+        sids = {h.security_id for h in holdings}
+        securities = {s.security_id: s for s in
+                      Security.query.filter(Security.security_id.in_(sids)).all()}
+        enriched = []
+        for h in sorted(holdings,
+                        key=lambda x: -(x.institution_value or 0)):
+            sec = securities.get(h.security_id)
+            unrealized = None
+            unrealized_pct = None
+            if (h.institution_value is not None
+                    and h.cost_basis is not None):
+                unrealized = round(h.institution_value - h.cost_basis, 2)
+                if h.cost_basis > 0:
+                    unrealized_pct = round(
+                        100.0 * unrealized / h.cost_basis, 1)
+            enriched.append({'holding': h, 'security': sec,
+                             'unrealized': unrealized,
+                             'unrealized_pct': unrealized_pct})
+        total_value = sum((h.institution_value or 0) for h in holdings)
+        last_sync = None
+        item = PlaidItem.query.filter_by(item_id=account.item_id).first()
+        if item and item.investments_synced_at:
+            last_sync = item.investments_synced_at
+        label = (account.name or account.official_name
+                 or account.mask or account.account_id)
+        if account.mask:
+            label = f'{label} ••{account.mask}'
+        groups.append({
+            'account_label': label, 'company': company, 'rows': enriched,
+            'market_value': round(total_value, 2),
+            'currency': account.iso_currency_code or account.currency or 'USD',
+            'last_sync': last_sync,
+        })
+    from ..models import StrategyTracker
+    last_run = (StrategyTracker.query
+                .order_by(StrategyTracker.ran_at.desc()).first())
+    return _page(HOLDINGS_BODY, page='investments', groups=groups,
+                 enabled_items=enabled_items, last_run=last_run,
+                 flash_msg=request.args.get('flash', ''))
+
+
+@bp.get('/admin/investment_transactions')
+def investment_transactions_page():
+    """Investment transaction history with type + ticker filters (v0.4.29)."""
+    from ..models import Security, SecurityTransaction, PlaidAccount
+    cur_type = (request.args.get('type') or '').strip().lower()
+    cur_ticker = (request.args.get('ticker') or '').strip().upper()
+    try:
+        limit = int(request.args.get('limit') or 500)
+    except ValueError:
+        limit = 500
+    limit = max(50, min(limit, 5000))
+    scope = _current_company()
+    q = SecurityTransaction.query
+    if scope:
+        scoped_ids = [aid for aid, c in _resolve_account_companies().items()
+                      if c == scope]
+        q = q.filter(SecurityTransaction.account_id.in_(scoped_ids))
+    if cur_type:
+        q = q.filter(SecurityTransaction.type == cur_type)
+    if cur_ticker:
+        matching_sids = [s.security_id for s in Security.query.filter(
+            db.or_(Security.ticker_symbol.ilike(cur_ticker),
+                   Security.option_underlying_ticker.ilike(cur_ticker))).all()]
+        if not matching_sids:
+            matching_sids = ['__no_match__']
+        q = q.filter(SecurityTransaction.security_id.in_(matching_sids))
+    total = q.count()
+    txns = (q.order_by(SecurityTransaction.date.desc().nullslast(),
+                       SecurityTransaction.id.desc())
+            .limit(limit).all())
+    # Enrich with securities in one query
+    sids = {t.security_id for t in txns if t.security_id}
+    secs = {s.security_id: s for s in
+            Security.query.filter(Security.security_id.in_(sids)).all()}
+    rows = [{'txn': t, 'security': secs.get(t.security_id)} for t in txns]
+    return _page(INVESTMENT_TXNS_BODY, page='investments', rows=rows,
+                 total=total, cur_type=cur_type, cur_ticker=cur_ticker)
 
 
 # ── v0.4.5 · Counterparty overlay ────────────────────────────────

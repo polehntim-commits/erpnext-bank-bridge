@@ -301,6 +301,23 @@ def pull_item(item: PlaidItem, plaid_client: PlaidClient) -> dict:
             log.warning('liability refresh failed for %s', item.item_id,
                         exc_info=True)
 
+    # v0.4.30 · investment holdings + transactions run on EVERY sync tick,
+    # NOT gated by _should_refresh_accounts. The account-refresh throttle
+    # (default 24h) is designed to save on /accounts/get calls whose
+    # balance data is dashboard-only; investments data drives the v0.5.0
+    # lot tracker, which needs current holdings + fresh trade history on
+    # every sync so the strategy dashboard reflects the latest state.
+    # Same fail-soft posture as liabilities: an Item without the
+    # `investments` product answers {} and the sync continues.
+    try:
+        from . import investments
+        investments.sync_investments_for_item(
+            item, plaid_client, access_token)
+    except Exception:  # pragma: no cover - defensive
+        db.session.rollback()
+        log.warning('investment sync failed for %s', item.item_id,
+                    exc_info=True)
+
     # v0.4.0: an Item whose every account is balance-only (e.g. a 401k-only
     # institution) has no transactions to fetch — Plaid returns none without the
     # `investments` product — so skip the billable /transactions/sync entirely.

@@ -1277,6 +1277,109 @@ Negative amounts are read in both printed forms (`-1,234.56` and `(1,234.56)`).
 An unrecognized layout, or a scanned statement with no text layer, yields **no
 balance** — never a guess. The PDF is still stored and viewable.
 
+### Reading real statements (v0.4.41)
+
+Two things had to change once production Wells Fargo PDFs started arriving.
+
+**Line structure decides which amount a label owns.** Up to v0.4.40 the parser
+flattened the whole PDF into one string and took the first amount within 120
+characters of a label. On a one-column consumer statement that works. On a
+Wells Fargo Advisors brokerage statement it does not: the *Cash sweep activity*
+table extracts as
+
+```
+TRANSFER TO BANK DEPOSIT SWEEP ENDING BALANCE06/16 100,000.00 06/30 39,751.95
+```
+
+and `ending balance` claimed `100,000.00` — a single transfer — as the month's
+closing balance. All 26 real statements on the test install parsed a wrong
+closing that way. Matching is now **per line**, and the run between a label and
+its amount must contain **no digits** (after an `on <date>` clause is stripped,
+so `Beginning balance on July 1  $17,600.00` still reads). A label followed by
+`06/16` is a table row and is refused.
+
+**Labels only mean something inside their section.** `Interest`, `Total` and
+`Other additions` each appear many times in a 35-page brokerage statement, and
+the one that matters sits under a particular heading. Every field is looked up
+inside a named section, which is also what stops the twelve-page holdings
+table — whose ~90 rows each begin `Total …` — from answering a question about
+realized gains. A heading is distinguished from prose that merely mentions it
+(page 2 opens a disclosure paragraph with the words "Income summary:") by
+carrying its column headers or being short.
+
+**Brokerage statements state two different balances.** The *Progress summary*
+gives total account value — cash plus securities at market. The *Cash flow
+summary* gives the cash side alone. The **cash** figure is what reconciliation
+and opening-balance anchoring use, because it is the only one the mirror can
+reproduce — Bank Bridge sums cash events and has no record of market
+appreciation. Total account value is shown beside it, never reconciled against.
+
+### Everything a statement asserts (v0.4.41)
+
+The parser no longer stops at two balances. Everything it recovers lands in
+`PlaidStatement.parsed_metadata` (JSONB), with the handful that get queried
+promoted to real columns beside it and written from the same blob, so the two
+can never disagree.
+
+| Layout | Fields recovered |
+|---|---|
+| **WF Advisors** (brokerage) — 31 fields, **verified** against 26 production statements | cash opening/closing, total account value opening/closing, cash deposited/withdrawn, securities purchased/sold/deposited/withdrawn, income and distributions, other additions/subtractions, net additions/subtractions to cash, advisory + platform fees, interest, sweep income, ordinary + qualified dividends, taxable/tax-exempt/total income, unrealized + realized gains (period and YTD, short and long term), checks written, ATM and card activity, available funds |
+| **WF deposit** (checking/savings/MMA) — *unverified* | opening/closing balance, deposits and credits, withdrawals and debits, checks paid, interest earned, service fees, average ledger and collected balance |
+| **WF credit card** — *unverified* | previous and new balance, payments and credits, purchases, cash advances, fees charged, interest charged, minimum payment due, payment due date, credit limit, available credit |
+
+Every blob also carries its own provenance: `parser_version`, `layout`,
+`verified`, `fields_failed`, and the period the *document* states for itself —
+kept beside the calendar month derived from Plaid, because a bank whose cycle
+isn't a calendar month makes every reconciliation in that window suspect and
+this is the only record of it.
+
+**"Unverified" is a real caveat.** The deposit and card field tables were
+written from the standard Wells Fargo layouts but have not been checked against
+a real document, because the live install holds none — its deposit and card
+"statements" are Plaid sandbox mocks (*First Platypus Bank*, `Balance on
+XX/XX:`) with no labelled totals at all. Figures from them are safe in the
+sense everything here is safe — an unrecognized layout yields nothing, never a
+guess — but the UI marks them **unverified layout** until a real statement has
+been eyeballed against one.
+
+**Extraction is defensive per field.** Each field runs inside its own
+try/except; a pattern that raises costs that one figure, is named in
+`fields_failed`, and is logged with the statement it failed on. A bad regex can
+never take down the metadata for a statement whose balances parsed perfectly.
+
+### Validation — statement vs Plaid vs the mirror
+
+`/admin/statements/<id>` puts three independent accounts of the same month side
+by side:
+
+| | What it is | Why it can be wrong |
+|---|---|---|
+| **Statement** | what the institution wrote down and mailed | recovered by regex from a PDF, so it can be *misread* |
+| **Plaid** | what the API reports for the account now | a snapshot of *today* — compared only on the newest statement |
+| **Mirror** | what Bank Bridge computes from stored transactions | complete arithmetic over a feed that may have *gaps* |
+
+Two agreeing is ordinary. Two *disagreeing* is the finding, and each cause has
+a different fix. Rows are flagged when they differ by more than
+`STATEMENTS_VARIANCE_DOLLARS` (default `$1.00`) **and**
+`STATEMENTS_VARIANCE_PCT` (default `0.001`) — both, so neither a rounding cent
+on a $1.3M balance nor a fixed percentage of a tiny one raises noise. Signs are
+normalised once, to cash-in-positive, so subtracting one column from the other
+means something; the stored figures keep the bank's own signs.
+
+**Statements are checked against each other.** One month's closing balance is
+the next month's opening, so any statement whose opening disagrees with the
+prior month's closing is flagged `parse_suspect` and marked **⚠ chain** in the
+UI. It is advisory — a posted opening balance is still gated by the full
+reconciliation test — but it catches a misparse without ERPNext, without a
+mirrored transaction, and without anyone reading a PDF.
+
+**After upgrading, press *Re-parse stored PDFs*** on `/admin/statements`. A
+pull skips statements it already holds, so an improved parser reaches nothing
+already on disk until you ask. The re-parse re-reads the bytes, rewrites only
+the parsed columns, and leaves the PDFs and every posted journal entry alone;
+the corrected balances then flow to the ERPNext `Bank Statement` records on the
+next sync.
+
 ### Enabling it
 
 The `statements` product must be approved on your Plaid application and requested
@@ -2485,6 +2588,8 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `STATEMENTS_RECONCILE_TOLERANCE` | `1.00` | v0.4.9 · how far a statement's closing balance may sit from the mirror's own arithmetic before the period is flagged. Also load-bearing: a statement outside this tolerance is never used to book an opening balance |
 | `ERPNEXT_STATEMENTS_ENABLED` | `true` | v0.4.10 · provision the `Bank Statement` doctype and upload statements into ERPNext. Off → nothing is provisioned or uploaded, and v0.4.9's local storage behaves identically |
 | `ERPNEXT_STATEMENTS_AUTO_SYNC` | `true` | v0.4.10 · upload automatically at startup and after each pull. Off leaves the doctype provisioned but makes uploading a manual step (`scripts.backfill_erpnext_statements`) |
+| `STATEMENTS_VARIANCE_DOLLARS` | `1.00` | v0.4.41 · dollar half of the flag threshold on the statement validation view. A figure must differ from the mirror by more than this **and** more than `STATEMENTS_VARIANCE_PCT` to be flagged |
+| `STATEMENTS_VARIANCE_PCT` | `0.001` | v0.4.41 · fractional half of the same threshold (0.1%). Requiring both is what keeps a rounding cent on a $1.3M balance, and a fixed percentage of a $4 one, out of the report |
 | `ERPNEXT_STATEMENT_VARIANCE_THRESHOLD` | `10.00` | v0.4.10 · how large a reconciliation variance must be to earn a row in the discrepancy report. Distinct from `STATEMENTS_RECONCILE_TOLERANCE`, which decides whether a period reconciles *at all* — this decides what is worth a human's attention |
 | `ERPNEXT_STATEMENT_COVERAGE_MONTHS` | `12` | v0.4.10 · how many closed months the statement coverage report looks back over for gaps |
 | `RECONNECT_ADOPT_ENABLED` | `true` | v0.4.11 · when a bank is re-linked, let each new account inherit the ERPNext mapping, Company and opening balance of the retired account it replaces, on an unambiguous (institution, last-4, type, subtype) match. Off → a re-link produces unconfigured accounts, as before v0.4.11 |
