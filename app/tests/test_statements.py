@@ -37,6 +37,7 @@ Covered here:
     python3 -m unittest discover -s tests -v
 """
 import os
+import re
 import tempfile
 import unittest
 import unittest.mock
@@ -209,6 +210,42 @@ def wf_advisors_pdf(cash_open='255,038.26', cash_close='39,751.95',
             '06/30 ENDING BALANCE $0.00',
         ]
     return make_pdf(lines)
+
+
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures')
+
+
+def fixture_pdf(name: str) -> bytes:
+    """A synthetic statement fixture, rendered into a real PDF.
+
+    The fixtures are HAND-WRITTEN text (app/tests/fixtures/*_synthetic.txt),
+    never the output of running pypdf over a real statement: that output
+    carries the account holder's address, personal email, the advisor's name
+    and direct line, the account number and every transaction with merchant and
+    card last-4, in a form that greps more cleanly than the PDF does. Only the
+    LABELS and DOLLAR FIGURES are verbatim, because those are the parser's
+    behaviour rather than anyone's identity. See .gitignore, which refuses both
+    the PDFs and anything named *_extracted.txt.
+
+    Rendering to a PDF and back — rather than feeding the text straight in —
+    is deliberate: it exercises extract_lines and the pypdf round trip, so a
+    fixture cannot pass through a code path the real documents skip."""
+    with open(os.path.join(FIXTURES, name), encoding='utf-8') as fh:
+        lines = [l.rstrip('\n') for l in fh
+                 if l.strip() and not l.lstrip().startswith('#')]
+    return make_pdf(lines)
+
+
+def wf_advisors_june_2025_pdf() -> bytes:
+    """Self-directed brokerage holding only swept cash — the statement whose
+    row the live install was showing a closing balance of -10.78 for."""
+    return fixture_pdf('wf_advisors_snapshot_synthetic.txt')
+
+
+def wf_advisors_managed_pdf() -> bytes:
+    """ASSET ADVISOR managed brokerage holding securities — the second
+    account, whose statement prints a materially different vocabulary."""
+    return fixture_pdf('wf_advisors_managed_synthetic.txt')
 
 
 def wf_deposit_pdf() -> bytes:
@@ -602,22 +639,18 @@ class WellsFargoAdvisorsParseTest(StatementsBase):
             'portfolio_opening': 1360707.12, 'portfolio_closing': 1313136.16,
             'deposits_total': 10000.00, 'withdrawals_total': -20047.16,
             'change_in_value': -37523.80,
-            'securities_bought_total': -338826.84,
-            'securities_sold_total': 131931.66,
-            'income_and_distributions': 1656.03,
-            'net_additions_to_cash': 143587.69,
-            'net_subtractions_from_cash': -358874.00,
+            'securities_purchased': -338826.84,
+            'securities_sold': 131931.66,
+            'income_distributions': 1656.03,
+            'net_additions': 143587.69,
+            'net_subtractions': -358874.00,
             'other_additions': 10000.00, 'other_subtractions': -20047.16,
-            'fees_total': 0.00,
-            'interest_total': 980.73, 'sweep_income': 75.78,
-            'dividends_ordinary': 434.29, 'dividends_qualified': 1145.96,
+            'advisory_fees': 0.00,
+            'interest_income': 980.73, 'sweep_income': 75.78,
+            'ordinary_dividends': 434.29, 'qualified_dividends': 1145.96,
             'dividends_total': 1580.25,
-            'taxable_income': 2636.76, 'tax_exempt_income': 0.00,
+            'total_taxable_income': 2636.76, 'tax_exempt_income': 0.00,
             'total_income': 2636.76,
-            'unrealized_gains': 44611.96, 'realized_gains': -2928.43,
-            'realized_gains_ytd': -2663.87,
-            'gains_short_term_unrealized': -4180.15,
-            'gains_long_term_unrealized': 48792.11,
             'available_funds': 39751.95,
         }
         for key, want in expected.items():
@@ -628,16 +661,22 @@ class WellsFargoAdvisorsParseTest(StatementsBase):
         """The roll-up line is literally 'Total' and carries three columns —
         unrealized, realized this period, realized year to date."""
         m = stmts.parse_statement(wf_advisors_pdf())['metadata']
-        self.assertEqual(m['unrealized_gains'], 44611.96)
-        self.assertEqual(m['realized_gains'], -2928.43)
-        self.assertEqual(m['realized_gains_ytd'], -2663.87)
+        self.assertEqual(m['total_gainloss'], {
+            'unrealized': 44611.96, 'realized_period': -2928.43,
+            'realized_ytd': -2663.87})
+        self.assertEqual(m['short_term_gainloss'], {
+            'unrealized': -4180.15, 'realized_period': -3968.19,
+            'realized_ytd': -5053.13})
+        self.assertEqual(m['long_term_gainloss'], {
+            'unrealized': 48792.11, 'realized_period': 1039.76,
+            'realized_ytd': 2389.26})
 
     def test_a_holdings_table_cannot_answer_for_the_gain_loss_summary(self):
         """~90 holdings rows also begin with 'Total'. Section scoping is what
         stops one of them being read as the account's realized gain."""
         m = stmts.parse_statement(wf_advisors_pdf(with_holdings=True))['metadata']
-        self.assertEqual(m['unrealized_gains'], 44611.96)
-        self.assertEqual(m['realized_gains'], -2928.43)
+        self.assertEqual(m['total_gainloss']['unrealized'], 44611.96)
+        self.assertEqual(m['total_gainloss']['realized_period'], -2928.43)
 
     def test_prose_mentioning_a_section_is_not_that_section(self):
         """Page 2 of every WF statement carries 'Income summary: The Income
@@ -645,7 +684,7 @@ class WellsFargoAdvisorsParseTest(StatementsBase):
         that paragraph would make every income figure wrong."""
         m = stmts.parse_statement(wf_advisors_pdf(with_prose=True))['metadata']
         self.assertEqual(m['total_income'], 2636.76)
-        self.assertEqual(m['interest_total'], 980.73)
+        self.assertEqual(m['interest_income'], 980.73)
 
     def test_the_period_the_statement_states_is_recovered(self):
         """Plaid gives only month+year, i.e. the CALENDAR month. What the
@@ -681,6 +720,259 @@ class WellsFargoAdvisorsParseTest(StatementsBase):
         self.assertEqual(got['opening'], 255038.26)
         self.assertEqual(got['closing'], 39751.95)
         self.assertEqual(got['metadata']['fields_failed'], ['boom'])
+
+
+class June2025GroundTruthTest(StatementsBase):
+    """The production statement that exposed the whole problem.
+
+    Account ...6030, June 2025. The live install was showing this row with a
+    closing balance of **-10.78** — the amount of one cash-sweep transfer,
+    which the v0.4.40 recognizer picked up because 'ENDING BALANCE' happens to
+    be followed by it in the flattened text. The real closing balance is
+    7,793.51. Every figure asserted here was read off that document."""
+
+    EXPECTED = {
+        'cash_opening': 9467.48,
+        'income_distributions': 0.34,
+        'other_additions': 0.00,
+        'net_additions': 0.34,
+        'check_withdrawals': 0.00,
+        'atm_activity': -1674.31,
+        'other_subtractions': 0.00,
+        'net_subtractions': -1674.31,
+        'cash_closing': 7793.51,
+        'sweep_income': 0.34,
+        'total_taxable_income': 0.34,
+        'tax_exempt_income': 0.00,
+        'total_income': 0.34,
+        'portfolio_opening': 9467.48,
+        'portfolio_closing': 7793.51,
+        'available_funds': 7793.51,
+    }
+
+    def test_every_snapshot_figure(self):
+        m = stmts.parse_statement(wf_advisors_june_2025_pdf())['metadata']
+        for key, want in self.EXPECTED.items():
+            self.assertEqual(m.get(key), want, key)
+        self.assertEqual(m['fields_failed'], [])
+
+    def test_the_closing_balance_is_not_the_sweep_transfer(self):
+        """THE REGRESSION. -10.78 is a single transfer out of the sweep; the
+        month closed at 7,793.51."""
+        got = stmts.parse_statement(wf_advisors_june_2025_pdf())
+        self.assertEqual(got['closing'], 7793.51)
+        self.assertNotEqual(got['closing'], -10.78)
+        self.assertEqual(got['opening'], 9467.48)
+
+    def test_an_all_zero_gain_loss_summary_is_still_three_columns(self):
+        m = stmts.parse_statement(wf_advisors_june_2025_pdf())['metadata']
+        zero = {'unrealized': 0.0, 'realized_period': 0.0, 'realized_ytd': 0.0}
+        for key in ('short_term_gainloss', 'long_term_gainloss',
+                    'total_gainloss'):
+            self.assertEqual(m[key], zero, key)
+
+    def test_the_column_header_glued_to_the_income_label_still_matches(self):
+        """The line reads 'TAXABLE Money market/sweep funds 0.34 1.60' — the
+        section's column header runs into the label. Matching only the
+        prefixed form would work here and fail on a statement that prints the
+        label alone, so both are listed."""
+        self.assertEqual(
+            stmts.parse_statement(wf_advisors_june_2025_pdf())
+            ['metadata']['sweep_income'], 0.34)
+        bare = make_pdf([
+            'Cash flow summary THIS PERIOD THIS YEAR',
+            'Opening value of cash and sweep balances $9,467.48',
+            'Closing value of cash and sweep balances $7,793.51',
+            'Income summary * THIS PERIOD THIS YEAR',
+            'Money market/sweep funds 0.34 1.60',
+            'Total income $0.34 $1.60',
+        ])
+        self.assertEqual(stmts.parse_statement(bare)
+                         ['metadata']['sweep_income'], 0.34)
+
+    def test_the_page_inventory_records_what_is_not_mined(self):
+        """A production statement is 9+ pages and this parser reads the
+        summary. The inventory is how a decision about mining the rest gets
+        made from data rather than by opening PDFs by hand."""
+        m = stmts.parse_statement(wf_advisors_june_2025_pdf())['metadata']
+        self.assertTrue(m['pages'])
+        page = m['pages'][0]
+        self.assertEqual(page['page'], 1)
+        self.assertIn('lines', page)
+        self.assertIn('heading', page)
+
+
+class ManagedBrokerageGroundTruthTest(StatementsBase):
+    """The SECOND production account — ASSET ADVISOR managed, ~$1.5M, holding
+    securities. Account ...9401, June 2025.
+
+    Same institution, materially different statement: the cash flow summary
+    gains four lines the cash-only account never prints, the income summary
+    gains four more, the gain/loss rows are labelled differently, and two
+    non-numeric fields appear that mark the account as managed. Every figure
+    here was read off that document."""
+
+    EXPECTED = {
+        'cash_opening': 3507.75,
+        'cash_closing': 9702.20,
+        'portfolio_opening': 1539523.99,
+        'portfolio_closing': 1557537.86,
+        'income_distributions': 1121.79,
+        'securities_sold': 24705.10,
+        'securities_purchased': -19587.94,
+        'advisory_fees': 0.00,
+        'interest_income': 0.00,
+        'ordinary_dividends': 218.77,
+        'qualified_dividends': 885.38,
+        'other_income': 0.00,
+        'total_taxable_income': 1121.79,
+        'tax_exempt_income': 0.00,
+        'total_income': 1121.79,
+        'net_additions': 25826.89,
+        'net_subtractions': -19632.44,
+        'other_additions': 0.00,
+        'other_subtractions': -44.50,
+        'gross_proceeds': 24705.10,
+        'foreign_withholding': -40.80,
+        'available_funds': 9702.20,
+    }
+
+    def test_every_snapshot_figure(self):
+        m = stmts.parse_statement(wf_advisors_managed_pdf())['metadata']
+        for key, want in self.EXPECTED.items():
+            self.assertEqual(m.get(key), want, key)
+        self.assertEqual(m['fields_failed'], [])
+
+    def test_the_gain_loss_grid(self):
+        """'Short term (S)' here vs 'Short term/Net lots' on the cash-only
+        account — the (S)/(L) are tax-lot designators the parser tolerates."""
+        m = stmts.parse_statement(wf_advisors_managed_pdf())['metadata']
+        self.assertEqual(m['short_term_gainloss'], {
+            'unrealized': 27499.81, 'realized_period': 268.08,
+            'realized_ytd': 2388.87})
+        self.assertEqual(m['long_term_gainloss'], {
+            'unrealized': 7486.80, 'realized_period': 0.00,
+            'realized_ytd': 3377.61})
+        self.assertEqual(m['total_gainloss'], {
+            'unrealized': 34986.61, 'realized_period': 268.08,
+            'realized_ytd': 5766.48})
+
+    def test_electronic_funds_transfers_are_split_by_position(self):
+        """The label is printed TWICE with identical wording, once under
+        additions and once under subtractions — the sign lives in the position.
+        Reporting whichever came first would call an outflow an inflow on any
+        month where the two differ, which is the month it would matter."""
+        m = stmts.parse_statement(wf_advisors_managed_pdf())['metadata']
+        self.assertEqual(m['electronic_transfers_in'], 0.00)
+        self.assertEqual(m['electronic_transfers_out'], 0.00)
+        # …and the YEAR column proves the two rows really are distinct.
+        self.assertNotIn('electronic_transfers', m)
+
+    def test_a_bare_other_label_reads_its_own_row(self):
+        """'Other' is a substring of 'Other additions', 'Other subtractions'
+        and most disclosure prose. Whole-word matching is what makes the income
+        summary's bare row safe to name."""
+        m = stmts.parse_statement(wf_advisors_managed_pdf())['metadata']
+        self.assertEqual(m['other_income'], 0.00)
+        self.assertEqual(m['other_additions'], 0.00)
+        self.assertEqual(m['other_subtractions'], -44.50)
+
+    def test_the_advisory_program_marks_a_managed_account(self):
+        """Presence is the signal — a self-directed brokerage prints neither.
+        Strings, not numbers: '1.00%' is a disclosed rate to reproduce
+        verbatim, not something to compute with."""
+        m = stmts.parse_statement(wf_advisors_managed_pdf())['metadata']
+        self.assertEqual(m['advisory_program'], 'ASSET ADVISOR')
+        self.assertEqual(m['advisory_fee_rate'], '1.00%')
+        cash_only = stmts.parse_statement(
+            wf_advisors_june_2025_pdf())['metadata']
+        self.assertNotIn('advisory_program', cash_only)
+        self.assertNotIn('advisory_fee_rate', cash_only)
+
+    def test_the_holdings_table_still_cannot_answer_for_gain_loss(self):
+        """This fixture carries real holdings rows, every one beginning
+        'Total'."""
+        m = stmts.parse_statement(wf_advisors_managed_pdf())['metadata']
+        self.assertEqual(m['total_gainloss']['unrealized'], 34986.61)
+
+
+class FixtureHygieneTest(unittest.TestCase):
+    """The fixtures are the one place a real statement's contents could reach
+    the repository. This test is the guard.
+
+    A statement PDF carries a home address, a personal email, the advisor's
+    name and direct line, the account number and every transaction with
+    merchant and card last-4. The text extracted from one carries all of it in
+    a form that greps and indexes more cleanly than the PDF does — so a
+    committed .txt is worse, not better. Fixtures are hand-written with every
+    identifying field replaced; only labels and dollar figures are verbatim."""
+
+    def _fixture_text(self):
+        for name in sorted(os.listdir(FIXTURES)):
+            with open(os.path.join(FIXTURES, name), encoding='utf-8',
+                      errors='replace') as fh:
+                yield name, fh.read()
+
+    def test_no_artifact_in_the_fixtures_dir_could_reach_a_commit(self):
+        """Asks GIT, not the filesystem.
+
+        The risk being guarded is 'a real statement gets committed', not 'a
+        file exists on someone's disk' — and the suite itself drops a stray
+        zero-byte `test.pdf` in here on a full run (harmless, ignored, source
+        not yet found). Asserting on os.listdir made this test fail for that
+        scratch file while a genuinely dangerous file that git happens to
+        ignore would pass just the same. Checking what git would actually
+        include tests the property that matters and cannot go flaky."""
+        import subprocess
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        try:
+            out = subprocess.run(
+                ['git', 'status', '--porcelain', '--untracked-files=all',
+                 '--', 'app/tests/fixtures'],
+                cwd=root, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:  # pragma: no cover
+            self.skipTest(f'git unavailable: {e}')
+        if out.returncode != 0:  # pragma: no cover - not a git checkout
+            self.skipTest('not a git working tree')
+        for line in out.stdout.splitlines():
+            path = line[3:].strip().strip('"')
+            self.assertTrue(
+                path.endswith('_synthetic.txt'),
+                f'{path} is visible to git in the fixtures directory. Only '
+                f'hand-written *_synthetic.txt fixtures may be committed — a '
+                f'PDF or an extracted .txt carries the account holder\'s '
+                f'address, email, account number and full transaction detail.')
+
+    def test_fixtures_carry_no_personal_identifiers(self):
+        """Patterns, not a blocklist of one person's details — the point is to
+        catch the NEXT paste, from whoever's statement it is."""
+        patterns = (
+            (r'\b\d{3,5}\s+[A-Z][A-Za-z]+\s+(RD|ROAD|ST|STREET|AVE|AVENUE|'
+             r'LN|LANE|DR|DRIVE|BLVD|CT|COURT|WAY)\b', 'street address'),
+            (r'\b[A-Za-z0-9._%+-]+@(?!example\.com)[A-Za-z0-9.-]+\.'
+             r'[A-Za-z]{2,}\b', 'email address'),
+            (r'\b\d{5}-\d{4}\b', 'ZIP+4'),
+            (r'\b(?!555-000-0000)\d{3}-\d{3}-\d{4}\b', 'phone number'),
+            # 0000-0000 is the fully-masked placeholder; any OTHER 4-4 digit
+            # group in a fixture is a real account number that got pasted in.
+            (r'\b(?!0000-0000)\d{4}-\d{4}\b', 'account number'),
+        )
+        for name, text in self._fixture_text():
+            for pattern, what in patterns:
+                found = re.search(pattern, text)
+                self.assertIsNone(
+                    found, f'{name} looks like it contains a {what}: '
+                           f'{found.group(0) if found else ""!r}')
+
+    def test_the_gitignore_refuses_both_artifact_kinds(self):
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        with open(os.path.join(root, '.gitignore'), encoding='utf-8') as fh:
+            rules = fh.read()
+        for rule in ('app/tests/fixtures/*.pdf',
+                     'app/tests/fixtures/*_extracted.txt'):
+            self.assertIn(rule, rules)
 
 
 class DepositAndCardParseTest(StatementsBase):
@@ -860,12 +1152,46 @@ class ReparseStoredTest(StatementsBase):
         self.assertEqual(stats['suspect'], 0)
         self.assertFalse(jun.parse_suspect)
 
+    def test_a_row_parsed_by_an_older_recognizer_is_stale(self):
+        """`parser_version` is what makes a bump self-healing — and the live
+        install proved it is needed: v0.4.41 shipped a corrected parser and
+        every production row kept its v0.4.40 figures, because a pull skips
+        PDFs it already holds and the fix only landed when someone pressed a
+        button they didn't know about."""
+        row = self._stored('s-jun', '2026-06', wf_advisors_pdf(),
+                           date(2026, 6, 1), date(2026, 6, 30))
+        self.assertTrue(stmts.is_stale(row))       # never parsed at all
+        stmts.reparse_stale()
+        self.assertFalse(stmts.is_stale(row))
+        self.assertEqual(row.closing_balance, 39751.95)
+
+    def test_reparsing_stale_rows_leaves_current_ones_alone(self):
+        """Idempotent and cheap on a settled install: a second pass opens no
+        PDF at all."""
+        self._stored('s-jun', '2026-06', wf_advisors_pdf(),
+                     date(2026, 6, 1), date(2026, 6, 30))
+        first = stmts.reparse_stale()
+        self.assertEqual(first['examined'], 1)
+        self.assertEqual(stmts.reparse_stale()['examined'], 0)
+        self.assertEqual(stmts.stale_statements(), [])
+
+    def test_a_row_with_no_pdf_is_never_stale(self):
+        """There is nothing to re-read, so its figures are the best obtainable
+        — counting it as stale would leave a warning nobody can ever clear."""
+        row = PlaidStatement(statement_id='s-gone', plaid_item_id='item-1',
+                             plaid_account_id='acct-1', pdf_path='',
+                             opening_balance=100.0, closing_balance=200.0)
+        db.session.add(row)
+        db.session.commit()
+        self.assertFalse(stmts.is_stale(row))
+
     def test_the_whole_metadata_blob_is_rewritten_not_just_the_balances(self):
         row = self._stored('s-jun', '2026-06', wf_advisors_pdf(),
                            date(2026, 6, 1), date(2026, 6, 30))
         stats = stmts.reparse_stored()
         self.assertEqual(row.parsed_metadata['dividends_total'], 1580.25)
-        self.assertEqual(row.parsed_metadata['realized_gains'], -2928.43)
+        self.assertEqual(row.parsed_metadata['total_gainloss']
+                         ['realized_period'], -2928.43)
         self.assertEqual(row.parser_version(), stmts.PARSER_VERSION)
         self.assertGreater(stats['fields'], 20)
         self.assertEqual(stats['failed_fields'], 0)
@@ -986,8 +1312,9 @@ class ValidationTest(StatementsBase):
         can check it — it is what a journal entry cites."""
         st = self._statement()
         rows = self._rows(stmts.validate_statement(st, self.account))
-        self.assertEqual(rows['unrealized_gains']['statement'], 44611.96)
-        self.assertIsNone(rows['unrealized_gains']['computed'])
+        self.assertEqual(rows['total_gainloss.unrealized']['statement'],
+                         44611.96)
+        self.assertIsNone(rows['total_gainloss.unrealized']['computed'])
 
     def test_a_cycle_that_is_not_the_calendar_month_is_surfaced(self):
         st = self._statement()
@@ -1046,7 +1373,7 @@ class StatementPagesRenderTest(StatementsBase):
         self.assertIn('39751.95', body.replace(',', ''))
         # every column header, and figures from across the metadata blob
         for text in ('Statement', 'Plaid', 'Mirror', 'Delta', 'Variance',
-                     'Dividends — total', 'Realized gain/loss — this period',
+                     'Dividends — total', 'Gain/loss — total',
                      'Securities purchased'):
             self.assertIn(text, body, text)
 

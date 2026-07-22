@@ -1327,11 +1327,38 @@ can never disagree.
 | **WF deposit** (checking/savings/MMA) — *unverified* | opening/closing balance, deposits and credits, withdrawals and debits, checks paid, interest earned, service fees, average ledger and collected balance |
 | **WF credit card** — *unverified* | previous and new balance, payments and credits, purchases, cash advances, fees charged, interest charged, minimum payment due, payment due date, credit limit, available credit |
 
+The gain/loss summary is stored as **three dicts, not nine keys** —
+`short_term_gainloss`, `long_term_gainloss`, `total_gainloss`, each
+`{unrealized, realized_period, realized_ytd}` — because the statement prints a
+3×3 table and one holding period's three columns are one fact.
+
 Every blob also carries its own provenance: `parser_version`, `layout`,
-`verified`, `fields_failed`, and the period the *document* states for itself —
-kept beside the calendar month derived from Plaid, because a bank whose cycle
-isn't a calendar month makes every reconciliation in that window suspect and
-this is the only record of it.
+`verified`, `fields_failed`, a `pages` inventory of what is in the document but
+*not* mined (a production brokerage statement is 9+ pages; this reads the
+summary), and the period the *document* states for itself — kept beside the
+calendar month derived from Plaid, because a bank whose cycle isn't a calendar
+month makes every reconciliation in that window suspect and this is the only
+record of it.
+
+### A parser bump heals itself (v0.4.42)
+
+v0.4.41 shipped a parser that corrected a wrong closing balance on all 26
+production statements — and then **nothing changed**. `_store_one` skips any
+statement whose PDF it already holds, so the corrected recognizer never
+re-read a byte; every row kept the figure the old one produced until an
+operator pressed *Re-parse stored PDFs*, a button nobody knew to press. The
+install ran new code over old numbers for as long as it took someone to notice
+a balance that looked wrong. That is the exact shape of bug a reconciliation
+tool exists to prevent, so it is now prevented structurally:
+
+- every row records the `parser_version` that produced its figures;
+- the scheduled statement job re-reads any row whose version isn't the running
+  one, on the same cadence as the pull;
+- `/admin/statements` shows a banner while any stale row remains.
+
+The pass is idempotent and free on a settled install — every row already
+carries the current version, so it costs one query and opens no PDF. The manual
+button stays, for when you don't want to wait for the schedule.
 
 **"Unverified" is a real caveat.** The deposit and card field tables were
 written from the standard Wells Fargo layouts but have not been checked against

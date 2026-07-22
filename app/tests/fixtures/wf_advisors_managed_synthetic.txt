@@ -1,0 +1,114 @@
+# SPDX-License-Identifier: MIT
+#
+# Wells Fargo Advisors SNAPSHOT — ASSET ADVISOR managed brokerage holding
+# securities. Modelled on a June 2025 production statement for a different
+# account than wf_advisors_snapshot_synthetic.txt.
+#
+# HAND-WRITTEN, NOT EXTRACTED — see the header of that file for why, and for
+# the redaction table. Labels and dollar figures verbatim; identity replaced.
+# Account number is masked to 0000-0000, same as the other fixture.
+#
+# WHY A SECOND FIXTURE. The same institution prints a MATERIALLY DIFFERENT
+# statement for a managed account holding securities, and every difference is
+# a place the parser can be wrong:
+#
+#   * the cash flow summary gains 'Securities sold and redeemed', 'Securities
+#     purchased', 'Advisory, manager and platform fees' — and 'Electronic
+#     funds transfers', which appears TWICE, once under additions and once
+#     under subtractions, with the sign carried by position rather than label
+#   * the income summary gains 'Interest', 'Ordinary dividends and ST capital
+#     gains', 'Qualified dividends', and a bare 'Other'
+#   * the gain/loss rows read 'Short term (S)' here and 'Short term/Net lots'
+#     on the cash-only account — the (S)/(L) are tax-lot designators
+#   * new blocks appear: a bond maturity schedule, 'Gross proceeds' and
+#     'Foreign withholding' on one line, and the advisory program + effective
+#     fee rate that mark this account as managed rather than self-directed
+
+SNAPSHOT
+Current period ending June 30, 2025
+ACCOUNT NAME: ORCHARD EXAMPLE LLC
+ACCOUNT NUMBER: 0000-0000
+REDACTED MAILING ADDRESS
+user@example.com
+Your Financial Advisor:
+TEST ADVISOR Phone: 555-000-0000
+Wells Fargo Advisors is a trade name used by Wells Fargo Clearing Services, LLC
+
+# --- statement page 1 of 9 -------------------------------------------------
+Page 1 of 9SNAPSHOT
+ASSET ADVISOR SNAPSHOT
+Progress summary Value over time
+THIS PERIOD THIS YEAR 1,748,000
+Opening value $1,539,523.99 $237,676.49
+Cash deposited 0.00 1,343,731.89 1,287,000Securities deposited 0.00 0.00
+Cash withdrawn -44.50 -57,949.27
+Securities withdrawn 0.00 0.00 858,000Change in value 18,058.37 38,203.46
+Closing value $1,557,537.86 $1,557,537.86 429,000
+Portfolio summary
+CURRENT ASSET TYPE VALUE ON MAY 31 % VALUE ON JUN 30 % ANN. INCOME
+ASSETS Cash and sweep balances 3,507.75 0.23 9,702.20 0.62 269
+Fixed income securities 1,290,185.00 83.80 1,294,618.00 83.12 0
+Asset value $1,539,523.99 100% $1,557,537.86 100% $429
+
+# --- statement page 2 of 9 -------------------------------------------------
+Page 2 of 9SNAPSHOT
+ASSET ADVISOR SNAPSHOT
+Cash flow summary THIS PERIOD THIS YEAR
+Opening value of cash and sweep balances $3,507.75
+Income and distributions 1,121.79 3,810.15
+Securities sold and redeemed 24,705.10 141,997.80
+Electronic funds transfers 0.00 1,324,731.89
+Other additions 0.00 19,000.00
+Net additions to cash $25,826.89 $1,489,539.84
+Securities purchased -19,587.94 -1,419,751.14
+Electronic funds transfers 0.00 -20,000.00
+Advisory, manager and platform fees 0.00 -4,124.71
+Other subtractions, transfers & charges -44.50 -37,949.27
+Net subtractions from cash -$19,632.44 -$1,481,825.12
+Closing value of cash and sweep balances $9,702.20
+Income summary * THIS PERIOD THIS YEAR
+Interest 0.00 1,460.93
+Ordinary dividends and ST capital gains 218.77 1,450.70
+Qualified dividends 885.38 2,243.53
+Other 0.00 23.55
+Total taxable income $1,121.79 $5,271.08
+Total federally tax-exempt income $0.00 $0.00
+Total income $1,121.79 $5,271.08
+Summary totals.
+Gain/loss summary UNREALIZED THIS PERIOD REALIZED THIS YEAR REALIZED
+Short term (S) 27,499.81 268.08 2,388.87
+Long term (L) 7,486.80 0.00 3,377.61
+Total $34,986.61 $268.08 $5,766.48
+
+# --- statement page 3 of 9 -------------------------------------------------
+Page 3 of 9SNAPSHOT
+ASSET ADVISOR SNAPSHOT
+Account type: Brokerage Cash Services Brokerage account number: 0000-0000
+Your advisory program: ASSET ADVISOR
+Your Effective Fee Rate:** 1.00% Document delivery status
+Your total available funds $9,702.20
+June 1, 2025 - June 30, 2025
+
+# --- statement page 4 of 9 -------------------------------------------------
+Page 4 of 9
+% OFBond maturity schedule
+AMOUNT MATURING CURRENT VALUE MATURING VALUE
+under 1 year 1,300,000.00 1,294,618.00 100.001,500,000 1 to 5 years 0.00 0.00 0.00
+6 to 10 years 0.00 0.00 0.00
+1,000,000 11 to 15 years 0.00 0.00 0.00
+16 to 20 years 0.00 0.00 0.00
+21 to 30 years 0.00 0.00 0.00
+500,000 over 30 years 0.00 0.00 0.00
+Total $1,300,000.00 $1,294,618.00 100.00%
+Additional information THIS PERIOD THIS YEAR
+Gross proceeds 24,705.10 112,187.77 Foreign withholding -40.80 -147.72
+
+# --- statement page 5 of 9 -------------------------------------------------
+# Holdings detail. Every row begins 'Total', which is why the gain/loss
+# lookup above must stay scoped to its own section.
+Page 5 of 9
+DESCRIPTION ACCOUNT QUANTITY ORIG PRICE ORIG COST PRICE MARKET VALUE GAIN/LOSS INCOME YIELD (%)
+Total 1.13 100.12000 $172.63 $17,283.50 176.2300 $17,644.14 $360.64 $81 0.46
+Total 0.55 20.17700 $173.00 $3,490.63 357.3700 $7,210.65 $3,720.02 $18 0.25
+Total Cash and Sweep Balances 0.62 $9,702.20 $269.00
+Total Bank Deposits $9,382.20

@@ -277,7 +277,7 @@ def resolve_pdf_path(statement: PlaidStatement) -> str | None:
 # Stored on every row (`parsed_metadata['parser_version']`), which is what lets
 # an operator tell a stale parse from a current one and re-parse only what is
 # behind — see reparse_stored.
-PARSER_VERSION = '0.4.41'
+PARSER_VERSION = '0.4.42'
 
 # Ordered most- to least-specific. 'previous balance' must be tried before a
 # bare 'balance', and the credit-card wording ('previous balance', 'new
@@ -387,6 +387,28 @@ def _to_float(match) -> float:
     return round(value, 2)
 
 
+def _label_at(line: str, label: str) -> int:
+    """Where `label` starts as a WHOLE WORD in `line`, or -1.
+
+    A plain substring search is wrong for the short labels a statement prints.
+    Wells Fargo's income summary has a row labelled just 'Other' — and 'other'
+    is a substring of 'Other additions', 'Other subtractions' and any number of
+    disclosure sentences. Requiring a non-letter before the match (and after,
+    so 'interest' does not answer for 'interest-bearing') makes a bare label
+    safe to use, which is what lets the field tables name one."""
+    start = 0
+    while True:
+        idx = line.find(label, start)
+        if idx < 0:
+            return -1
+        before = line[idx - 1] if idx else ' '
+        after_pos = idx + len(label)
+        after = line[after_pos] if after_pos < len(line) else ' '
+        if not before.isalpha() and not after.isalpha():
+            return idx
+        start = idx + 1
+
+
 def _amounts_on_line(line: str, label: str) -> list[float]:
     """Every amount `label` owns on this already-lowercased line, left to right.
 
@@ -408,7 +430,7 @@ def _amounts_on_line(line: str, label: str) -> list[float]:
     answer and the common one."""
     if _ROW_PREFIX.match(line):
         return []
-    idx = line.find(label)
+    idx = _label_at(line, label)
     if idx < 0:
         return []
     rest = line[idx + len(label):]
@@ -528,50 +550,79 @@ _WF_ADVISORS_FIELDS = (
      ('opening value of cash and sweep balances',), 0, ()),
     ('cash_closing', 'cash flow summary',
      ('closing value of cash and sweep balances',), 0, ()),
-    ('income_and_distributions', 'cash flow summary',
+    ('income_distributions', 'cash flow summary',
      ('income and distributions',), 0, ()),
-    ('securities_sold_total', 'cash flow summary',
+    ('securities_sold', 'cash flow summary',
      ('securities sold and redeemed',), 0, ()),
-    ('securities_bought_total', 'cash flow summary',
+    ('securities_purchased', 'cash flow summary',
      ('securities purchased',), 0, ()),
     ('other_additions', 'cash flow summary', ('other additions',), 0, ()),
     ('other_subtractions', 'cash flow summary',
      ('other subtractions, transfers & charges', 'other subtractions'), 0, ()),
-    ('fees_total', 'cash flow summary',
+    ('advisory_fees', 'cash flow summary',
      ('advisory, manager and platform fees',), 0, ()),
-    ('net_additions_to_cash', 'cash flow summary',
+    ('net_additions', 'cash flow summary',
      ('net additions to cash',), 0, ()),
-    ('net_subtractions_from_cash', 'cash flow summary',
+    ('net_subtractions', 'cash flow summary',
      ('net subtractions from cash',), 0, ()),
-    ('checks_written_total', 'cash flow summary',
+    ('check_withdrawals', 'cash flow summary',
      ('withdrawals by check',), 0, ()),
-    ('card_activity_total', 'cash flow summary',
+    ('atm_activity', 'cash flow summary',
      ('atm and checkcard activity',), 0, ()),
+    # NOTE 'Electronic funds transfers' is NOT here — it is printed twice, once
+    # under additions and once under subtractions, and is split by position in
+    # _extract_electronic_transfers.
     # Income summary
-    ('interest_total', 'income summary', ('interest',), 0, ()),
+    ('interest_income', 'income summary', ('interest',), 0, ()),
     ('sweep_income', 'income summary',
-     ('taxable money market/sweep funds',), 0, ()),
-    ('dividends_ordinary', 'income summary',
+     ('taxable money market/sweep funds',
+      'money market/sweep funds'), 0, ()),
+    ('ordinary_dividends', 'income summary',
      ('ordinary dividends and st capital gains',), 0, ()),
-    ('dividends_qualified', 'income summary', ('qualified dividends',), 0, ()),
-    ('taxable_income', 'income summary', ('total taxable income',), 0, ()),
+    ('qualified_dividends', 'income summary', ('qualified dividends',), 0, ()),
+    # A bare label, safe only because _label_at matches whole words — 'other'
+    # is a substring of 'Other additions' and of most disclosure sentences.
+    ('other_income', 'income summary', ('other',), 0, ()),
+    ('total_taxable_income', 'income summary',
+     ('total taxable income',), 0, ()),
     ('tax_exempt_income', 'income summary',
      ('total federally tax-exempt income',), 0, ()),
     ('total_income', 'income summary', ('total income',), 0, ()),
-    # Gain/loss summary. The roll-up line is literally 'Total', which is why
-    # this MUST be section-scoped — the holdings tables further on print ~90
-    # more lines beginning with the same word. Columns, per the heading
-    # 'UNREALIZED | THIS PERIOD REALIZED | THIS YEAR REALIZED'.
-    ('unrealized_gains', 'gain/loss summary', ('total',), 0, ()),
-    ('realized_gains', 'gain/loss summary', ('total',), 1, ()),
-    ('realized_gains_ytd', 'gain/loss summary', ('total',), 2, ()),
-    ('gains_short_term_unrealized', 'gain/loss summary',
-     ('short term (s)', 'short term'), 0, ()),
-    ('gains_long_term_unrealized', 'gain/loss summary',
-     ('long term (l)', 'long term'), 0, ()),
+    # Additional information — one printed line carries both fields.
+    ('gross_proceeds', '', ('gross proceeds',), 0, ()),
+    ('foreign_withholding', '', ('foreign withholding',), 0, ()),
+    # NOTE the gain/loss summary is NOT here — it is the one block whose rows
+    # each carry three meaningful columns, so it is extracted by
+    # _extract_gainloss into a dict per row rather than flattened into nine
+    # loose keys.
     # Anywhere
     ('available_funds', '', ('your total available funds',), 0, ()),
 )
+
+# The gain/loss summary, whose heading names three columns:
+#
+#   Gain/loss summary **   UNREALIZED | THIS PERIOD REALIZED | THIS YEAR REALIZED
+#   Short term/Net lots          0.00 |                 0.00 |            0.00
+#   Long term (L)                0.00 |                 0.00 |            0.00
+#   Total                       $0.00 |                $0.00 |           $0.00
+#
+# Each row becomes one dict keyed by column, because the three numbers are one
+# fact about one holding period and splitting them into `short_term_unrealized`
+# / `short_term_realized` / `short_term_realized_ytd` would be nine keys
+# describing a 3×3 table. The roll-up row is literally 'Total', which is why
+# this MUST stay section-scoped: the holdings tables further on print ~90 more
+# lines beginning with that same word.
+#
+# 'Short term/Net lots' is the wording on an account holding only sweep cash;
+# 'Short term (S)' is what an account with securities prints. Both appear in
+# production, so both are listed.
+_GAINLOSS_ROWS = (
+    ('short_term_gainloss', ('short term/net lots', 'short term (s)',
+                             'short term')),
+    ('long_term_gainloss', ('long term (l)', 'long term')),
+    ('total_gainloss', ('total',)),
+)
+_GAINLOSS_COLUMNS = ('unrealized', 'realized_period', 'realized_ytd')
 
 # Wells Fargo deposit (checking / savings / money market).
 # UNVERIFIED — see this section's header. Written from the standard Wells Fargo
@@ -588,7 +639,7 @@ _WF_DEPOSIT_FIELDS = (
     ('withdrawals_total', '',
      ('total withdrawals and other debits', 'withdrawals and other debits',
       'withdrawals/subtractions', 'withdrawals/debits'), 0, ()),
-    ('checks_written_total', '', ('checks paid', 'total checks'), 0, ()),
+    ('check_withdrawals', '', ('checks paid', 'total checks'), 0, ()),
     ('interest_earned', '',
      ('interest earned this statement period', 'interest paid this period',
       'interest earned', 'interest paid'), 0, ()),
@@ -774,13 +825,120 @@ def _extract_fields(lines, specs) -> tuple[dict, list[str]]:
     return values, failed
 
 
+def _extract_gainloss(lines) -> dict:
+    """The gain/loss summary as {row_key: {column: amount}}.
+
+    Separate from the generic field table because this is the one block whose
+    columns all carry meaning — see _GAINLOSS_ROWS. A row is only emitted when
+    the line actually carried three amounts; a two-column variant would
+    otherwise silently label the year-to-date figure as this period's."""
+    scope = _section(lines, 'gain/loss summary')
+    if not scope:
+        return {}
+    out = {}
+    for key, labels in _GAINLOSS_ROWS:
+        found = _find_amounts(scope, labels)
+        if len(found) >= len(_GAINLOSS_COLUMNS):
+            out[key] = dict(zip(_GAINLOSS_COLUMNS, found))
+    return out
+
+
+def _extract_electronic_transfers(lines) -> dict:
+    """'Electronic funds transfers', which is printed TWICE.
+
+    The cash flow summary lists it once under additions and once under
+    subtractions, with identical wording — the sign lives in the position, not
+    the label:
+
+        Income and distributions            1,121.79
+        Securities sold and redeemed       24,705.10
+        Electronic funds transfers              0.00   <- money IN
+        Other additions                         0.00
+        Net additions to cash             $25,826.89
+        Securities purchased              -19,587.94
+        Electronic funds transfers              0.00   <- money OUT
+        Advisory, manager and platform fees     0.00
+
+    So the two are split on the 'Net additions to cash' line that separates the
+    halves, and stored as two keys rather than one. A single key cannot
+    represent two different lines, and picking whichever the recognizer saw
+    first would silently report an inflow as an outflow on any month where they
+    differ — which is exactly the month it would matter."""
+    scope = _section(lines, 'cash flow summary')
+    if not scope:
+        return {}
+    pivot = next((i for i, line in enumerate(scope)
+                  if _label_at(line, 'net additions to cash') >= 0), None)
+    if pivot is None:
+        return {}
+    label = ('electronic funds transfers',)
+    out = {}
+    inflow = _find_amounts(scope[:pivot], label)
+    outflow = _find_amounts(scope[pivot + 1:], label)
+    if inflow:
+        out['electronic_transfers_in'] = inflow[0]
+    if outflow:
+        out['electronic_transfers_out'] = outflow[0]
+    return out
+
+
+# Descriptive (non-numeric) fields: what KIND of account this is. Their
+# presence is the signal — a self-directed brokerage prints neither — which is
+# what distinguishes a managed account from one the operator trades themselves.
+_ADVISORY_PROGRAM = re.compile(
+    r'your advisory program:\s*([a-z0-9 &/.\'-]{2,60})', re.IGNORECASE)
+_FEE_RATE = re.compile(
+    r'your effective fee rate:?\**\s*(\d{1,3}(?:\.\d{1,3})?\s*%)',
+    re.IGNORECASE)
+
+
+def _extract_advisory(lines) -> dict:
+    """{'advisory_program', 'advisory_fee_rate'} where the statement names
+    them. Strings, deliberately: '1.00%' is a disclosed rate to reproduce
+    verbatim on a report, not a number to compute with."""
+    out = {}
+    for line in lines:
+        if 'advisory_program' not in out:
+            m = _ADVISORY_PROGRAM.search(line)
+            if m:
+                out['advisory_program'] = m.group(1).strip().upper()
+        if 'advisory_fee_rate' not in out:
+            m = _FEE_RATE.search(line)
+            if m:
+                out['advisory_fee_rate'] = m.group(1).replace(' ', '')
+    return out
+
+
+def page_inventory(pages) -> list[dict]:
+    """[{'page', 'lines', 'heading'}] — what is actually IN this PDF.
+
+    Recorded because the summary block this parser reads is one page of nine on
+    a real Wells Fargo Advisors statement, and the rest (holdings, transaction
+    detail, realized-gain lots, fee schedules, dividend detail) is unmined. An
+    inventory in the metadata is how a decision about mining any of it can be
+    made from data rather than from opening fourteen PDFs by hand."""
+    out = []
+    for i, text in enumerate(pages, start=1):
+        lines = [re.sub(r'\s+', ' ', l).strip()
+                 for l in (text or '').splitlines() if l.strip()]
+        if not lines:
+            continue
+        # The first line is the running header ('Page 2 of 9SNAPSHOT'); the
+        # most useful label is whichever of the first few lines names a block.
+        heading = next((l for l in lines[:4]
+                        if 'summary' in l.lower() or 'activity' in l.lower()),
+                       lines[0])
+        out.append({'page': i, 'lines': len(lines), 'heading': heading[:80]})
+    return out
+
+
 def _derive(values: dict) -> None:
     """Figures the statement implies but doesn't print on a line of their own.
 
     Only sums of fields already recovered — nothing here reads the PDF again,
     so a derived value can never be more speculative than its inputs."""
-    ordinary = values.get('dividends_ordinary')
-    qualified = values.get('dividends_qualified')
+    ordinary = values.get('ordinary_dividends')
+    qualified = values.get('qualified_dividends')
     if ordinary is not None or qualified is not None:
         values['dividends_total'] = round((ordinary or 0.0)
                                           + (qualified or 0.0), 2)
@@ -810,15 +968,38 @@ def parse_statement(pdf_bytes: bytes) -> dict:
         period_start / period_end   the period the STATEMENT states, ISO, when
                         it prints one — kept beside the bounds derived from
                         Plaid's month+year rather than replacing them
+        pages           an inventory of what is in the document but unmined
+                        (see page_inventory)
 
     Every balance is float-or-None and all-None is an ordinary result rather
     than a failure — see this module's docstring. Never raises."""
-    lines = extract_lines(pdf_bytes)
+    pages = extract_pages(pdf_bytes)
+    lines = []
+    for page in pages:
+        for raw in page.splitlines():
+            line = re.sub(r'\s+', ' ', raw).strip().lower()
+            if line:
+                lines.append(line)
     if not lines:
         return _blank_parse()
 
     layout = detect_layout(lines)
     values, failed = _extract_fields(lines, _LAYOUT_FIELDS.get(layout, ()))
+    if layout == 'wf_advisors':
+        # Blocks the (key, section, labels, column) table cannot describe: a
+        # 3×3 grid, a label printed twice with the sign carried by position,
+        # and two non-numeric fields. Each in its own try/except, for the same
+        # reason every other field is — see _extract_fields.
+        for name, extractor in (('gainloss', _extract_gainloss),
+                                ('electronic_transfers',
+                                 _extract_electronic_transfers),
+                                ('advisory', _extract_advisory)):
+            try:
+                values.update(extractor(lines))
+            except Exception:
+                log.warning('statement block %r failed to extract', name,
+                            exc_info=True)
+                failed.append(name)
     _derive(values)
 
     open_key, close_key = _HEADLINE_FIELDS.get(layout, ('', ''))
@@ -858,6 +1039,7 @@ def parse_statement(pdf_bytes: bytes) -> dict:
         'fields_failed': failed,
         'period_start': start.isoformat() if start else None,
         'period_end': end.isoformat() if end else None,
+        'pages': page_inventory(pages),
     })
     if due is not None:
         metadata['payment_due_date'] = due.isoformat()
@@ -887,8 +1069,16 @@ def parse_balances(pdf_bytes: bytes) -> dict:
 # 'parser_version' and 'fields_failed' sitting in the middle of the money.
 _META_HOUSEKEEPING = frozenset({
     'parser_version', 'layout', 'verified', 'fields_failed',
-    'period_start', 'period_end', 'payment_due_date',
+    'period_start', 'period_end', 'payment_due_date', 'pages',
+    'advisory_program', 'advisory_fee_rate',
 })
+
+# How a gain/loss column reads in a table of figures.
+_GAINLOSS_COLUMN_LABELS = {
+    'unrealized': 'unrealized',
+    'realized_period': 'realized, this period',
+    'realized_ytd': 'realized, year to date',
+}
 
 # Presentation order and labels for the figures. A dict is unordered and
 # alphabetical is meaningless here — 'Available funds' before 'Cash opening'
@@ -912,40 +1102,65 @@ FIGURE_LABELS = (
     ('payments_total', 'Payments and credits'),
     ('purchases_total', 'Purchases'),
     ('cash_advances_total', 'Cash advances'),
-    ('checks_written_total', 'Checks written'),
-    ('card_activity_total', 'ATM and card activity'),
+    ('check_withdrawals', 'Withdrawals by check'),
+    ('atm_activity', 'ATM and CheckCard activity'),
     ('other_additions', 'Other additions'),
     ('other_subtractions', 'Other subtractions and transfers'),
-    ('net_additions_to_cash', 'Net additions to cash'),
-    ('net_subtractions_from_cash', 'Net subtractions from cash'),
-    ('securities_bought_total', 'Securities purchased'),
-    ('securities_sold_total', 'Securities sold and redeemed'),
+    ('net_additions', 'Net additions to cash'),
+    ('net_subtractions', 'Net subtractions from cash'),
+    ('securities_purchased', 'Securities purchased'),
+    ('securities_sold', 'Securities sold and redeemed'),
+    ('electronic_transfers_in', 'Electronic funds transfers in'),
+    ('electronic_transfers_out', 'Electronic funds transfers out'),
     ('securities_deposited', 'Securities deposited'),
     ('securities_withdrawn', 'Securities withdrawn'),
     ('change_in_value', 'Change in market value'),
-    ('income_and_distributions', 'Income and distributions'),
-    ('interest_total', 'Interest'),
+    ('income_distributions', 'Income and distributions'),
+    ('interest_income', 'Interest'),
     ('interest_earned', 'Interest earned'),
     ('interest_charged', 'Interest charged'),
     ('sweep_income', 'Sweep / money-market income'),
-    ('dividends_ordinary', 'Dividends — ordinary and short-term gains'),
-    ('dividends_qualified', 'Dividends — qualified'),
+    ('ordinary_dividends', 'Dividends — ordinary and short-term gains'),
+    ('qualified_dividends', 'Dividends — qualified'),
     ('dividends_total', 'Dividends — total'),
-    ('taxable_income', 'Taxable income'),
+    ('other_income', 'Other income'),
+    ('total_taxable_income', 'Taxable income'),
     ('tax_exempt_income', 'Tax-exempt income'),
     ('total_income', 'Total income'),
+    ('gross_proceeds', 'Gross proceeds'),
+    ('foreign_withholding', 'Foreign withholding'),
+    ('advisory_fees', 'Advisory, manager and platform fees'),
     ('fees_total', 'Fees'),
     ('service_fees', 'Service fees'),
-    ('unrealized_gains', 'Unrealized gain/loss'),
-    ('realized_gains', 'Realized gain/loss — this period'),
-    ('realized_gains_ytd', 'Realized gain/loss — year to date'),
-    ('gains_short_term_unrealized', 'Unrealized — short term'),
-    ('gains_long_term_unrealized', 'Unrealized — long term'),
+    ('short_term_gainloss', 'Short term / net lots'),
+    ('long_term_gainloss', 'Long term'),
+    ('total_gainloss', 'Gain/loss — total'),
     ('average_ledger_balance', 'Average ledger balance'),
     ('average_collected_balance', 'Average collected balance'),
 )
 
 _FIGURE_LABEL = dict(FIGURE_LABELS)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _expand(key: str, label: str, value):
+    """One metadata entry as [(key, label, amount)].
+
+    A plain number is one row. A gain/loss dict is THREE — one per column —
+    because a 3×3 table read as three opaque objects tells a reader nothing,
+    and flattening it at storage time would have meant nine loose keys for
+    what is one fact about one holding period."""
+    if _is_number(value):
+        return [(key, label, value)]
+    if isinstance(value, dict):
+        return [(f'{key}.{col}',
+                 f'{label} — {_GAINLOSS_COLUMN_LABELS.get(col, col)}',
+                 value[col])
+                for col in _GAINLOSS_COLUMNS if _is_number(value.get(col))]
+    return []
 
 
 def metadata_figures(metadata: dict) -> list[tuple[str, str, float]]:
@@ -954,14 +1169,17 @@ def metadata_figures(metadata: dict) -> list[tuple[str, str, float]]:
     rather than being dropped — a field added by a newer parser must still be
     visible on a page rendered by an older template."""
     metadata = metadata or {}
-    known = [(k, _FIGURE_LABEL[k], metadata[k]) for k, _ in FIGURE_LABELS
-             if isinstance(metadata.get(k), (int, float))
-             and not isinstance(metadata.get(k), bool)]
-    seen = {k for k, _, _ in known}
-    extra = [(k, k.replace('_', ' ').capitalize(), v)
-             for k, v in sorted(metadata.items())
-             if k not in seen and k not in _META_HOUSEKEEPING
-             and isinstance(v, (int, float)) and not isinstance(v, bool)]
+    known, seen = [], set()
+    for key, label in FIGURE_LABELS:
+        rows = _expand(key, label, metadata.get(key))
+        if rows:
+            known.extend(rows)
+            seen.add(key)
+    extra = []
+    for key, value in sorted(metadata.items()):
+        if key in seen or key in _META_HOUSEKEEPING:
+            continue
+        extra.extend(_expand(key, key.replace('_', ' ').capitalize(), value))
     return known + extra
 
 
@@ -1026,8 +1244,8 @@ def _movement_totals(account, start, end) -> dict:
     withdrawals negative. Flipping once, here, is what lets a validation row
     subtract one column from the other and have the answer mean something."""
     out = {'deposits_total': 0.0, 'withdrawals_total': 0.0,
-           'dividends_total': 0.0, 'interest_total': 0.0, 'fees_total': 0.0,
-           'securities_bought_total': 0.0, 'securities_sold_total': 0.0}
+           'dividends_total': 0.0, 'interest_income': 0.0, 'advisory_fees': 0.0,
+           'securities_purchased': 0.0, 'securities_sold': 0.0}
     if account is None or start is None or end is None:
         return out
     rows = (BankTransaction.query
@@ -1058,13 +1276,13 @@ def _movement_totals(account, start, end) -> dict:
             if 'dividend' in sub:
                 out['dividends_total'] += cash
             elif 'interest' in sub:
-                out['interest_total'] += cash
+                out['interest_income'] += cash
             elif kind == 'fee' or 'fee' in sub:
-                out['fees_total'] += cash
+                out['advisory_fees'] += cash
             elif kind == 'buy':
-                out['securities_bought_total'] += cash
+                out['securities_purchased'] += cash
             elif kind == 'sell':
-                out['securities_sold_total'] += cash
+                out['securities_sold'] += cash
     return {k: round(v, 2) for k, v in out.items()}
 
 
@@ -1074,8 +1292,8 @@ def _movement_totals(account, start, end) -> dict:
 # so these compare directly with no per-field sign handling.
 _COMPARABLE = (
     'deposits_total', 'withdrawals_total', 'dividends_total',
-    'interest_total', 'fees_total',
-    'securities_bought_total', 'securities_sold_total',
+    'interest_income', 'advisory_fees',
+    'securities_purchased', 'securities_sold',
 )
 
 
@@ -1107,6 +1325,8 @@ def validate_statement(statement: PlaidStatement,
            'layout': metadata.get('layout') or (statement.parse_method or ''),
            'verified': bool(metadata.get('verified')),
            'fields_failed': list(metadata.get('fields_failed') or []),
+           'advisory_program': metadata.get('advisory_program') or '',
+           'advisory_fee_rate': metadata.get('advisory_fee_rate') or '',
            'period_matches': None}
 
     # Does the period the STATEMENT prints agree with the one derived from
@@ -1280,7 +1500,49 @@ def flag_parse_continuity(statement: PlaidStatement) -> bool:
     return suspect
 
 
-def reparse_stored(account_id: str = '') -> dict:
+def is_stale(statement: PlaidStatement) -> bool:
+    """Whether this row's figures came from an older parser than the one now
+    running. A row with no PDF on disk is never stale — there is nothing to
+    re-read, so its figures are the best that will ever be had."""
+    return (pdf_exists(statement)
+            and statement.parser_version() != PARSER_VERSION)
+
+
+def stale_statements(account_id: str = '') -> list:
+    """Every held statement whose figures predate the running parser."""
+    q = PlaidStatement.query
+    if account_id:
+        q = q.filter(PlaidStatement.plaid_account_id == account_id)
+    return [s for s in q.all() if is_stale(s)]
+
+
+def reparse_stale() -> dict:
+    """Re-read every statement whose figures predate the running parser.
+
+    THIS IS THE FIX FOR THE FAILURE v0.4.42 WAS WRITTEN AFTER. v0.4.41 shipped
+    a parser that corrected a wrong closing balance on all 26 production
+    statements — and then nothing changed, because `_store_one` skips any
+    statement whose PDF it already holds and the correction only reached the
+    database when an operator pressed a button nobody knew to press. The
+    install ran the new code over the old numbers for as long as it took
+    someone to notice, which is exactly the shape of bug an audit trail is
+    supposed to prevent.
+
+    So a parser bump now heals itself: this runs on the same schedule as the
+    statement pull, and a row is re-read when its `parser_version` is not the
+    running one. It is idempotent and cheap on a settled install — every row
+    already carries the current version, so the pass costs one query and reads
+    no PDFs at all."""
+    stale = stale_statements()
+    if not stale:
+        return {'examined': 0, 'changed': 0, 'unreadable': 0, 'suspect': 0,
+                'fields': 0, 'failed_fields': 0}
+    log.info('%d statement(s) parsed by an older recognizer — re-reading',
+             len(stale))
+    return reparse_stored(only_stale=True)
+
+
+def reparse_stored(account_id: str = '', *, only_stale: bool = False) -> dict:
     """Re-run the parser over PDFs already on disk, without re-downloading.
 
     This is how an install picks up a parser improvement. `_store_one` skips any
@@ -1302,6 +1564,8 @@ def reparse_stored(account_id: str = '') -> dict:
         q = q.filter(PlaidStatement.plaid_account_id == account_id)
     rows = q.order_by(PlaidStatement.plaid_account_id,
                       PlaidStatement.period_start.asc().nullsfirst()).all()
+    if only_stale:
+        rows = [r for r in rows if is_stale(r)]
     for row in rows:
         path = resolve_pdf_path(row)
         if not path:

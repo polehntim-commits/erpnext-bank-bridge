@@ -259,6 +259,7 @@ def _run_statements_pull(app) -> None:
     pull must never take the scheduler thread (or the nightly sync sharing it)
     down with it."""
     from .. import audit
+    from .. import db
     from .. import plaid_settings
     from .. import statements
     with app.app_context():
@@ -279,6 +280,29 @@ def _run_statements_pull(app) -> None:
                 log.info('[scheduler] statement pull complete: %s', result)
         except Exception:  # pragma: no cover - never let the job die
             log.exception('[scheduler] statement pull crashed')
+        # v0.4.42 — re-read any statement whose figures predate the running
+        # parser. Its own try block, and deliberately NOT gated on the pull:
+        # the whole point is that this heals an install whose PDFs are ALREADY
+        # on disk, which is precisely the case a pull skips.
+        #
+        # Why this exists: v0.4.41 corrected a wrong closing balance on every
+        # production statement and then changed nothing, because the correction
+        # only reached the database when an operator pressed a button nobody
+        # knew to press. A parser bump has to heal itself or it hasn't shipped.
+        # Costs one query on a settled install — every row already carries the
+        # current version, so no PDF is opened.
+        try:
+            healed = statements.reparse_stale()
+            if healed['examined']:
+                audit.record('statements_reparsed', subject_type=None,
+                             after=healed,
+                             notes=(f"re-read {healed['examined']} statement(s) "
+                                    f"parsed by an older recognizer; "
+                                    f"{healed['changed']} changed"))
+                log.info('[scheduler] stale statement re-parse: %s', healed)
+        except Exception:  # pragma: no cover - never let the job die
+            db.session.rollback()
+            log.exception('[scheduler] stale statement re-parse crashed')
         # v0.4.10 — push whatever we now hold into ERPNext. Its own try block,
         # and deliberately NOT gated on the pull succeeding: a Plaid outage (or
         # a Plaid that was never configured) still leaves previously-fetched

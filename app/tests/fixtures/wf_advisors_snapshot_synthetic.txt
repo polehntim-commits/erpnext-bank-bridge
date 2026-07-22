@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: MIT
+#
+# Wells Fargo Advisors SNAPSHOT — self-directed brokerage holding only swept
+# cash. Modelled on a June 2025 production statement.
+#
+# HAND-WRITTEN, NOT EXTRACTED. Every identifying field is replaced; only the
+# LABELS and the DOLLAR FIGURES are verbatim, because those are what the parser
+# matches on and what its assertions mean. A file produced by running pypdf
+# over a real statement carries the account holder's home address, personal
+# email, the advisor's name and direct line, the account number, and every
+# transaction with merchant and card last-4 — in a form that greps and indexes
+# more cleanly than the PDF does. It must never be committed; see .gitignore.
+#
+# Redactions applied:
+#   mailing address     -> REDACTED MAILING ADDRESS
+#   email               -> user@example.com
+#   advisor name/phone  -> TEST ADVISOR / 555-000-0000
+#   account number      -> 0000-0000
+#   merchants / card    -> MERCHANT A / MERCHANT B, no card digits
+#
+# Lines beginning '#' are stripped by the loader; everything else is fed to the
+# parser as one line of extracted PDF text. Blank lines are preserved as page
+# breaks in spirit only — the parser reads the whole document.
+
+SNAPSHOT
+Current period ending June 30, 2025
+ACCOUNT NAME: ORCHARD EXAMPLE LLC
+ACCOUNT NUMBER: 0000-0000
+REDACTED MAILING ADDRESS
+user@example.com
+Your Financial Advisor:
+TEST ADVISOR Phone: 555-000-0000
+Wells Fargo Advisors is a trade name used by Wells Fargo Clearing Services, LLC
+
+# --- physical page 5 = statement page 1 of 9 -------------------------------
+Page 1 of 9SNAPSHOT
+ORCHARD EXAMPLE LLC
+Progress summary Value over time
+THIS PERIOD THIS YEAR
+Opening value $9,467.48 $0.00
+Cash deposited 0.00 42,354.80 12,000Securities deposited 0.00 0.00
+Cash withdrawn -1,674.31 -34,561.29
+Securities withdrawn 0.00 0.00 6,000Change in value 0.34 1.60
+Closing value $7,793.51 $7,793.51 4,000
+Portfolio summary
+CURRENT ASSET TYPE VALUE ON MAY 31 % VALUE ON JUN 30 % ANN. INCOME
+ASSETS Cash and sweep balances 9,467.48 100.00 7,793.51 100.00 4
+Fixed income securities 0.00 0.00 0.00 0.00 0
+Asset value $9,467.48 100% $7,793.51 100% $4
+
+# --- physical page 6 = statement page 2 of 9 -------------------------------
+Page 2 of 9SNAPSHOT
+ORCHARD EXAMPLE LLC
+Cash flow summary THIS PERIOD THIS YEAR
+Opening value of cash and sweep balances $9,467.48
+Income and distributions 0.34 1.60
+Other additions 0.00 37,786.80
+Net additions to cash $0.34 $37,788.40
+Withdrawals by check 0.00 -4,568.00
+ATM and CheckCard activity -1,674.31 -6,381.93
+Other subtractions, transfers & charges 0.00 -19,044.96
+Net subtractions from cash -$1,674.31 -$29,994.89
+Closing value of cash and sweep balances $7,793.51
+Income summary * THIS PERIOD THIS YEAR
+TAXABLE Money market/sweep funds 0.34 1.60
+Total taxable income $0.34 $1.60
+Total federally tax-exempt income $0.00 $0.00
+Total income $0.34 $1.60
+* Certain distributions made in the current year are reported as prior year income according to IRS regulations. This may cause a difference between Cash Flow and Income
+Summary totals.
+Gain/loss summary ** UNREALIZED THIS PERIOD REALIZED THIS YEAR REALIZED
+Short term/Net lots 0.00 0.00 0.00
+Long term (L) 0.00 0.00 0.00
+Total $0.00 $0.00 $0.00
+** Net tax lots can combine short and long term holdings into the Short term/Net lots category.
+
+# --- physical page 7 = statement page 3 of 9 -------------------------------
+Page 3 of 9SNAPSHOT
+ORCHARD EXAMPLE LLC
+Account type: Brokerage Cash Services Brokerage account number: 0000-0000
+Money market and sweep funds 7,793.51 Statements: X
+Your total available funds $7,793.51
+June 1, 2025 - June 30, 2025
+
+# --- physical page 8 = statement page 4 of 9 -------------------------------
+Page 4 of 9
+Cash and Sweep Balances
+DESCRIPTION ACCOUNT YIELD EARNED* MARKET VALUE ANNUAL INCOME
+Total Cash and Sweep Balances 100.00 $7,793.51 $4.00
+Total Bank Deposits $7,793.51
+
+# --- physical page 9 = statement page 5 of 9 -------------------------------
+# Individual transaction detail. Merchants generalised; the parser reads none
+# of this, but the section has to be present because its subtotal rows are the
+# ones a naive recognizer mistakes for the statement's own figures.
+Page 5 of 9
+ATM and CheckCard activity
+VISA CHECK CARD MERCHANT A06/01 Cash -72.17
+VISA CHECK CARD MERCHANT B06/02 Cash -52.98
+Total ATM and CheckCard activity: -$1,674.31
+
+# --- physical page 12 = statement page 8 of 9 ------------------------------
+# THE TRAP. pypdf flattens this two-column table so that 'ENDING BALANCE' is
+# immediately followed by a single sweep transfer's amount. The v0.4.40
+# recognizer read -10.78 as this month's closing balance; it is 7,793.51.
+Page 8 of 9
+Cash sweep activity
+DATE TRANSACTION DESCRIPTION AMOUNT BANK BALANCE
+BEGINNING BALANCE TRANSFER FROM BANK DEPOSIT SWEEP06/01 9,467.48 06/09 -10.78
+TRANSFER FROM BANK DEPOSIT SWEEP ENDING BALANCE06/05 -10.78 06/30 7,793.51
+06/01 BEGINNING BALANCE $0.00
+06/30 ENDING BALANCE $0.00

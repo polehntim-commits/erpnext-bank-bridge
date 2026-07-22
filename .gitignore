@@ -45,3 +45,25 @@ docker-compose.override.yml
 .coverage
 htmlcov/
 .claude/
+
+# Real bank statements and anything extracted from one — NEVER COMMIT.
+#
+# A statement PDF carries the account holder's home address, personal email,
+# the financial advisor's name and direct line, the account number, and every
+# individual transaction with merchant and card last-4. Its extracted text
+# carries exactly the same PII in a form that greps and indexes cleanly, so the
+# .txt is not a safer artifact than the .pdf — it is a worse one.
+#
+# Test fixtures are HAND-WRITTEN from a real statement's layout with every
+# identifying field replaced (see app/tests/fixtures/*_synthetic.txt). Only the
+# labels and the dollar figures the parser matches on are kept verbatim; those
+# are behaviour, not identity. A file that was produced by extraction rather
+# than written by hand does not belong in the repository, whatever it is named.
+*.pdf
+**/*_extracted.txt
+app/tests/fixtures/*.pdf
+app/tests/fixtures/*_extracted.txt
+app/tests/fixtures/*_sample.*
+app/tests/fixtures/*_raw.*
+statements/
+**/statements/*.pdf

@@ -4802,8 +4802,16 @@ STATEMENTS_BODY = """
   </p>
   <button type="submit">Pull statements</button>
 </form>
-<form method="post" action="/admin/statements/reparse" class="card">
+<form method="post" action="/admin/statements/reparse"
+      class="card" {% if stale %}style="border-color:#f5a623;background:#fff8e1"{% endif %}>
   <b>Re-parse stored PDFs</b>
+  {% if stale %}
+  <p class="warn" style="font-size:13px;margin:6px 0">
+    &#9888; {{ stale }} statement(s) still show figures from an older parser.
+    The scheduled statement job re-reads them automatically; press this to do
+    it now.
+  </p>
+  {% endif %}
   <p style="font-size:13px;color:#666;margin:6px 0">
     Re-reads the balances out of every PDF already on disk, without downloading
     anything. Run this after an upgrade that improves the parser — a pull skips
@@ -4943,6 +4951,7 @@ def statements_page():
     return _page(STATEMENTS_BODY, page='statements',
                  rows=_statement_groups(), enabled=stmts.is_enabled(),
                  interval_days=stmts.pull_interval_days(),
+                 stale=len(stmts.stale_statements()),
                  flash_msg=request.args.get('flash', ''))
 
 
@@ -5200,6 +5209,13 @@ STATEMENT_DETAIL_BODY = """
       {% if v.period_matches is false %}
       <span class="pill pill-err" title="The bank's cycle is not the calendar month Plaid reported. Every reconciliation for this period compares transactions from the wrong window.">&#9888; periods disagree</span>
       {% endif %}
+    {% endif %}
+    {% if v.advisory_program or v.advisory_fee_rate %}
+    <br><b>Advisory program:</b> {{ v.advisory_program or '—' }}
+    {% if v.advisory_fee_rate %}
+    · <b>Effective fee rate:</b> {{ v.advisory_fee_rate }}
+    {% endif %}
+    <span class="pill pill-muted" title="This account is managed — the statement names an advisory program and a disclosed fee rate. A self-directed brokerage prints neither.">managed</span>
     {% endif %}
     <br><b>Read by:</b>
     <code>{{ v.layout or 'no recognizer — nothing was parsed' }}</code>
