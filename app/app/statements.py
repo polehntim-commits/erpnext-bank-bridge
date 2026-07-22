@@ -1207,6 +1207,76 @@ def metadata_figures(metadata: dict) -> list[tuple[str, str, float]]:
 # Nothing here writes to ERPNext. That is a property of the release, not an
 # oversight.
 
+# How far a supersede chain is walked before we assume something is wrong.
+# A real chain is one or two links (a bank re-link, occasionally two); ten is
+# far past any legitimate history and exists so a cycle introduced by bad data
+# cannot hang a page render.
+_MAX_SUPERSEDE_DEPTH = 10
+
+
+def supersede_chain(account_id: str) -> list:
+    """Every account id that is the SAME REAL ACCOUNT as `account_id`.
+
+    THE BUG THIS EXISTS FOR. When a bank is re-linked, Plaid mints a new
+    account_id for the same physical account, and Bank Bridge records the
+    relationship with `superseded_by_account_id`. What it does NOT do is move
+    the transactions: the pre-relink history stays on the old row and
+    everything after lands on the new one. So on the live install, ••3158 has
+    two rows — one holding 2025-06 → 2026-03, the other 2026-04 onward — and
+    any query filtering on a single account_id sees roughly half the history
+    and silently reports the rest as missing money.
+
+    Which of the two rows hygiene marked 'active' is arbitrary, so this walks
+    the chain in BOTH directions — successors via `superseded_by_account_id`,
+    predecessors via the rows pointing AT this one — and transitively, since a
+    twice-relinked account is three rows deep. That makes the active/superseded
+    designation cosmetic for reconciliation purposes: pair to either row and
+    the same transactions are found.
+
+    Breadth-first with a visited set, so a cycle in the data (which should be
+    impossible and therefore will eventually happen) terminates instead of
+    looping. Returns the ids including the one asked for."""
+    account_id = (account_id or '').strip()
+    if not account_id:
+        return []
+    seen = {account_id}
+    frontier = [account_id]
+    for _ in range(_MAX_SUPERSEDE_DEPTH):
+        if not frontier:
+            break
+        # Successors: rows these point at. Predecessors: rows pointing at them.
+        successors = {
+            (a.superseded_by_account_id or '').strip()
+            for a in PlaidAccount.query
+            .filter(PlaidAccount.account_id.in_(tuple(frontier))).all()
+            if (a.superseded_by_account_id or '').strip()}
+        predecessors = {
+            a.account_id for a in PlaidAccount.query
+            .filter(PlaidAccount.superseded_by_account_id.in_(
+                tuple(frontier))).all()}
+        frontier = sorted((successors | predecessors) - seen)
+        seen.update(frontier)
+    if len(seen) > 1:
+        log.debug('account %s resolves to a supersede chain of %d rows',
+                  account_id, len(seen))
+    return sorted(seen)
+
+
+def _bank_total(account_ids, start, end) -> float:
+    """Σ Plaid amounts for settled BankTransactions across a set of account
+    ids, in Plaid's own convention (positive = money out)."""
+    if not account_ids or start is None or end is None:
+        return 0.0
+    rows = (BankTransaction.query
+            .filter(BankTransaction.account_id.in_(tuple(account_ids)),
+                    BankTransaction.date >= start,
+                    BankTransaction.date <= end,
+                    BankTransaction.pending.is_(False),
+                    BankTransaction.removed.is_(False))
+            .all())
+    return sum(float(t.amount or 0.0) for t in rows)
+
+
 def anchor_transaction_sum(account: PlaidAccount, start: date | None,
                            end: date | None) -> float:
     """Everything Plaid mirrored in [start, end], normalised so CASH IN IS
@@ -1231,18 +1301,23 @@ def anchor_transaction_sum(account: PlaidAccount, start: date | None,
     Only the companion's BANK transactions are added. Its SecurityTransactions
     are not, because `signed_movement` already sums those for the brokerage
     account itself and counting them twice would replace one wrong answer with
-    another."""
+    another.
+
+    v0.4.45 · BOTH SIDES WALK THEIR SUPERSEDE CHAIN. A re-linked account has
+    its history split across two rows and neither one alone is the account —
+    see `supersede_chain`. Symmetric on purpose: the brokerage side can have
+    been re-linked just as easily as the cash side, and fixing only the
+    companion would leave the same bug on the other half of the identity."""
     total = -signed_movement(account, start, end)
     partner_id = (account.paired_account_id or '').strip()
     if partner_id and start is not None and end is not None:
-        rows = (BankTransaction.query
-                .filter(BankTransaction.account_id == partner_id,
-                        BankTransaction.date >= start,
-                        BankTransaction.date <= end,
-                        BankTransaction.pending.is_(False),
-                        BankTransaction.removed.is_(False))
-                .all())
-        total += -sum(float(t.amount or 0.0) for t in rows)
+        # The partner's whole chain, minus anything already counted as part of
+        # this account's own identity — a pairing that happens to point into
+        # the same chain must not double-count it.
+        own = set(supersede_chain(account.account_id))
+        partner_ids = [aid for aid in supersede_chain(partner_id)
+                       if aid not in own]
+        total += -_bank_total(partner_ids, start, end)
     return round(total, 2)
 
 
@@ -1284,13 +1359,52 @@ def _same_company(a: PlaidAccount, b: PlaidAccount, items: dict) -> bool:
     return owner(a) == owner(b)
 
 
-def _candidate_partners(account: PlaidAccount, accounts: list,
-                        items: dict) -> list:
-    """Depository accounts that could be this brokerage account's cash side."""
+def pair_candidates(account: PlaidAccount, accounts: list = None,
+                    items: dict = None) -> list:
+    """The accounts `account` may legitimately be paired with.
+
+    v0.4.45 · SCOPED TO THE PLAID ITEM. This used to be "any depository under
+    the same Company", which is far too wide: two brokerage accounts under one
+    entity have two different companions, and offering all four made it
+    possible — easy, even — to pair an account to the wrong one. A cash-services
+    companion is by construction part of the same Plaid Link connection as the
+    brokerage account it serves, so the Item IS the correct scope. Company is
+    kept as a second constraint rather than replaced, because folding one
+    entity's cash into another's reconciliation is never right even within one
+    connection.
+
+    Four rules, each cutting out a way to be wrong:
+
+      * SAME ITEM — companions always arrive together
+      * SAME COMPANY — never fold one entity's cash into another's
+      * COMPATIBLE TYPE — only a depository account can be a brokerage
+        account's cash side; two brokerages are not companions
+      * NOT SUPERSEDED — a retired row is half an account (see
+        supersede_chain), and pairing to one is a trap the UI should not set.
+        Note the chain walk means pairing to a superseded row still WORKS; this
+        is about not inviting it.
+
+    Returns [] for a non-investment account: pairing is a property of the
+    brokerage side, which is where `paired_account_id` lives."""
+    if (account.type or '').lower() not in ('investment', 'brokerage'):
+        return []
+    if accounts is None:
+        accounts = PlaidAccount.query.order_by(PlaidAccount.name).all()
+    if items is None:
+        items = {it.item_id: (it.owning_company or '').strip()
+                 for it in PlaidItem.query.all()}
     return [c for c in accounts
             if c.account_id != account.account_id
+            and c.item_id == account.item_id
             and (c.type or '').lower() == 'depository'
+            and not (c.superseded_by_account_id or '').strip()
             and _same_company(account, c, items)]
+
+
+# Retained name for the auto-linker, which wants exactly the same rule — the
+# UI and the detector disagreeing about what a valid pairing is would be a bug
+# in itself.
+_candidate_partners = pair_candidates
 
 
 def autolink_cash_services() -> dict:
@@ -2246,17 +2360,17 @@ def signed_movement(account: PlaidAccount, start: date | None,
     BankTransaction was empty for those accounts, producing massive spurious
     deltas whenever the statement's actual closing reflected investment
     activity. Both models use the same Plaid sign convention (positive =
-    money out of account) so the sums combine directly."""
+    money out of account) so the sums combine directly.
+
+    v0.4.45 · sums the account's whole SUPERSEDE CHAIN, not one row of it. A
+    re-linked account keeps its pre-relink transactions on the old row, so
+    filtering on a single account_id sees only part of the history and reports
+    the rest as unexplained. See `supersede_chain` for why walking both
+    directions is what makes the active/superseded designation cosmetic."""
     if start is None or end is None:
         return 0.0
-    rows = (BankTransaction.query
-            .filter(BankTransaction.account_id == account.account_id,
-                    BankTransaction.date >= start,
-                    BankTransaction.date <= end,
-                    BankTransaction.pending.is_(False),
-                    BankTransaction.removed.is_(False))
-            .all())
-    bank_total = sum(float(t.amount or 0.0) for t in rows)
+    account_ids = supersede_chain(account.account_id)
+    bank_total = _bank_total(account_ids, start, end)
     # v0.4.38: brokerage/investment accounts have SecurityTransaction rows
     # that also move cash. Include them so reconciliation reflects the
     # complete picture (buys reduce cash, sells add cash, dividends add
@@ -2264,7 +2378,8 @@ def signed_movement(account: PlaidAccount, start: date | None,
     if (account.type or '').lower() in ('investment', 'brokerage'):
         from .models import SecurityTransaction
         sec_rows = (SecurityTransaction.query
-                    .filter(SecurityTransaction.account_id == account.account_id,
+                    .filter(SecurityTransaction.account_id.in_(
+                        tuple(account_ids)),
                             SecurityTransaction.date >= start,
                             SecurityTransaction.date <= end)
                     .all())

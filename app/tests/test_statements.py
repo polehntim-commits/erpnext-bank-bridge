@@ -1366,6 +1366,231 @@ class AccountPairingTest(StatementsBase):
         self.assertIn('/admin/accounts/pair', body)
 
 
+class SupersedeChainTest(StatementsBase):
+    """Re-linked accounts, whose history is SPLIT across two rows (v0.4.45).
+
+    When a bank is re-linked Plaid mints a new account_id for the same physical
+    account. Bank Bridge records that with `superseded_by_account_id` — but the
+    transactions do not move: everything before the re-link stays on the old
+    row, everything after lands on the new one. On the live install ••3158 has
+    two rows, one holding 2025-06 → 2026-03 and the other 2026-04 onward, and
+    which one hygiene marked 'active' was arbitrary.
+
+    So any query filtering on ONE account_id sees roughly half the history and
+    reports the other half as missing money. That is the bug: pairing ••6030 to
+    either ••3158 row produced a partner sum of $0 for ten of thirteen periods.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client_ = self.app.test_client()
+        self.brokerage = self._acct('brk-new', 'BUSINESS BROKERAGE', '6030',
+                                    'investment', 'brokerage')
+        # The cash side, split by a re-link: `cash-old` was superseded by
+        # `cash-new`, and each holds part of the same account's history.
+        self.cash_old = self._acct('cash-old', 'BROKERAGE CASH', '3158',
+                                   'depository', 'checking')
+        self.cash_new = self._acct('cash-new', 'BROKERAGE CASH', '3158',
+                                   'depository', 'checking')
+        self.cash_old.superseded_by_account_id = 'cash-new'
+        db.session.commit()
+
+    def _acct(self, account_id, name, mask, type_, subtype, item_id=None):
+        a = PlaidAccount(account_id=account_id,
+                         item_id=item_id or self.item.item_id,
+                         name=name, mask=mask, type=type_, subtype=subtype)
+        db.session.add(a)
+        db.session.commit()
+        return a
+
+    def _statement(self):
+        st = PlaidStatement(statement_id='s-jun',
+                            plaid_item_id=self.item.item_id,
+                            plaid_account_id='brk-new',
+                            period_start=date(2025, 6, 1),
+                            period_end=date(2025, 6, 30))
+        db.session.add(st)
+        stmts.apply_parse(st, stmts.parse_statement(
+            wf_advisors_june_2025_pdf()))
+        db.session.commit()
+        return st
+
+    def _txn(self, account_id, txn_id, amount):
+        db.session.add(BankTransaction(
+            plaid_transaction_id=txn_id, account_id=account_id,
+            date=date(2025, 6, 15), amount=amount, name='TXN'))
+        db.session.commit()
+
+    def _pair_and_sum(self, partner_id):
+        self.brokerage.paired_account_id = partner_id
+        db.session.commit()
+        return stmts.anchor_transaction_sum(
+            self.brokerage, date(2025, 6, 1), date(2025, 6, 30))
+
+    # ── the walk itself ─────────────────────────────────────────────────────
+
+    def test_the_chain_is_walked_in_both_directions(self):
+        """Which row hygiene called 'active' is arbitrary, so asking from
+        either end has to give the same answer."""
+        self.assertEqual(stmts.supersede_chain('cash-old'),
+                         ['cash-new', 'cash-old'])
+        self.assertEqual(stmts.supersede_chain('cash-new'),
+                         ['cash-new', 'cash-old'])
+
+    def test_the_chain_is_transitive(self):
+        """A twice-relinked account is three rows deep."""
+        third = self._acct('cash-older', 'BROKERAGE CASH', '3158',
+                           'depository', 'checking')
+        third.superseded_by_account_id = 'cash-old'
+        db.session.commit()
+        self.assertEqual(stmts.supersede_chain('cash-new'),
+                         ['cash-new', 'cash-old', 'cash-older'])
+
+    def test_an_unlinked_account_is_its_own_chain(self):
+        self.assertEqual(stmts.supersede_chain('brk-new'), ['brk-new'])
+        self.assertEqual(stmts.supersede_chain(''), [])
+
+    def test_a_cycle_terminates(self):
+        """Should be impossible, and therefore will eventually happen."""
+        self.cash_new.superseded_by_account_id = 'cash-old'
+        db.session.commit()
+        self.assertEqual(stmts.supersede_chain('cash-old'),
+                         ['cash-new', 'cash-old'])
+
+    # ── the bug, on the partner side ────────────────────────────────────────
+
+    def test_history_split_by_a_relink_is_summed_whole(self):
+        """THE LIVE BUG: 243 transactions on one row, 56 on the other."""
+        self._statement()
+        self._txn('cash-new', 't-new', 673.97)
+        self._txn('cash-old', 't-old', 1000.00)
+        self.assertEqual(self._pair_and_sum('cash-new'), -1673.97)
+
+    def test_pairing_to_either_row_gives_the_same_answer(self):
+        """This is what makes the active/superseded designation cosmetic — Tim
+        can re-run hygiene later or not, and reconciliation is unaffected."""
+        self._statement()
+        self._txn('cash-new', 't-new', 673.97)
+        self._txn('cash-old', 't-old', 1000.00)
+        self.assertEqual(self._pair_and_sum('cash-new'),
+                         self._pair_and_sum('cash-old'))
+
+    def test_the_anchor_variance_collapses_once_the_chain_is_walked(self):
+        self._statement()
+        self._txn('cash-new', 't-new', 673.97)
+        self._txn('cash-old', 't-old', 1000.00)
+        self.brokerage.paired_account_id = 'cash-old'
+        db.session.commit()
+        stmts.rebuild_statement_anchors()
+        anchor = stmts.anchors_for_account('brk-new')[0]
+        self.assertEqual(anchor.transaction_sum, -1673.97)
+        self.assertEqual(anchor.variance, 0.0)
+        self.assertTrue(anchor.reconciles())
+
+    # ── the same fix on the brokerage side ──────────────────────────────────
+
+    def test_the_brokerage_side_walks_its_own_chain_too(self):
+        """Symmetric on purpose: the brokerage account can have been re-linked
+        just as easily, and fixing only the companion leaves the same bug on
+        the other half of the identity."""
+        from app.models import SecurityTransaction
+        old_brk = self._acct('brk-old', 'BUSINESS BROKERAGE', '6030',
+                             'investment', 'brokerage')
+        old_brk.superseded_by_account_id = 'brk-new'
+        db.session.add(SecurityTransaction(
+            plaid_investment_transaction_id='iv-old', account_id='brk-old',
+            date=date(2025, 6, 10), amount=500.00, type='buy'))
+        db.session.commit()
+        self._statement()
+        self.assertEqual(
+            stmts.anchor_transaction_sum(self.brokerage, date(2025, 6, 1),
+                                         date(2025, 6, 30)), -500.00)
+
+    def test_a_pairing_into_its_own_chain_is_not_double_counted(self):
+        self._statement()
+        self._txn('brk-new', 't-own', 1673.97)
+        self.assertEqual(self._pair_and_sum('brk-new'), -1673.97)
+
+
+class PairCandidateScopeTest(StatementsBase):
+    """Which accounts the pairing dropdown offers (v0.4.45).
+
+    The old rule — any depository under the same Company — was far too wide:
+    two brokerage accounts under one entity have two different companions, and
+    showing all four made pairing to the wrong one easy. A cash-services
+    companion is by construction part of the same Plaid Link connection as the
+    brokerage account it serves, so the Item is the correct scope."""
+
+    def setUp(self):
+        super().setUp()
+        self.client_ = self.app.test_client()
+        self.other_item = self._item('item-other')
+        self.brokerage = self._acct('brk', 'BUSINESS BROKERAGE', '6030',
+                                    'investment', 'brokerage')
+        self.companion = self._acct('cash', 'BROKERAGE CASH', '3158',
+                                    'depository', 'checking')
+
+    def _acct(self, account_id, name, mask, type_, subtype, item_id=None,
+              company=None):
+        a = PlaidAccount(account_id=account_id,
+                         item_id=item_id or self.item.item_id,
+                         name=name, mask=mask, type=type_, subtype=subtype,
+                         owning_company=company)
+        db.session.add(a)
+        db.session.commit()
+        return a
+
+    def _options(self, account=None):
+        return {c.account_id for c in
+                stmts.pair_candidates(account or self.brokerage)}
+
+    def test_the_companion_on_the_same_connection_is_offered(self):
+        self.assertEqual(self._options(), {'cash'})
+
+    def test_an_account_on_another_plaid_connection_is_not(self):
+        """The scope-creep this fix removes: another WF connection's checking
+        account is not this brokerage account's companion."""
+        self._acct('other-cash', 'OTHER CASH', '9999', 'depository',
+                   'checking', item_id='item-other')
+        self.assertEqual(self._options(), {'cash'})
+
+    def test_a_superseded_row_is_not_offered(self):
+        """Pairing to one still WORKS via the chain walk — this is about not
+        inviting it. Tim paired to a superseded row because the UI let him."""
+        retired = self._acct('cash-old', 'BROKERAGE CASH', '3158',
+                             'depository', 'checking')
+        retired.superseded_by_account_id = 'cash'
+        db.session.commit()
+        self.assertEqual(self._options(), {'cash'})
+
+    def test_another_brokerage_is_not_a_companion(self):
+        self._acct('brk2', 'SECOND BROKERAGE', '9401', 'investment',
+                   'brokerage')
+        self.assertEqual(self._options(), {'cash'})
+
+    def test_a_depository_account_offers_nothing(self):
+        """Pairing is a property of the brokerage side — that is where
+        `paired_account_id` lives."""
+        self.assertEqual(self._options(self.companion), set())
+
+    def test_the_company_constraint_still_applies(self):
+        """Same connection, different entity: folding one company's cash into
+        another's reconciliation is never right."""
+        self.companion.owning_company = 'Another Entity, LLC'
+        self.brokerage.owning_company = 'Orchard Example, LLC'
+        db.session.commit()
+        self.assertEqual(self._options(), set())
+
+    def test_the_detector_and_the_ui_share_one_rule(self):
+        """The two disagreeing about what a valid pairing is would itself be a
+        bug."""
+        self.assertIs(stmts._candidate_partners, stmts.pair_candidates)
+
+    def test_the_dropdown_names_its_scope(self):
+        body = self.client_.get('/admin/accounts').data.decode()
+        self.assertIn('under this Plaid connection', body)
+
+
 class SandboxVisibilityTest(StatementsBase):
     """Hiding the Plaid Sandbox test accounts (v0.4.44).
 

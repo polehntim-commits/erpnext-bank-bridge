@@ -1392,15 +1392,42 @@ wrong. `PlaidAccount.paired_account_id` fixes that: when set,
 SecurityTransactions — those are already summed for the brokerage side, and
 double-counting replaces one wrong answer with another).
 
+**Re-linked accounts are one account (v0.4.45).** When a bank is re-linked
+Plaid mints a new `account_id` for the same physical account; Bank Bridge
+records that with `superseded_by_account_id`, but the transactions do **not**
+move — everything before the re-link stays on the old row. On the live install
+••3158 has two rows, one holding 2025-06 → 2026-03 and the other 2026-04
+onward, and which one hygiene marked "active" was arbitrary. So a sum filtering
+on a single `account_id` saw about half the history and reported the rest as
+missing money: pairing ••6030 to *either* ••3158 row produced a partner sum of
+$0 for ten of thirteen periods.
+
+`supersede_chain()` walks the relationship **both directions and transitively**
+(bounded at 10 links, so bad data can't loop), and both sides of the sum use it
+— the brokerage side can be re-linked just as easily as the cash side. That
+makes the active/superseded designation **cosmetic for reconciliation**: pair
+to either row and the same transactions are found, so hygiene can be re-run
+later, or not, without changing a single anchor.
+
 **Detection, strongest evidence first.** The statement prints
 `Brokerage Cash Services number: 1234567890`, whose last four digits are the
 companion's Plaid mask — the bank's own assertion of the relationship, captured
 into `PlaidStatement.cash_services_account_number`. Failing that, a
 `… BROKERAGE …` account beside exactly one `… BROKERAGE CASH …` under the same
 Company is the same relationship spelled differently. A pairing is made only
-when **exactly one** candidate matches and never across Companies — pairing the
-wrong cash account would silently fold another account's transactions into this
-reconciliation, which is worse than a visible gap. Runs after each re-parse
+when **exactly one** candidate matches — pairing the wrong cash account would
+silently fold another account's transactions into this reconciliation, which is
+worse than a visible gap.
+
+**Candidates are scoped to the Plaid Item** (v0.4.45), not merely the Company:
+two brokerage accounts under one entity have two different companions, and
+offering all four made pairing to the wrong one easy. A companion always
+arrives on the same Link connection as the account it serves, so the Item is
+the right scope; Company is kept as a second constraint, type must be
+compatible (only a depository can be a brokerage's cash side), and superseded
+rows are excluded — pairing to one still *works* via the chain walk, but the UI
+shouldn't invite it. The dropdown and the auto-linker share one function, since
+disagreeing about what a valid pairing is would itself be a bug. Runs after each re-parse
 (before the anchor rebuild — the key is recovered by the re-parse and the sums
 depend on the pairing). **A manual pairing on `/admin/accounts` always wins.**
 

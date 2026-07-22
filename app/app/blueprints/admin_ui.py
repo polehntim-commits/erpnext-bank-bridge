@@ -32,6 +32,7 @@ from werkzeug.security import check_password_hash
 
 from .. import account_cleanup
 from .. import account_visibility as av
+from .. import statements as stmts_mod
 from .. import audit
 from .. import categorization
 from .. import counterparty
@@ -788,6 +789,11 @@ ACCOUNTS_BODY = """
         </select>
         <button type="submit" class="secondary"
                 style="padding:3px 8px;font-size:11px;margin-top:3px">Save pair</button>
+        <div style="font-size:10px;color:#777;margin-top:3px;max-width:190px">
+          Candidates are depository accounts under this Plaid connection —
+          a Brokerage Cash Services companion always arrives on the same
+          connection as the brokerage account it serves.
+        </div>
       </form>
       {% endif %}
     </td>
@@ -1114,17 +1120,19 @@ def accounts_page():
     # WITH: other visible accounts under the same Company. `sandbox_ids` lets
     # the template tag a sandbox row when the toggle is on, so a test account
     # can never be mistaken for a real one.
-    companies_by_account = _resolve_account_companies()
     visible = [a for g in groups for a in g['accounts']]
-    pair_options = {}
-    for a in visible:
-        mine = companies_by_account.get(a.account_id, '')
-        pair_options[a.account_id] = [
-            o for o in visible
-            if o.account_id != a.account_id
-            and companies_by_account.get(o.account_id, '') == mine]
+    # v0.4.45 · one rule, defined once in statements.pair_candidates and shared
+    # with the auto-linker. Scoped to the Plaid Item — a cash-services
+    # companion always arrives on the same Link connection as the brokerage
+    # account it serves — and excluding superseded rows, which are half an
+    # account and a trap to pair to.
+    item_companies = {it.item_id: (it.owning_company or '').strip()
+                      for it in PlaidItem.query.all()}
+    all_accounts = PlaidAccount.query.order_by(PlaidAccount.name).all()
+    pair_options = {a.account_id: stmts_mod.pair_candidates(
+        a, all_accounts, item_companies) for a in visible}
     pair_names = {a.account_id: (a.name or a.account_id) for a in visible}
-    pair_masks = {a.account_id: (a.mask or '????') for a in visible}
+    pair_masks = {a.account_id: (a.mask or '????') for a in all_accounts}
     sandbox_ids = av.sandbox_account_ids()
     visibility = av.summary()
     # v0.4.43 · statement-anchored variance per account. Company-agnostic by
