@@ -790,9 +790,10 @@ ACCOUNTS_BODY = """
         <button type="submit" class="secondary"
                 style="padding:3px 8px;font-size:11px;margin-top:3px">Save pair</button>
         <div style="font-size:10px;color:#777;margin-top:3px;max-width:190px">
-          Candidates are depository accounts under this Plaid connection —
-          a Brokerage Cash Services companion always arrives on the same
-          connection as the brokerage account it serves.
+          Candidates are depository accounts under this Plaid connection,
+          and only ones not already paired to another account — a Brokerage
+          Cash Services companion arrives on the same connection as the
+          brokerage account it serves, and serves exactly one.
         </div>
       </form>
       {% endif %}

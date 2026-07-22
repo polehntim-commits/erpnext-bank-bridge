@@ -1409,6 +1409,20 @@ makes the active/superseded designation **cosmetic for reconciliation**: pair
 to either row and the same transactions are found, so hygiene can be re-run
 later, or not, without changing a single anchor.
 
+**…and the overlap is counted once (v0.4.46).** Walking the chain fixed the
+split history and exposed the opposite problem in the months either side of the
+re-link: Plaid ingested the same purchases into *both* account_ids with
+**different `plaid_transaction_id`s**, so id-based dedupe cannot see them. On
+••3158's May 2026 window that is 28 rows for 14 real purchases — the anchor
+summed **−$33,775.58** where the bank saw **−$16,887.79**.
+
+Rows are therefore deduplicated on a `(date, amount, normalised name)`
+fingerprint, and **only across account_ids, never within one**: two identical
+charges on the same day on the *same* account are two real purchases. For each
+fingerprint the rows of whichever single account holds the most copies are
+kept, so a genuine intra-account repeat survives alongside its cross-account
+mirror.
+
 **Detection, strongest evidence first.** The statement prints
 `Brokerage Cash Services number: 1234567890`, whose last four digits are the
 companion's Plaid mask — the bank's own assertion of the relationship, captured

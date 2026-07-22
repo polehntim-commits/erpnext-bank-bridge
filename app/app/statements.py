@@ -1262,9 +1262,61 @@ def supersede_chain(account_id: str) -> list:
     return sorted(seen)
 
 
+def _fingerprint(txn) -> tuple:
+    """(date, amount, normalised name) — what makes two rows THE SAME REAL
+    EVENT even though Plaid gave them different ids.
+
+    Name is stripped and lowercased because the two sides of a re-link are two
+    separate Plaid ingestions of the same feed and their capitalisation is not
+    guaranteed to agree; a missing name folds to ''. Amount and date are used
+    as-is: a cent or a day of difference means two events."""
+    return (txn.date, round(float(txn.amount or 0.0), 2),
+            (getattr(txn, 'name', '') or '').strip().lower())
+
+
+def dedupe_across_accounts(rows) -> list:
+    """Drop rows that a re-link caused to be recorded twice.
+
+    THE BUG THIS EXISTS FOR. `supersede_chain` (v0.4.45) fixed history being
+    SPLIT across two rows of a re-linked account. It exposed the opposite
+    problem in the overlap: for the months on both sides of the re-link, Plaid
+    ingested the same purchases into BOTH account_ids with DIFFERENT
+    `plaid_transaction_id`s. On the live install every May 2026 purchase on
+    ••3158 appears twice that way, and the anchor summed −$33,778 where the
+    bank saw −$16,763. Id-based dedupe cannot catch it; the ids genuinely
+    differ. What matches exactly is (date, amount, name).
+
+    ONLY ACROSS ACCOUNTS, NEVER WITHIN ONE. Two identical charges on the same
+    day from the same merchant on the SAME account are two real purchases —
+    buying the same coffee twice is not a data error — so within a single
+    account_id everything is kept. What is removed is the mirror image of a set
+    on another account_id in the chain.
+
+    Implemented as: for each fingerprint, keep the rows belonging to whichever
+    single account_id holds the MOST copies of it. That preserves a genuine
+    intra-account repeat (the account with two keeps both) while collapsing the
+    cross-account duplicate (two accounts with one each keep one). Ties break
+    on account_id so the result is stable rather than dependent on row order."""
+    by_fingerprint: dict = {}
+    for row in rows:
+        by_fingerprint.setdefault(_fingerprint(row), {}).setdefault(
+            row.account_id, []).append(row)
+    kept = []
+    for per_account in by_fingerprint.values():
+        if len(per_account) == 1:
+            kept.extend(next(iter(per_account.values())))
+            continue
+        winner = max(sorted(per_account), key=lambda a: len(per_account[a]))
+        kept.extend(per_account[winner])
+    return kept
+
+
 def _bank_total(account_ids, start, end) -> float:
     """Σ Plaid amounts for settled BankTransactions across a set of account
-    ids, in Plaid's own convention (positive = money out)."""
+    ids, in Plaid's own convention (positive = money out).
+
+    Deduplicated across the chain (see dedupe_across_accounts) — a re-link
+    leaves the same real purchase recorded on both account_ids."""
     if not account_ids or start is None or end is None:
         return 0.0
     rows = (BankTransaction.query
@@ -1274,6 +1326,8 @@ def _bank_total(account_ids, start, end) -> float:
                     BankTransaction.pending.is_(False),
                     BankTransaction.removed.is_(False))
             .all())
+    if len(account_ids) > 1:
+        rows = dedupe_across_accounts(rows)
     return sum(float(t.amount or 0.0) for t in rows)
 
 
@@ -1383,6 +1437,13 @@ def pair_candidates(account: PlaidAccount, accounts: list = None,
         supersede_chain), and pairing to one is a trap the UI should not set.
         Note the chain walk means pairing to a superseded row still WORKS; this
         is about not inviting it.
+      * NOT ALREADY SOMEONE ELSE'S CASH SIDE (v0.4.46) — a cash-services
+        account serves exactly one brokerage account. Once ••3158 is paired to
+        ••6030 it is not a candidate for ••9401, and offering it there invites
+        an operator to move one account's entire transaction history into
+        another's reconciliation with a single click. The CURRENT selection is
+        always still offered, so opening the dropdown on an already-paired
+        account shows what it is paired to rather than a blank.
 
     Returns [] for a non-investment account: pairing is a property of the
     brokerage side, which is where `paired_account_id` lives."""
@@ -1393,11 +1454,16 @@ def pair_candidates(account: PlaidAccount, accounts: list = None,
     if items is None:
         items = {it.item_id: (it.owning_company or '').strip()
                  for it in PlaidItem.query.all()}
+    claimed = {(a.paired_account_id or '').strip() for a in accounts
+               if a.account_id != account.account_id
+               and (a.paired_account_id or '').strip()}
     return [c for c in accounts
             if c.account_id != account.account_id
             and c.item_id == account.item_id
             and (c.type or '').lower() == 'depository'
             and not (c.superseded_by_account_id or '').strip()
+            and (c.account_id not in claimed
+                 or c.account_id == (account.paired_account_id or '').strip())
             and _same_company(account, c, items)]
 
 
@@ -2383,6 +2449,11 @@ def signed_movement(account: PlaidAccount, start: date | None,
                             SecurityTransaction.date >= start,
                             SecurityTransaction.date <= end)
                     .all())
+        # Deduped for the same reason the bank rows are, defensively: the live
+        # data doesn't show doubled security transactions today, but a re-link
+        # overlap is a property of the re-link, not of the table.
+        if len(account_ids) > 1:
+            sec_rows = dedupe_across_accounts(sec_rows)
         sec_total = sum(float(t.amount or 0.0) for t in sec_rows)
         return round(bank_total + sec_total, 2)
     return round(bank_total, 2)

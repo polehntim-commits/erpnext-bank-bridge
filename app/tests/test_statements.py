@@ -1512,6 +1512,130 @@ class SupersedeChainTest(StatementsBase):
         self.assertEqual(self._pair_and_sum('brk-new'), -1673.97)
 
 
+class ChainDedupeTest(StatementsBase):
+    """Re-link OVERLAP: the same real purchase recorded on both account_ids
+    (v0.4.46).
+
+    v0.4.45's chain walk fixed history being SPLIT across two rows. It exposed
+    the opposite problem in the months either side of the re-link: Plaid
+    ingested the same purchases into BOTH account_ids with DIFFERENT
+    `plaid_transaction_id`s, so id-based dedupe cannot see it. What matches
+    exactly is (date, amount, name).
+
+    On the live install, ••3158's May 2026 window holds 28 rows for 14 real
+    purchases, and the anchor summed −$33,775.58 where the bank saw about half
+    that. This class reproduces that shape."""
+
+    def setUp(self):
+        super().setUp()
+        self.brokerage = self._acct('brk', 'BUSINESS BROKERAGE', '6030',
+                                    'investment', 'brokerage')
+        self.cash_new = self._acct('cash-new', 'BROKERAGE CASH', '3158',
+                                   'depository', 'checking')
+        self.cash_old = self._acct('cash-old', 'BROKERAGE CASH', '3158',
+                                   'depository', 'checking')
+        self.cash_old.superseded_by_account_id = 'cash-new'
+        self.brokerage.paired_account_id = 'cash-new'
+        db.session.commit()
+
+    def _acct(self, account_id, name, mask, type_, subtype):
+        a = PlaidAccount(account_id=account_id, item_id=self.item.item_id,
+                         name=name, mask=mask, type=type_, subtype=subtype)
+        db.session.add(a)
+        db.session.commit()
+        return a
+
+    def _txn(self, account_id, txn_id, amount, day, name):
+        db.session.add(BankTransaction(
+            plaid_transaction_id=txn_id, account_id=account_id,
+            date=date(2026, 5, day), amount=amount, name=name))
+
+    def _may_sum(self):
+        return stmts.anchor_transaction_sum(
+            self.brokerage, date(2026, 5, 1), date(2026, 5, 31))
+
+    def test_the_same_purchase_on_both_rows_is_counted_once(self):
+        """14 real purchases, 28 rows, different ids on each side — the live
+        May 2026 shape. The deduplicated sum equals one side alone."""
+        purchases = [(1 + i, 100.00 + i, f'MERCHANT {i}') for i in range(14)]
+        for i, (day, amount, name) in enumerate(purchases):
+            self._txn('cash-new', f'new-{i}', amount, day, name)
+            # Same event, different Plaid id — exactly what a re-link produces.
+            self._txn('cash-old', f'old-{i}', amount, day, name)
+        db.session.commit()
+        one_side = -sum(a for _, a, _ in purchases)
+        self.assertEqual(self._may_sum(), round(one_side, 2))
+
+    def test_the_raw_sum_would_have_been_double(self):
+        """Pins the bug rather than only the fix."""
+        for i in range(14):
+            self._txn('cash-new', f'new-{i}', 100.00, 1 + i, f'M{i}')
+            self._txn('cash-old', f'old-{i}', 100.00, 1 + i, f'M{i}')
+        db.session.commit()
+        rows = BankTransaction.query.all()
+        self.assertEqual(len(rows), 28)
+        self.assertEqual(round(sum(float(t.amount) for t in rows), 2), 2800.00)
+        self.assertEqual(self._may_sum(), -1400.00)
+
+    def test_two_real_purchases_on_ONE_account_are_both_kept(self):
+        """Buying the same coffee twice in a day is not a data error. Only the
+        cross-account mirror is removed."""
+        self._txn('cash-new', 'a', 50.00, 4, 'CAFE')
+        self._txn('cash-new', 'b', 50.00, 4, 'CAFE')
+        db.session.commit()
+        self.assertEqual(self._may_sum(), -100.00)
+
+    def test_a_genuine_repeat_survives_alongside_its_mirror(self):
+        """Two on one account, one on the other: the real answer is two, not
+        one and not three."""
+        self._txn('cash-new', 'a', 50.00, 4, 'CAFE')
+        self._txn('cash-new', 'b', 50.00, 4, 'CAFE')
+        self._txn('cash-old', 'mirror', 50.00, 4, 'CAFE')
+        db.session.commit()
+        self.assertEqual(self._may_sum(), -100.00)
+
+    def test_casing_and_missing_names_still_match(self):
+        self._txn('cash-new', 'a', 11500.00, 27, '  Tim Transfer ')
+        self._txn('cash-old', 'b', 11500.00, 27, 'TIM TRANSFER')
+        self._txn('cash-new', 'c', 200.00, 4, None)
+        self._txn('cash-old', 'd', 200.00, 4, '')
+        db.session.commit()
+        self.assertEqual(self._may_sum(), -11700.00)
+
+    def test_a_different_amount_or_date_is_a_different_event(self):
+        """A cent or a day apart means two purchases, not one recorded twice."""
+        self._txn('cash-new', 'a', 100.00, 4, 'SHOP')
+        self._txn('cash-old', 'b', 100.01, 4, 'SHOP')
+        self._txn('cash-old', 'c', 100.00, 5, 'SHOP')
+        db.session.commit()
+        self.assertEqual(self._may_sum(), -300.01)
+
+    def test_a_single_account_chain_is_never_deduped(self):
+        """No re-link, no overlap — and no risk of collapsing real repeats."""
+        self.brokerage.paired_account_id = None
+        self.cash_old.superseded_by_account_id = None
+        db.session.commit()
+        self._txn('brk', 'a', 75.00, 4, 'SAME')
+        self._txn('brk', 'b', 75.00, 4, 'SAME')
+        db.session.commit()
+        self.assertEqual(self._may_sum(), -150.00)
+
+    def test_security_transactions_are_deduped_too(self):
+        """Defensive: the live data doesn't show doubled security rows today,
+        but a re-link overlap is a property of the re-link, not the table."""
+        from app.models import SecurityTransaction
+        old_brk = self._acct('brk-old', 'BUSINESS BROKERAGE', '6030',
+                             'investment', 'brokerage')
+        old_brk.superseded_by_account_id = 'brk'
+        for account_id, txn_id in (('brk', 'iv-a'), ('brk-old', 'iv-b')):
+            db.session.add(SecurityTransaction(
+                plaid_investment_transaction_id=txn_id,
+                account_id=account_id, date=date(2026, 5, 10),
+                amount=500.00, name='BUY XYZ', type='buy'))
+        db.session.commit()
+        self.assertEqual(self._may_sum(), -500.00)
+
+
 class PairCandidateScopeTest(StatementsBase):
     """Which accounts the pairing dropdown offers (v0.4.45).
 
@@ -1580,6 +1704,25 @@ class PairCandidateScopeTest(StatementsBase):
         self.brokerage.owning_company = 'Orchard Example, LLC'
         db.session.commit()
         self.assertEqual(self._options(), set())
+
+    def test_a_candidate_already_paired_elsewhere_is_hidden(self):
+        """A cash-services account serves exactly one brokerage account. Once
+        ••3158 is ••6030's cash side, offering it on ••9401 invites moving one
+        account's whole history into another's reconciliation in one click."""
+        second = self._acct('brk2', 'SECOND BROKERAGE', '9401', 'investment',
+                            'brokerage')
+        other_cash = self._acct('cash2', 'SECOND CASH', '3194', 'depository',
+                                'checking')
+        self.brokerage.paired_account_id = 'cash'
+        db.session.commit()
+        self.assertEqual(self._options(second), {'cash2'})
+        self.assertEqual(other_cash.account_id, 'cash2')
+
+    def test_the_current_selection_is_always_still_offered(self):
+        """Otherwise opening the dropdown on a paired account shows a blank."""
+        self.brokerage.paired_account_id = 'cash'
+        db.session.commit()
+        self.assertIn('cash', self._options())
 
     def test_the_detector_and_the_ui_share_one_rule(self):
         """The two disagreeing about what a valid pairing is would itself be a
