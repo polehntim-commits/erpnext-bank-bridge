@@ -4890,6 +4890,18 @@ STATEMENTS_BODY = """
   &middot; <span class="warn">&#9888; {{ group.suspect }} period(s) don't chain
   on from the month before</span>
   {% endif %}
+  {% if group.anchor_periods %}
+  <br><span style="font-size:12px">
+    Statement-anchored:
+    <span style="color:#1b5e20">&#10003; {{ group.anchor_reconciled }}
+      reconciled</span>{% if group.anchor_unreconciled %} ·
+    <span class="warn">&#9888; {{ group.anchor_unreconciled }} need
+      attention</span>{% endif %}
+    of {{ group.anchor_periods }}
+    &middot; <a href="/admin/reconciliation/{{ group.statements[0].statement.plaid_account_id
+        if group.statements else '' }}" style="font-size:11px">detail &rarr;</a>
+  </span>
+  {% endif %}
 </div>
 <table>
   <tr><th>Period</th><th class="num">Opening</th><th class="num">Movement</th>
@@ -5116,8 +5128,15 @@ def _statement_groups() -> list:
                  or account.mask or account.account_id)
         if account.mask:
             label = f'{label} ••{account.mask}'
+        # v0.5.0 · per-account anchor reconciled/unreconciled count — the
+        # at-a-glance "which accounts still need attention", and the same
+        # figures Bank Bridge writes to ERPNext.
+        anchor = stmts.anchor_summary(account.account_id)
         groups.append({
             'account_label': label, 'company': company, 'statements': rows,
+            'anchor_periods': anchor['periods'],
+            'anchor_unreconciled': anchor['unexplained'],
+            'anchor_reconciled': anchor['periods'] - anchor['unexplained'],
             'mismatches': sum(1 for r in rows if r['status'] == 'mismatch'),
             'reconciled': sum(1 for r in rows if r['status'] == 'ok'),
             # v0.4.20: computed rows aren't bank cross-checks; count separately

@@ -971,5 +971,191 @@ class RegressionTests(ERPStatementBase):
         self.assertIn(('plaid_statements', 'erpnext_synced_at'), added)
 
 
+class ReconciliationStatusPushTests(ERPStatementBase):
+    """Pushing reconciliation STATUS (not corrections) to the Bank Statement
+    record (v0.4.50).
+
+    A bookkeeper opens the ERPNext Bank Statement and sees it is already
+    reconciled, with the variance and the reason, without leaving ERPNext. The
+    boundary this class guards is that STATUS is all that moves: no Journal
+    Entry, no opening-balance rewrite, no adjustment posting."""
+
+    def _paired_setup(self):
+        """A brokerage account paired to a cash companion, one anchored
+        statement, and a tagged transaction on the companion — the shape the
+        reason field is built for. Synthetic names and round amounts only."""
+        from app.models import (PlaidAccount, BankTransaction, CategorizationRule,
+                                PlaidStatement)
+        from app import categorization
+        brk = PlaidAccount(account_id='brk', item_id='item-abc',
+                           name='BUSINESS BROKERAGE', mask='9401',
+                           type='investment', subtype='brokerage',
+                           paired_account_id='cash',
+                           erpnext_bank_account_name='BA-1',
+                           import_status='imported')
+        cash = PlaidAccount(account_id='cash', item_id='item-abc',
+                            name='BROKERAGE CASH', mask='3194',
+                            type='depository', subtype='checking')
+        db.session.add_all([brk, cash])
+        db.session.add(CategorizationRule(
+            name='owner', priority=100, active=True,
+            match_type='description_regex', match_value='OWNER',
+            bb_internal_tag='owner_distribution'))
+        # The bank says cash went 100 -> 0; a single tagged draw of 100 out
+        # explains it exactly, so the period reconciles.
+        db.session.add(BankTransaction(
+            plaid_transaction_id='draw', account_id='cash', amount=100.0,
+            date=date(2026, 7, 12), name='TEST OWNER DRAW'))
+        st = PlaidStatement(statement_id='st-brk', plaid_item_id='item-abc',
+                            plaid_account_id='brk',
+                            period_start=date(2026, 7, 1),
+                            period_end=date(2026, 7, 31),
+                            opening_balance=100.0, closing_balance=0.0)
+        db.session.add(st)
+        db.session.commit()
+        st.parsed_metadata = {'cash_opening': 100.0, 'cash_closing': 0.0}
+        db.session.commit()
+        categorization.backfill_internal_tags()
+        stmts.rebuild_statement_anchors()
+        return st
+
+    # ── provisioning ────────────────────────────────────────────────────────
+
+    def test_the_three_custom_fields_are_provisioned(self):
+        client = self._client()
+        self.assertTrue(es.ensure_status_custom_fields(client))
+        made = {d['fieldname'] for d in client.created['Custom Field'].values()}
+        self.assertEqual(made, {'bank_bridge_reconciled', 'bank_bridge_variance',
+                                'bank_bridge_reason'})
+        for d in client.created['Custom Field'].values():
+            self.assertEqual(d['dt'], 'Bank Statement')
+
+    def test_provisioning_is_idempotent(self):
+        client = self._client()
+        es.ensure_status_custom_fields(client)
+        es.ensure_status_custom_fields(client)
+        creates = [c for c in client.calls
+                   if c[0] == 'create_doc' and c[1] == 'Custom Field']
+        self.assertEqual(len(creates), 3)          # not six
+
+    def test_provision_report_adds_the_fields(self):
+        client = self._client()
+        es.provision_report(client)
+        self.assertTrue(es.status_fields_available(client))
+
+    # ── the fields' values ────────────────────────────────────────────────────
+
+    def test_status_fields_from_the_anchor(self):
+        st = self._paired_setup()
+        fields = es.status_fields(st)
+        self.assertEqual(fields['bank_bridge_reconciled'], 1)
+        self.assertEqual(fields['bank_bridge_variance'], 0.0)
+        self.assertEqual(fields['bank_bridge_reason'], 'owner_distribution')
+
+    def test_an_unreconciled_period_reads_as_such(self):
+        from app.models import PlaidStatement
+        self._paired_setup()
+        # A second brokerage period with no matching cash movement → variance.
+        st = PlaidStatement(statement_id='st-gap', plaid_item_id='item-abc',
+                            plaid_account_id='brk',
+                            period_start=date(2026, 8, 1),
+                            period_end=date(2026, 8, 31),
+                            opening_balance=500.0, closing_balance=500.0)
+        db.session.add(st)
+        db.session.commit()
+        st.parsed_metadata = {'cash_opening': 500.0, 'cash_closing': 700.0}
+        db.session.commit()
+        stmts.rebuild_statement_anchors()
+        fields = es.status_fields(st)
+        self.assertEqual(fields['bank_bridge_reconciled'], 0)
+        self.assertEqual(fields['bank_bridge_variance'], 200.0)
+        self.assertEqual(fields['bank_bridge_reason'], 'untagged')
+
+    def test_a_missing_anchor_leaves_the_fields_unset(self):
+        """Should not happen post-v0.4.43, but a defensive empty beats
+        asserting a reconciled/zero state we never computed."""
+        self._account()
+        st = self._statement()          # no anchor rebuilt
+        self.assertEqual(es.status_fields(st), {})
+
+    # ── the boundary: STATUS, not corrections ─────────────────────────────────
+
+    def test_no_journal_entry_is_ever_posted(self):
+        from app.models import GeneratedJournalEntry
+        st = self._paired_setup()
+        client = self._client()
+        es.ensure_status_custom_fields(client)
+        es.sync_statement(client, st)
+        es.push_reconciliation(client, st)
+        # Nothing this module does creates a Journal Entry, locally or in ERPNext.
+        self.assertEqual(GeneratedJournalEntry.query.count(), 0)
+        self.assertEqual(len(client.created.get('Journal Entry', {})), 0)
+        self.assertFalse(any(c[0] == 'create_doc' and c[1] == 'Journal Entry'
+                             for c in client.calls))
+
+    def test_the_opening_balance_is_never_rewritten_by_status(self):
+        """Status writes touch only the bb_ fields (plus the balances the
+        v0.4.41 verdict already carried) — never an adjustment or a JE."""
+        st = self._paired_setup()
+        client = self._client()
+        es.ensure_status_custom_fields(client)
+        es.sync_statement(client, st)
+        record = client.created['Bank Statement'][st.erpnext_docname]
+        # The opening balance on the record is the parsed one, unchanged.
+        self.assertEqual(record['opening_balance'], 100.0)
+
+    # ── the record ────────────────────────────────────────────────────────────
+
+    def test_the_fields_reach_erpnext_on_create(self):
+        st = self._paired_setup()
+        client = self._client()
+        es.ensure_status_custom_fields(client)
+        result = es.sync_statement(client, st)
+        record = client.created['Bank Statement'][result['docname']]
+        self.assertEqual(record['bank_bridge_reconciled'], 1)
+        self.assertEqual(record['bank_bridge_variance'], 0.0)
+        self.assertEqual(record['bank_bridge_reason'], 'owner_distribution')
+
+    def test_resync_is_idempotent_no_write(self):
+        st = self._paired_setup()
+        client = self._client()
+        es.ensure_status_custom_fields(client)
+        es.sync_statement(client, st)
+        writes = len([c for c in client.calls if c[0] == 'update_doc'])
+        self.assertEqual(es.push_reconciliation(client, st), 'unchanged')
+        self.assertEqual(
+            len([c for c in client.calls if c[0] == 'update_doc']), writes)
+
+    def test_a_changed_reason_is_pushed(self):
+        st = self._paired_setup()
+        client = self._client()
+        es.ensure_status_custom_fields(client)
+        es.sync_statement(client, st)
+        # Re-tag: the same transaction now attributes differently.
+        from app.models import CategorizationRule
+        from app import categorization
+        CategorizationRule.query.filter_by(name='owner').first().active = False
+        db.session.add(CategorizationRule(
+            name='member', priority=90, active=True,
+            match_type='description_regex', match_value='OWNER',
+            bb_internal_tag='member_distribution'))
+        db.session.commit()
+        categorization.backfill_internal_tags()
+        self.assertEqual(es.push_reconciliation(client, st), 'updated')
+        record = client.created['Bank Statement'][st.erpnext_docname]
+        self.assertEqual(record['bank_bridge_reason'], 'member_distribution')
+
+    def test_an_install_without_the_custom_fields_omits_them(self):
+        """Degrade cleanly: no Custom Field doctype → the pre-v0.4.50 payload,
+        which ERPNext still accepts."""
+        st = self._paired_setup()
+        client = self._client(missing_doctypes={'Custom Field'})
+        result = es.sync_statement(client, st)
+        record = client.created['Bank Statement'][result['docname']]
+        self.assertNotIn('bank_bridge_reconciled', record)
+        # …and the balances/verdict still made it.
+        self.assertIn('reconciliation_status', record)
+
+
 if __name__ == '__main__':
     unittest.main()

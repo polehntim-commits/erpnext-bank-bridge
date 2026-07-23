@@ -1486,6 +1486,36 @@ Applied consistently to `/admin/accounts`, `/admin/statements`,
 `/admin/investment_transactions`, the dashboard account count, and the Plaid
 cost estimate.
 
+## Reconciliation status in ERPNext (v0.5.0)
+
+A bookkeeper opens the ERPNext **Bank Statement** record and sees *this period
+is already reconciled*, with the variance and the reason — without leaving
+ERPNext to check Bank Bridge. Three custom fields carry it:
+
+| Field | Type | Value |
+|---|---|---|
+| `bank_bridge_reconciled` | Check | 1 when the `StatementAnchor`'s `|variance|` ≤ threshold (default $1.00) |
+| `bank_bridge_variance` | Currency | the anchor variance, signed |
+| `bank_bridge_reason` | Small Text | the period's internal-tag summary (v0.4.49), `untagged` when unreconciled with no tags |
+
+**This is STATUS, not a correction.** It emits **no Journal Entry**, rewrites
+**no opening balance**, and posts **no adjustment** — verified by a test that
+asserts the JE count never moves when status is pushed. That is the line the
+"no ERPNext writes" rule actually drew: a correction would need unwinding when
+Orchard Meadow's own ERPNext splits off, but a status field re-populates
+cleanly on that instance's Bank Statement records with nothing to undo. The
+same values write idempotently on re-push (diffed, so a settled install writes
+nothing), and travel with the verdict so a re-anchor or a re-tag reaches ERPNext
+on the next refresh.
+
+The fields are provisioned as **Custom Fields** (not baked into the doctype
+spec), because the Bank Statement doctype already exists on every v0.4.10
+install — a Custom Field is the only idempotent way to reach an
+already-created doctype, and it works identically on a fresh one. An ERPNext
+that lacks the Custom Field doctype degrades to the exact pre-v0.5.0 payload
+rather than failing the sync. `/admin/statements` shows a per-account
+reconciled / needs-attention count at a glance.
+
 ## Internal attribution tags (v0.4.49)
 
 The reconciliation view's **Reason** column auto-populates from the
@@ -2812,6 +2842,7 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `STATEMENTS_VARIANCE_DOLLARS` | `1.00` | v0.4.41 · dollar half of the flag threshold on the statement validation view. A figure must differ from the mirror by more than this **and** more than `STATEMENTS_VARIANCE_PCT` to be flagged |
 | `STATEMENTS_VARIANCE_PCT` | `0.001` | v0.4.41 · fractional half of the same threshold (0.1%). Requiring both is what keeps a rounding cent on a $1.3M balance, and a fixed percentage of a $4 one, out of the report |
 | `ERPNEXT_STATEMENT_VARIANCE_THRESHOLD` | `10.00` | v0.4.10 · how large a reconciliation variance must be to earn a row in the discrepancy report. Distinct from `STATEMENTS_RECONCILE_TOLERANCE`, which decides whether a period reconciles *at all* — this decides what is worth a human's attention |
+| `ERPNEXT_STATEMENT_STATUS_THRESHOLD` | `1.00` | v0.5.0 · how far a `StatementAnchor`'s variance may sit from zero and still set `bank_bridge_reconciled = 1` on the ERPNext Bank Statement record. A dollar spans rounding and sub-$1 statement fees. Separate from `STATEMENTS_RECONCILE_TOLERANCE` so the ERPNext-visible flag can be loosened without changing which statements are safe to anchor on |
 | `ERPNEXT_STATEMENT_COVERAGE_MONTHS` | `12` | v0.4.10 · how many closed months the statement coverage report looks back over for gaps |
 | `RECONNECT_ADOPT_ENABLED` | `true` | v0.4.11 · when a bank is re-linked, let each new account inherit the ERPNext mapping, Company and opening balance of the retired account it replaces, on an unambiguous (institution, last-4, type, subtype) match. Off → a re-link produces unconfigured accounts, as before v0.4.11 |
 | `ERPNEXT_ADOPT_EXISTING` | `true` | v0.4.15 · when the `plaid_account_id` dedup key misses (which on a re-link it always does), reuse the Bank Account this real account is already on the books as, matched on Bank + last-4 + Company then Bank + subtype + Company. Never adopts across Companies or over a record a live Plaid account still claims. Off → `plaid_account_id` is the only dedup key, as before v0.4.15 |

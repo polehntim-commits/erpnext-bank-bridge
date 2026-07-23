@@ -115,6 +115,24 @@ def discrepancy_threshold() -> float:
         return 10.00
 
 
+def status_reconciled_threshold() -> float:
+    """How far a StatementAnchor's variance may sit from zero and still count as
+    RECONCILED for the ERPNext status field
+    (ERPNEXT_STATEMENT_STATUS_THRESHOLD, default 1.00).
+
+    A dollar spans ordinary rounding and the sub-$1 statement fees that Plaid
+    doesn't always mirror, and catches anything larger. Defaults to the same
+    value as statements.reconcile_tolerance because they answer the same
+    question — 'is this period materially reconciled?' — but it is a separate
+    knob so an operator can loosen the ERPNext-visible flag without changing
+    which statements are safe to anchor on."""
+    try:
+        return abs(float(current_app.config.get(
+            'ERPNEXT_STATEMENT_STATUS_THRESHOLD', 1.00)))
+    except (TypeError, ValueError):
+        return 1.00
+
+
 def coverage_months() -> int:
     """How many months back the coverage report looks
     (ERPNEXT_STATEMENT_COVERAGE_MONTHS, default 12)."""
@@ -185,6 +203,108 @@ def bank_statement_doctype_spec() -> dict:
             {'role': 'Accounts User', 'read': 1, 'report': 1},
         ],
     }
+
+
+# v0.5.0 · reconciliation STATUS fields — what Bank Bridge CONCLUDED about a
+# statement, shown on the Bank Statement record so a bookkeeper sees "already
+# reconciled" without leaving ERPNext.
+#
+# THESE ARE STATUS, NOT CORRECTIONS. They describe Bank Bridge's audit trail;
+# they emit no Journal Entry, rewrite no opening balance, and post no
+# adjustment. That is the line the "no ERPNext writes" rule actually drew (see
+# StatementAnchor): a correction would need unwinding when Orchard Meadow's own
+# ERPNext splits off, but a status field re-populates cleanly on that instance's
+# Bank Statement records with nothing to undo.
+#
+# Provisioned as Custom Fields rather than baked into the doctype spec, because
+# the doctype already exists on every v0.4.10 install — a Custom Field is the
+# only way to reach an already-created doctype idempotently, and it works
+# identically on a fresh one.
+_STATUS_CUSTOM_FIELDS = (
+    {'fieldname': 'bank_bridge_reconciled', 'fieldtype': 'Check',
+     'label': 'Bank Bridge Reconciled', 'default': '0', 'read_only': 1,
+     'insert_after': 'variance_amount',
+     'description': 'Set by Bank Bridge when this period reconciles within '
+                    'tolerance. Status only — no accounting entry is posted.'},
+    {'fieldname': 'bank_bridge_variance', 'fieldtype': 'Currency',
+     'label': 'Bank Bridge Variance', 'default': '0', 'read_only': 1,
+     'insert_after': 'bank_bridge_reconciled',
+     'description': 'The reconciliation variance Bank Bridge computed, signed '
+                    '(what the bank saw that the transaction feed did not).'},
+    {'fieldname': 'bank_bridge_reason', 'fieldtype': 'Small Text',
+     'label': 'Bank Bridge Reason', 'read_only': 1,
+     'insert_after': 'bank_bridge_variance',
+     'description': "Bank Bridge's attribution of this period's movement, from "
+                    'its categorization tags. Internal note — never a posting.'},
+)
+
+
+def ensure_status_custom_fields(client: ERPNextClient | None) -> bool:
+    """Idempotently add the three reconciliation-status Custom Fields to the
+    Bank Statement doctype. A no-op once they exist.
+
+    Returns True when they are present (or were just created), False when this
+    ERPNext lacks the Custom Field doctype — in which case the send-side simply
+    omits the three fields, degrading to the pre-v0.5.0 payload rather than
+    failing the sync. Never raises for an ordinary API error on one field: the
+    status overlay is a convenience, and one un-provisionable field must not
+    sink the statement sync that carries the PDF and the balances."""
+    if client is None:
+        return False
+    from .erpnext_accounts import CUSTOM_FIELD_DT
+    if is_doctype_unavailable(CUSTOM_FIELD_DT):
+        return False
+    all_ok = True
+    for spec in _STATUS_CUSTOM_FIELDS:
+        try:
+            existing = client.list_docs(
+                CUSTOM_FIELD_DT,
+                filters=[['dt', '=', BANK_STATEMENT_DT],
+                         ['fieldname', '=', spec['fieldname']]],
+                fields=['name'], limit_page_length=1)
+        except (ERPNextAPIError, ERPNextError) as e:
+            if isinstance(e, ERPNextAPIError) and _is_missing_doctype_error(e):
+                log.warning('Custom Field doctype unavailable — Bank Statement '
+                            'status fields not provisioned (%s)', str(e)[:200])
+                _mark_doctype_unavailable(CUSTOM_FIELD_DT)
+                return False
+            log.warning('could not probe Custom Field %s: %s',
+                        spec['fieldname'], str(e)[:200])
+            all_ok = False
+            continue
+        if existing:
+            continue
+        doc = {'dt': BANK_STATEMENT_DT}
+        doc.update(spec)
+        try:
+            client.create_doc(CUSTOM_FIELD_DT, doc)
+            log.info('provisioned Bank Statement status field %s',
+                     spec['fieldname'])
+        except (ERPNextAPIError, ERPNextError) as e:
+            log.warning('could not create Custom Field %s: %s',
+                        spec['fieldname'], str(e)[:200])
+            all_ok = False
+    return all_ok
+
+
+def status_fields_available(client: ERPNextClient | None) -> bool:
+    """Whether the three status Custom Fields exist right now — a cheap gate the
+    send-side uses to decide whether to include them. One list call; tolerant of
+    every error by answering False (omit the fields)."""
+    if client is None:
+        return False
+    from .erpnext_accounts import CUSTOM_FIELD_DT
+    if is_doctype_unavailable(CUSTOM_FIELD_DT):
+        return False
+    try:
+        rows = client.list_docs(
+            CUSTOM_FIELD_DT,
+            filters=[['dt', '=', BANK_STATEMENT_DT],
+                     ['fieldname', '=', 'bank_bridge_reconciled']],
+            fields=['name'], limit_page_length=1)
+    except (ERPNextAPIError, ERPNextError):
+        return False
+    return bool(rows)
 
 
 def _is_permission_error(e: ERPNextAPIError) -> bool:
@@ -290,6 +410,11 @@ def provision_report(client: ERPNextClient | None) -> dict:
             return {'ok': False, 'state': PROVISION_FOREIGN, 'reason': ''}
         log.info('Bank Statement doctype already present — nothing to provision')
         _mark_doctype_available(BANK_STATEMENT_DT)
+        # v0.5.0 · the doctype predates the status fields on every v0.4.10
+        # install, so an "already present" answer is exactly when they need
+        # adding. Best-effort — a field that won't provision degrades the
+        # status overlay, it does not fail the sync.
+        ensure_status_custom_fields(client)
         return {'ok': True, 'state': PROVISION_PRESENT, 'reason': ''}
     log.info('Bank Statement doctype absent — creating it')
     try:
@@ -303,6 +428,7 @@ def provision_report(client: ERPNextClient | None) -> dict:
                 log.info('Bank Statement doctype created concurrently by '
                          'another worker — treating as provisioned')
                 _mark_doctype_available(BANK_STATEMENT_DT)
+                ensure_status_custom_fields(client)
                 return {'ok': True, 'state': PROVISION_PRESENT, 'reason': ''}
         except (ERPNextAPIError, ERPNextError):
             pass
@@ -316,6 +442,7 @@ def provision_report(client: ERPNextClient | None) -> dict:
         return {'ok': False, 'state': state, 'reason': detail}
     log.info('provisioned the %s doctype', BANK_STATEMENT_DT)
     _mark_doctype_available(BANK_STATEMENT_DT)
+    ensure_status_custom_fields(client)
     return {'ok': True, 'state': PROVISION_CREATED, 'reason': ''}
 
 
@@ -391,17 +518,21 @@ def find_by_plaid_id(client: ERPNextClient, statement_id: str) -> dict | None:
     attempts a create, which the unique constraint rejects safely."""
     if not statement_id:
         return None
+    # opening/closing_balance are read (v0.4.41) and the bb_ status fields
+    # (v0.5.0) because push_reconciliation diffs all of them — a probe that
+    # omitted a field would read every record as having its default and rewrite
+    # it on every pass, exactly the churn the diff exists to avoid. The status
+    # fields are requested only when they exist, so an un-provisioned install's
+    # query is unchanged.
+    fields = ['name', MARKER_FIELD, 'reconciliation_status', 'variance_amount',
+              'opening_balance', 'closing_balance', PDF_FIELDNAME]
+    if status_fields_available(client):
+        fields += list(_STATUS_FIELD_NAMES)
     try:
         rows = client.list_docs(
             BANK_STATEMENT_DT,
             filters=[[MARKER_FIELD, '=', statement_id]],
-            # opening/closing_balance are read (v0.4.41) because
-            # push_reconciliation now diffs them too — a probe that omitted
-            # them would read every record as having 0.00 and rewrite it on
-            # every pass, which is exactly the churn the diff exists to avoid.
-            fields=['name', MARKER_FIELD, 'reconciliation_status',
-                    'variance_amount', 'opening_balance', 'closing_balance',
-                    PDF_FIELDNAME],
+            fields=fields,
             limit_page_length=1)
     except (ERPNextAPIError, ERPNextError) as e:
         log.warning('could not probe %s for %s: %s', BANK_STATEMENT_DT,
@@ -493,6 +624,53 @@ def _num(value) -> float:
         return 0.0
 
 
+# The status fields, in the shape ERPNext stores them, so a diff on re-sync is
+# a plain equality check. A Check field round-trips as 0/1.
+_STATUS_FIELD_NAMES = ('bank_bridge_reconciled', 'bank_bridge_variance',
+                       'bank_bridge_reason')
+
+
+def status_fields(statement: PlaidStatement) -> dict:
+    """The three reconciliation-STATUS fields for one statement, from its
+    StatementAnchor (v0.5.0).
+
+    STATUS, NOT A CORRECTION: this reads the anchor Bank Bridge already
+    computed and formats it for display. It builds no Journal Entry and changes
+    no balance.
+
+      * bank_bridge_reconciled — 1 when |variance| <= the status threshold
+      * bank_bridge_variance   — the anchor variance, signed
+      * bank_bridge_reason     — the period's internal-tag summary (v0.4.49),
+                                 'untagged' when unreconciled with no tags
+
+    Returns {} when no anchor exists for the statement — which should not happen
+    post-v0.4.43, so it is logged — leaving the three fields untouched on the
+    ERPNext record rather than asserting a reconciled/zero state we did not
+    actually compute."""
+    from .models import StatementAnchor
+    from . import statements as stmts
+    anchor = (StatementAnchor.query
+              .filter_by(statement_id=statement.id).first()
+              if statement.id else None)
+    if anchor is None or anchor.variance is None:
+        log.warning('statement %s has no anchor — status fields left unset',
+                    statement.statement_id)
+        return {}
+    variance = round(float(anchor.variance), 2)
+    reconciled = 1 if abs(variance) <= status_reconciled_threshold() else 0
+    account = (PlaidAccount.query
+               .filter_by(account_id=statement.plaid_account_id).first())
+    reason = ''
+    if account is not None:
+        reason = stmts.period_tag_summary(
+            account, statement.period_start, statement.period_end)
+    if not reason and not reconciled:
+        reason = 'untagged'
+    return {'bank_bridge_reconciled': reconciled,
+            'bank_bridge_variance': variance,
+            'bank_bridge_reason': reason}
+
+
 def push_reconciliation(client: ERPNextClient | None,
                         statement: PlaidStatement, *,
                         existing: dict | None = None) -> str:
@@ -530,6 +708,13 @@ def push_reconciliation(client: ERPNextClient | None,
         wanted['opening_balance'] = round(float(statement.opening_balance), 2)
     if statement.closing_balance is not None:
         wanted['closing_balance'] = round(float(statement.closing_balance), 2)
+    # v0.5.0 · the reconciliation-status fields travel with the verdict, so a
+    # re-anchor (variance changed) or a re-tag (reason changed) reaches ERPNext
+    # on the next refresh. Gated on the fields existing, and diffed below so a
+    # settled install writes nothing.
+    status_available = status_fields_available(client)
+    if status_available:
+        wanted.update(status_fields(statement))
     if existing is not None:
         current = {
             'reconciliation_status': (existing.get('reconciliation_status')
@@ -539,6 +724,22 @@ def push_reconciliation(client: ERPNextClient | None,
         for field in ('opening_balance', 'closing_balance'):
             if field in wanted:
                 current[field] = _num(existing.get(field))
+        # Compare the status fields the same way — a Check is 0/1, a Currency
+        # is a rounded float, Small Text is a plain string. Only fields we are
+        # actually sending are compared, so an install without the Custom
+        # Fields still short-circuits on the balances alone.
+        if status_available:
+            current['bank_bridge_reconciled'] = int(
+                existing.get('bank_bridge_reconciled') or 0)
+            current['bank_bridge_variance'] = _num(
+                existing.get('bank_bridge_variance'))
+            current['bank_bridge_reason'] = (
+                existing.get('bank_bridge_reason') or '')
+            wanted['bank_bridge_reconciled'] = int(
+                wanted.get('bank_bridge_reconciled') or 0)
+            wanted['bank_bridge_variance'] = _num(
+                wanted.get('bank_bridge_variance'))
+            wanted['bank_bridge_reason'] = wanted.get('bank_bridge_reason') or ''
         if current == wanted:
             return 'unchanged'
     try:
@@ -618,6 +819,11 @@ def sync_statement(client: ERPNextClient | None, statement: PlaidStatement, *,
 
     doc = {**payload_for(statement, bank_account=bank_account),
            **verdict_fields(statement)}
+    # v0.5.0 · reconciliation status, only when the Custom Fields exist —
+    # an install that couldn't provision them gets the exact pre-v0.5.0
+    # payload, which ERPNext accepts unchanged.
+    if status_fields_available(client):
+        doc.update(status_fields(statement))
     try:
         created = client.create_doc(BANK_STATEMENT_DT, doc)
     except (ERPNextAPIError, ERPNextError) as e:
@@ -765,16 +971,21 @@ def sync_all(client: ERPNextClient | None = None, *, dry_run: bool = False,
 # whether they are looking at ERPNext.
 
 def list_records(client: ERPNextClient | None) -> list | None:
-    """Every Bank Statement record, or None when ERPNext can't answer."""
+    """Every Bank Statement record, or None when ERPNext can't answer.
+
+    Includes the v0.5.0 status fields when they exist, so the bulk refresh in
+    sync_all diffs against the real values and doesn't rewrite every record on
+    each pass."""
     if not available(client):
         return None
+    fields = ['name', 'bank_account', 'period_start', 'period_end',
+              'opening_balance', 'closing_balance', MARKER_FIELD,
+              'reconciliation_status', 'variance_amount']
+    if status_fields_available(client):
+        fields += list(_STATUS_FIELD_NAMES)
     try:
         return client.list_docs(
-            BANK_STATEMENT_DT,
-            fields=['name', 'bank_account', 'period_start', 'period_end',
-                    'opening_balance', 'closing_balance', MARKER_FIELD,
-                    'reconciliation_status', 'variance_amount'],
-            order_by='period_start asc')
+            BANK_STATEMENT_DT, fields=fields, order_by='period_start asc')
     except (ERPNextAPIError, ERPNextError) as e:
         log.warning('could not list %s records: %s', BANK_STATEMENT_DT,
                     str(e)[:200])
