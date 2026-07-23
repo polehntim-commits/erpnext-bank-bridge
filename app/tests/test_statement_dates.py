@@ -204,6 +204,48 @@ class MatcherTest(StatementsBase):
         stmts.store_statement_transactions(st)
         self.assertEqual(StatementTransaction.query.count(), 1)
 
+    def test_relink_duplicate_twin_is_stamped_into_the_same_window(self):
+        """v0.5.6 · a re-link mirrors the SAME purchase onto both account_ids of
+        the chain. The matcher stamps one; its unstamped twin must be pulled
+        into the same statement month (as 'duplicate') so dedupe collapses the
+        pair — otherwise the effective-date filter splits them across two
+        months and both get counted (the ••6030 May +$125.15 bug)."""
+        cash2 = self._acct('cash2', 'BROKERAGE CASH 2', '3194', 'depository')
+        self.cash.superseded_by_account_id = cash2.account_id
+        db.session.commit()
+        # The bank posts the 05/29 purchase on 06/01.
+        st = self._statement(activity_pdf(
+            ['VISA CHECK CARD MERCHANT A06/01 Cash -52.98']))
+        a = self._bank('dupA', 52.98, date(2026, 5, 29), name='MERCHANT A',
+                       account_id='cash')
+        b = self._bank('dupB', 52.98, date(2026, 5, 29), name='MERCHANT A',
+                       account_id='cash2')
+        stmts.store_statement_transactions(st)
+        result = stmts.match_statement_to_bank_transactions(st)
+        self.assertEqual(result['duplicate'], 1)
+        db.session.refresh(a); db.session.refresh(b)
+        # Both copies now sit in June, and exactly one is flagged 'duplicate'.
+        self.assertEqual(a.statement_posted_date, date(2026, 6, 1))
+        self.assertEqual(b.statement_posted_date, date(2026, 6, 1))
+        self.assertIn('duplicate',
+                      {a.statement_match_status, b.statement_match_status})
+        chain = ['cash', 'cash2']
+        # dedupe collapses the pair: counted once in June, zero in May.
+        self.assertEqual(
+            stmts._bank_total(chain, date(2026, 6, 1), date(2026, 6, 30)), 52.98)
+        self.assertEqual(
+            stmts._bank_total(chain, date(2026, 5, 1), date(2026, 5, 31)), 0.0)
+
+    def test_a_lone_match_stamps_no_duplicate(self):
+        """No twin → no 'duplicate' side effect (guards against over-stamping
+        genuine same-amount-but-distinct transactions)."""
+        st = self._statement(activity_pdf(
+            ['VISA CHECK CARD MERCHANT A06/03 Cash -274.99']))
+        self._bank('b1', 274.99, date(2026, 6, 5), name='MERCHANT A')
+        stmts.store_statement_transactions(st)
+        result = stmts.match_statement_to_bank_transactions(st)
+        self.assertEqual(result['duplicate'], 0)
+
 
 class AnchorEffectiveDateTest(StatementsBase):
     """The payoff: a transaction the bank and Plaid date into different months

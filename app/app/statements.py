@@ -1877,7 +1877,8 @@ def match_statement_to_bank_transactions(statement: PlaidStatement) -> dict:
     re-derives the same matches. Returns
     {'matched', 'ambiguous', 'no_match', 'skipped'}."""
     from .models import BankTransaction, StatementTransaction
-    stats = {'matched': 0, 'ambiguous': 0, 'no_match': 0, 'skipped': 0}
+    stats = {'matched': 0, 'ambiguous': 0, 'no_match': 0, 'skipped': 0,
+             'duplicate': 0}
     account = PlaidAccount.query.filter_by(
         account_id=statement.plaid_account_id).first()
     if account is None:
@@ -1943,6 +1944,32 @@ def match_statement_to_bank_transactions(statement: PlaidStatement) -> dict:
         st.matched_bank_transaction_id = match.id
         st.match_status = status
         stats['matched' if status == 'matched' else 'ambiguous'] += 1
+        # v0.5.6 · KEEP A RE-LINK DUPLICATE PAIR IN ONE WINDOW. A re-link mirrors
+        # the SAME purchase onto both account_ids of the chain with identical
+        # fingerprints (see dedupe_across_accounts). The matcher stamps ONE of
+        # them; the effective-date filter (v0.5.3) then pulls that copy into the
+        # bank's month while its unstamped twin keeps Plaid's date and lands in
+        # the PRECEDING month. dedupe_across_accounts runs per-window, so the
+        # twins never co-occur and BOTH get counted — on ••6030 that split
+        # ••3158's two 05/28-authorised card purchases across May/June and
+        # over-counted May by exactly their sum ($125.15). Stamp the same
+        # date onto every fingerprint-identical, still-unstamped sibling so the
+        # pair shares one window and dedupe collapses it. 'duplicate' records why
+        # without pretending the sibling is an independent statement match.
+        fp = _fingerprint(match)
+        siblings = (BankTransaction.query
+                    .filter(BankTransaction.account_id.in_(tuple(search_ids)),
+                            BankTransaction.id != match.id,
+                            BankTransaction.amount == match.amount,
+                            BankTransaction.date == match.date,
+                            BankTransaction.statement_posted_date.is_(None),
+                            BankTransaction.removed.is_(False))
+                    .all())
+        for sib in siblings:
+            if _fingerprint(sib) == fp:
+                sib.statement_posted_date = st.posted_date
+                sib.statement_match_status = 'duplicate'
+                stats['duplicate'] += 1
     db.session.commit()
     return stats
 

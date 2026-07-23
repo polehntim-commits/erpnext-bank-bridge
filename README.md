@@ -1567,6 +1567,32 @@ the ERPNext push, always supersedes the reconstruction. Runs in the re-parse
 epilogue, after matching and before the anchor rebuild. Gated per-Item by
 `PlaidItem.statement_derived_backfill_enabled` (default TRUE).
 
+## Re-link duplicate split by the date override (v0.5.6)
+
+The last of ••6030's residual was **+$125.15 in May 2026**, and it turned out to
+be an interaction between two earlier fixes. A re-link mirrors the same purchase
+onto both account_ids of the supersede chain with identical fingerprints;
+`dedupe_across_accounts` (v0.4.46) exists to collapse exactly that. But the
+statement-date override (v0.5.3) stamps `statement_posted_date` on only **one**
+copy — the one the matcher pairs — moving it into the bank's month while its
+unstamped twin keeps Plaid's date in the **preceding** month. Because dedupe
+runs per effective-date window, the twins never co-occur in a single window and
+**both get counted**. On ••6030, two 05/28-authorised card purchases ($72.17 and
+$52.98) — which the bank posts 06/01 — were counted in both May and June; their
+sum is exactly the $125.15.
+
+The fix is one addition to the matcher: when it stamps a match, it stamps the
+same date onto every fingerprint-identical, still-unstamped sibling on the chain
+(flagged `duplicate`), so the pair shares one window and dedupe collapses it.
+Verified on live data: May **+$125.15 → $0.00**, all eight already-reconciled
+months unchanged at $0.00, 16 twins re-homed across the chain with **only** May's
+variance moving.
+
+June's remaining **+$76.37** is *not* this bug: it is a single 06/29-authorised
+purchase Plaid dates 06/30 that the bank posts in **July** — a genuine boundary
+item that self-resolves once the July statement is fetched and matched (the
+v0.5.3 override moves it out of June). Nothing to force now.
+
 ## Investment Advisory Agreement automation (v0.5.2, Phase E)
 
 Codifies the fee, benchmark, performance and compliance mechanics of an
