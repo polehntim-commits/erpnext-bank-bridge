@@ -1909,7 +1909,20 @@ def match_statement_to_bank_transactions(statement: PlaidStatement) -> dict:
                               BankTransaction.date >= lo,
                               BankTransaction.date <= hi,
                               BankTransaction.pending.is_(False),
-                              BankTransaction.removed.is_(False))
+                              BankTransaction.removed.is_(False),
+                              # v0.5.5 · only the REAL feed is matchable. A
+                              # statement-derived row (synthesize_missing_
+                              # transactions) is BUILT from this very st, so
+                              # letting it be a candidate would flip st out of
+                              # 'no_match' and the synth cleanup would then
+                              # delete it — an oscillation. Excluding synth rows
+                              # keeps 'no_match' meaning "Plaid never returned
+                              # it", which is what synthesis keys on, and is
+                              # what makes "Plaid wins over synth" hold: once
+                              # the real feed carries the line, st matches it
+                              # and its stale synth row is reaped.
+                              db.or_(BankTransaction.source.is_(None),
+                                     BankTransaction.source != 'statement'))
                       .all())
         # Prefer a description overlap when it narrows the field.
         narrowed = [c for c in candidates
@@ -1986,6 +1999,164 @@ def match_all_statements() -> dict:
                         st.statement_id, exc_info=True)
     db.session.commit()
     return totals
+
+
+def _synth_target_ids(account: PlaidAccount) -> list:
+    """Which account chain a statement's synthesized cash rows land on.
+
+    A paired brokerage's cash activity lives on its companion (that is where
+    the anchor already sums it — see anchor_transaction_sum), so a row Plaid
+    dropped must be materialized THERE to be counted. An unpaired account holds
+    its own cash, so it lands on itself. Either way the full supersede chain,
+    so a re-link doesn't scatter it."""
+    partner_id = (account.paired_account_id or '').strip()
+    return supersede_chain(partner_id or account.account_id)
+
+
+def synthesize_missing_transactions(account_id: str = '') -> dict:
+    """Materialize a BankTransaction for each statement line Plaid never
+    returned — but ONLY when doing so provably improves reconciliation (v0.5.5).
+
+    THE PROBLEM. A bank statement is the authoritative record; Plaid's feed is
+    a best-effort mirror of it. When the mirror drops a line — an interest
+    posting, an external deposit — the statement's own Activity Detail still
+    carries it, matched to nothing (`match_status == 'no_match'`). Bank Bridge
+    exists to spare a bookkeeper that gap, so it can rebuild the missing row
+    from the statement.
+
+    WHY IT IS SAFE TO DO AUTOMATICALLY — the variance guard. Not every
+    'no_match' line is a dropped transaction. On a Wells Fargo Advisors account
+    the no-matches are dominated by internal journals (a $150k sweep between
+    two of the holder's own accounts) whose cash Plaid DID record, just on the
+    companion under a different description — so the period already reconciles.
+    Synthesizing those would double-count and BREAK a reconciled month. The
+    guard is the discipline that prevents it: a row is created only if it
+    strictly shrinks |period variance|. A dropped $0.34 interest posting in a
+    period that is off by $0.34 gets built; a $150k journal in a period that
+    already balances is declined, because materializing it would move variance
+    from $0 to $150k. Synthesis can therefore never make the books worse — the
+    worst case is that it does nothing.
+
+    Sign. The statement prints the holder's view (money in positive); Plaid's
+    convention is the opposite, so the synthesized amount is the NEGATION —
+    identical to the matcher's own `-st.amount`, kept consistent on purpose.
+
+    Idempotent and Plaid-wins. Each synth row is keyed to the
+    StatementTransaction it came from (`source_statement_txn_id`), so a re-run
+    finds it rather than duplicating it. When the real feed later delivers the
+    line, the matcher (which ignores synth rows) flips that st out of
+    'no_match', and the now-stale synth row is deleted here — Plaid, being
+    canonical for the ERPNext push, always supersedes the reconstruction.
+
+    Gated per-Item by `statement_derived_backfill_enabled`. Runs the rules
+    engine on each new row (its internal tag), exactly like a feed row. Never
+    raises; returns counts."""
+    from .models import BankTransaction, StatementTransaction
+    from . import categorization
+    stats = {'created': 0, 'reaped': 0, 'skipped_dedupe': 0,
+             'skipped_guard': 0, 'skipped_disabled': 0, 'tagged': 0,
+             'statements': 0}
+    tol = reconcile_tolerance()
+
+    # ── pass 1 · reap synth rows the real feed has superseded ───────────────
+    # A synth row whose StatementTransaction is gone or no longer 'no_match'
+    # (Plaid delivered the line, the matcher paired it) has served its purpose.
+    existing = (BankTransaction.query
+                .filter(BankTransaction.source == 'statement',
+                        BankTransaction.source_statement_txn_id.isnot(None)))
+    if account_id:
+        existing = existing.filter(
+            BankTransaction.account_id.in_(tuple(supersede_chain(account_id))))
+    for synth in existing.all():
+        st = db.session.get(StatementTransaction, synth.source_statement_txn_id)
+        if st is None or st.match_status != 'no_match':
+            db.session.delete(synth)
+            stats['reaped'] += 1
+    db.session.flush()
+
+    # ── pass 2 · build the still-missing rows, period by period ─────────────
+    q = PlaidStatement.query.filter(PlaidStatement.period_start.isnot(None))
+    if account_id:
+        q = q.filter(PlaidStatement.plaid_account_id == account_id)
+    for statement in q.all():
+        try:
+            account = PlaidAccount.query.filter_by(
+                account_id=statement.plaid_account_id).first()
+            if account is None or not statement_needs_activity(statement):
+                continue
+            item = PlaidItem.query.filter_by(item_id=account.item_id).first()
+            if not (item and item.statement_derived_backfill_enabled):
+                stats['skipped_disabled'] += 1
+                continue
+            no_match = (StatementTransaction.query
+                        .filter_by(statement_id=statement.id,
+                                   match_status='no_match')
+                        .filter(StatementTransaction.posted_date.isnot(None))
+                        .order_by(StatementTransaction.sequence).all())
+            if not no_match:
+                continue
+            # The guard needs a real reconciliation target; a period missing an
+            # opening or closing has no variance to improve, so decline it.
+            variance = _anchor_values(statement, account).get('variance')
+            if variance is None:
+                continue
+            stats['statements'] += 1
+            target_ids = _synth_target_ids(account)
+            target_id = target_ids[0]
+            running = float(variance)
+            for st in no_match:
+                # Already built for this line, and still needed → keep as-is.
+                if BankTransaction.query.filter_by(
+                        source_statement_txn_id=st.id).first() is not None:
+                    continue
+                plaid_amount = round(-float(st.amount or 0.0), 2)
+                fp_name = (st.description or '').strip().lower()
+                # Fingerprint dedupe (date, amount, name): if the real feed
+                # already carries this exact line, Plaid wins — never build a
+                # second copy. Keeps the effective count at exactly 1.
+                dup = (BankTransaction.query
+                       .filter(BankTransaction.account_id.in_(tuple(target_ids)),
+                               BankTransaction.amount == plaid_amount,
+                               BankTransaction.date == st.posted_date,
+                               db.or_(BankTransaction.source.is_(None),
+                                      BankTransaction.source != 'statement'))
+                       .all())
+                if any((d.name or '').strip().lower() == fp_name for d in dup):
+                    stats['skipped_dedupe'] += 1
+                    continue
+                # Variance guard: adding a row of Plaid amount P moves the
+                # companion's counted cash by P, so variance moves by -P =
+                # +st.amount... i.e. the new variance is `running - st.amount`.
+                # Build only if that is strictly closer to zero.
+                projected = round(running - float(st.amount or 0.0), 2)
+                if abs(projected) >= abs(running):
+                    stats['skipped_guard'] += 1
+                    continue
+                synth = BankTransaction(
+                    plaid_transaction_id=f'synth:{st.id}',
+                    account_id=target_id, amount=plaid_amount,
+                    iso_currency_code=account.iso_currency_code or 'USD',
+                    date=st.posted_date, name=(st.description or '')[:500],
+                    pending=False, removed=False,
+                    statement_posted_date=st.posted_date,
+                    statement_match_status='synthesized',
+                    source='statement', source_statement_txn_id=st.id)
+                db.session.add(synth)
+                db.session.flush()
+                # Rules engine, same as any feed row: stamp the internal tag.
+                # JE generation stays on the normal push path — the synth row
+                # is now an ordinary BankTransaction the sync will categorize.
+                if categorization.apply_internal_tag(synth):
+                    stats['tagged'] += 1
+                stats['created'] += 1
+                running = projected
+        except Exception:  # pragma: no cover - one period must not stall the rest
+            db.session.rollback()
+            log.warning('synthesis failed for statement %s',
+                        statement.statement_id, exc_info=True)
+            continue
+    db.session.commit()
+    return stats
 
 
 def rebuild_statement_anchors(account_id: str | None = None) -> dict:
@@ -2669,6 +2840,17 @@ def reparse_stored(account_id: str = '', *, only_stale: bool = False) -> dict:
         db.session.rollback()
         log.warning('statement-transaction match after re-parse failed',
                     exc_info=True)
+    # v0.5.5 · AFTER matching (so 'no_match' is settled) and BEFORE anchors (so
+    # a synthesized row is counted in the rebuild). Self-limiting: it only
+    # creates rows that shrink variance, so this is safe on the admin-button
+    # path with no operator in the loop.
+    try:
+        stats['synthesized'] = synthesize_missing_transactions()['created']
+    except Exception:  # pragma: no cover
+        db.session.rollback()
+        log.warning('statement-derived synthesis after re-parse failed',
+                    exc_info=True)
+        stats['synthesized'] = 0
     try:
         stats['anchors'] = rebuild_statement_anchors()['written']
     except Exception:  # pragma: no cover

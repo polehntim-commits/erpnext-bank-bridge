@@ -101,6 +101,13 @@ class PlaidItem(db.Model):
     # date NULL and reconciliation falls back to Plaid's date unchanged.
     statement_date_override_enabled = db.Column(db.Boolean, default=True,
                                                 nullable=False)
+    # v0.5.5 · kill switch for statement-derived BankTransaction synthesis. On
+    # (default), a no-match statement line Plaid never returned is materialized
+    # as a BankTransaction — but only when it strictly improves reconciliation
+    # (see statements.synthesize_missing_transactions). Off leaves the feed
+    # untouched. Per-Item so an operator can quarantine one account.
+    statement_derived_backfill_enabled = db.Column(db.Boolean, default=True,
+                                                   nullable=False)
     last_error = db.Column(db.Text, nullable=True)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -342,6 +349,17 @@ class BankTransaction(db.Model):
     # how the match went: '' (not run), 'matched', 'no_match', 'ambiguous'.
     statement_posted_date = db.Column(db.Date, nullable=True, index=True)
     statement_match_status = db.Column(db.String(20), default='')
+    # v0.5.5 · where this row came from: 'plaid' (the feed) or 'statement' (a
+    # row Bank Bridge SYNTHESIZED from a bank statement line Plaid never
+    # returned — see statements.synthesize_missing_transactions). Synthesis is
+    # deliberately conservative: a row is only ever created when it strictly
+    # reduces its period's reconciliation variance, so it can never make the
+    # books worse. `source_statement_txn_id` is the StatementTransaction it was
+    # built from — the idempotency key that stops a re-run duplicating it.
+    source = db.Column(db.String(20), default='plaid', index=True)
+    source_statement_txn_id = db.Column(
+        db.Integer, db.ForeignKey('statement_transactions.id'),
+        nullable=True, index=True)
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -366,6 +384,8 @@ class BankTransaction(db.Model):
             'statement_posted_date': (self.statement_posted_date.isoformat()
                                       if self.statement_posted_date else None),
             'statement_match_status': self.statement_match_status or '',
+            'source': self.source or 'plaid',
+            'source_statement_txn_id': self.source_statement_txn_id,
         }
 
     # ── v0.3.2 · autocomplete feeds for the rule builder ──────────────

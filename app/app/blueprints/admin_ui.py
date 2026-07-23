@@ -1707,6 +1707,13 @@ TRANSACTIONS_BODY = """
       {% endfor %}
     </select>
   </label>
+  <label style="margin:0">Origin
+    <select name="source" title="Where the row came from: the Plaid feed, or a line Bank Bridge synthesized from a bank statement (v0.5.5).">
+      <option value="">(any)</option>
+      <option value="plaid" {{ 'selected' if cur_source=='plaid' else '' }}>plaid feed</option>
+      <option value="statement" {{ 'selected' if cur_source=='statement' else '' }}>📄 statement-derived</option>
+    </select>
+  </label>
   <label style="margin:0">Search
     <input name="q" value="{{ cur_q }}" placeholder="name / merchant">
   </label>
@@ -1816,7 +1823,7 @@ TRANSACTIONS_BODY = """
   <tr>
     <td>{{ r.date.isoformat() if r.date else '—' }}</td>
     <td><code>••{{ acct_mask.get(r.account_id, '??') }}</code></td>
-    <td style="max-width:280px">{{ r.name }}{% if r.merchant_name %} <span style="color:#888">· {{ r.merchant_name }}</span>{% endif %}{% if r.pending %} <span class="pill pill-muted">pending</span>{% endif %}</td>
+    <td style="max-width:280px">{{ r.name }}{% if r.merchant_name %} <span style="color:#888">· {{ r.merchant_name }}</span>{% endif %}{% if r.pending %} <span class="pill pill-muted">pending</span>{% endif %}{% if r.source == 'statement' %} <span class="pill pill-muted" title="Synthesized from a bank-statement line Plaid never returned (v0.5.5). Reconciliation-only — the real feed supersedes it if it later arrives.">📄 statement</span>{% endif %}</td>
     <td class="num">{{ '%.2f'|format(r.amount) }} {{ r.iso_currency_code }}</td>
     <td>
       {% if r.removed %}<span class="pill pill-muted">removed</span>
@@ -1931,6 +1938,17 @@ def transactions_page():
         like = f'%{cur_q}%'
         q = q.filter(db.or_(BankTransaction.name.ilike(like),
                             BankTransaction.merchant_name.ilike(like)))
+    # v0.5.5 · origin filter: 'statement' isolates the rows Bank Bridge
+    # synthesized from a bank statement (a line Plaid never returned), 'plaid'
+    # the feed itself. Unrecognized values degrade to "no filter".
+    cur_source = (request.args.get('source') or '').strip()
+    if cur_source == 'statement':
+        q = q.filter(BankTransaction.source == 'statement')
+    elif cur_source == 'plaid':
+        q = q.filter(db.or_(BankTransaction.source.is_(None),
+                            BankTransaction.source != 'statement'))
+    else:
+        cur_source = ''
     # v0.4.6 · the rule-state filter, orthogonal to `status` above (that one is
     # about the Plaid → ERPNext push; this one about what the rules engine did
     # afterwards). Unrecognized values degrade to "no filter".
@@ -1979,6 +1997,7 @@ def transactions_page():
                  total_matching=total_matching,
                  cur_status=cur_status, cur_account=cur_account, cur_q=cur_q,
                  cur_company=cur_company, cur_state=cur_state,
+                 cur_source=cur_source,
                  state_filters=rule_stats.STATE_FILTERS,
                  state_help=_STATE_HELP.get(cur_state, ''),
                  groups=groups, ungrouped=ungrouped, rule_urls=rule_urls,

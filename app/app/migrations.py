@@ -216,6 +216,19 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     ('bank_transactions', 'statement_match_status', "VARCHAR(20) DEFAULT ''"),
     ('plaid_items', 'statement_date_override_enabled',
      'BOOLEAN DEFAULT true NOT NULL'),
+
+    # v0.5.5 — statement-derived BankTransaction synthesis. The `source` column
+    # backfills to 'plaid' so every existing row is correctly labelled as a
+    # feed transaction; only rows synthesize() creates carry 'statement'.
+    # `source_statement_txn_id` (the StatementTransaction a synth row was built
+    # from, and its idempotency key) backfills to NULL — no existing row was
+    # synthesized. The per-Item kill switch defaults TRUE; synthesis is
+    # self-limiting (it only ever creates a row that reduces reconciliation
+    # variance), so on-by-default cannot corrupt an already-reconciled period.
+    ('bank_transactions', 'source', "VARCHAR(20) DEFAULT 'plaid'"),
+    ('bank_transactions', 'source_statement_txn_id', 'INTEGER'),
+    ('plaid_items', 'statement_derived_backfill_enabled',
+     'BOOLEAN DEFAULT true NOT NULL'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,

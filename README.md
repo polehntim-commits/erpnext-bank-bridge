@@ -1527,6 +1527,46 @@ periods. A residual line the bank shows but Plaid never returned (e.g. a $65
 statement fee) is real off-Plaid activity this can't fix — it surfaces as
 `no_match` for the operator.
 
+## Statement-derived transaction synthesis (v0.5.5)
+
+A `no_match` line is one the bank recorded and Plaid never returned. v0.5.5 can
+**rebuild** the missing `BankTransaction` from the statement — Bank Bridge's
+core job, sparing a bookkeeper the manual entry. The synthesized row lands on
+the paired cash companion (an unpaired account uses its own id), carries the
+**negated** holder-view amount (statement convention is opposite Plaid's, same
+flip the matcher uses), and is tagged `source='statement'` with a 📄 badge and
+an origin filter in the transaction list. It is keyed to its
+`StatementTransaction` (`source_statement_txn_id`) so re-runs never duplicate
+it, and runs the categorization rules exactly like a feed row.
+
+**The variance guard — why this is safe to run unattended.** Not every
+`no_match` line is a dropped transaction. On a Wells Fargo Advisors account the
+no-matches are dominated by **internal journals** — a $150k sweep between two of
+the holder's own accounts — whose cash Plaid *did* record, on the companion
+under a different description, so the period already reconciles. Synthesizing
+those would double-count and **break a reconciled month**. So a row is created
+**only when it strictly shrinks that period's reconciliation variance**. A
+dropped $0.34 interest posting in a period off by $0.34 is built; a $150k
+journal in a period that already balances is declined. Synthesis can therefore
+never make the books worse — worst case, it does nothing.
+
+Verified against live data before shipping: across **both** paired brokerages
+and all 26 statements, the guard **declined every** `no_match` row — 0 rows
+created — because every such period already reconciled at $0.00. The naive
+"materialize all no-matches" approach would have injected ~340 spurious rows
+(including −$150k/−$110k/−$10k journals), wrecking every reconciled period. It
+follows that ••6030's residual **+$201.52** (May +$125.15, June +$76.37) is
+**not** a dropped-transaction problem: May's lines are all `ambiguous` (matched,
+not missing) and the gap is Plaid recording *more* outflow than the statement —
+which adding statement rows cannot close. It is flagged, not papered over.
+
+Idempotent and **Plaid-wins**: when the real feed later delivers a synthesized
+line, the matcher (which ignores synth rows) flips its `StatementTransaction`
+out of `no_match`, and the now-stale synth row is reaped — Plaid, canonical for
+the ERPNext push, always supersedes the reconstruction. Runs in the re-parse
+epilogue, after matching and before the anchor rebuild. Gated per-Item by
+`PlaidItem.statement_derived_backfill_enabled` (default TRUE).
+
 ## Investment Advisory Agreement automation (v0.5.2, Phase E)
 
 Codifies the fee, benchmark, performance and compliance mechanics of an
