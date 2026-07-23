@@ -751,6 +751,23 @@ ACCOUNTS_BODY = """
     <span style="font-size:11px;color:#999">correction only</span>
   </form>
   {% endif %}
+  {% if grp.has_investment %}
+  {# v0.5.1 · the investment-JE kill switch. OFF by default; these are real
+     P&L entries, so posting is opt-in per Item. #}
+  <br><form method="post"
+        action="/admin/items/{{ grp.item.item_id }}/invest_je_posting"
+        style="display:inline-flex;gap:6px;align-items:center;margin-top:6px"
+        onsubmit="return confirm('{{ 'STOP posting' if grp.item.invest_je_posting_enabled else 'START posting' }} investment transactions as Journal Entries for this connection? These are real accounting entries that hit the P&L.')">
+    <input type="hidden" name="enabled"
+           value="{{ '0' if grp.item.invest_je_posting_enabled else '1' }}">
+    <span style="font-size:12px">Investment JE posting:
+      <b style="color:{{ '#1b5e20' if grp.item.invest_je_posting_enabled else '#a04000' }}">
+        {{ 'ON' if grp.item.invest_je_posting_enabled else 'OFF' }}</b></span>
+    <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">
+      {{ 'Turn off' if grp.item.invest_je_posting_enabled else 'Turn on' }}</button>
+    <span style="font-size:11px;color:#999">real P&amp;L entries — opt-in</span>
+  </form>
+  {% endif %}
 </div>
 <table>
   <tr><th>Account</th><th>Mask</th><th>Type</th><th class="num">Balance</th>
@@ -1112,6 +1129,10 @@ def accounts_page():
             # '' for a healthy Item, so the banner renders nothing extra.
             'reauth_help': (reconnect.REAUTH_HELP.get(it.reauth_reason or '', '')
                             if it.needs_reauth else ''),
+            # v0.5.1 · only show the investment-JE kill switch on a connection
+            # that actually holds an investment account.
+            'has_investment': any((a.type or '').lower() in
+                                  ('investment', 'brokerage') for a in accts),
         })
     any_needs_reauth = any(g['item'].needs_reauth and not g['item'].disconnected
                            for g in groups)
@@ -1520,6 +1541,33 @@ def set_item_company(item_id):
         msg = f'{label} accounts now owned by {new_company}'
     else:
         msg = f'{label} owning Company cleared (accounts use the ERPNext default)'
+    return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
+@bp.post('/admin/items/<item_id>/invest_je_posting')
+def set_invest_je_posting(item_id):
+    """Turn investment-transaction Journal Entry posting ON or OFF for one
+    linked Item (v0.5.1).
+
+    The default is OFF and this is the ONLY way to turn it on — a deliberate
+    opt-in, because these are real accounting entries that hit the P&L. Nothing
+    is posted retroactively by flipping the switch; the next investment sync (or
+    a manual post) is what emits JEs for the transactions already held."""
+    it = PlaidItem.query.filter_by(item_id=item_id).first()
+    if it is None:
+        return redirect('/admin/accounts?flash=' + quote_plus('Item not found'))
+    enabled = bool(request.form.get('enabled') == '1')
+    before = it.invest_je_posting_enabled
+    it.invest_je_posting_enabled = enabled
+    db.session.commit()
+    audit.record('invest_je_posting_toggled', subject_type='PlaidItem',
+                 subject_id=it.item_id,
+                 before={'invest_je_posting_enabled': before},
+                 after={'invest_je_posting_enabled': enabled},
+                 notes=f'investment JE posting {"enabled" if enabled else "disabled"}')
+    label = it.institution_name or it.item_id
+    msg = (f'{label}: investment JE posting is now '
+           f'{"ON — trades will post as Journal Entries" if enabled else "OFF"}.')
     return redirect('/admin/accounts?flash=' + quote_plus(msg))
 
 
@@ -4890,6 +4938,12 @@ STATEMENTS_BODY = """
   &middot; <span class="warn">&#9888; {{ group.suspect }} period(s) don't chain
   on from the month before</span>
   {% endif %}
+  {% if group.clearing_imbalance and group.clearing_imbalance|abs > 0.005 %}
+  <br><span class="warn" style="font-size:12px">&#9888; Cash Clearing off by
+    {{ '%+.2f'|format(group.clearing_imbalance) }} — a trade's security and
+    companion cash legs don't match; the clearing account won't net to zero
+    until it's resolved.</span>
+  {% endif %}
   {% if group.anchor_periods %}
   <br><span style="font-size:12px">
     Statement-anchored:
@@ -5106,6 +5160,16 @@ BALANCE_HISTORY_BODY = """
 """
 
 
+def _clearing_imbalance(account_id: str) -> float:
+    """Best-effort Cash Clearing imbalance for a paired brokerage; 0.0 on any
+    error (a display convenience must never 500 the statements page)."""
+    try:
+        from .. import invest_je
+        return invest_je.clearing_imbalance(account_id)
+    except Exception:  # pragma: no cover
+        return 0.0
+
+
 def _statement_groups() -> list:
     """One group per Plaid account that has statements, each carrying its
     reconciled rows. Accounts with no statements are omitted — an empty section
@@ -5137,6 +5201,11 @@ def _statement_groups() -> list:
             'anchor_periods': anchor['periods'],
             'anchor_unreconciled': anchor['unexplained'],
             'anchor_reconciled': anchor['periods'] - anchor['unexplained'],
+            # v0.5.1 · Cash Clearing imbalance for a paired brokerage — non-zero
+            # means a trade's SecurityTransaction and its companion
+            # BankTransaction don't match, which would leave the clearing
+            # account off zero. 0.0 for an unpaired account.
+            'clearing_imbalance': _clearing_imbalance(account.account_id),
             'mismatches': sum(1 for r in rows if r['status'] == 'mismatch'),
             'reconciled': sum(1 for r in rows if r['status'] == 'ok'),
             # v0.4.20: computed rows aren't bank cross-checks; count separately

@@ -1486,6 +1486,43 @@ Applied consistently to `/admin/accounts`, `/admin/statements`,
 `/admin/investment_transactions`, the dashboard account count, and the Plaid
 cost estimate.
 
+## Investment transactions as Journal Entries (v0.5.1, Phase D)
+
+Every `SecurityTransaction` on a brokerage account can post as a Journal Entry
+with security-level detail (*Bought 100 TEST-AAPL at $150.00 = $15,000.00*): a
+buy moves cost into `Marketable Securities - <ticker>`, a sell realizes gain or
+loss, an advisory fee hits an expense line, a dividend an income line. GL
+accounts are created on first use, idempotently.
+
+**The Cash Clearing bridge.** The reconciliation subsystem (v0.4.48) established
+that a paired brokerage's trade cash is *already* on the companion depository as
+an "Increase/Decrease from Brokerage activity" `BankTransaction` — which the
+rules engine also posts. Booking the security JE against the sweep account too
+would **double-book every trade**. So a paired brokerage's investment JEs settle
+against a per-Company **`1099 - Cash Clearing - Brokerage`** account:
+
+```
+Buy $10k:   DR Marketable Securities 10,000   CR Cash Clearing 10,000
+companion:  DR Cash Clearing         10,000   CR Bank         10,000   (rules)
+            → Marketable +10k, Bank −10k, Clearing nets to ZERO
+```
+
+Clearing must always net to zero; a non-zero balance means a
+`SecurityTransaction` without its matching companion `BankTransaction`, surfaced
+on `/admin/statements`. An **unpaired** brokerage has no companion double-post,
+so it settles against its own bank leaf directly.
+
+**Kill switch, default OFF.** Nothing posts until the operator flips
+`invest_je_posting_enabled` on the Item (`/admin/accounts`) — these are real P&L
+entries, so an upgrade auto-posts nothing. **Idempotent** on
+`plaid_investment_transaction_id`: a re-sync of the same trade generates no
+second JE. **Cost basis** is Specific Identification via `TradedCycle`, FIFO
+against `RetainedLot` otherwise (lots consumed only after the JE posts, so an
+ERPNext failure never leaves phantom-sold inventory). Every line carries
+`company = owning_company`, so Orchard Meadow's JEs move by export/import with
+nothing to unwind. **Unrealized gains are never posted** — Marketable Securities
+sits at cost until a sell.
+
 ## Reconciliation status in ERPNext (v0.5.0)
 
 A bookkeeper opens the ERPNext **Bank Statement** record and sees *this period

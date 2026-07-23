@@ -85,6 +85,13 @@ class PlaidItem(db.Model):
     # cadence differs from the transactions_sync loop. Nullable — a fresh
     # Item's investments_synced_at is NULL until Phase A step 2 runs.
     investments_synced_at = db.Column(db.DateTime, nullable=True)
+    # v0.5.1 · the per-Item (effectively per-Company) KILL SWITCH for posting
+    # investment transactions as Journal Entries. Defaults FALSE, and that
+    # default is load-bearing: these are real accounting entries that hit the
+    # P&L, so an upgrade must post NOTHING until the operator explicitly opts
+    # this Item in on /admin/accounts. See invest_je.posting_enabled.
+    invest_je_posting_enabled = db.Column(db.Boolean, default=False,
+                                          nullable=False)
     last_error = db.Column(db.Text, nullable=True)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -693,6 +700,14 @@ class GeneratedJournalEntry(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     plaid_transaction_id = db.Column(db.String(120), unique=True,
                                      nullable=False, index=True)
+    # v0.5.1 · for an INVESTMENT JE (posted from a SecurityTransaction rather
+    # than a BankTransaction), the Plaid investment-transaction id — the
+    # idempotency key that stops a re-sync of the same trade generating a
+    # second JE. NULL on every bank-side JE. `plaid_transaction_id` still holds
+    # a value there too, a synthetic `inv:<id>`, only to satisfy its NOT NULL
+    # UNIQUE constraint; this column is the one investment lookups key on.
+    plaid_investment_transaction_id = db.Column(db.String(120), nullable=True,
+                                                unique=True, index=True)
     rule_id = db.Column(db.Integer, nullable=True, index=True)
     erpnext_journal_entry_name = db.Column(db.String(255), nullable=True, index=True)
     # pending_review | approved | rejected | error | blocked |

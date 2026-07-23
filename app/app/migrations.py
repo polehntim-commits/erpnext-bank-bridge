@@ -188,6 +188,26 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # until an operator sets a tag on a rule and backfills.
     ('categorization_rules', 'bb_internal_tag', "TEXT DEFAULT ''"),
     ('bank_transactions', 'bb_internal_tag', "TEXT DEFAULT ''"),
+    # v0.5.1 — Phase D: investment transactions posted as Journal Entries.
+    # The kill switch defaults FALSE so an upgrade posts NOTHING until the
+    # operator opts an Item in — these are real P&L entries. The investment-id
+    # column is the idempotency key for an investment JE; NULL on every
+    # existing (bank-side) row, so an upgrade changes no behaviour.
+    ('plaid_items', 'invest_je_posting_enabled', 'BOOLEAN DEFAULT false NOT NULL'),
+    ('generated_journal_entries', 'plaid_investment_transaction_id',
+     'VARCHAR(120)'),
+]
+
+# Additive UNIQUE indexes an upgrade introduces, as (index_name, table,
+# column). Kept separate from SCHEMA_MIGRATIONS because a column ADD and its
+# index are two statements; create_all() builds them together on a fresh DB, so
+# these only matter when the column was just added to an existing table.
+SCHEMA_INDEXES: list[tuple[str, str, str]] = [
+    # v0.5.1 · the investment-JE idempotency key. UNIQUE so a re-sync that
+    # tried to insert a second JE for the same trade fails loudly rather than
+    # double-posting.
+    ('ux_gje_plaid_investment_txn', 'generated_journal_entries',
+     'plaid_investment_transaction_id'),
 ]
 
 
@@ -209,6 +229,32 @@ def _add_column_if_missing(table: str, column: str, ddl: str) -> None:
     with db.engine.begin() as conn:
         conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} {ddl}'))
     log.info('migration: added %s.%s', table, column)
+
+
+def _add_unique_index_if_missing(index_name: str, table: str,
+                                 column: str) -> None:
+    """CREATE UNIQUE INDEX <index_name> ON <table>(<column>) when it isn't
+    already present and the column exists.
+
+    Portable across Postgres and SQLite (both support `CREATE UNIQUE INDEX IF
+    NOT EXISTS`, and the inspector guard keeps it a clean no-op either way).
+    Runs AFTER the column ADDs, so the column it indexes is guaranteed present
+    on both a fresh DB (create_all) and an upgrading one (the ADD above)."""
+    insp = inspect(db.engine)
+    if table not in insp.get_table_names():
+        return
+    cols = {c['name'] for c in insp.get_columns(table)}
+    if column not in cols:
+        return  # its column ADD did not happen (shouldn't occur post-ADD)
+    existing = {ix['name'] for ix in insp.get_indexes(table)}
+    if index_name in existing:
+        return
+    with db.engine.begin() as conn:
+        conn.execute(text(
+            f'CREATE UNIQUE INDEX IF NOT EXISTS {index_name} '
+            f'ON {table} ({column})'))
+    log.info('migration: added unique index %s on %s.%s', index_name, table,
+             column)
 
 
 def _column(table: str, column: str) -> dict | None:
@@ -282,6 +328,10 @@ def run_migrations() -> None:
         # 1. Additive columns — idempotent, no-op once present or on a fresh DB.
         for table, column, ddl in SCHEMA_MIGRATIONS:
             _add_column_if_missing(table, column, ddl)
+        # Additive unique indexes — after every column ADD, since each indexes
+        # a column the loop above guarantees exists (v0.5.1).
+        for index_name, table, column in SCHEMA_INDEXES:
+            _add_unique_index_if_missing(index_name, table, column)
         # 2. In-place type/constraint fixes (v0.1.2): the account-import audit
         # line logs direction 'erpnext_account_import' (22 chars), which
         # overflows the original VARCHAR(20) and made the commit fail on
