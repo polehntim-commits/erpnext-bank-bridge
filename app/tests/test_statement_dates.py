@@ -32,12 +32,21 @@ from app.models import (BankTransaction, PlaidAccount, PlaidItem,
 from tests.test_statements import StatementsBase, make_pdf
 
 
-def activity_pdf(rows, period='JUNE 1, 2026 - JUNE 30, 2026', extra=None):
+def activity_pdf(rows, period='JUNE 1, 2026 - JUNE 30, 2026', extra=None,
+                 cash_open=None, cash_close=None):
     """A statement PDF with an Activity Detail section. `rows` are raw flattened
-    lines exactly as pypdf would emit them (date glued into the middle)."""
-    lines = ['Page 5 of 9', 'TEST CLIENT LLC', period, 'Activity detail',
-             'ATM and CheckCard activity',
-             'DATE ACCOUNT TYPE TRANSACTION DESCRIPTION AMOUNT']
+    lines exactly as pypdf would emit them (date glued into the middle).
+
+    When `cash_open`/`cash_close` are given, the WF Advisors Cash-flow summary
+    lines are prepended so a full re-parse recovers the anchored balances too —
+    needed by tests that run reparse_stored (which re-parses the PDF)."""
+    lines = ['Page 5 of 9', 'TEST CLIENT LLC', period]
+    if cash_open is not None:
+        lines += ['Cash flow summary THIS PERIOD THIS YEAR',
+                  f'Opening value of cash and sweep balances ${cash_open:,.2f}',
+                  f'Closing value of cash and sweep balances ${cash_close:,.2f}']
+    lines += ['Activity detail', 'ATM and CheckCard activity',
+              'DATE ACCOUNT TYPE TRANSACTION DESCRIPTION AMOUNT']
     lines += rows
     lines.append('Total ATM and CheckCard activity: -$0.00')
     lines += (extra or [])
@@ -263,6 +272,62 @@ class AnchorEffectiveDateTest(StatementsBase):
                      for a in stmts.anchors_for_account('brk')}
         self.assertEqual(by_period[date(2025, 12, 1)].variance, 0.0)
         self.assertEqual(by_period[date(2026, 1, 1)].variance, 0.0)
+
+    def test_reparse_stored_runs_the_whole_pipeline(self):
+        """v0.5.4 regression: reparse_stored (the admin-button path) must itself
+        store statement transactions, match them and rebuild anchors — the bug
+        was that only reparse_stale did, so the button populated nothing."""
+        dec_pdf = activity_pdf(
+            [], period='DECEMBER 1, 2025 - DECEMBER 31, 2025',
+            cash_open=10000.0, cash_close=9288.0,
+            extra=['Withdrawals by check',
+                   'DATE ACCOUNT TYPE CHECK NUMBER DESCRIPTION EXPENSE CODE AMOUNT',
+                   '0001015 TEST PAYEE Unspecified12/31 Cash -712.00',
+                   'Total Withdrawals by check: -$712.00'])
+        self._statement('st-dec', date(2025, 12, 1), date(2025, 12, 31),
+                        10000.0, 9288.0, dec_pdf)
+        self._statement('st-jan', date(2026, 1, 1), date(2026, 1, 31),
+                        9288.0, 9288.0,
+                        activity_pdf([], period='JANUARY 1, 2026 - JANUARY 31, 2026',
+                                     cash_open=9288.0, cash_close=9288.0))
+        db.session.add(BankTransaction(
+            plaid_transaction_id='wire', account_id='cash', amount=712.0,
+            date=date(2026, 1, 2), name='TEST PAYEE'))
+        db.session.commit()
+        result = stmts.reparse_stored()
+        # StatementTransaction populated, dates stamped, anchors collapsed.
+        self.assertGreaterEqual(result['statement_transactions'], 1)
+        self.assertEqual(result['matched'], 1)
+        self.assertEqual(
+            BankTransaction.query.filter_by(plaid_transaction_id='wire')
+            .first().statement_posted_date, date(2025, 12, 31))
+        by_period = {a.period_start: a
+                     for a in stmts.anchors_for_account('brk')}
+        self.assertEqual(by_period[date(2025, 12, 1)].variance, 0.0)
+        self.assertEqual(by_period[date(2026, 1, 1)].variance, 0.0)
+
+    def test_reparse_stored_survives_a_bad_pdf(self):
+        """One corrupt PDF must not stall the batch (the 'hang' guard)."""
+        good = self._statement('st-good', date(2026, 1, 1), date(2026, 1, 31),
+                               100.0, 100.0, activity_pdf([]))
+        bad = self._statement('st-bad', date(2026, 2, 1), date(2026, 2, 28),
+                              100.0, 100.0, activity_pdf([]))
+        with open(bad.pdf_path, 'wb') as fh:
+            fh.write(b'not a pdf at all')
+        result = stmts.reparse_stored()   # must not raise or hang
+        self.assertGreaterEqual(result['examined'] + result['errors'], 1)
+
+    def test_only_paired_brokerage_statements_are_activity_parsed(self):
+        """The perf gate: a plain depository statement isn't activity-parsed."""
+        solo = PlaidAccount(account_id='solo', item_id=self.item.item_id,
+                            name='PLAIN CHECKING', mask='7777',
+                            type='depository', subtype='checking')
+        db.session.add(solo)
+        db.session.commit()
+        self.assertTrue(stmts.statement_needs_activity(
+            PlaidStatement(plaid_account_id='brk')))
+        self.assertFalse(stmts.statement_needs_activity(
+            PlaidStatement(plaid_account_id='solo')))
 
     def test_match_all_and_reparse_runs_end_to_end(self):
         dec_pdf = activity_pdf(

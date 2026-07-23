@@ -986,13 +986,29 @@ def parse_statement(pdf_bytes: bytes) -> dict:
 
     Every balance is float-or-None and all-None is an ordinary result rather
     than a failure — see this module's docstring. Never raises."""
-    pages = extract_pages(pdf_bytes)
+    return parse_statement_from_pages(extract_pages(pdf_bytes))
+
+
+def _pages_to_lines(pages) -> list:
+    """Pages → the lowercased, whitespace-collapsed lines the parsers read.
+    Split out so a caller with pages already in hand (reparse_stored) does not
+    pay pypdf's ~4s-per-PDF extraction twice."""
     lines = []
     for page in pages:
         for raw in page.splitlines():
             line = re.sub(r'\s+', ' ', raw).strip().lower()
             if line:
                 lines.append(line)
+    return lines
+
+
+def parse_statement_from_pages(pages) -> dict:
+    """`parse_statement` on pages already extracted — the extraction-free core.
+
+    v0.5.4 · pypdf's extract is the whole cost of a re-parse (~4s per PDF), so
+    reparse_stored extracts ONCE and feeds both this and the activity parser
+    from the same pages. Extracting twice per PDF was the 38-minute 'hang'."""
+    lines = _pages_to_lines(pages)
     if not lines:
         return _blank_parse()
 
@@ -1162,7 +1178,14 @@ def parse_activity_detail(pdf_bytes: bytes, period_start: date | None,
     row is never mistaken for a transaction. The posted date's year is resolved
     against the statement period (see _resolve_year). Never raises — an
     unreadable PDF or an unfamiliar layout yields []."""
-    lines = extract_lines(pdf_bytes)
+    return parse_activity_detail_from_lines(
+        extract_lines(pdf_bytes), period_start, period_end)
+
+
+def parse_activity_detail_from_lines(lines, period_start: date | None,
+                                     period_end: date | None) -> list[dict]:
+    """`parse_activity_detail` on lines already extracted — so reparse_stored
+    shares one pypdf extraction across the balance parse and this (v0.5.4)."""
     if not lines:
         return []
     out = []
@@ -1779,22 +1802,48 @@ def _anchor_values(statement: PlaidStatement, account: PlaidAccount) -> dict:
 
 # ── statement-transaction extraction + matching (v0.5.3) ─────────────────────
 
-def store_statement_transactions(statement: PlaidStatement) -> int:
+def statement_needs_activity(statement: PlaidStatement) -> bool:
+    """Whether it is worth parsing this statement's Activity Detail at all.
+
+    Only a paired brokerage's statements feed the date-override fix (the WF
+    Advisors pattern): the transactions on such a statement live on its cash
+    companion, and matching them is what corrects the reconciliation window. A
+    depository or card statement — and the dozen sandbox ones — gain nothing,
+    so skipping them keeps a re-parse from paying pypdf's extraction cost on
+    340 PDFs when only ~26 matter."""
+    account = PlaidAccount.query.filter_by(
+        account_id=statement.plaid_account_id).first()
+    if account is None:
+        return False
+    if (account.paired_account_id or '').strip():
+        return True
+    # Or it IS the companion of some paired brokerage.
+    return PlaidAccount.query.filter_by(
+        paired_account_id=account.account_id).first() is not None
+
+
+def store_statement_transactions(statement: PlaidStatement, *,
+                                 rows=None, lines=None) -> int:
     """Parse a statement's Activity Detail and persist the rows, replacing any
     prior parse of the same statement. Returns the count stored. Never raises.
 
+    `rows` (already parsed) or `lines` (already extracted) let reparse_stored
+    supply what it has, so this pays no extra pypdf extraction (v0.5.4).
     Idempotent: keyed on (statement_id, sequence), and a re-parse deletes the
     old rows first, so re-running converges rather than accumulating."""
     from .models import StatementTransaction
-    path = resolve_pdf_path(statement)
-    if not path:
-        return 0
-    try:
-        with open(path, 'rb') as fh:
-            rows = parse_activity_detail(fh.read(), statement.period_start,
-                                         statement.period_end)
-    except OSError:
-        return 0
+    if rows is None:
+        if lines is None:
+            path = resolve_pdf_path(statement)
+            if not path:
+                return 0
+            try:
+                with open(path, 'rb') as fh:
+                    lines = extract_lines(fh.read())
+            except OSError:
+                return 0
+        rows = parse_activity_detail_from_lines(
+            lines, statement.period_start, statement.period_end)
     (StatementTransaction.query
      .filter_by(statement_id=statement.id).delete())
     for row in rows:
@@ -1902,17 +1951,32 @@ def _desc_overlap(statement_desc: str, bank_name: str) -> bool:
 
 
 def match_all_statements() -> dict:
-    """Extract + match Activity Detail for every stored statement whose PDF is
-    on disk. Runs in the reparse epilogue. Never raises."""
-    totals = {'statements': 0, 'transactions': 0, 'matched': 0,
-              'ambiguous': 0, 'no_match': 0}
+    """Match every statement's stored Activity Detail transactions to their
+    BankTransactions. Never raises.
+
+    v0.5.4 · MATCH-ONLY. It matches the StatementTransaction rows already on
+    disk and does NOT re-extract the PDF — reparse_stored stored them from the
+    single extraction it already paid for, so re-reading here is the double
+    read that made the pipeline take 38 minutes. Only a statement that has
+    rows but was never stored (a standalone call) gets its rows stored on
+    demand, from a lazy read."""
+    from .models import StatementTransaction
+    totals = {'statements': 0, 'matched': 0, 'ambiguous': 0, 'no_match': 0}
+    # Only statements that actually have Activity Detail rows are worth a pass.
+    ids = {r.statement_id for r in
+           StatementTransaction.query.with_entities(
+               StatementTransaction.statement_id).distinct()}
+    # …plus any that SHOULD have rows but don't yet (standalone use).
     for st in PlaidStatement.query.all():
         try:
-            n = store_statement_transactions(st)
-            if n == 0:
+            has_rows = st.id in ids
+            if not has_rows and statement_needs_activity(st):
+                if store_statement_transactions(st) == 0:
+                    continue
+                has_rows = True
+            if not has_rows:
                 continue
             totals['statements'] += 1
-            totals['transactions'] += n
             result = match_statement_to_bank_transactions(st)
             for key in ('matched', 'ambiguous', 'no_match'):
                 totals[key] += result[key]
@@ -2508,44 +2572,16 @@ def reparse_stale() -> dict:
     stale = stale_statements()
     if not stale:
         return {'examined': 0, 'changed': 0, 'unreadable': 0, 'suspect': 0,
-                'fields': 0, 'failed_fields': 0, 'anchors': 0, 'paired': 0,
-                'matched': 0}
+                'fields': 0, 'failed_fields': 0, 'errors': 0, 'anchors': 0,
+                'paired': 0, 'matched': 0, 'statement_transactions': 0}
     log.info('%d statement(s) parsed by an older recognizer — re-reading',
              len(stale))
-    stats = reparse_stored(only_stale=True)
-    # v0.4.43 · anchors are DERIVED from the figures that just changed, so a
-    # chain left standing after a re-parse asserts the old numbers as this
-    # account's balance truth. Rebuilding here is what keeps the two from ever
-    # disagreeing — the same lesson as reparse_stale itself, one layer up.
-    # v0.4.44 · pairing runs BEFORE the rebuild and after the re-parse, which
-    # is the only order that works: the cash-services number it keys on was
-    # just recovered by the re-parse, and the anchor sums it feeds depend on
-    # the pairing being set.
-    try:
-        stats['paired'] = autolink_cash_services()['paired']
-    except Exception:  # pragma: no cover - detection must not break a re-parse
-        db.session.rollback()
-        log.warning('cash-services autolink after re-parse failed',
-                    exc_info=True)
-        stats['paired'] = 0
-    # v0.5.3 · extract each statement's Activity Detail and stamp the bank's
-    # posted date onto the matching BankTransactions. Runs AFTER pairing (it
-    # needs the companion) and BEFORE the anchor rebuild (the anchors sum the
-    # effective dates it just wrote).
-    try:
-        stats['matched'] = match_all_statements()['matched']
-    except Exception:  # pragma: no cover - never break a re-parse
-        db.session.rollback()
-        log.warning('statement-transaction match after re-parse failed',
-                    exc_info=True)
-        stats['matched'] = 0
-    try:
-        stats['anchors'] = rebuild_statement_anchors()['written']
-    except Exception:  # pragma: no cover - a report must not break a re-parse
-        db.session.rollback()
-        log.warning('anchor rebuild after re-parse failed', exc_info=True)
-        stats['anchors'] = 0
-    return stats
+    # v0.5.4 · reparse_stored now runs the WHOLE pipeline itself — the balance
+    # re-parse, the Activity Detail store, pairing, matching and the anchor
+    # rebuild, in order. reparse_stale is just the stale-filter over it, so the
+    # scheduled path and the /admin/statements button (which calls
+    # reparse_stored directly) heal identically.
+    return reparse_stored(only_stale=True)
 
 
 def reparse_stored(account_id: str = '', *, only_stale: bool = False) -> dict:
@@ -2564,7 +2600,8 @@ def reparse_stored(account_id: str = '', *, only_stale: bool = False) -> dict:
     Never raises; returns {'examined', 'changed', 'unreadable', 'suspect',
     'fields', 'failed_fields'}."""
     stats = {'examined': 0, 'changed': 0, 'unreadable': 0, 'suspect': 0,
-             'fields': 0, 'failed_fields': 0}
+             'fields': 0, 'failed_fields': 0, 'errors': 0,
+             'statement_transactions': 0, 'matched': 0, 'anchors': 0}
     q = PlaidStatement.query
     if account_id:
         q = q.filter(PlaidStatement.plaid_account_id == account_id)
@@ -2573,28 +2610,40 @@ def reparse_stored(account_id: str = '', *, only_stale: bool = False) -> dict:
     if only_stale:
         rows = [r for r in rows if is_stale(r)]
     for row in rows:
-        path = resolve_pdf_path(row)
-        if not path:
-            stats['unreadable'] += 1
-            continue
-        stats['examined'] += 1
-        before = (row.opening_balance, row.closing_balance,
-                  row.portfolio_opening_value, row.portfolio_closing_value)
+        # ONE try/except around the whole per-statement body, so a single
+        # corrupt PDF logs and the batch advances rather than stalling
+        # (v0.5.4 · the failure the "hang" report warned about).
         try:
+            path = resolve_pdf_path(row)
+            if not path:
+                stats['unreadable'] += 1
+                continue
             with open(path, 'rb') as fh:
-                parsed = parse_statement(fh.read())
-        except OSError as e:
-            log.info('could not re-read %s: %s', path, e)
-            stats['unreadable'] += 1
+                pages = extract_pages(fh.read())    # the ONE extraction
+            stats['examined'] += 1
+            before = (row.opening_balance, row.closing_balance,
+                      row.portfolio_opening_value, row.portfolio_closing_value)
+            parsed = parse_statement_from_pages(pages)
+            apply_parse(row, parsed)
+            after = (row.opening_balance, row.closing_balance,
+                     row.portfolio_opening_value, row.portfolio_closing_value)
+            if before != after:
+                stats['changed'] += 1
+            meta = parsed.get('metadata') or {}
+            stats['fields'] += len(metadata_figures(meta))
+            stats['failed_fields'] += len(meta.get('fields_failed') or [])
+            # v0.5.4 · store the Activity Detail transactions from the SAME
+            # extraction, only for statements that feed the date-override fix.
+            if statement_needs_activity(row):
+                n = store_statement_transactions(
+                    row, lines=_pages_to_lines(pages))
+                stats['statement_transactions'] += n
+        except Exception:  # noqa: BLE001 - one bad PDF must not stall the rest
+            db.session.rollback()
+            stats['errors'] += 1
+            log.warning('re-parse failed for statement %s — skipping',
+                        row.statement_id, exc_info=True)
             continue
-        apply_parse(row, parsed)
-        after = (row.opening_balance, row.closing_balance,
-                 row.portfolio_opening_value, row.portfolio_closing_value)
-        if before != after:
-            stats['changed'] += 1
-        meta = parsed.get('metadata') or {}
-        stats['fields'] += len(metadata_figures(meta))
-        stats['failed_fields'] += len(meta.get('fields_failed') or [])
     # Continuity runs in a second pass, after every row has its new figures:
     # a statement is checked against the month before it, and that month may
     # itself have been re-parsed a moment ago.
@@ -2603,6 +2652,28 @@ def reparse_stored(account_id: str = '', *, only_stale: bool = False) -> dict:
         if flag_parse_continuity(row):
             stats['suspect'] += 1
     db.session.commit()
+    # v0.5.4 · the full downstream pipeline, IN ORDER, so reparse_stored (the
+    # admin-button path) heals end to end and not only reparse_stale did:
+    #   pairing (companion) → match (stamp bank dates) → anchors (use them).
+    # Each isolated so a failure in one still commits the work before it.
+    try:
+        stats['paired'] = autolink_cash_services()['paired']
+    except Exception:  # pragma: no cover
+        db.session.rollback()
+        log.warning('cash-services autolink after re-parse failed',
+                    exc_info=True)
+        stats['paired'] = 0
+    try:
+        stats['matched'] = match_all_statements()['matched']
+    except Exception:  # pragma: no cover
+        db.session.rollback()
+        log.warning('statement-transaction match after re-parse failed',
+                    exc_info=True)
+    try:
+        stats['anchors'] = rebuild_statement_anchors()['written']
+    except Exception:  # pragma: no cover
+        db.session.rollback()
+        log.warning('anchor rebuild after re-parse failed', exc_info=True)
     return stats
 
 

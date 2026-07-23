@@ -1504,6 +1504,18 @@ line Plaid never returned). The bank's date is stamped onto the transaction as
 `COALESCE(statement_posted_date, date)` — so a transaction is counted in the
 month the *statement* assigns.
 
+**v0.5.4 wiring fix.** In v0.5.3 the statement-transaction pipeline lived only
+in `reparse_stale`'s epilogue, so the `/admin/statements` "Re-parse stored PDFs"
+button (which calls `reparse_stored`) populated nothing. Worse, extracting each
+PDF *twice* (balance parse + activity parse) at pypdf's ~4s/PDF turned a
+340-statement re-parse into a **38-minute** apparent hang. Now `reparse_stored`
+extracts each PDF **once** and reuses the pages for both, gates activity parsing
+to the ~26 paired-brokerage statements that actually need it, wraps each
+statement in its own try/except (one bad PDF can't stall the batch), and runs
+the whole pipeline itself — store → pair → match → rebuild. Verified on live
+data: 2.3 min, 471 statement-transaction rows, 173 dates stamped, and the
+Dec/Jan ±$712 pair collapsed to $0.00.
+
 Runs in the re-parse epilogue, after pairing and before the anchor rebuild.
 Gated by `PlaidItem.statement_date_override_enabled` (default TRUE — a matched
 bank date is strictly more authoritative than Plaid's; off leaves every date
