@@ -1622,7 +1622,11 @@ class ChainDedupeTest(StatementsBase):
 
     def test_security_transactions_are_deduped_too(self):
         """Defensive: the live data doesn't show doubled security rows today,
-        but a re-link overlap is a property of the re-link, not the table."""
+        but a re-link overlap is a property of the re-link, not the table.
+
+        A KEPT type (a dividend) rather than a trade, so this exercises the
+        dedup and not the v0.4.47 trade exclusion — the two combine, but this
+        test is about the former."""
         from app.models import SecurityTransaction
         old_brk = self._acct('brk-old', 'BUSINESS BROKERAGE', '6030',
                              'investment', 'brokerage')
@@ -1631,7 +1635,8 @@ class ChainDedupeTest(StatementsBase):
             db.session.add(SecurityTransaction(
                 plaid_investment_transaction_id=txn_id,
                 account_id=account_id, date=date(2026, 5, 10),
-                amount=500.00, name='BUY XYZ', type='buy'))
+                amount=500.00, name='DIV XYZ', type='cash',
+                subtype='cash/dividend'))
         db.session.commit()
         self.assertEqual(self._may_sum(), -500.00)
 
@@ -1843,6 +1848,282 @@ class SandboxVisibilityTest(StatementsBase):
             resp = self.client_.get(url)
             self.assertEqual(resp.status_code, 200, url)
             self.assertNotIn('Plaid Checking', resp.data.decode(), url)
+
+
+class TradeSideExclusionTest(StatementsBase):
+    """A trade's two legs, counted once (v0.4.47).
+
+    Every trade in an Asset Advisor account produces TWO Plaid records for ONE
+    cash movement: a SecurityTransaction on the brokerage ('sold 200 XYZ') and
+    a BankTransaction on the paired companion ('Securities sold and redeemed
+    +$50,000'). Summing both double-counted every trade — ••9401 reported
+    +$579,271 of movement for a February the statement says $278K arrived in,
+    and −$627,727 of variance overall.
+
+    Same shape as the v0.4.46 duplicate, different mechanism: that was one feed
+    ingested twice, this is two legs of one event in two tables that no
+    fingerprint can match (different amounts, names, sometimes dates)."""
+
+    def setUp(self):
+        super().setUp()
+        self.brokerage = self._acct('brk', 'BUSINESS BROKERAGE', '9401',
+                                    'investment', 'brokerage')
+        self.cash = self._acct('cash', 'BROKERAGE CASH', '3194',
+                               'depository', 'checking')
+
+    def _acct(self, account_id, name, mask, type_, subtype):
+        a = PlaidAccount(account_id=account_id, item_id=self.item.item_id,
+                         name=name, mask=mask, type=type_, subtype=subtype)
+        db.session.add(a)
+        db.session.commit()
+        return a
+
+    def _pair(self):
+        self.brokerage.paired_account_id = 'cash'
+        db.session.commit()
+
+    def _sec(self, txn_id, amount, type_, subtype='', name='SEC'):
+        from app.models import SecurityTransaction
+        db.session.add(SecurityTransaction(
+            plaid_investment_transaction_id=txn_id,
+            account_id='brk', date=date(2026, 2, 10), amount=amount,
+            type=type_, subtype=subtype, name=name))
+        db.session.commit()
+
+    def _bank(self, account_id, txn_id, amount, name='TXN'):
+        db.session.add(BankTransaction(
+            plaid_transaction_id=txn_id, account_id=account_id,
+            date=date(2026, 2, 10), amount=amount, name=name))
+        db.session.commit()
+
+    def _sum(self):
+        return stmts.anchor_transaction_sum(
+            self.brokerage, date(2026, 2, 1), date(2026, 2, 28))
+
+    def test_the_scenario_from_the_bug_report(self):
+        """A $10 dividend and a $50,000 sale, with the sale's proceeds also on
+        the companion. The answer is $50,010, not $100,010."""
+        self._pair()
+        # Plaid: negative amount = cash INTO the account.
+        self._sec('iv-div', -10.00, 'cash', 'cash/dividend', 'DIVIDEND')
+        self._sec('iv-sell', -50000.00, 'sell', 'sell/sell', 'SOLD 200 XYZ')
+        self._bank('cash', 'bt-proceeds', -50000.00, 'SECURITIES SOLD')
+        self.assertEqual(self._sum(), 50010.00)
+
+    def test_income_types_are_kept(self):
+        """Real cash events the companion does not reliably carry — dropping
+        them would under-report income the statement's own Income summary
+        shows."""
+        self._pair()
+        for i, (kind, sub) in enumerate((('cash', 'cash/dividend'),
+                                         ('cash', 'cash/interest'),
+                                         ('tax', 'tax/tax'),
+                                         ('fee', 'fee/miscellaneous fee'))):
+            self._sec(f'iv-{i}', -10.00, kind, sub)
+        self.assertEqual(self._sum(), 40.00)
+
+    def test_sweep_mechanics_are_dropped_even_though_the_type_is_cash(self):
+        """THE CORRECTION LIVE DATA FORCED. Plaid files the bank deposit sweep
+        under type 'cash', which reads like income and is not — it is the same
+        dollars moving between the brokerage's cash and the sweep vehicle, and
+        the real movement is already on the companion.
+
+        Excluding on TYPE alone would have dropped ••6030's transfers
+        (+$284,000) while keeping its 243 sweep rows (−$283,994), turning a
+        −$11 residual into +$283,994 — far worse than the bug being fixed."""
+        self._pair()
+        self._sec('iv-in', -608003.09, 'cash', 'cash/deposit',
+                  'BANK DEPOSIT SWEEP')
+        self._sec('iv-out', 324008.70, 'cash', 'cash/withdrawal',
+                  'BANK DEPOSIT SWEEP')
+        self._sec('iv-div', -35.58, 'cash', 'cash/dividend', 'BLACKROCK')
+        self.assertEqual(self._sum(), 35.58)
+
+    def test_a_bare_subtype_is_handled_as_well_as_a_prefixed_one(self):
+        """Plaid's subtype is 'cash/deposit' on some feeds and 'deposit' on
+        others."""
+        self._pair()
+        self._sec('iv-a', -100.00, 'cash', 'deposit', 'BANK DEPOSIT SWEEP')
+        self._sec('iv-b', -10.00, 'cash', 'dividend')
+        self.assertEqual(self._sum(), 10.00)
+
+    def test_trade_types_are_dropped(self):
+        self._pair()
+        for i, kind in enumerate(('buy', 'sell', 'transfer', 'cancel')):
+            self._sec(f'iv-{i}', -1000.00, kind)
+        self.assertEqual(self._sum(), 0.0)
+
+    def test_an_unpaired_brokerage_still_counts_everything(self):
+        """With no companion holding the mirror, excluding trades would
+        under-count a self-directed brokerage whose whole cash story Plaid
+        reports here."""
+        self._sec('iv-sell', -50000.00, 'sell')
+        self._sec('iv-div', -10.00, 'cash', 'cash/dividend')
+        self.assertEqual(self._sum(), 50010.00)
+
+    def test_an_unknown_type_is_kept(self):
+        """The deliberate direction to fail in: an over-count is a visible
+        variance to investigate; a silent exclusion of real cash looks like a
+        clean reconciliation that is quietly wrong."""
+        self._pair()
+        self._sec('iv-new', -42.00, 'some_future_plaid_type')
+        self.assertEqual(self._sum(), 42.00)
+
+    def test_the_sweep_interest_double_count_on_6030(self):
+        """••6030's residual was 68¢/month: sweep interest counted on the
+        brokerage as a SecurityTransaction AND on the companion as an 'Income
+        and distributions' bank line. Interest is income, so it stays on the
+        brokerage — what must not ALSO land is a trade leg."""
+        self._pair()
+        self._sec('iv-int', -0.68, 'cash', 'cash/interest', 'INTEREST')
+        self._sec('iv-sweep', -0.68, 'cash', 'cash/deposit',
+                  'BANK DEPOSIT SWEEP')
+        self.assertEqual(self._sum(), 0.68)
+
+    def test_the_variance_collapses_on_a_trading_month(self):
+        self._pair()
+        st = PlaidStatement(statement_id='s-feb',
+                            plaid_item_id=self.item.item_id,
+                            plaid_account_id='brk',
+                            period_start=date(2026, 2, 1),
+                            period_end=date(2026, 2, 28))
+        db.session.add(st)
+        stmts.apply_parse(st, stmts.parse_statement(
+            wf_advisors_managed_pdf()))
+        # The bank says cash went 3,507.75 → 9,702.20, i.e. +6,194.45.
+        st.parsed_metadata = dict(st.parsed_metadata,
+                                  cash_opening=3507.75, cash_closing=9702.20)
+        db.session.commit()
+        self._sec('iv-sell', -100000.00, 'sell')      # the trade leg
+        self._bank('cash', 'bt-proceeds', -100000.00)  # its cash leg
+        self._bank('cash', 'bt-out', 93805.55)         # everything else
+        stmts.rebuild_statement_anchors()
+        anchor = stmts.anchors_for_account('brk')[0]
+        self.assertEqual(anchor.transaction_sum, 6194.45)
+        self.assertEqual(anchor.variance, 0.0)
+
+
+class ReconciliationPickerTest(StatementsBase):
+    """The account picker on /admin/reconciliation (v0.4.47).
+
+    A Wells Fargo Advisors setup is FOUR Plaid accounts but TWO
+    reconciliations: the brokerage accounts hold the statements and therefore
+    the anchors, their cash-services companions hold every transaction but no
+    statement to measure it against. Offering all four presented four choices
+    for two answers, two of which opened an empty page."""
+
+    def setUp(self):
+        super().setUp()
+        self.client_ = self.app.test_client()
+        self.brk = self._acct('brk-6030', 'BUSINESS BROKERAGE', '6030',
+                              'investment')
+        self.cash = self._acct('cash-3158', 'BROKERAGE CASH', '3158',
+                               'depository')
+        self.brk.paired_account_id = 'cash-3158'
+        db.session.commit()
+        self._anchor(self.brk)
+
+    def _acct(self, account_id, name, mask, type_):
+        a = PlaidAccount(account_id=account_id, item_id=self.item.item_id,
+                         name=name, mask=mask, type=type_,
+                         subtype='brokerage' if type_ == 'investment'
+                         else 'checking')
+        db.session.add(a)
+        db.session.commit()
+        return a
+
+    def _anchor(self, account):
+        st = PlaidStatement(statement_id=f'st-{account.account_id}',
+                            plaid_item_id=self.item.item_id,
+                            plaid_account_id=account.account_id,
+                            period_start=date(2025, 6, 1),
+                            period_end=date(2025, 6, 30))
+        db.session.add(st)
+        stmts.apply_parse(st, stmts.parse_statement(
+            wf_advisors_june_2025_pdf()))
+        db.session.commit()
+        stmts.rebuild_statement_anchors()
+
+    def test_only_accounts_with_anchors_are_offered(self):
+        """Two Plaid accounts, one reconciliation."""
+        offered = {a.account_id for a in stmts.accounts_with_anchors()}
+        self.assertEqual(offered, {'brk-6030'})
+
+    def test_an_unanchored_brokerage_account_is_not_offered(self):
+        """Honest: the page's empty state says to rebuild; listing an account
+        with nothing behind it does not."""
+        self._acct('brk-9401', 'SECOND BROKERAGE', '9401', 'investment')
+        self.assertNotIn('brk-9401',
+                         {a.account_id for a in stmts.accounts_with_anchors()})
+
+    def test_the_label_names_the_pair(self):
+        """The pair changes what the numbers MEAN — this view aggregates both
+        Plaid accounts."""
+        self.assertEqual(stmts.account_label(self.brk, self.cash),
+                         'BUSINESS BROKERAGE ••6030 ⇄ ••3158')
+        self.assertEqual(stmts.account_label(self.cash),
+                         'BROKERAGE CASH ••3158')
+
+    def test_the_picker_renders_the_paired_label(self):
+        body = self.client_.get('/admin/reconciliation').data.decode()
+        self.assertIn('••6030 ⇄ ••3158', body)
+        self.assertNotIn('value="cash-3158"', body)
+
+    def test_a_deep_link_to_the_cash_side_redirects_to_the_brokerage(self):
+        """A bookmark at the companion should land where the reconciliation
+        actually is, not on an empty table."""
+        resp = self.client_.get('/admin/reconciliation/cash-3158')
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn('/admin/reconciliation/brk-6030', resp.headers['Location'])
+        body = self.client_.get(resp.headers['Location']).data.decode()
+        self.assertIn('cash side', body)
+
+    def test_the_query_param_form_redirects_too(self):
+        resp = self.client_.get('/admin/reconciliation?account_id=cash-3158')
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn('brk-6030', resp.headers['Location'])
+
+    def test_an_unpaired_account_without_anchors_falls_back_with_a_note(self):
+        orphan = self._acct('orphan', 'LONE CHECKING', '7777', 'depository')
+        resp = self.client_.get(f'/admin/reconciliation/{orphan.account_id}')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.data.decode()
+        self.assertIn('no statement anchors', body)
+        self.assertIn('••6030', body)
+
+    def test_both_url_forms_reach_the_same_account(self):
+        """Both are in circulation; neither may break."""
+        by_path = self.client_.get('/admin/reconciliation/brk-6030')
+        by_query = self.client_.get('/admin/reconciliation?account_id=brk-6030')
+        self.assertEqual(by_path.status_code, 200)
+        self.assertEqual(by_query.status_code, 200)
+        for body in (by_path.data.decode(), by_query.data.decode()):
+            self.assertIn('9467.48', body.replace(',', ''))
+
+    def test_an_unpaired_anchored_account_appears_without_an_arrow(self):
+        """A brokerage with no companion is still one reconciliation — it just
+        isn't an aggregate, and the label shouldn't imply otherwise."""
+        solo = self._acct('brk-solo', 'SOLO BROKERAGE', '5555', 'investment')
+        self._anchor(solo)
+        self.assertEqual(stmts.account_label(solo), 'SOLO BROKERAGE ••5555')
+        body = self.client_.get('/admin/reconciliation').data.decode()
+        self.assertIn('SOLO BROKERAGE ••5555', body)
+        self.assertIn('••6030 ⇄ ••3158', body)
+
+    def test_sandbox_accounts_stay_out_of_the_picker(self):
+        """Even with anchors: the sandbox filter runs over the picker list."""
+        fake = self._acct('brk-sandbox', 'Plaid IRA', '5555', 'investment')
+        fake.owning_company = 'Bank Bridge Test'
+        db.session.commit()
+        self._anchor(fake)
+        self.assertIn('brk-sandbox',
+                      {a.account_id for a in stmts.accounts_with_anchors()})
+        body = self.client_.get('/admin/reconciliation').data.decode()
+        self.assertNotIn('Plaid IRA', body)
+
+    def test_the_accounts_page_points_the_cash_row_at_its_brokerage(self):
+        body = self.client_.get('/admin/accounts').data.decode()
+        self.assertIn('reconciled with ••6030', body)
 
 
 class FixtureHygieneTest(unittest.TestCase):

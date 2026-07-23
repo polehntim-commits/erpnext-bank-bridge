@@ -807,6 +807,15 @@ ACCOUNTS_BODY = """
          across every anchored statement period. Shown here because this is the
          page an operator is already on when they wonder. #}
       {% set anc = anchor_map.get(a.account_id) %}
+      {% if not anc and reconciles_under.get(a.account_id) %}
+      {# The cash side of a pair has no anchors of its own — its transactions
+         are reconciled on the brokerage account. Point there rather than
+         leaving this row looking unreconciled. #}
+      <br><a href="/admin/reconciliation/{{ reconciles_under[a.account_id] }}"
+             style="font-size:11px;color:#666;text-decoration:none"
+             title="This is the cash side of a paired brokerage account. Its transactions are reconciled there.">
+        &#128279; reconciled with ••{{ pair_masks.get(reconciles_under[a.account_id], '????') }}</a>
+      {% endif %}
       {% if anc and anc.periods %}
       <br><a href="/admin/reconciliation/{{ a.account_id }}"
              style="font-size:11px;text-decoration:none"
@@ -1134,6 +1143,11 @@ def accounts_page():
         a, all_accounts, item_companies) for a in visible}
     pair_names = {a.account_id: (a.name or a.account_id) for a in visible}
     pair_masks = {a.account_id: (a.mask or '????') for a in all_accounts}
+    # {cash_account_id: brokerage_account_id} — the inverse of pairing, so the
+    # companion row can link to where it IS reconciled instead of nowhere.
+    reconciles_under = {(a.paired_account_id or '').strip(): a.account_id
+                        for a in all_accounts
+                        if (a.paired_account_id or '').strip()}
     sandbox_ids = av.sandbox_account_ids()
     visibility = av.summary()
     # v0.4.43 · statement-anchored variance per account. Company-agnostic by
@@ -1155,6 +1169,7 @@ def accounts_page():
                  anchor_map=anchor_map, pair_options=pair_options,
                  pair_names=pair_names, pair_masks=pair_masks,
                  sandbox_ids=sandbox_ids, visibility=visibility,
+                 reconciles_under=reconciles_under,
                  bank_accounts=bank_accounts, bank_account_names=bank_account_names,
                  supported_map=supported_map, any_imported=any_imported,
                  unpostable=sync_engine.unpostable_by_account(),
@@ -5325,6 +5340,7 @@ def balance_history():
 
 RECONCILIATION_BODY = """
 <h2>Statement-anchored reconciliation</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
 <p style="font-size:14px;color:#555;max-width:1000px">
   What each account <b>actually held</b> at every statement boundary, according
   to the bank's own PDF — held here, in Bank Bridge, independent of ERPNext.
@@ -5349,7 +5365,7 @@ RECONCILIATION_BODY = """
       {% for a in accounts %}
       <option value="{{ a.account_id }}"
         {{ 'selected' if a.account_id == account.account_id else '' }}>
-        {{ a.name or a.account_id }}{% if a.mask %} ••{{ a.mask }}{% endif %}
+        {{ labels.get(a.account_id, a.name or a.account_id) }}
       </option>
       {% endfor %}
     </select>
@@ -5694,21 +5710,56 @@ def set_sandbox_visibility():
 def reconciliation_page(account_id: str = ''):
     """Statement-anchored reconciliation for one account (v0.4.43).
 
+    Reachable as BOTH `/admin/reconciliation/<account_id>` and
+    `/admin/reconciliation?account_id=…` — the path form is canonical and the
+    query form is accepted because links to it are already in circulation.
+
     NOT filtered by ERPNext Company — see StatementAnchor. The accounts this
     page matters most for are the ones whose books do not exist yet."""
     from .. import statements as stmts
     accounts = av.filter_accounts(stmts.accounts_with_anchors())
+    flash_msg = request.args.get('flash', '')
     if not accounts:
         return _page(RECONCILIATION_BODY, page='reconciliation', accounts=[],
                      account=PlaidAccount(account_id=''), anchors=[],
-                     summary=stmts.anchor_summary(''), total_transactions=0.0)
-    account_id = account_id or request.args.get('account_id', '')
+                     summary=stmts.anchor_summary(''), total_transactions=0.0,
+                     labels={}, flash_msg=flash_msg)
+    account_id = (account_id or request.args.get('account_id', '')).strip()
+
+    # A bookmark or an older link may point at the CASH-SERVICES side of a
+    # pair. That account has no reconciliation of its own — it is half of one —
+    # so send the reader to the brokerage account that aggregates it rather
+    # than rendering an empty table and letting them conclude the data is
+    # missing.
+    if account_id and not any(a.account_id == account_id for a in accounts):
+        owner = stmts.brokerage_for_partner(account_id)
+        requested = PlaidAccount.query.filter_by(account_id=account_id).first()
+        mask = f'••{requested.mask}' if requested and requested.mask \
+            else 'that account'
+        if owner is not None:
+            return redirect(f'/admin/reconciliation/{owner.account_id}?flash='
+                            + quote_plus(
+                                f'{mask} is the cash side of '
+                                f'••{owner.mask or "????"} — its transactions '
+                                'are reconciled there, against that account\'s '
+                                'statements.'))
+        if requested is not None:
+            flash_msg = (f'{mask} has no statement anchors, so there is '
+                         'nothing to reconcile against. Showing '
+                         f'{stmts.account_label(accounts[0])} instead.')
+
     account = next((a for a in accounts if a.account_id == account_id),
                    accounts[0])
     anchors = stmts.anchors_for_account(account.account_id)
+    # Labels name the PAIR, because that is what the numbers aggregate.
+    partners = {a.account_id: a for a in PlaidAccount.query.all()}
+    labels = {a.account_id: stmts.account_label(
+        a, partners.get((a.paired_account_id or '').strip()))
+        for a in accounts}
     return _page(RECONCILIATION_BODY, page='reconciliation', accounts=accounts,
-                 account=account, anchors=anchors,
+                 account=account, anchors=anchors, labels=labels,
                  summary=stmts.anchor_summary(account.account_id),
+                 flash_msg=flash_msg,
                  total_transactions=round(
                      sum(float(a.transaction_sum or 0.0) for a in anchors), 2))
 

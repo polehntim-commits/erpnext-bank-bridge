@@ -1409,7 +1409,26 @@ makes the active/superseded designation **cosmetic for reconciliation**: pair
 to either row and the same transactions are found, so hygiene can be re-run
 later, or not, without changing a single anchor.
 
-**…and the overlap is counted once (v0.4.46).** Walking the chain fixed the
+**A trade's two legs are counted once (v0.4.47).** Every trade in a managed
+account produces two Plaid records for one cash movement: a
+`SecurityTransaction` on the brokerage (*sold 200 XYZ*) and a `BankTransaction`
+on the paired companion (*Securities sold and redeemed +$50,000*). With both in
+the sum, ••9401 reported +$579K of movement for a month the statement says
+$278K arrived in. So for a **paired** brokerage account, trade-side security
+transactions are dropped — their cash leg is on the companion — while
+dividends, interest, fees and tax are kept (real cash the companion doesn't
+carry). An **unpaired** brokerage keeps everything: with no companion, that
+security feed is its whole cash story.
+
+Type alone wasn't enough. Plaid files the **bank deposit sweep** under type
+`cash`, which reads like income but is the same dollars moving to the sweep
+vehicle — already on the companion. Excluding on type alone would have kept
+••6030's 243 sweep rows while dropping its transfers, turning a −$11 residual
+into +$284K. The `cash/deposit` and `cash/withdrawal` **subtypes** are what
+separate sweep mechanics from a `cash/dividend`. On live data the rule takes
+••6030's security-side contribution to $0.00 and ••9401's from +$664K to +$15K.
+
+**…and the re-link overlap is counted once (v0.4.46).** Walking the chain fixed the
 split history and exposed the opposite problem in the months either side of the
 re-link: Plaid ingested the same purchases into *both* account_ids with
 **different `plaid_transaction_id`s**, so id-based dedupe cannot see them. On
@@ -1502,6 +1521,17 @@ can be reconciled against a transaction feed, since the mirror has no record of
 market movement. `parser_version` is stamped on every row, and
 `rebuild_statement_anchors()` runs automatically after each stale re-parse, so
 a chain can never assert figures a later recognizer already corrected.
+
+**The picker lists reconciliations, not Plaid rows (v0.4.47).** A Wells Fargo
+Advisors setup is four Plaid accounts but **two** reconciliations: the
+brokerage accounts hold the statements and therefore the anchors; their
+cash-services companions hold every transaction and no statement to measure it
+against. The account picker is keyed on `StatementAnchor`, so the companions
+(and any brokerage account not yet anchored) don't appear, and each option is
+labelled with its pair — `BUSINESS BROKERAGE ••6030 ⇄ ••3158` — because that is
+what the numbers aggregate. A link or bookmark pointing at a companion
+redirects to the brokerage side with a note saying why, rather than rendering
+an empty table. Both `/admin/reconciliation/<id>` and `?account_id=…` work.
 
 `/admin/accounts` shows each account's variance inline — the one-line answer to
 *"is this account's Plaid data telling the whole story?"* — and the chain

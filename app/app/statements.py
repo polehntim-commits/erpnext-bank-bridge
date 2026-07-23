@@ -1311,6 +1311,66 @@ def dedupe_across_accounts(rows) -> list:
     return kept
 
 
+# SecurityTransaction types whose CASH LEG is recorded on the paired
+# cash-services account, and which must therefore not be counted twice.
+#
+# THE BUG THIS EXISTS FOR. Every trade in an Asset Advisor account produces two
+# Plaid records for one cash movement: a SecurityTransaction on the brokerage
+# ('sold 200 shares of XYZ') and a BankTransaction on the companion
+# ('Securities sold and redeemed +$50,000'). Summing both double-counts every
+# trade — ••9401 reported +$579,271 of movement for a February where the
+# statement says $278K actually arrived, and −$627,727 of variance overall.
+#
+# Same SHAPE as the v0.4.46 fingerprint duplicate, different mechanism: that
+# one was the same feed ingested twice by a re-link, this one is the two legs
+# of a single event landing in two different tables where no fingerprint can
+# match them (different amounts, different names, sometimes different dates).
+#
+# 'transfer' is here because a transfer between a brokerage account and its own
+# cash-services companion is an internal move: counting it on both sides
+# invents cash. 'cancel' reverses a trade, so it belongs with the trades.
+_TRADE_SIDE_TYPES = frozenset({'buy', 'sell', 'transfer', 'cancel'})
+
+# …and SWEEP MECHANICS, which type alone does not catch. Plaid files the bank
+# deposit sweep under type 'cash', which reads like income and is not: it is
+# the same dollars moving between the brokerage's cash and the sweep vehicle,
+# and the real movement is already on the companion.
+#
+# This is the correction that live data forced. Excluding on TYPE alone would
+# have dropped ••6030's transfers (+$284,000) while keeping 243 sweep rows
+# (−$283,994), taking a −$11 residual to +$283,994 — far worse than the bug
+# being fixed. The subtype is what distinguishes 'cash/deposit BANK DEPOSIT
+# SWEEP' from 'cash/dividend'.
+_INTERNAL_SUBTYPES = frozenset({'deposit', 'withdrawal'})
+
+
+def counts_as_brokerage_cash(txn) -> bool:
+    """Whether a SecurityTransaction's cash movement is the BROKERAGE's to
+    report, given a paired companion holds the cash side.
+
+    Dividends, interest, fees and tax are kept: they are real cash events that
+    Plaid does not reliably surface on the companion, and dropping them would
+    under-report income the statement's own Income summary does show.
+
+    Dropped are the two legs that ARE mirrored: trades (type) and sweep
+    mechanics (subtype). Note the subtype check only applies within type
+    'cash' — a 'transfer/deposit' is already gone on the type rule, and no
+    other type uses these subtypes for something we want to keep.
+
+    An UNRECOGNISED type is KEPT. That is the deliberate direction to fail in —
+    it preserves pre-v0.4.47 behaviour for anything Plaid adds later, and an
+    over-count shows up as a visible variance to investigate, where a silent
+    exclusion of real cash movement would look like a clean reconciliation that
+    is quietly wrong. Only what is known to have a mirror is dropped."""
+    kind = (getattr(txn, 'type', '') or '').strip().lower()
+    if kind in _TRADE_SIDE_TYPES:
+        return False
+    # Plaid's subtype is 'cash/deposit'-style on some feeds and bare on others.
+    subtype = (getattr(txn, 'subtype', '') or '').strip().lower()
+    leaf = subtype.rsplit('/', 1)[-1]
+    return not (kind == 'cash' and leaf in _INTERNAL_SUBTYPES)
+
+
 def _bank_total(account_ids, start, end) -> float:
     """Σ Plaid amounts for settled BankTransactions across a set of account
     ids, in Plaid's own convention (positive = money out).
@@ -1715,19 +1775,67 @@ def anchor_summary(account_id: str, year: int | None = None) -> dict:
 
 
 def accounts_with_anchors() -> list:
-    """Every account holding at least one statement, newest-named first.
+    """Every account that actually HAS an anchor chain, by name.
+
+    v0.4.47 · keyed on StatementAnchor rather than on PlaidStatement. The
+    difference matters because of pairing: a Wells Fargo Advisors setup has
+    four Plaid accounts but only TWO reconciliations. The brokerage accounts
+    hold the statements and therefore the anchors; their cash-services
+    companions hold neither — every transaction, but no statement to measure it
+    against. Offering all four in a picker presents four choices for two
+    answers, and two of them open an empty page.
+
+    Also excludes a brokerage account whose statements have not been anchored
+    yet, which is the honest thing to show: the page's empty state tells you to
+    rebuild, and listing an account with nothing behind it does not.
 
     Deliberately NOT filtered by ERPNext Company: the accounts this feature
     exists for are the ones whose books do not exist yet."""
-    ids = {s.plaid_account_id for s in
-           PlaidStatement.query.with_entities(
-               PlaidStatement.plaid_account_id).distinct()}
+    from .models import StatementAnchor
+    ids = {a.account_id for a in
+           StatementAnchor.query.with_entities(
+               StatementAnchor.account_id).distinct()}
     ids.discard(None)
     if not ids:
         return []
     return (PlaidAccount.query
             .filter(PlaidAccount.account_id.in_(tuple(ids)))
             .order_by(PlaidAccount.name).all())
+
+
+def brokerage_for_partner(account_id: str) -> PlaidAccount | None:
+    """The brokerage account whose cash side is `account_id`, or None.
+
+    The inverse of `paired_account_id`, and what lets a link or a bookmark
+    pointing at the cash-services account land somewhere useful: that account
+    has no reconciliation of its own, but it is half of one."""
+    account_id = (account_id or '').strip()
+    if not account_id:
+        return None
+    return (PlaidAccount.query
+            .filter(PlaidAccount.paired_account_id == account_id)
+            .order_by(PlaidAccount.name).first())
+
+
+def account_label(account: PlaidAccount, partner: PlaidAccount = None) -> str:
+    """'BUSINESS BROKERAGE ••6030 ⇄ ••3158' — one economic account, named as
+    such.
+
+    The pair is shown at pick-time because it changes what the numbers MEAN:
+    this reconciliation aggregates both Plaid accounts, and a reader who
+    doesn't know that will wonder why a brokerage account with zero
+    BankTransactions has a transaction sum."""
+    name = account.name or account.official_name or account.account_id
+    if account.mask:
+        name = f'{name} ••{account.mask}'
+    partner_id = (account.paired_account_id or '').strip()
+    if partner_id:
+        if partner is None:
+            partner = PlaidAccount.query.filter_by(
+                account_id=partner_id).first()
+        if partner is not None:
+            name = f'{name} ⇄ ••{partner.mask or "????"}'
+    return name
 
 
 # ── validating a statement against everything else we know ──────────────────
@@ -2432,7 +2540,13 @@ def signed_movement(account: PlaidAccount, start: date | None,
     re-linked account keeps its pre-relink transactions on the old row, so
     filtering on a single account_id sees only part of the history and reports
     the rest as unexplained. See `supersede_chain` for why walking both
-    directions is what makes the active/superseded designation cosmetic."""
+    directions is what makes the active/superseded designation cosmetic.
+
+    v0.4.47 · when the account is PAIRED, trade-side SecurityTransactions are
+    dropped because their cash leg is already recorded on the companion — see
+    `counts_as_brokerage_cash`. Unpaired accounts keep everything: with no
+    companion holding the mirror, excluding trades would under-count a
+    self-directed brokerage whose entire cash story Plaid reports here."""
     if start is None or end is None:
         return 0.0
     account_ids = supersede_chain(account.account_id)
@@ -2449,6 +2563,9 @@ def signed_movement(account: PlaidAccount, start: date | None,
                             SecurityTransaction.date >= start,
                             SecurityTransaction.date <= end)
                     .all())
+        # v0.4.47 · a trade's cash leg is already on the paired companion.
+        if (account.paired_account_id or '').strip():
+            sec_rows = [t for t in sec_rows if counts_as_brokerage_cash(t)]
         # Deduped for the same reason the bank rows are, defensively: the live
         # data doesn't show doubled security transactions today, but a re-link
         # overlap is a property of the re-link, not of the table.
