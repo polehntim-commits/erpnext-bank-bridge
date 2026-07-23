@@ -170,6 +170,7 @@ NAV_HTML = """
   <a href="/admin/statements" class="{{ 'active' if page == 'statements' else '' }}">Statements</a>
   <a href="/admin/reconciliation" class="{{ 'active' if page == 'reconciliation' else '' }}">Reconciliation</a>
   <a href="/admin/strategy" class="{{ 'active' if page == 'investments' else '' }}">Strategy</a>
+  <a href="/admin/advisory" class="{{ 'active' if page == 'advisory' else '' }}">Advisory</a>
   <a href="/admin/audit" class="{{ 'active' if page == 'audit' else '' }}">Audit</a>
   <a href="/admin/data_hygiene" class="{{ 'active' if page == 'hygiene' else '' }}" style="color:#8fbfa5">Hygiene</a>
   <a href="/admin/sync_log" class="{{ 'active' if page == 'sync_log' else '' }}">Sync Log</a>
@@ -7479,3 +7480,199 @@ def counterparty_top_api():
         'fiscal_year_start': counterparty.fiscal_year_start().isoformat(),
         'rows': counterparty.top_by_activity(_cp_client(),
                                              company=_current_company())})
+
+
+# ── v0.5.2 · Phase E: Investment Advisory Agreement dashboard ────────────────
+
+ADVISORY_LIST_BODY = """
+<h2>Investment Advisory Agreements</h2>
+<p style="font-size:14px;color:#555;max-width:820px">
+  Each agreement's fee accrual, performance and compliance are computed and
+  stored here, so the quarterly reporting is a review of what Bank Bridge worked
+  out — not a recomputation. Fee posting to ERPNext is opt-in per agreement.
+</p>
+{% if not agreements %}
+<div class="banner-warn"><h3>No agreements yet</h3>
+  An Investment Advisory Agreement records the fee and performance terms between
+  a Client (an ERPNext Company) and a Manager. None is configured.</div>
+{% else %}
+<table>
+  <tr><th>Agreement</th><th>Client</th><th>Manager</th>
+      <th class="num">AUM</th><th>Fee posting</th><th>Status</th></tr>
+  {% for a in agreements %}
+  <tr>
+    <td><a href="/admin/advisory/{{ a.id }}">{{ a.name or 'Agreement #' ~ a.id }}</a></td>
+    <td>{{ a.client_company }}</td>
+    <td>{{ a.manager_name }}</td>
+    <td class="num">{{ '%.2f'|format(aum_by_id.get(a.id, 0.0)) }}</td>
+    <td>{% if a.fee_accrual_enabled %}<span class="pill pill-ok">on</span>
+        {% else %}<span class="pill pill-muted">off</span>{% endif %}</td>
+    <td>{{ a.status }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+"""
+
+
+ADVISORY_DASHBOARD_BODY = """
+<h2>{{ d.agreement.name or 'Advisory Agreement' }}</h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+{% if d.risk_violations %}
+<div class="banner-warn" style="border-left-color:#b71c1c">
+  <h3 style="color:#b71c1c">&#9888; {{ d.risk_violations|length }} risk-control
+    violation(s) as of {{ d.risk_check_date }}</h3>
+  <ul style="margin:6px 0 0;font-size:13px">
+    {% for v in d.risk_violations %}
+    <li><b>{{ v.ticker }}</b> at {{ '%.2f'|format(v.pct) }}% (limit
+      {{ '%.1f'|format(v.limit) }}%) — {{ v.action }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<div class="card" style="max-width:900px">
+  <p style="font-size:14px;margin:0">
+    <b>Client:</b> {{ d.agreement.client_company }}
+    · <b>Manager:</b> {{ d.agreement.manager_name }}
+    · <b>Base fee:</b> {{ '%.4f'|format(d.agreement.total_base_fee_rate) }}
+      (bank {{ '%.4f'|format(d.agreement.bank_fee_rate) }},
+       manager {{ '%.4f'|format(d.agreement.manager_base_fee_rate) }})
+    · <b>Performance fee:</b> {{ '%.2f'|format(d.agreement.performance_fee_rate) }}
+    · <b>Hurdle:</b> {{ d.agreement.hurdle_benchmark }}
+  </p>
+</div>
+
+<div class="kpis" style="margin:12px 0">
+  <div class="kpi"><b>{{ '%.2f'|format(d.aum) }}</b><br>
+    <span style="font-size:12px;color:#666">current AUM</span></div>
+  <div class="kpi"><b>{{ '%.2f'|format(d.ytd_base_fee) }}</b><br>
+    <span style="font-size:12px;color:#666">YTD base fee accrued</span></div>
+  <div class="kpi"><b>{{ '%.2f'|format(d.ytd_performance_fee) }}</b><br>
+    <span style="font-size:12px;color:#666">YTD performance fee accrued</span></div>
+  <div class="kpi"><b>{{ '%.2f'|format(d.high_water_mark) }}</b><br>
+    <span style="font-size:12px;color:#666">high-water mark</span></div>
+</div>
+
+{% if d.latest_snapshot %}
+{% set s = d.latest_snapshot %}
+<h3>{{ s.period_label }} performance</h3>
+<table style="max-width:700px">
+  <tr><td>Opening AUM</td><td class="num">{{ '%.2f'|format(s.opening_aum) }}</td></tr>
+  <tr><td>Closing AUM</td><td class="num">{{ '%.2f'|format(s.closing_aum) }}</td></tr>
+  <tr><td>Portfolio return</td><td class="num">{{ '%.2f'|format(s.net_return_pct) }}%</td></tr>
+  <tr><td>Hurdle return</td><td class="num">{{ '%.2f'|format(s.hurdle_return_pct) }}%</td></tr>
+  <tr><td>Excess return</td><td class="num">{{ '%+.2f'|format(s.excess_return_pct) }}%</td></tr>
+  <tr><td>Above high-water mark?</td>
+      <td class="num">{{ 'yes' if s.above_high_water_mark else 'no' }}</td></tr>
+  <tr style="font-weight:600"><td>Performance fee accrued</td>
+      <td class="num" style="color:{{ '#1b5e20' if s.performance_fee_accrued > 0 else '#666' }}">
+        {{ '%.2f'|format(s.performance_fee_accrued) }}</td></tr>
+  <tr><td colspan="2" style="font-size:12px;color:#666">{{ s.notes }}</td></tr>
+</table>
+{% endif %}
+
+{% if d.high_water_marks %}
+<h3>High-water mark timeline</h3>
+<table style="max-width:520px;font-size:13px">
+  <tr><th>Date</th><th>Period</th><th class="num">Mark</th></tr>
+  {% for m in d.high_water_marks %}
+  <tr><td>{{ m.mark_date }}</td><td>{{ m.established_by_period }}</td>
+      <td class="num">{{ '%.2f'|format(m.mark_value) }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+<h3>Fee posting controls</h3>
+<p style="font-size:13px;color:#555;max-width:820px">
+  Each switch is OFF by default. Accruals and the performance math run
+  regardless — the switch gates only whether a Journal Entry reaches the
+  Client's books. Nothing hits the P&amp;L without you turning it on.
+</p>
+{% for key, label, on in [
+    ('fee_accrual_enabled', 'Base fee JE posting', d.agreement.fee_accrual_enabled),
+    ('performance_fee_enabled', 'Performance fee posting', d.agreement.performance_fee_enabled),
+    ('risk_control_alerts_enabled', 'Risk-control alerts', d.agreement.risk_control_alerts_enabled)] %}
+<form method="post" action="/admin/advisory/{{ d.agreement.id }}/toggle"
+      style="display:inline-flex;gap:8px;align-items:center;margin:0 12px 8px 0">
+  <input type="hidden" name="switch" value="{{ key }}">
+  <input type="hidden" name="enabled" value="{{ '0' if on else '1' }}">
+  <span style="font-size:13px">{{ label }}:
+    <b style="color:{{ '#1b5e20' if on else '#a04000' }}">{{ 'ON' if on else 'OFF' }}</b></span>
+  <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px">
+    {{ 'Turn off' if on else 'Turn on' }}</button>
+</form>
+{% endfor %}
+
+<h3>Fee accruals</h3>
+<table>
+  <tr><th>Date</th><th>Type</th><th>Period</th><th class="num">Amount</th>
+      <th>Posted to ERPNext</th></tr>
+  {% for a in d.accruals %}
+  <tr>
+    <td>{{ a.accrual_date }}</td><td>{{ a.fee_type }}</td>
+    <td>{{ a.period_label }}</td>
+    <td class="num">{{ '%.2f'|format(a.amount) }}</td>
+    <td>{% if a.posted_to_erpnext %}<span class="pill pill-ok">posted
+        {{ a.erpnext_je_id }}</span>{% else %}
+        <span class="pill pill-muted">not posted</span>
+        <br><span style="font-size:11px;color:#888">{{ a.notes }}</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  {% if not d.accruals %}
+  <tr><td colspan="5" style="color:#888">No accruals recorded yet.</td></tr>
+  {% endif %}
+</table>
+<p style="font-size:13px"><a href="/admin/advisory">&larr; all agreements</a></p>
+"""
+
+
+@bp.get('/admin/advisory')
+def advisory_list():
+    """Every advisory agreement, with current AUM."""
+    from .. import advisory
+    from ..models import AdvisoryAgreement
+    agreements = (AdvisoryAgreement.query
+                  .order_by(AdvisoryAgreement.name).all())
+    aum_by_id = {a.id: advisory.agreement_aum(a) for a in agreements}
+    return _page(ADVISORY_LIST_BODY, page='advisory',
+                 agreements=agreements, aum_by_id=aum_by_id)
+
+
+@bp.get('/admin/advisory/<int:agreement_id>')
+def advisory_dashboard(agreement_id):
+    """One agreement's dashboard — a render of stored figures, not a
+    recomputation (the design test for this whole feature)."""
+    from .. import advisory
+    from ..models import AdvisoryAgreement
+    agreement = db.session.get(AdvisoryAgreement, agreement_id)
+    if agreement is None:
+        return redirect('/admin/advisory?flash=' + quote_plus('No such agreement.'))
+    return _page(ADVISORY_DASHBOARD_BODY, page='advisory',
+                 d=advisory.dashboard(agreement),
+                 flash_msg=request.args.get('flash', ''))
+
+
+@bp.post('/admin/advisory/<int:agreement_id>/toggle')
+def advisory_toggle(agreement_id):
+    """Flip one of the three per-agreement kill switches. Nothing is posted
+    retroactively — the switch gates the NEXT settlement/accrual/alert."""
+    from ..models import AdvisoryAgreement
+    agreement = db.session.get(AdvisoryAgreement, agreement_id)
+    if agreement is None:
+        return redirect('/admin/advisory?flash=' + quote_plus('No such agreement.'))
+    switch = (request.form.get('switch') or '').strip()
+    if switch not in ('fee_accrual_enabled', 'performance_fee_enabled',
+                      'risk_control_alerts_enabled'):
+        return redirect(f'/admin/advisory/{agreement_id}?flash='
+                        + quote_plus('Unknown switch.'))
+    enabled = request.form.get('enabled') == '1'
+    before = getattr(agreement, switch)
+    setattr(agreement, switch, enabled)
+    db.session.commit()
+    audit.record('advisory_switch_toggled', subject_type='AdvisoryAgreement',
+                 subject_id=agreement.id,
+                 before={switch: before}, after={switch: enabled},
+                 notes=f'{switch} {"enabled" if enabled else "disabled"}')
+    return redirect(f'/admin/advisory/{agreement_id}?flash='
+                    + quote_plus(f'{switch} is now {"ON" if enabled else "OFF"}.'))

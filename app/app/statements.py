@@ -277,7 +277,7 @@ def resolve_pdf_path(statement: PlaidStatement) -> str | None:
 # Stored on every row (`parsed_metadata['parser_version']`), which is what lets
 # an operator tell a stale parse from a current one and re-parse only what is
 # behind — see reparse_stored.
-PARSER_VERSION = '0.4.44'
+PARSER_VERSION = '0.5.3'
 
 # Ordered most- to least-specific. 'previous balance' must be tried before a
 # bare 'balance', and the credit-card wording ('previous balance', 'new

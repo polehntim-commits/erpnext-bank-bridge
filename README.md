@@ -1486,6 +1486,40 @@ Applied consistently to `/admin/accounts`, `/admin/statements`,
 `/admin/investment_transactions`, the dashboard account count, and the Plaid
 cost estimate.
 
+## Investment Advisory Agreement automation (v0.5.2, Phase E)
+
+Codifies the fee, benchmark, performance and compliance mechanics of an
+Investment Management Agreement (a Client — an ERPNext Company — and a Manager)
+so the quarterly reporting the agreement requires is a **review of what Bank
+Bridge computed, not a recomputation**. Every derived figure is stored, not just
+displayed. Seven new tables: `AdvisoryAgreement`, `DailyAUM`, `HighWaterMark`,
+`HurdleRateSample`, `PerformanceSnapshot`, `AdvisoryFeeAccrual`,
+`RiskControlCheck`.
+
+**Four engines, and where each stops:**
+
+- **Daily AUM + base-fee accrual** — `AUM × total_base_fee_rate / 365`, split
+  into the bank's cut (recorded, never posted — WF deducts it) and the
+  Manager's (accrued to the payable). Always runs; idempotent per day.
+- **Quarterly base-fee settlement** — aggregates the Manager slice and posts
+  `DR advisory expense, CR fee account`. Gated by `fee_accrual_enabled`.
+- **Performance fee** — time-weighted return vs the hurdle (10-year Treasury,
+  from FRED or manual entry), against a **high-water mark that only ratchets
+  up**. A fee accrues only when *both* the hurdle is cleared *and* closing AUM
+  exceeds the prior peak (recapture prevention). Accrued quarterly, **paid
+  annually on Client approval** — no quarterly JE. Gated by
+  `performance_fee_enabled`.
+- **Daily risk controls** — single-position, bitcoin and sizing limits;
+  violations recorded always, **alerts** gated by
+  `risk_control_alerts_enabled`.
+
+**All three kill switches default FALSE.** The engines run regardless (the
+dashboard shows the numbers); the switch gates only whether a Journal Entry or
+an alert fires. Nothing hits the Client's P&L without the Manager opting in —
+the same boundary as v0.5.0/v0.5.1. Every JE carries `company =
+client_company`. `/admin/advisory/<id>` renders the stored figures with the
+three toggles inline.
+
 ## Investment transactions as Journal Entries (v0.5.1, Phase D)
 
 Every `SecurityTransaction` on a brokerage account can post as a Journal Entry

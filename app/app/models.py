@@ -10,7 +10,7 @@ in to_dict() ever emits it."""
 from datetime import datetime, timezone
 
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.ext.mutable import MutableDict, MutableList
 
 from . import db
 
@@ -1635,3 +1635,294 @@ class OptionsIncomeEntry(db.Model):
             'total_premium': self.total_premium,
             'realized': bool(self.realized),
         }
+
+
+# ── v0.5.2 · Phase E: Investment Advisory Agreement automation ──────────────
+#
+# Seven models codify the fee, benchmark, performance and compliance mechanics
+# of an Investment Management Agreement between a Client (an ERPNext Company)
+# and a Manager, so the quarterly reporting the agreement requires is produced
+# and audit-defensible rather than reassembled by hand each quarter.
+#
+# The DESIGN TEST for every field: does it let a bookkeeper REVIEW what Bank
+# Bridge computed, or force them to recompute it? Every derived figure is
+# stored, not just displayed, so the answer is always "review".
+#
+# ALL FEE POSTING IS OPT-IN. The three kill switches on AdvisoryAgreement default
+# FALSE — the daily accruals, performance math and risk checks all RUN (they are
+# data the dashboard shows), but nothing reaches ERPNext's P&L until the Manager
+# turns the relevant switch on. That is the same boundary as v0.5.1: status and
+# computation are free; a write to the books is a deliberate act.
+
+
+class AdvisoryAgreement(db.Model):
+    """One Investment Management Agreement. The Client is an ERPNext Company;
+    the Manager is a person (their fees are the Manager's personal SE income,
+    tracked outside Bank Bridge — this is the CLIENT's system).
+
+    `managed_account_ids` is a JSON list of the Plaid account_ids the agreement
+    covers; `risk_control_config` a JSON dict of the position-sizing limits the
+    daily compliance check enforces. Fee RATES are stored so a report reproduces
+    the exact math the agreement was billed under, even after a later amendment
+    changes them."""
+    __tablename__ = 'advisory_agreements'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False, default='')
+    effective_date = db.Column(db.Date, nullable=True)
+    client_company = db.Column(db.String(140), nullable=False, default='')
+    manager_name = db.Column(db.String(255), nullable=False, default='')
+    managed_account_ids = db.Column(
+        MutableList.as_mutable(db.JSON().with_variant(JSONB, 'postgresql')),
+        default=list)
+    # ERPNext account docnames for the quarterly settlement JE.
+    fee_account_id = db.Column(db.String(255), default='')       # CR side
+    advisory_expense_account = db.Column(db.String(255), default='')  # DR side
+    total_base_fee_rate = db.Column(db.Float, default=0.0200)
+    bank_fee_rate = db.Column(db.Float, default=0.0075)
+    performance_fee_rate = db.Column(db.Float, default=0.20)
+    hurdle_benchmark = db.Column(db.String(60), default='us_10y_treasury')
+    high_water_mark_enabled = db.Column(db.Boolean, default=True)
+    risk_control_config = db.Column(
+        MutableDict.as_mutable(db.JSON().with_variant(JSONB, 'postgresql')),
+        default=dict)
+    # The three kill switches — all default FALSE. The engines run regardless;
+    # these gate only the side effects (a JE, an alert). See this section's
+    # header.
+    fee_accrual_enabled = db.Column(db.Boolean, default=False, nullable=False)
+    performance_fee_enabled = db.Column(db.Boolean, default=False,
+                                        nullable=False)
+    risk_control_alerts_enabled = db.Column(db.Boolean, default=False,
+                                            nullable=False)
+    status = db.Column(db.String(20), default='active', index=True)
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    @property
+    def manager_base_fee_rate(self) -> float:
+        """The Manager's slice of the base fee — the total less the bank's cut,
+        floored at zero so a misconfigured bank_fee_rate can't invert it."""
+        return max(0.0, round(float(self.total_base_fee_rate or 0.0)
+                              - float(self.bank_fee_rate or 0.0), 6))
+
+    def account_ids(self) -> list:
+        return list(self.managed_account_ids or [])
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'name': self.name,
+            'effective_date': self.effective_date.isoformat()
+            if self.effective_date else None,
+            'client_company': self.client_company,
+            'manager_name': self.manager_name,
+            'managed_account_ids': self.account_ids(),
+            'fee_account_id': self.fee_account_id or '',
+            'advisory_expense_account': self.advisory_expense_account or '',
+            'total_base_fee_rate': self.total_base_fee_rate,
+            'bank_fee_rate': self.bank_fee_rate,
+            'manager_base_fee_rate': self.manager_base_fee_rate,
+            'performance_fee_rate': self.performance_fee_rate,
+            'hurdle_benchmark': self.hurdle_benchmark,
+            'high_water_mark_enabled': bool(self.high_water_mark_enabled),
+            'risk_control_config': dict(self.risk_control_config or {}),
+            'fee_accrual_enabled': bool(self.fee_accrual_enabled),
+            'performance_fee_enabled': bool(self.performance_fee_enabled),
+            'risk_control_alerts_enabled': bool(self.risk_control_alerts_enabled),
+            'status': self.status,
+        }
+
+
+class DailyAUM(db.Model):
+    """One day's assets-under-management snapshot for an agreement, with that
+    day's base-fee accrual and the quarter-to-date running total. Unique on
+    (agreement, date) so a re-sample of the same day overwrites rather than
+    doubling the accrual."""
+    __tablename__ = 'daily_aum'
+    id = db.Column(db.Integer, primary_key=True)
+    agreement_id = db.Column(db.Integer,
+                             db.ForeignKey('advisory_agreements.id'),
+                             nullable=False, index=True)
+    date = db.Column(db.Date, nullable=False, index=True)
+    total_market_value = db.Column(db.Float, nullable=False, default=0.0)
+    fee_accrual_daily = db.Column(db.Float, nullable=False, default=0.0)
+    cumulative_fee_accrual_qtd = db.Column(db.Float, nullable=False, default=0.0)
+    created_at = db.Column(db.DateTime, default=_now)
+    __table_args__ = (
+        db.UniqueConstraint('agreement_id', 'date', name='ux_daily_aum'),
+    )
+
+    def to_dict(self):
+        return {'id': self.id, 'agreement_id': self.agreement_id,
+                'date': self.date.isoformat() if self.date else None,
+                'total_market_value': self.total_market_value,
+                'fee_accrual_daily': self.fee_accrual_daily,
+                'cumulative_fee_accrual_qtd': self.cumulative_fee_accrual_qtd}
+
+
+class HighWaterMark(db.Model):
+    """The running AUM peak the performance fee is measured against. A new mark
+    is only ever recorded when it EXCEEDS the prior one (the ratchet), so this
+    table is the audit trail of every high the account made — and the ceiling
+    below which no performance fee may be charged (recapture prevention)."""
+    __tablename__ = 'high_water_marks'
+    id = db.Column(db.Integer, primary_key=True)
+    agreement_id = db.Column(db.Integer,
+                             db.ForeignKey('advisory_agreements.id'),
+                             nullable=False, index=True)
+    mark_date = db.Column(db.Date, nullable=False, index=True)
+    mark_value = db.Column(db.Float, nullable=False)
+    established_by_period = db.Column(db.String(10), default='')  # e.g. 2026-Q2
+    created_at = db.Column(db.DateTime, default=_now)
+
+    def to_dict(self):
+        return {'id': self.id, 'agreement_id': self.agreement_id,
+                'mark_date': self.mark_date.isoformat()
+                if self.mark_date else None,
+                'mark_value': self.mark_value,
+                'established_by_period': self.established_by_period}
+
+
+class HurdleRateSample(db.Model):
+    """One day's hurdle benchmark rate (the 10-year Treasury), from FRED or the
+    Treasury feed, or hand-entered. Unique on date so a re-poll overwrites."""
+    __tablename__ = 'hurdle_rate_samples'
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Date, nullable=False, unique=True, index=True)
+    rate_pct = db.Column(db.Float, nullable=False)
+    source = db.Column(db.String(40), default='manual')
+    created_at = db.Column(db.DateTime, default=_now)
+
+    def to_dict(self):
+        return {'id': self.id,
+                'date': self.date.isoformat() if self.date else None,
+                'rate_pct': self.rate_pct, 'source': self.source}
+
+
+class PerformanceSnapshot(db.Model):
+    """One quarter's performance calculation. Every input AND output is stored —
+    opening/closing AUM, the flows, the returns, the hurdle, the high-water
+    marks either side, and the fee accrued — so the quarterly figure can be
+    reviewed line by line rather than re-derived. Unique on (agreement,
+    quarter_end) so a recompute replaces the row."""
+    __tablename__ = 'performance_snapshots'
+    id = db.Column(db.Integer, primary_key=True)
+    agreement_id = db.Column(db.Integer,
+                             db.ForeignKey('advisory_agreements.id'),
+                             nullable=False, index=True)
+    quarter_end = db.Column(db.Date, nullable=False, index=True)
+    opening_aum = db.Column(db.Float, default=0.0)
+    closing_aum = db.Column(db.Float, default=0.0)
+    contributions = db.Column(db.Float, default=0.0)
+    withdrawals = db.Column(db.Float, default=0.0)
+    average_aum = db.Column(db.Float, default=0.0)
+    gross_return_pct = db.Column(db.Float, default=0.0)
+    net_return_pct = db.Column(db.Float, default=0.0)
+    hurdle_return_pct = db.Column(db.Float, default=0.0)
+    excess_return_pct = db.Column(db.Float, default=0.0)
+    performance_fee_accrued = db.Column(db.Float, default=0.0)
+    high_water_mark_at_start = db.Column(db.Float, default=0.0)
+    high_water_mark_at_end = db.Column(db.Float, default=0.0)
+    hurdle_cleared = db.Column(db.Boolean, default=False)
+    above_high_water_mark = db.Column(db.Boolean, default=False)
+    notes = db.Column(db.Text, default='')
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+    __table_args__ = (
+        db.UniqueConstraint('agreement_id', 'quarter_end',
+                            name='ux_perf_snapshot'),
+    )
+
+    def period_label(self) -> str:
+        if not self.quarter_end:
+            return ''
+        return f'{self.quarter_end.year}-Q{(self.quarter_end.month - 1) // 3 + 1}'
+
+    def to_dict(self):
+        return {'id': self.id, 'agreement_id': self.agreement_id,
+                'quarter_end': self.quarter_end.isoformat()
+                if self.quarter_end else None,
+                'period_label': self.period_label(),
+                'opening_aum': self.opening_aum, 'closing_aum': self.closing_aum,
+                'contributions': self.contributions,
+                'withdrawals': self.withdrawals, 'average_aum': self.average_aum,
+                'gross_return_pct': self.gross_return_pct,
+                'net_return_pct': self.net_return_pct,
+                'hurdle_return_pct': self.hurdle_return_pct,
+                'excess_return_pct': self.excess_return_pct,
+                'performance_fee_accrued': self.performance_fee_accrued,
+                'high_water_mark_at_start': self.high_water_mark_at_start,
+                'high_water_mark_at_end': self.high_water_mark_at_end,
+                'hurdle_cleared': bool(self.hurdle_cleared),
+                'above_high_water_mark': bool(self.above_high_water_mark),
+                'notes': self.notes}
+
+
+class AdvisoryFeeAccrual(db.Model):
+    """One accrued fee — base, performance, or bank — and whether it has been
+    posted to ERPNext yet. The `posted_to_erpnext` flag is what the dashboard
+    reads to show a bookkeeper exactly which accruals are still pending a JE.
+    A BANK fee is recorded for the audit trail but is never posted (WF Advisors
+    deducts it directly)."""
+    __tablename__ = 'advisory_fee_accruals'
+    id = db.Column(db.Integer, primary_key=True)
+    agreement_id = db.Column(db.Integer,
+                             db.ForeignKey('advisory_agreements.id'),
+                             nullable=False, index=True)
+    accrual_date = db.Column(db.Date, nullable=False, index=True)
+    fee_type = db.Column(db.String(20), nullable=False, index=True)  # base|performance|bank
+    # For a quarterly base settlement, the quarter it settles (e.g. 2026-Q2),
+    # which is also the idempotency key: one settlement accrual per (agreement,
+    # type, period).
+    period_label = db.Column(db.String(10), default='', index=True)
+    amount = db.Column(db.Float, nullable=False, default=0.0)
+    posted_to_erpnext = db.Column(db.Boolean, default=False, index=True)
+    erpnext_je_id = db.Column(db.String(255), nullable=True)
+    notes = db.Column(db.Text, default='')
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {'id': self.id, 'agreement_id': self.agreement_id,
+                'accrual_date': self.accrual_date.isoformat()
+                if self.accrual_date else None,
+                'fee_type': self.fee_type, 'period_label': self.period_label,
+                'amount': self.amount,
+                'posted_to_erpnext': bool(self.posted_to_erpnext),
+                'erpnext_je_id': self.erpnext_je_id or '', 'notes': self.notes}
+
+
+class RiskControlCheck(db.Model):
+    """One day's compliance snapshot: the per-position concentrations, the
+    limits in force, and the list of any rules the portfolio tripped. Stored
+    daily so the quarterly report's adherence section is a lookup, not a
+    reconstruction."""
+    __tablename__ = 'risk_control_checks'
+    id = db.Column(db.Integer, primary_key=True)
+    agreement_id = db.Column(db.Integer,
+                             db.ForeignKey('advisory_agreements.id'),
+                             nullable=False, index=True)
+    check_date = db.Column(db.Date, nullable=False, index=True)
+    position_concentrations = db.Column(
+        MutableDict.as_mutable(db.JSON().with_variant(JSONB, 'postgresql')),
+        default=dict)
+    single_position_limit_pct = db.Column(db.Float, default=0.0)
+    sector_concentration_limit_pct = db.Column(db.Float, default=0.0)
+    bitcoin_allocation_pct = db.Column(db.Float, default=0.0)
+    violations = db.Column(
+        MutableList.as_mutable(db.JSON().with_variant(JSONB, 'postgresql')),
+        default=list)
+    created_at = db.Column(db.DateTime, default=_now)
+    __table_args__ = (
+        db.UniqueConstraint('agreement_id', 'check_date',
+                            name='ux_risk_control_check'),
+    )
+
+    def to_dict(self):
+        return {'id': self.id, 'agreement_id': self.agreement_id,
+                'check_date': self.check_date.isoformat()
+                if self.check_date else None,
+                'position_concentrations': dict(self.position_concentrations or {}),
+                'single_position_limit_pct': self.single_position_limit_pct,
+                'sector_concentration_limit_pct':
+                    self.sector_concentration_limit_pct,
+                'bitcoin_allocation_pct': self.bitcoin_allocation_pct,
+                'violations': list(self.violations or [])}

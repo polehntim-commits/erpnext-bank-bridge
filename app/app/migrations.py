@@ -196,6 +196,14 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     ('plaid_items', 'invest_je_posting_enabled', 'BOOLEAN DEFAULT false NOT NULL'),
     ('generated_journal_entries', 'plaid_investment_transaction_id',
      'VARCHAR(120)'),
+    # v0.5.2 — Phase E (Investment Advisory Agreement automation) introduces
+    # SEVEN new TABLES (advisory_agreements, daily_aum, high_water_marks,
+    # hurdle_rate_samples, performance_snapshots, advisory_fee_accruals,
+    # risk_control_checks). None need a line here: create_all() builds a missing
+    # table, and this release adds no column to any table that already exists
+    # (the same situation as v0.4.9's plaid_statements and v0.4.43's
+    # statement_anchors). An upgrading install gains seven empty tables and
+    # changes no existing row.
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,
