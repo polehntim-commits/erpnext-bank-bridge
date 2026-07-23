@@ -57,7 +57,7 @@ import logging
 import os
 import re
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from flask import current_app
 
@@ -1075,6 +1075,142 @@ def parse_balances(pdf_bytes: bytes) -> dict:
     return parse_statement(pdf_bytes)
 
 
+# ── Activity Detail: individual transactions with the BANK's posted date ─────
+#
+# The Snapshot page (above) gives a period's TOTALS. The Activity Detail pages
+# give the individual transactions — and each one's DATE, which is the reason
+# this exists. Plaid and the bank routinely file the same transaction in
+# DIFFERENT statement windows (a wire the bank dates Dec 31 and Plaid dates
+# Jan 2), and reconciliation, which sums by date, then shows +$712 in one month
+# and −$712 in the next. Reading the bank's own posted date lets the anchor
+# engine count each transaction in the month the STATEMENT assigns it.
+#
+# THE LAYOUT, as pypdf flattens it. Under a section header ('ATM and CheckCard
+# activity', 'Withdrawals by check', 'Income and distributions', …) each
+# transaction is a row whose posted date is GLUED into the middle of the line,
+# between the description and the amount:
+#
+#     VISA CHECK CARD 76 - 3RD ST 7606/01 Cash -72.17
+#     0001014 ROD HUANTE Unspecified06/04 Cash -7,200.00
+#     INTEREST BANK DEPOSIT SWEEP06/30 Cash 0.39
+#
+# i.e. <description>MM/DD <account-type> <amount>. Secondary lines follow (the
+# auth date, a reference number, 'PURCHASE', the city) and carry no such
+# pattern, so they are ignored. The running-balance 'Cash sweep activity' rows
+# put the date at the START ('06/01 BEGINNING BALANCE $0.00') and are excluded
+# by requiring a non-empty description before the date.
+
+# One transaction row: a description, then MM/DD, an account-type word, and the
+# amount at end of line. Anchored at end so the amount is unambiguous, and the
+# account-type word (usually 'Cash') is what distinguishes a real row from a
+# summary line that merely contains a date.
+_ACTIVITY_ROW = re.compile(
+    r'^(?P<desc>.*?)(?P<mm>\d{1,2})/(?P<dd>\d{1,2})\s+[A-Za-z][A-Za-z ]{0,14}?\s+'
+    r'(?P<amt>\(?-?\$?[\d,]+\.\d{2}\)?)\s*$')
+
+# The Activity Detail section headers we read, lowercased. 'Cash sweep
+# activity' is deliberately absent — its rows are running balances, not
+# transactions (the v0.4.41 trap), and hitting it ENDS transaction parsing.
+_ACTIVITY_SECTIONS = {
+    'income and distributions': 'income',
+    'other additions': 'other_additions',
+    'withdrawals by check': 'checks',
+    'atm and checkcard activity': 'card',
+    'other subtractions, transfers & charges': 'other_subtractions',
+}
+_ACTIVITY_STOP = ('cash sweep activity', 'portfolio detail',
+                  'important information', 'disclosures')
+
+
+def _resolve_year(mm: int, dd: int, start: date | None,
+                  end: date | None) -> int | None:
+    """The year an MM/DD posted date belongs to, given the statement period.
+
+    A period is one calendar month, but a December statement spans a year
+    boundary and a posted date can sit a day or two either side of the bounds.
+    So the candidate years are the period's, and the one whose date lands
+    closest INSIDE (or nearest to) the window wins — preferring period_end's
+    year on a tie."""
+    if start is None or end is None:
+        return None
+    best, best_dist = None, None
+    for year in {start.year, end.year}:
+        try:
+            cand = date(year, mm, dd)
+        except ValueError:
+            continue
+        if start <= cand <= end:
+            return year
+        dist = min(abs((cand - start).days), abs((cand - end).days))
+        if best_dist is None or dist < best_dist or (
+                dist == best_dist and year == end.year):
+            best, best_dist = year, dist
+    return best
+
+
+def _amount_value(raw: str) -> float:
+    m = _AMOUNT_RE.search(raw)
+    return _to_float(m) if m else 0.0
+
+
+def parse_activity_detail(pdf_bytes: bytes, period_start: date | None,
+                          period_end: date | None) -> list[dict]:
+    """Every transaction in a statement's Activity Detail, as
+    [{sequence, posted_date, amount, description, section}].
+
+    Scoped to the recognized sections so a summary figure or a sweep-balance
+    row is never mistaken for a transaction. The posted date's year is resolved
+    against the statement period (see _resolve_year). Never raises — an
+    unreadable PDF or an unfamiliar layout yields []."""
+    lines = extract_lines(pdf_bytes)
+    if not lines:
+        return []
+    out = []
+    section = ''
+    seq = 0
+    for line in lines:
+        low = line.lower()
+        if any(stop in low for stop in _ACTIVITY_STOP):
+            section = ''
+            continue
+        matched_header = next(
+            (name for header, name in _ACTIVITY_SECTIONS.items()
+             if low.startswith(header) or low == header),
+            None)
+        # A header line names the section and is BARE — no currency amount.
+        # This is what separates the Activity Detail header 'Income and
+        # distributions' from the Cash-flow-summary line 'Income and
+        # distributions 0.34 1.60', whose two amounts disqualify it. Without
+        # this, a summary label would open a section on the wrong page.
+        if (matched_header and not _AMOUNT_RE.search(line)
+                and not _ACTIVITY_ROW.match(line)):
+            section = matched_header
+            continue
+        if not section:
+            continue
+        if low.startswith('total') or low.startswith('date '):
+            continue
+        m = _ACTIVITY_ROW.match(line)
+        if not m:
+            continue
+        desc = m.group('desc').strip()
+        if not desc or _ROW_PREFIX.match(line):
+            continue  # a description-less / date-first row is not a transaction
+        year = _resolve_year(int(m.group('mm')), int(m.group('dd')),
+                             period_start, period_end)
+        if year is None:
+            continue
+        try:
+            posted = date(year, int(m.group('mm')), int(m.group('dd')))
+        except ValueError:
+            continue
+        seq += 1
+        out.append({'sequence': seq, 'posted_date': posted,
+                    'amount': _amount_value(m.group('amt')),
+                    'description': desc[:500], 'section': section})
+    return out
+
+
 # ── reading the metadata blob ───────────────────────────────────────────────
 
 # Keys that are bookkeeping about the parse rather than figures the bank
@@ -1342,18 +1478,32 @@ def dedupe_across_accounts(rows) -> list:
 # are all kept exactly as before. The exclusion is a property of PAIRING.
 
 
+def _effective_date_col():
+    """The date reconciliation counts a BankTransaction under: the bank's own
+    statement date (v0.5.3) when the matcher stamped one, else Plaid's. A
+    single COALESCE so the window filter is a plain SQL comparison in both
+    Postgres and SQLite."""
+    return db.func.coalesce(BankTransaction.statement_posted_date,
+                            BankTransaction.date)
+
+
 def _bank_total(account_ids, start, end) -> float:
     """Σ Plaid amounts for settled BankTransactions across a set of account
     ids, in Plaid's own convention (positive = money out).
 
     Deduplicated across the chain (see dedupe_across_accounts) — a re-link
-    leaves the same real purchase recorded on both account_ids."""
+    leaves the same real purchase recorded on both account_ids.
+
+    v0.5.3 · the period filter is on the EFFECTIVE date — the bank's statement
+    date when known, Plaid's otherwise — so a transaction the bank and Plaid
+    date into different months is counted in the bank's, matching the anchored
+    opening/closing it is reconciled against."""
     if not account_ids or start is None or end is None:
         return 0.0
+    eff = _effective_date_col()
     rows = (BankTransaction.query
             .filter(BankTransaction.account_id.in_(tuple(account_ids)),
-                    BankTransaction.date >= start,
-                    BankTransaction.date <= end,
+                    eff >= start, eff <= end,
                     BankTransaction.pending.is_(False),
                     BankTransaction.removed.is_(False))
             .all())
@@ -1625,6 +1775,153 @@ def _anchor_values(statement: PlaidStatement, account: PlaidAccount) -> dict:
             'transaction_sum': txn_sum, 'computed_closing': computed,
             'variance': variance,
             'parser_version': statement.parser_version()}
+
+
+# ── statement-transaction extraction + matching (v0.5.3) ─────────────────────
+
+def store_statement_transactions(statement: PlaidStatement) -> int:
+    """Parse a statement's Activity Detail and persist the rows, replacing any
+    prior parse of the same statement. Returns the count stored. Never raises.
+
+    Idempotent: keyed on (statement_id, sequence), and a re-parse deletes the
+    old rows first, so re-running converges rather than accumulating."""
+    from .models import StatementTransaction
+    path = resolve_pdf_path(statement)
+    if not path:
+        return 0
+    try:
+        with open(path, 'rb') as fh:
+            rows = parse_activity_detail(fh.read(), statement.period_start,
+                                         statement.period_end)
+    except OSError:
+        return 0
+    (StatementTransaction.query
+     .filter_by(statement_id=statement.id).delete())
+    for row in rows:
+        db.session.add(StatementTransaction(
+            statement_id=statement.id, sequence=row['sequence'],
+            posted_date=row['posted_date'], amount=row['amount'],
+            description=row['description'], section=row['section']))
+    db.session.flush()
+    return len(rows)
+
+
+def _override_enabled(account: PlaidAccount) -> bool:
+    """Whether this account's Item permits stamping statement dates."""
+    item = PlaidItem.query.filter_by(item_id=account.item_id).first()
+    return bool(item and item.statement_date_override_enabled)
+
+
+def match_statement_to_bank_transactions(statement: PlaidStatement) -> dict:
+    """Pair each StatementTransaction with a BankTransaction on the paired
+    companion account and stamp the bank's posted date onto it (v0.5.3).
+
+    THE MATCH KEY is (exact amount, ±5 days, description overlap). A brokerage
+    statement's Activity Detail lists the CASH-side activity, which Plaid
+    mirrors on the companion account — so the search runs over the companion's
+    supersede chain. Exactly one candidate → matched; several → the closest
+    date, flagged 'ambiguous'; none → 'no_match', surfaced for review (a line
+    Plaid never returned).
+
+    Gated by the Item's `statement_date_override_enabled`: off, nothing is
+    stamped and reconciliation keeps using Plaid's dates. Idempotent — a re-run
+    re-derives the same matches. Returns
+    {'matched', 'ambiguous', 'no_match', 'skipped'}."""
+    from .models import BankTransaction, StatementTransaction
+    stats = {'matched': 0, 'ambiguous': 0, 'no_match': 0, 'skipped': 0}
+    account = PlaidAccount.query.filter_by(
+        account_id=statement.plaid_account_id).first()
+    if account is None:
+        return stats
+    partner_id = (account.paired_account_id or '').strip()
+    # The cash activity lives on the companion; an unpaired account's own
+    # transactions are the fallback search space.
+    search_ids = supersede_chain(partner_id or account.account_id)
+    if not _override_enabled(account):
+        stats['skipped'] = 1
+        return stats
+
+    rows = (StatementTransaction.query
+            .filter_by(statement_id=statement.id)
+            .order_by(StatementTransaction.sequence).all())
+    for st in rows:
+        if st.posted_date is None:
+            continue
+        lo = st.posted_date - timedelta(days=5)
+        hi = st.posted_date + timedelta(days=5)
+        # The statement prints amounts in the holder's view (negative = money
+        # out); Plaid's convention is the opposite (positive = out). The same
+        # transaction is therefore the NEGATION across the two, so a −$712
+        # statement withdrawal matches a +$712 Plaid amount.
+        plaid_amount = round(-st.amount, 2)
+        candidates = (BankTransaction.query
+                      .filter(BankTransaction.account_id.in_(tuple(search_ids)),
+                              BankTransaction.amount == plaid_amount,
+                              BankTransaction.date >= lo,
+                              BankTransaction.date <= hi,
+                              BankTransaction.pending.is_(False),
+                              BankTransaction.removed.is_(False))
+                      .all())
+        # Prefer a description overlap when it narrows the field.
+        narrowed = [c for c in candidates
+                    if _desc_overlap(st.description, c.name or c.merchant_name)]
+        pool = narrowed or candidates
+        if not pool:
+            st.match_status = 'no_match'
+            stats['no_match'] += 1
+            continue
+        if len(pool) == 1:
+            match = pool[0]
+            status = 'matched'
+        else:
+            match = min(pool, key=lambda c: abs((c.date - st.posted_date).days))
+            status = 'ambiguous'
+        match.statement_posted_date = st.posted_date
+        match.statement_match_status = status
+        st.matched_bank_transaction_id = match.id
+        st.match_status = status
+        stats['matched' if status == 'matched' else 'ambiguous'] += 1
+    db.session.commit()
+    return stats
+
+
+_DESC_STOP = {'visa', 'check', 'card', 'purchase', 'authorized', 'on', 'the',
+              'cash', 'debit', 'credit', 'pos', 'ach'}
+
+
+def _desc_overlap(statement_desc: str, bank_name: str) -> bool:
+    """Whether two descriptions share a meaningful token — a light confirmation
+    that two same-amount transactions are the same event, tolerant of the
+    banks' different formatting. Common boilerplate ('VISA', 'PURCHASE') is
+    ignored so it can't manufacture a match."""
+    def tokens(s):
+        return {t for t in re.findall(r'[a-z0-9]{3,}', (s or '').lower())
+                if t not in _DESC_STOP}
+    a, b = tokens(statement_desc), tokens(bank_name)
+    return bool(a & b)
+
+
+def match_all_statements() -> dict:
+    """Extract + match Activity Detail for every stored statement whose PDF is
+    on disk. Runs in the reparse epilogue. Never raises."""
+    totals = {'statements': 0, 'transactions': 0, 'matched': 0,
+              'ambiguous': 0, 'no_match': 0}
+    for st in PlaidStatement.query.all():
+        try:
+            n = store_statement_transactions(st)
+            if n == 0:
+                continue
+            totals['statements'] += 1
+            totals['transactions'] += n
+            result = match_statement_to_bank_transactions(st)
+            for key in ('matched', 'ambiguous', 'no_match'):
+                totals[key] += result[key]
+        except Exception:  # pragma: no cover - never break the epilogue
+            db.session.rollback()
+            log.warning('statement-transaction match failed for %s',
+                        st.statement_id, exc_info=True)
+    db.session.commit()
+    return totals
 
 
 def rebuild_statement_anchors(account_id: str | None = None) -> dict:
@@ -2211,7 +2508,8 @@ def reparse_stale() -> dict:
     stale = stale_statements()
     if not stale:
         return {'examined': 0, 'changed': 0, 'unreadable': 0, 'suspect': 0,
-                'fields': 0, 'failed_fields': 0, 'anchors': 0, 'paired': 0}
+                'fields': 0, 'failed_fields': 0, 'anchors': 0, 'paired': 0,
+                'matched': 0}
     log.info('%d statement(s) parsed by an older recognizer — re-reading',
              len(stale))
     stats = reparse_stored(only_stale=True)
@@ -2230,6 +2528,17 @@ def reparse_stale() -> dict:
         log.warning('cash-services autolink after re-parse failed',
                     exc_info=True)
         stats['paired'] = 0
+    # v0.5.3 · extract each statement's Activity Detail and stamp the bank's
+    # posted date onto the matching BankTransactions. Runs AFTER pairing (it
+    # needs the companion) and BEFORE the anchor rebuild (the anchors sum the
+    # effective dates it just wrote).
+    try:
+        stats['matched'] = match_all_statements()['matched']
+    except Exception:  # pragma: no cover - never break a re-parse
+        db.session.rollback()
+        log.warning('statement-transaction match after re-parse failed',
+                    exc_info=True)
+        stats['matched'] = 0
     try:
         stats['anchors'] = rebuild_statement_anchors()['written']
     except Exception:  # pragma: no cover - a report must not break a re-parse

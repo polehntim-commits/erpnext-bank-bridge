@@ -204,6 +204,18 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # (the same situation as v0.4.9's plaid_statements and v0.4.43's
     # statement_anchors). An upgrading install gains seven empty tables and
     # changes no existing row.
+    #
+    # v0.5.3 — statement-derived transaction date override. The new
+    # `statement_transactions` TABLE is built by create_all(); these three
+    # ADDs are on tables that already exist. All backfill harmlessly: the two
+    # bank_transactions columns to NULL/'' ("matcher hasn't run"), and the
+    # override switch to TRUE — the WF Advisors pattern this fixes is exactly
+    # where it should be on, and it only ever moves a transaction into the
+    # bank's own stated month.
+    ('bank_transactions', 'statement_posted_date', 'DATE'),
+    ('bank_transactions', 'statement_match_status', "VARCHAR(20) DEFAULT ''"),
+    ('plaid_items', 'statement_date_override_enabled',
+     'BOOLEAN DEFAULT true NOT NULL'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,

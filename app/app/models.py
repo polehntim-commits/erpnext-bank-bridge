@@ -92,6 +92,15 @@ class PlaidItem(db.Model):
     # this Item in on /admin/accounts. See invest_je.posting_enabled.
     invest_je_posting_enabled = db.Column(db.Boolean, default=False,
                                           nullable=False)
+    # v0.5.3 · whether the statement-transaction matcher may stamp
+    # `statement_posted_date` onto this Item's BankTransactions. Defaults TRUE:
+    # the WF Advisors pattern (a paired brokerage whose statements carry an
+    # Activity Detail) is exactly what this fixes, and a matched date only ever
+    # moves a transaction into the month the bank's own statement assigns it —
+    # a strictly more-authoritative source than Plaid's. Off leaves every
+    # date NULL and reconciliation falls back to Plaid's date unchanged.
+    statement_date_override_enabled = db.Column(db.Boolean, default=True,
+                                                nullable=False)
     last_error = db.Column(db.Text, nullable=True)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -321,8 +330,25 @@ class BankTransaction(db.Model):
     # period's variance, and — like the rule column it comes from — never
     # included in anything sent to ERPNext. '' = untagged.
     bb_internal_tag = db.Column(db.Text, default='')
+    # v0.5.3 · the date the BANK's statement posted this transaction, when the
+    # statement-transaction matcher found it (statements.match_statement_to_
+    # bank_transactions). NULL until then. It exists because Plaid and the bank
+    # routinely attribute the same transaction to DIFFERENT statement windows —
+    # a $712 wire the bank dates Dec 31 and Plaid dates Jan 2 lands in opposite
+    # reconciliation periods, leaving +$712 in one and −$712 in the next. The
+    # anchor engine reads COALESCE(statement_posted_date, date), so a matched
+    # transaction is counted in the month the STATEMENT says, matching the
+    # anchored opening/closing on both sides. `statement_match_status` records
+    # how the match went: '' (not run), 'matched', 'no_match', 'ambiguous'.
+    statement_posted_date = db.Column(db.Date, nullable=True, index=True)
+    statement_match_status = db.Column(db.String(20), default='')
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def effective_date(self):
+        """The date reconciliation should count this transaction under — the
+        bank's statement date when known, else Plaid's."""
+        return self.statement_posted_date or self.date
 
     def to_dict(self):
         return {
@@ -337,6 +363,9 @@ class BankTransaction(db.Model):
             'posted_at': self.posted_at.isoformat() if self.posted_at else None,
             'removed': bool(self.removed), 'sync_error': self.sync_error,
             'bb_internal_tag': self.bb_internal_tag or '',
+            'statement_posted_date': (self.statement_posted_date.isoformat()
+                                      if self.statement_posted_date else None),
+            'statement_match_status': self.statement_match_status or '',
         }
 
     # ── v0.3.2 · autocomplete feeds for the rule builder ──────────────
@@ -1032,6 +1061,55 @@ class PlaidStatement(db.Model):
             'erpnext_synced_at': (self.erpnext_synced_at.isoformat()
                                   if self.erpnext_synced_at else None),
         }
+
+
+class StatementTransaction(db.Model):
+    """One transaction row parsed out of a statement's Activity Detail (v0.5.3).
+
+    The Snapshot page the v0.4.42 parser reads gives the period's TOTALS; the
+    Activity Detail pages give the individual transactions, each with the date
+    the BANK posted it. That posted date is the whole point: it is the
+    authority the matcher (statements.match_statement_to_bank_transactions)
+    stamps onto the corresponding BankTransaction so reconciliation counts a
+    transaction in the bank's statement window rather than Plaid's, which
+    routinely disagree by a few days across a month boundary.
+
+    `sequence` is the row's order within the statement, and (statement_id,
+    sequence) is unique — so a re-parse overwrites row-for-row rather than
+    accumulating duplicates. `matched_bank_transaction_id` records which
+    BankTransaction the row paired to, NULL when none did (surfaced for the
+    operator: a statement line Plaid never returned)."""
+    __tablename__ = 'statement_transactions'
+    id = db.Column(db.Integer, primary_key=True)
+    statement_id = db.Column(db.Integer,
+                             db.ForeignKey('plaid_statements.id'),
+                             nullable=False, index=True)
+    sequence = db.Column(db.Integer, nullable=False)
+    posted_date = db.Column(db.Date, nullable=True, index=True)
+    settle_date = db.Column(db.Date, nullable=True)
+    amount = db.Column(db.Float, nullable=False, default=0.0)
+    description = db.Column(db.Text, default='')
+    section = db.Column(db.String(60), default='')
+    matched_bank_transaction_id = db.Column(db.Integer, nullable=True,
+                                            index=True)
+    match_status = db.Column(db.String(20), default='')
+    created_at = db.Column(db.DateTime, default=_now)
+    __table_args__ = (
+        db.UniqueConstraint('statement_id', 'sequence',
+                            name='ux_statement_transaction'),
+    )
+
+    def to_dict(self):
+        return {'id': self.id, 'statement_id': self.statement_id,
+                'sequence': self.sequence,
+                'posted_date': self.posted_date.isoformat()
+                if self.posted_date else None,
+                'settle_date': self.settle_date.isoformat()
+                if self.settle_date else None,
+                'amount': self.amount, 'description': self.description,
+                'section': self.section,
+                'matched_bank_transaction_id': self.matched_bank_transaction_id,
+                'match_status': self.match_status or ''}
 
 
 class StatementAnchor(db.Model):

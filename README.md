@@ -1486,6 +1486,35 @@ Applied consistently to `/admin/accounts`, `/admin/statements`,
 `/admin/investment_transactions`, the dashboard account count, and the Plaid
 cost estimate.
 
+## Statement-derived transaction dates (v0.5.3)
+
+The last of the ••6030 residual was **date-boundary attribution**: Plaid and the
+bank routinely file the same transaction in different statement windows. A $712
+wire the bank dates Dec 31 and Plaid dates Jan 2 lands in opposite reconciliation
+periods, showing **+$712 in one month and −$712 in the next**.
+
+The bank's own **Activity Detail** pages carry each transaction's posted date.
+This release parses them (beyond the Snapshot totals the v0.4.42 parser reads),
+into a new `StatementTransaction` table, then **matches** each line to the Plaid
+`BankTransaction` on the paired companion by *(amount — sign-flipped between the
+two conventions, ±5 days, description overlap)*. Exactly one candidate →
+`matched`; several → closest date, `ambiguous`; none → `no_match` (surfaced: a
+line Plaid never returned). The bank's date is stamped onto the transaction as
+`statement_posted_date`, and the anchor engine sums by
+`COALESCE(statement_posted_date, date)` — so a transaction is counted in the
+month the *statement* assigns.
+
+Runs in the re-parse epilogue, after pairing and before the anchor rebuild.
+Gated by `PlaidItem.statement_date_override_enabled` (default TRUE — a matched
+bank date is strictly more authoritative than Plaid's; off leaves every date
+NULL and reconciliation unchanged). Dedup still fingerprints on `(amount,
+description)`, unaffected by the date.
+
+On a synthetic Dec/Jan fixture the ±$712 pair collapses to **$0.00** in both
+periods. A residual line the bank shows but Plaid never returned (e.g. a $65
+statement fee) is real off-Plaid activity this can't fix — it surfaces as
+`no_match` for the operator.
+
 ## Investment Advisory Agreement automation (v0.5.2, Phase E)
 
 Codifies the fee, benchmark, performance and compliance mechanics of an
