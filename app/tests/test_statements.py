@@ -1624,10 +1624,12 @@ class ChainDedupeTest(StatementsBase):
         """Defensive: the live data doesn't show doubled security rows today,
         but a re-link overlap is a property of the re-link, not the table.
 
-        A KEPT type (a dividend) rather than a trade, so this exercises the
-        dedup and not the v0.4.47 trade exclusion — the two combine, but this
-        test is about the former."""
+        UNPAIRED here, because as of v0.4.48 a paired brokerage skips its
+        security transactions entirely (their cash is on the sweep companion).
+        The dedup this asserts is on the security chain of a self-directed
+        brokerage, which is where security rows are still summed."""
         from app.models import SecurityTransaction
+        self.brokerage.paired_account_id = None
         old_brk = self._acct('brk-old', 'BUSINESS BROKERAGE', '6030',
                              'investment', 'brokerage')
         old_brk.superseded_by_account_id = 'brk'
@@ -1850,19 +1852,21 @@ class SandboxVisibilityTest(StatementsBase):
             self.assertNotIn('Plaid Checking', resp.data.decode(), url)
 
 
-class TradeSideExclusionTest(StatementsBase):
-    """A trade's two legs, counted once (v0.4.47).
+class PairedSecurityExclusionTest(StatementsBase):
+    """A paired brokerage's cash lives entirely on its sweep companion
+    (v0.4.48).
 
-    Every trade in an Asset Advisor account produces TWO Plaid records for ONE
-    cash movement: a SecurityTransaction on the brokerage ('sold 200 XYZ') and
-    a BankTransaction on the paired companion ('Securities sold and redeemed
-    +$50,000'). Summing both double-counted every trade — ••9401 reported
-    +$579,271 of movement for a February the statement says $278K arrived in,
-    and −$627,727 of variance overall.
+    The companion is a "Brokerage Cash Services" account — a cash-sweep ledger
+    where every brokerage event (buy, sell, advisory fee, dividend) is recorded
+    as an 'Increase/Decrease from Brokerage activity' bank line. So the
+    companion's BankTransactions ARE the account's complete cash story, and the
+    brokerage's own SecurityTransactions would double-count it.
 
-    Same shape as the v0.4.46 duplicate, different mechanism: that was one feed
-    ingested twice, this is two legs of one event in two tables that no
-    fingerprint can match (different amounts, names, sometimes dates)."""
+    v0.4.47 tried to keep income and drop only trades. Verifying against 26
+    months of production data disproved that: keeping income left ••9401 at
+    −$30,225.86 total variance; the proposed sign-negation only flipped that to
+    +$30,225.86; excluding ALL security transactions drove it to exactly $0.00,
+    because the fees and dividends sweep to the companion too."""
 
     def setUp(self):
         super().setUp()
@@ -1900,85 +1904,50 @@ class TradeSideExclusionTest(StatementsBase):
         return stmts.anchor_transaction_sum(
             self.brokerage, date(2026, 2, 1), date(2026, 2, 28))
 
-    def test_the_scenario_from_the_bug_report(self):
-        """A $10 dividend and a $50,000 sale, with the sale's proceeds also on
-        the companion. The answer is $50,010, not $100,010."""
+    def test_the_bug_from_the_field(self):
+        """••9401 July 2025: three kept fees summed to −$3,933.26, which showed
+        up as exactly that much variance. The cash side is the companion."""
         self._pair()
-        # Plaid: negative amount = cash INTO the account.
-        self._sec('iv-div', -10.00, 'cash', 'cash/dividend', 'DIVIDEND')
-        self._sec('iv-sell', -50000.00, 'sell', 'sell/sell', 'SOLD 200 XYZ')
-        self._bank('cash', 'bt-proceeds', -50000.00, 'SECURITIES SOLD')
-        self.assertEqual(self._sum(), 50010.00)
+        self._sec('iv-fee1', -194.74, 'fee', 'fee/interest', 'ADVISORY FEE')
+        self._sec('iv-fee2', -3894.71, 'fee', 'fee/interest', 'QUARTERLY FEE')
+        self._sec('iv-cr', 156.19, 'fee', 'fee/miscellaneous fee', 'CREDIT')
+        # The real cash movement is a single sweep on the companion.
+        self._bank('cash', 'bt-sweep', 3933.26, 'Increase from Brokerage activity')
+        self.assertEqual(self._sum(), -3933.26)
 
-    def test_income_types_are_kept(self):
-        """Real cash events the companion does not reliably carry — dropping
-        them would under-report income the statement's own Income summary
-        shows."""
+    def test_every_security_type_is_excluded_when_paired(self):
+        """Trades AND income — the companion sweep carries all of it."""
         self._pair()
-        for i, (kind, sub) in enumerate((('cash', 'cash/dividend'),
-                                         ('cash', 'cash/interest'),
-                                         ('tax', 'tax/tax'),
-                                         ('fee', 'fee/miscellaneous fee'))):
-            self._sec(f'iv-{i}', -10.00, kind, sub)
-        self.assertEqual(self._sum(), 40.00)
-
-    def test_sweep_mechanics_are_dropped_even_though_the_type_is_cash(self):
-        """THE CORRECTION LIVE DATA FORCED. Plaid files the bank deposit sweep
-        under type 'cash', which reads like income and is not — it is the same
-        dollars moving between the brokerage's cash and the sweep vehicle, and
-        the real movement is already on the companion.
-
-        Excluding on TYPE alone would have dropped ••6030's transfers
-        (+$284,000) while keeping its 243 sweep rows (−$283,994), turning a
-        −$11 residual into +$283,994 — far worse than the bug being fixed."""
-        self._pair()
-        self._sec('iv-in', -608003.09, 'cash', 'cash/deposit',
-                  'BANK DEPOSIT SWEEP')
-        self._sec('iv-out', 324008.70, 'cash', 'cash/withdrawal',
-                  'BANK DEPOSIT SWEEP')
-        self._sec('iv-div', -35.58, 'cash', 'cash/dividend', 'BLACKROCK')
-        self.assertEqual(self._sum(), 35.58)
-
-    def test_a_bare_subtype_is_handled_as_well_as_a_prefixed_one(self):
-        """Plaid's subtype is 'cash/deposit' on some feeds and 'deposit' on
-        others."""
-        self._pair()
-        self._sec('iv-a', -100.00, 'cash', 'deposit', 'BANK DEPOSIT SWEEP')
-        self._sec('iv-b', -10.00, 'cash', 'dividend')
-        self.assertEqual(self._sum(), 10.00)
-
-    def test_trade_types_are_dropped(self):
-        self._pair()
-        for i, kind in enumerate(('buy', 'sell', 'transfer', 'cancel')):
-            self._sec(f'iv-{i}', -1000.00, kind)
+        for i, (t, st) in enumerate((('buy', 'buy/buy'), ('sell', 'sell/sell'),
+                                     ('cash', 'cash/dividend'),
+                                     ('fee', 'fee/interest'),
+                                     ('transfer', 'transfer/transfer'),
+                                     ('cash', 'cash/deposit'))):
+            self._sec(f'iv-{i}', -1000.00, t, st)
         self.assertEqual(self._sum(), 0.0)
 
-    def test_an_unpaired_brokerage_still_counts_everything(self):
-        """With no companion holding the mirror, excluding trades would
-        under-count a self-directed brokerage whose whole cash story Plaid
-        reports here."""
-        self._sec('iv-sell', -50000.00, 'sell')
+    def test_only_the_companion_bank_is_counted(self):
+        self._pair()
+        self._sec('iv-sell', -50000.00, 'sell', 'sell/sell')
+        self._sec('iv-div', -10.00, 'cash', 'cash/dividend')
+        # The sale proceeds arrive as a sweep on the companion.
+        self._bank('cash', 'bt', -50000.00, 'Decrease from Brokerage activity')
+        self.assertEqual(self._sum(), 50000.00)
+
+    def test_an_unpaired_brokerage_still_counts_all_its_securities(self):
+        """No companion, no sweep — the security feed is the only cash record,
+        so v0.4.48 leaves it untouched."""
+        self._sec('iv-sell', -50000.00, 'sell', 'sell/sell')
         self._sec('iv-div', -10.00, 'cash', 'cash/dividend')
         self.assertEqual(self._sum(), 50010.00)
 
-    def test_an_unknown_type_is_kept(self):
-        """The deliberate direction to fail in: an over-count is a visible
-        variance to investigate; a silent exclusion of real cash looks like a
-        clean reconciliation that is quietly wrong."""
+    def test_pairing_is_what_flips_the_behaviour(self):
+        """The same data reconciles differently paired vs not — the exclusion
+        is a property of pairing, not of the transactions."""
+        self._sec('iv-div', -10.00, 'cash', 'cash/dividend')
+        self.assertEqual(self._sum(), 10.00)     # unpaired: counted
         self._pair()
-        self._sec('iv-new', -42.00, 'some_future_plaid_type')
-        self.assertEqual(self._sum(), 42.00)
-
-    def test_the_sweep_interest_double_count_on_6030(self):
-        """••6030's residual was 68¢/month: sweep interest counted on the
-        brokerage as a SecurityTransaction AND on the companion as an 'Income
-        and distributions' bank line. Interest is income, so it stays on the
-        brokerage — what must not ALSO land is a trade leg."""
-        self._pair()
-        self._sec('iv-int', -0.68, 'cash', 'cash/interest', 'INTEREST')
-        self._sec('iv-sweep', -0.68, 'cash', 'cash/deposit',
-                  'BANK DEPOSIT SWEEP')
-        self.assertEqual(self._sum(), 0.68)
+        self.assertEqual(self._sum(), 0.0)       # paired: on the companion
 
     def test_the_variance_collapses_on_a_trading_month(self):
         self._pair()
@@ -1990,17 +1959,21 @@ class TradeSideExclusionTest(StatementsBase):
         db.session.add(st)
         stmts.apply_parse(st, stmts.parse_statement(
             wf_advisors_managed_pdf()))
-        # The bank says cash went 3,507.75 → 9,702.20, i.e. +6,194.45.
+        # Bank says cash went 3,507.75 -> 9,702.20, i.e. +6,194.45.
         st.parsed_metadata = dict(st.parsed_metadata,
                                   cash_opening=3507.75, cash_closing=9702.20)
         db.session.commit()
-        self._sec('iv-sell', -100000.00, 'sell')      # the trade leg
-        self._bank('cash', 'bt-proceeds', -100000.00)  # its cash leg
-        self._bank('cash', 'bt-out', 93805.55)         # everything else
+        # A busy month of trades on the brokerage side...
+        self._sec('iv-sell', -100000.00, 'sell', 'sell/sell')
+        self._sec('iv-buy', 90000.00, 'buy', 'buy/buy')
+        self._sec('iv-fee', -3894.71, 'fee', 'fee/interest')
+        # ...whose net cash effect is a single sweep on the companion.
+        self._bank('cash', 'bt-sweep', -6194.45, 'Increase from Brokerage activity')
         stmts.rebuild_statement_anchors()
         anchor = stmts.anchors_for_account('brk')[0]
         self.assertEqual(anchor.transaction_sum, 6194.45)
         self.assertEqual(anchor.variance, 0.0)
+
 
 
 class ReconciliationPickerTest(StatementsBase):

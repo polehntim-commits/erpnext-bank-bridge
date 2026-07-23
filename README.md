@@ -1409,24 +1409,24 @@ makes the active/superseded designation **cosmetic for reconciliation**: pair
 to either row and the same transactions are found, so hygiene can be re-run
 later, or not, without changing a single anchor.
 
-**A trade's two legs are counted once (v0.4.47).** Every trade in a managed
-account produces two Plaid records for one cash movement: a
-`SecurityTransaction` on the brokerage (*sold 200 XYZ*) and a `BankTransaction`
-on the paired companion (*Securities sold and redeemed +$50,000*). With both in
-the sum, ••9401 reported +$579K of movement for a month the statement says
-$278K arrived in. So for a **paired** brokerage account, trade-side security
-transactions are dropped — their cash leg is on the companion — while
-dividends, interest, fees and tax are kept (real cash the companion doesn't
-carry). An **unpaired** brokerage keeps everything: with no companion, that
-security feed is its whole cash story.
+**A paired brokerage's securities are not counted at all (v0.4.47–48).** The
+companion is a *Brokerage Cash Services* account — a cash-sweep ledger where
+every brokerage event (buy, sell, advisory fee, dividend) is recorded as an
+*Increase/Decrease from Brokerage activity* bank line. So the companion's
+`BankTransaction`s already **are** the account's complete cash story, and the
+brokerage's own `SecurityTransaction`s would double-count it.
 
-Type alone wasn't enough. Plaid files the **bank deposit sweep** under type
-`cash`, which reads like income but is the same dollars moving to the sweep
-vehicle — already on the companion. Excluding on type alone would have kept
-••6030's 243 sweep rows while dropping its transfers, turning a −$11 residual
-into +$284K. The `cash/deposit` and `cash/withdrawal` **subtypes** are what
-separate sweep mechanics from a `cash/dividend`. On live data the rule takes
-••6030's security-side contribution to $0.00 and ••9401's from +$664K to +$15K.
+v0.4.47 tried to keep income and drop only trades, on the theory the companion
+didn't carry income. Verifying against **26 months of production data**
+disproved it: keeping income left ••9401 at −$30,225.86 total variance, a
+proposed sign-negation only flipped that to +$30,225.86, and **excluding all
+security transactions drove it to exactly $0.00** — the fees and dividends
+sweep to the companion too. On ••6030 all three policies were identical
+(its security contribution was already ~0), leaving a genuine **$152.74**
+residual to tag rather than a double-count to remove.
+
+An **unpaired** brokerage is untouched: with no companion holding the sweep,
+its `SecurityTransaction`s are the only cash record there is.
 
 **…and the re-link overlap is counted once (v0.4.46).** Walking the chain fixed the
 split history and exposed the opposite problem in the months either side of the

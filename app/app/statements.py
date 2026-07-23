@@ -1311,64 +1311,35 @@ def dedupe_across_accounts(rows) -> list:
     return kept
 
 
-# SecurityTransaction types whose CASH LEG is recorded on the paired
-# cash-services account, and which must therefore not be counted twice.
+# A PAIRED BROKERAGE ACCOUNT'S SECURITY TRANSACTIONS ARE NOT COUNTED AT ALL.
 #
-# THE BUG THIS EXISTS FOR. Every trade in an Asset Advisor account produces two
-# Plaid records for one cash movement: a SecurityTransaction on the brokerage
-# ('sold 200 shares of XYZ') and a BankTransaction on the companion
-# ('Securities sold and redeemed +$50,000'). Summing both double-counts every
-# trade — ••9401 reported +$579,271 of movement for a February where the
-# statement says $278K actually arrived, and −$627,727 of variance overall.
+# The companion is a "Brokerage Cash Services" account, which is a CASH SWEEP
+# ledger by construction: every event in the brokerage — a buy, a sell, an
+# advisory fee, a dividend — sweeps cash to or from it, and the companion
+# records that sweep as an 'Increase/Decrease from Brokerage activity' bank
+# line. So the companion's BankTransactions already ARE the account's complete
+# cash story. Adding the brokerage's SecurityTransactions on top double-counts
+# every one of them.
 #
-# Same SHAPE as the v0.4.46 fingerprint duplicate, different mechanism: that
-# one was the same feed ingested twice by a re-link, this one is the two legs
-# of a single event landing in two different tables where no fingerprint can
-# match them (different amounts, different names, sometimes different dates).
+# v0.4.47 tried to keep income (dividends, fees) and drop only trades, on the
+# theory that the companion doesn't carry income. Verifying v0.4.48 against
+# 26 months of production data disproved that theory outright:
 #
-# 'transfer' is here because a transfer between a brokerage account and its own
-# cash-services companion is an internal move: counting it on both sides
-# invents cash. 'cancel' reverses a trade, so it belongs with the trades.
-_TRADE_SIDE_TYPES = frozenset({'buy', 'sell', 'transfer', 'cancel'})
-
-# …and SWEEP MECHANICS, which type alone does not catch. Plaid files the bank
-# deposit sweep under type 'cash', which reads like income and is not: it is
-# the same dollars moving between the brokerage's cash and the sweep vehicle,
-# and the real movement is already on the companion.
+#     ••9401, 26 periods, total variance
+#       include all security txns (pre-v0.4.47) : whatever
+#       keep income, drop trades (v0.4.47)      : −30,225.86
+#       NEGATE security amounts (proposed)      : +30,225.86   (sign flip only)
+#       EXCLUDE all security txns               :       0.00
 #
-# This is the correction that live data forced. Excluding on TYPE alone would
-# have dropped ••6030's transfers (+$284,000) while keeping 243 sweep rows
-# (−$283,994), taking a −$11 residual to +$283,994 — far worse than the bug
-# being fixed. The subtype is what distinguishes 'cash/deposit BANK DEPOSIT
-# SWEEP' from 'cash/dividend'.
-_INTERNAL_SUBTYPES = frozenset({'deposit', 'withdrawal'})
-
-
-def counts_as_brokerage_cash(txn) -> bool:
-    """Whether a SecurityTransaction's cash movement is the BROKERAGE's to
-    report, given a paired companion holds the cash side.
-
-    Dividends, interest, fees and tax are kept: they are real cash events that
-    Plaid does not reliably surface on the companion, and dropping them would
-    under-report income the statement's own Income summary does show.
-
-    Dropped are the two legs that ARE mirrored: trades (type) and sweep
-    mechanics (subtype). Note the subtype check only applies within type
-    'cash' — a 'transfer/deposit' is already gone on the type rule, and no
-    other type uses these subtypes for something we want to keep.
-
-    An UNRECOGNISED type is KEPT. That is the deliberate direction to fail in —
-    it preserves pre-v0.4.47 behaviour for anything Plaid adds later, and an
-    over-count shows up as a visible variance to investigate, where a silent
-    exclusion of real cash movement would look like a clean reconciliation that
-    is quietly wrong. Only what is known to have a mirror is dropped."""
-    kind = (getattr(txn, 'type', '') or '').strip().lower()
-    if kind in _TRADE_SIDE_TYPES:
-        return False
-    # Plaid's subtype is 'cash/deposit'-style on some feeds and bare on others.
-    subtype = (getattr(txn, 'subtype', '') or '').strip().lower()
-    leaf = subtype.rsplit('/', 1)[-1]
-    return not (kind == 'cash' and leaf in _INTERNAL_SUBTYPES)
+# The proposed sign fix only flipped the error's sign — the fees were being
+# counted, not mis-signed. Excluding them entirely, because the sweep on the
+# companion is their real cash leg, is what reconciles. On ••6030 the three
+# policies are identical (its kept-security sum was already ~0), leaving a
+# genuine $152.74 residual to tag rather than a double-count to remove.
+#
+# UNPAIRED brokerage accounts are untouched: with no companion holding the
+# sweep, their SecurityTransactions are the only cash record there is, so they
+# are all kept exactly as before. The exclusion is a property of PAIRING.
 
 
 def _bank_total(account_ids, start, end) -> float:
@@ -2542,11 +2513,12 @@ def signed_movement(account: PlaidAccount, start: date | None,
     the rest as unexplained. See `supersede_chain` for why walking both
     directions is what makes the active/superseded designation cosmetic.
 
-    v0.4.47 · when the account is PAIRED, trade-side SecurityTransactions are
-    dropped because their cash leg is already recorded on the companion — see
-    `counts_as_brokerage_cash`. Unpaired accounts keep everything: with no
-    companion holding the mirror, excluding trades would under-count a
-    self-directed brokerage whose entire cash story Plaid reports here."""
+    v0.4.48 · when the account is PAIRED, its SecurityTransactions are skipped
+    ENTIRELY — the companion is a cash-sweep ledger that already records every
+    security event's cash leg, so counting them here double-counts. Unpaired
+    accounts keep everything: with no companion holding the sweep, that
+    security feed is the only cash record there is. See _bank_total's comment
+    for the 26-month verification that settled this."""
     if start is None or end is None:
         return 0.0
     account_ids = supersede_chain(account.account_id)
@@ -2556,6 +2528,13 @@ def signed_movement(account: PlaidAccount, start: date | None,
     # complete picture (buys reduce cash, sells add cash, dividends add
     # cash, etc.).
     if (account.type or '').lower() in ('investment', 'brokerage'):
+        # v0.4.48 · a PAIRED brokerage's cash is entirely on its sweep
+        # companion (see _bank_total's neighbouring comment). Its own
+        # SecurityTransactions would double-count that, so they are skipped and
+        # only the bank side — the brokerage's own chain plus, via
+        # anchor_transaction_sum, the companion's — is summed.
+        if (account.paired_account_id or '').strip():
+            return round(bank_total, 2)
         from .models import SecurityTransaction
         sec_rows = (SecurityTransaction.query
                     .filter(SecurityTransaction.account_id.in_(
@@ -2563,9 +2542,6 @@ def signed_movement(account: PlaidAccount, start: date | None,
                             SecurityTransaction.date >= start,
                             SecurityTransaction.date <= end)
                     .all())
-        # v0.4.47 · a trade's cash leg is already on the paired companion.
-        if (account.paired_account_id or '').strip():
-            sec_rows = [t for t in sec_rows if counts_as_brokerage_cash(t)]
         # Deduped for the same reason the bank rows are, defensively: the live
         # data doesn't show doubled security transactions today, but a re-link
         # overlap is a property of the re-link, not of the table.
