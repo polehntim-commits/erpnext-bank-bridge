@@ -1698,6 +1698,53 @@ def rebuild_statement_anchors(account_id: str | None = None) -> dict:
     return stats
 
 
+def period_tag_summary(account: PlaidAccount, start: date | None,
+                       end: date | None) -> str:
+    """A short human summary of the internal tags carried by the transactions
+    in one statement period — what the reconciliation view's Reason column
+    shows (v0.4.49).
+
+    Looks at the SAME set of transactions the anchor sum does: the account's
+    supersede chain, plus the paired companion's chain, deduplicated across
+    accounts so a re-link's mirror rows are not counted twice. That alignment
+    is the point — the reason has to describe the movement the variance is
+    measured over, not some other window.
+
+      * one tag        → that tag ('owner_distribution')
+      * several tags    → dominant first, with counts
+                          ('owner_distribution (3), advisory_fee (1)')
+      * variance but no tagged rows → '' (the caller shows 'untagged')
+      * no transactions at all      → '' (the caller shows an em-dash)"""
+    if start is None or end is None:
+        return ''
+    ids = list(supersede_chain(account.account_id))
+    partner_id = (account.paired_account_id or '').strip()
+    if partner_id:
+        ids += [a for a in supersede_chain(partner_id) if a not in ids]
+    rows = (BankTransaction.query
+            .filter(BankTransaction.account_id.in_(tuple(ids)),
+                    BankTransaction.date >= start,
+                    BankTransaction.date <= end,
+                    BankTransaction.pending.is_(False),
+                    BankTransaction.removed.is_(False))
+            .all())
+    if len(ids) > 1:
+        rows = dedupe_across_accounts(rows)
+    counts: dict = {}
+    for row in rows:
+        tag = (row.bb_internal_tag or '').strip()
+        if tag:
+            counts[tag] = counts.get(tag, 0) + 1
+    if not counts:
+        return ''
+    # Dominant first (most transactions), ties broken alphabetically so the
+    # string is stable across renders.
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    if len(ordered) == 1:
+        return ordered[0][0]
+    return ', '.join(f'{tag} ({n})' for tag, n in ordered)
+
+
 def anchors_for_account(account_id: str) -> list:
     """One account's anchor chain, oldest period first — the order the chain
     has to be read in for a gap to mean anything."""

@@ -181,6 +181,13 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # until the next re-parse detects a pair and rebuilds the anchors.
     ('plaid_accounts', 'paired_account_id', 'VARCHAR(120)'),
     ('plaid_statements', 'cash_services_account_number', 'VARCHAR(40)'),
+    # v0.4.49 — Bank-Bridge-internal attribution tags. Both backfill to '',
+    # i.e. "no tag", which is true of every rule and every transaction on an
+    # existing install. The tag is never sent to ERPNext (see the columns'
+    # docstrings); an upgrade adds two empty columns and changes no behaviour
+    # until an operator sets a tag on a rule and backfills.
+    ('categorization_rules', 'bb_internal_tag', "TEXT DEFAULT ''"),
+    ('bank_transactions', 'bb_internal_tag', "TEXT DEFAULT ''"),
 ]
 
 

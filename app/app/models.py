@@ -308,6 +308,12 @@ class BankTransaction(db.Model):
     # keep the row for the audit trail and cancel the ERPNext doc.
     removed = db.Column(db.Boolean, default=False, index=True)
     sync_error = db.Column(db.Text, nullable=True)
+    # v0.4.49 · the internal attribution tag a CategorizationRule stamped on
+    # this transaction (see CategorizationRule.bb_internal_tag). Populated by
+    # the rules engine on match, read by the reconciliation view to explain a
+    # period's variance, and — like the rule column it comes from — never
+    # included in anything sent to ERPNext. '' = untagged.
+    bb_internal_tag = db.Column(db.Text, default='')
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -323,6 +329,7 @@ class BankTransaction(db.Model):
             'erpnext_bank_transaction_id': self.erpnext_bank_transaction_id,
             'posted_at': self.posted_at.isoformat() if self.posted_at else None,
             'removed': bool(self.removed), 'sync_error': self.sync_error,
+            'bb_internal_tag': self.bb_internal_tag or '',
         }
 
     # ── v0.3.2 · autocomplete feeds for the rule builder ──────────────
@@ -619,6 +626,21 @@ class CategorizationRule(db.Model):
     # — which clones the rule by design — would reset the column to 0 and make a
     # working rule look dead, which is the exact opposite of what it's for.
     match_count = db.Column(db.Integer, default=0, index=True)
+    # v0.4.49 · an optional BANK-BRIDGE-INTERNAL tag emitted when this rule
+    # matches, e.g. 'owner_distribution' or 'advisory_fee'. It exists so one
+    # rule can serve both jobs — categorization AND reconciliation attribution
+    # — instead of maintaining a second tagging engine over the same
+    # descriptors.
+    #
+    # NEVER LEAVES BANK BRIDGE. This is the load-bearing property: the tag is
+    # written to BankTransaction.bb_internal_tag and surfaced in the
+    # reconciliation view, and it appears in NO Journal Entry payload, remark,
+    # or any other ERPNext-bound field. The reconciliation ledger it feeds is
+    # deliberately ERPNext-independent (see StatementAnchor), and a tag that
+    # leaked into a JE remark would put an operator's private attribution
+    # ('member_distribution' — who a payment went to) into the accounting
+    # system this app is designed to keep it out of. '' = no tag, the default.
+    bb_internal_tag = db.Column(db.Text, default='')
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -652,6 +674,7 @@ class CategorizationRule(db.Model):
             'superseded_by': self.superseded_by,
             'archived': bool(self.archived),
             'match_count': int(self.match_count or 0),
+            'bb_internal_tag': self.bb_internal_tag or '',
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }

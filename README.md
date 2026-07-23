@@ -1486,6 +1486,37 @@ Applied consistently to `/admin/accounts`, `/admin/statements`,
 `/admin/investment_transactions`, the dashboard account count, and the Plaid
 cost estimate.
 
+## Internal attribution tags (v0.4.49)
+
+The reconciliation view's **Reason** column auto-populates from the
+categorization rules that already fire on transaction descriptors. A
+`CategorizationRule` can carry an optional `bb_internal_tag` (a slug like
+`owner_distribution` or `advisory_fee`); when it matches, that tag is stamped on
+`BankTransaction.bb_internal_tag`, and the reconciliation view aggregates the
+tags carried by each period's transactions:
+
+- one shared tag → that tag (`owner_distribution`)
+- several → dominant first, with counts (`owner_distribution (3), advisory_fee (1)`)
+- variance but nothing tagged → `untagged`; no transactions → em-dash
+
+One rule thus serves both categorization *and* reconciliation attribution — no
+second tagging engine over the same descriptors. The period window matches the
+anchor sum exactly (the account's supersede chain plus the paired companion's,
+deduped across the chain), so the reason describes the movement the variance is
+measured over.
+
+**The tag never leaves Bank Bridge.** It appears in no Journal Entry payload,
+remark, or any ERPNext-bound field — verified by test. That boundary is the
+point: an attribution like `member_distribution` records *who* a payment went
+to, which belongs in the operator's private reconciliation ledger, not in the
+accounting system this feature deliberately keeps it out of.
+
+A **Backfill tags** button re-runs every active rule against all stored
+transactions and updates only the tag column — never building or altering a
+Journal Entry — so a rule added today can label a year of history without
+retro-posting entries for it. It is a pure function of the current rules:
+idempotent, and it *clears* a tag whose rule lost it.
+
 ## Statement-anchored reconciliation (v0.4.43)
 
 Bank Bridge's own durable record of what each account **actually held** at each

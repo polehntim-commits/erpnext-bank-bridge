@@ -11,6 +11,7 @@
     cd app
     python3 -m unittest discover -s tests -v
 """
+import json
 import os
 import tempfile
 import unittest
@@ -568,6 +569,108 @@ class TestFullSyncWithJE(Base):
     def test_je_engine_off_by_default_no_je(self):
         # A second app WITHOUT the engine flag should not generate JEs.
         pass  # covered by TestSupplierEnabledDuringSync (default config, no JE)
+
+
+class TestInternalTags(Base):
+    """Bank-Bridge-internal attribution tags (v0.4.49).
+
+    A CategorizationRule can carry an internal tag that is stamped on matching
+    transactions and surfaced in the reconciliation view — and, load-bearingly,
+    goes NOWHERE near ERPNext. Synthetic merchant names throughout; the real
+    ones live only in the operator's rules, never in the repo."""
+
+    def _tagged_rule(self, tag='owner_distribution', value='TEST OWNER'):
+        return self._rule(match_type='description_regex', match_value=value,
+                          bb_internal_tag=tag)
+
+    def test_a_matching_rule_stamps_its_tag(self):
+        self._tagged_rule()
+        row = self._row(merchant='', name='TEST OWNER PAYMENT', tid='t1')
+        categorization.generate_journal_entry(FakeERPClient(), row)
+        db.session.refresh(row)
+        self.assertEqual(row.bb_internal_tag, 'owner_distribution')
+
+    def test_the_tag_never_reaches_the_journal_entry(self):
+        """The whole point: an attribution like 'member_distribution' — who a
+        payment went to — must not land in the accounting system."""
+        self._tagged_rule(tag='member_distribution', value='TEST MEMBER')
+        row = self._row(merchant='', name='TEST MEMBER SUPPORT', tid='t1')
+        erp = FakeERPClient()
+        gje = categorization.generate_journal_entry(erp, row)
+        blob = json.dumps(erp.created['Journal Entry']
+                          [gje.erpnext_journal_entry_name])
+        self.assertNotIn('member_distribution', blob)
+        self.assertNotIn('bb_internal_tag', blob)
+        self.assertNotIn('member_distribution', gje.description or '')
+
+    def test_a_rule_without_a_tag_leaves_the_column_empty(self):
+        self._rule(match_type='description_regex', match_value='TEST OWNER')
+        row = self._row(merchant='', name='TEST OWNER PAYMENT', tid='t1')
+        categorization.generate_journal_entry(FakeERPClient(), row)
+        db.session.refresh(row)
+        self.assertEqual(row.bb_internal_tag or '', '')
+
+    def test_the_tag_fires_even_when_je_generation_is_skipped(self):
+        """Matching earns the tag; JE generation is a separate concern. Here an
+        agnostic rule with a logical offset no Company can resolve skips the
+        JE, but the transaction is still tagged."""
+        self._account()
+        rule = self._rule(match_type='description_regex',
+                          match_value='TEST OWNER', bb_internal_tag='owner_distribution',
+                          offset_account='Nonexistent Logical Account',
+                          applies_to_company=None, debit_account='',
+                          credit_account='')
+        row = self._row(merchant='', name='TEST OWNER PAYMENT', tid='t1')
+        gje = categorization.generate_journal_entry(FakeERPClient(), row)
+        db.session.refresh(row)
+        self.assertEqual(row.bb_internal_tag, 'owner_distribution')
+        # …and no JE was posted.
+        self.assertTrue(gje is None or not gje.erpnext_journal_entry_name)
+
+    def test_internal_tag_for_is_a_pure_read(self):
+        self._tagged_rule()
+        row = self._row(merchant='', name='TEST OWNER PAYMENT', tid='t1')
+        self.assertEqual(categorization.internal_tag_for(row),
+                         'owner_distribution')
+        self.assertEqual(row.bb_internal_tag or '', '')   # nothing written
+
+    def test_backfill_tags_history_without_touching_jes(self):
+        """The retroactive path: a rule added today can label a year of old
+        transactions, and it must not retro-post accounting entries for them."""
+        self._tagged_rule()
+        for i in range(3):
+            self._row(merchant='', name=f'TEST OWNER {i}', tid=f'own-{i}')
+        self._row(merchant='', name='UNRELATED SHOP', tid='other')
+        result = categorization.backfill_internal_tags()
+        self.assertEqual(result['examined'], 4)
+        self.assertEqual(result['tagged'], 3)
+        self.assertEqual(GeneratedJournalEntry.query.count(), 0)
+        tagged = {r.plaid_transaction_id for r in BankTransaction.query
+                  if (r.bb_internal_tag or '')}
+        self.assertEqual(tagged, {'own-0', 'own-1', 'own-2'})
+
+    def test_backfill_is_idempotent(self):
+        self._tagged_rule()
+        self._row(merchant='', name='TEST OWNER PAYMENT', tid='t1')
+        first = categorization.backfill_internal_tags()
+        second = categorization.backfill_internal_tags()
+        self.assertEqual(first['tagged'], 1)
+        self.assertEqual(second['tagged'], 0)
+        self.assertEqual(second['unchanged'], 1)
+
+    def test_backfill_clears_a_tag_when_its_rule_loses_it(self):
+        """Backfill is a pure function of the current rules, so removing a
+        rule's tag and re-running converges rather than leaving a stale tag."""
+        rule = self._tagged_rule()
+        row = self._row(merchant='', name='TEST OWNER PAYMENT', tid='t1')
+        categorization.backfill_internal_tags()
+        self.assertEqual(row.bb_internal_tag, 'owner_distribution')
+        rule.bb_internal_tag = ''
+        db.session.commit()
+        result = categorization.backfill_internal_tags()
+        db.session.refresh(row)
+        self.assertEqual(row.bb_internal_tag or '', '')
+        self.assertEqual(result['cleared'], 1)
 
 
 if __name__ == '__main__':

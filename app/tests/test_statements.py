@@ -2099,6 +2099,108 @@ class ReconciliationPickerTest(StatementsBase):
         self.assertIn('reconciled with ••6030', body)
 
 
+class PeriodTagSummaryTest(StatementsBase):
+    """The reconciliation view's Reason column, auto-populated from the
+    internal tags on a period's transactions (v0.4.49).
+
+    Synthetic tags only — the real attribution vocabulary lives in the
+    operator's rules, never in the repo."""
+
+    def setUp(self):
+        super().setUp()
+        self.client_ = self.app.test_client()
+        self.brokerage = self._acct('brk', 'BUSINESS BROKERAGE', '9401',
+                                    'investment')
+        self.cash = self._acct('cash', 'BROKERAGE CASH', '3194', 'depository')
+        self.brokerage.paired_account_id = 'cash'
+        db.session.commit()
+
+    def _acct(self, account_id, name, mask, type_):
+        a = PlaidAccount(account_id=account_id, item_id=self.item.item_id,
+                         name=name, mask=mask, type=type_,
+                         subtype='brokerage' if type_ == 'investment'
+                         else 'checking')
+        db.session.add(a)
+        db.session.commit()
+        return a
+
+    def _txn(self, account_id, tid, tag, day=15):
+        db.session.add(BankTransaction(
+            plaid_transaction_id=tid, account_id=account_id,
+            date=date(2026, 2, day), amount=-100.0, name='TXN',
+            bb_internal_tag=tag))
+        db.session.commit()
+
+    def _summary(self):
+        return stmts.period_tag_summary(self.brokerage, date(2026, 2, 1),
+                                        date(2026, 2, 28))
+
+    def test_one_shared_tag_shows_that_tag(self):
+        self._txn('cash', 'a', 'owner_distribution')
+        self._txn('cash', 'b', 'owner_distribution', day=16)
+        self.assertEqual(self._summary(), 'owner_distribution')
+
+    def test_multiple_tags_show_the_dominant_with_counts(self):
+        for i in range(3):
+            self._txn('cash', f'o{i}', 'owner_distribution', day=10 + i)
+        self._txn('cash', 'f', 'advisory_fee', day=20)
+        self.assertEqual(self._summary(),
+                         'owner_distribution (3), advisory_fee (1)')
+
+    def test_no_tagged_transactions_yields_empty(self):
+        self._txn('cash', 'a', '')
+        self.assertEqual(self._summary(), '')
+
+    def test_it_reads_the_companion_chain(self):
+        """The tags live on the cash companion — the reason must see them, the
+        same set the anchor sum covers."""
+        self._txn('cash', 'a', 'internal_sweep')
+        self.assertEqual(self._summary(), 'internal_sweep')
+
+    def test_a_re_link_mirror_is_not_double_counted(self):
+        """Same fingerprint on both sides of a re-link → one transaction, so
+        one tag count."""
+        old = self._acct('cash-old', 'BROKERAGE CASH', '3194', 'depository')
+        old.superseded_by_account_id = 'cash'
+        db.session.commit()
+        # identical (date, amount, name) on both rows of the chain
+        for aid in ('cash', 'cash-old'):
+            db.session.add(BankTransaction(
+                plaid_transaction_id=f'{aid}-x', account_id=aid,
+                date=date(2026, 2, 15), amount=-100.0, name='SWEEP',
+                bb_internal_tag='internal_sweep'))
+        db.session.commit()
+        self.assertEqual(self._summary(), 'internal_sweep')
+
+    def test_the_reconciliation_view_shows_the_reason(self):
+        """End to end: a rule 'descriptor contains OWNER -> owner_distribution',
+        backfilled, then rendered in the Reason column."""
+        from app.models import CategorizationRule
+        db.session.add(CategorizationRule(
+            name='owner', priority=100, active=True,
+            match_type='description_regex', match_value='OWNER',
+            bb_internal_tag='owner_distribution'))
+        db.session.add(BankTransaction(
+            plaid_transaction_id='ot', account_id='cash',
+            date=date(2026, 2, 12), amount=-500.0, name='TEST OWNER DRAW'))
+        db.session.commit()
+        from app import categorization
+        categorization.backfill_internal_tags()
+        st = PlaidStatement(statement_id='s-feb',
+                            plaid_item_id=self.item.item_id,
+                            plaid_account_id='brk',
+                            period_start=date(2026, 2, 1),
+                            period_end=date(2026, 2, 28))
+        db.session.add(st)
+        stmts.apply_parse(st, stmts.parse_statement(wf_advisors_managed_pdf()))
+        st.parsed_metadata = dict(st.parsed_metadata, cash_opening=3507.75,
+                                  cash_closing=9702.20)
+        db.session.commit()
+        stmts.rebuild_statement_anchors()
+        body = self.client_.get('/admin/reconciliation/brk').data.decode()
+        self.assertIn('owner_distribution', body)
+
+
 class FixtureHygieneTest(unittest.TestCase):
     """The fixtures are the one place a real statement's contents could reach
     the repository. This test is the guard.
@@ -2160,6 +2262,16 @@ class FixtureHygieneTest(unittest.TestCase):
             # 0000-0000 is the fully-masked placeholder; any OTHER 4-4 digit
             # group in a fixture is a real account number that got pasted in.
             (r'\b(?!0000-0000)\d{4}-\d{4}\b', 'account number'),
+            # v0.4.49 · named people and real merchants the operator's own
+            # statements and rules contain. This guard scans ONLY the fixture
+            # files, so listing common merchants (Amazon, NAPA…) here is safe —
+            # a WF brokerage fixture never mentions them, but a stray paste of
+            # real transaction detail would. The tags used in tests are
+            # synthetic ('TEST OWNER' → owner_distribution), never these.
+            (r'(?i)\b(POLEHN|DANELLA|LENSCRAFTERS|TRADINGVIEW|VZWRLSS|'
+             r'TRALOR\s+STATION|SORREN|LES\s+SCHWAB|PRECISION\s+AUTOMOTIVE|'
+             r'NAPA|AMAZON|HOME\s+DEPOT)\b',
+             'real name or merchant'),
         )
         for name, text in self._fixture_text():
             for pattern, what in patterns:

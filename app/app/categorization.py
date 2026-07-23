@@ -42,7 +42,8 @@ from . import db
 from . import erpnext_bank
 from . import erpnext_settings
 from .erpnext_client import ERPNextAPIError, ERPNextError
-from .models import CategorizationRule, GeneratedJournalEntry, PlaidAccount
+from .models import (BankTransaction, CategorizationRule,
+                     GeneratedJournalEntry, PlaidAccount)
 
 log = logging.getLogger('bankbridge.categorization')
 
@@ -302,6 +303,67 @@ def find_matching_rule(row) -> CategorizationRule | None:
     that matches the transaction, or None. Thin wrapper over evaluate_rules()
     for callers that don't need the evaluation trace (e.g. the test sandbox)."""
     return evaluate_rules(row)[0]
+
+
+# ── Bank-Bridge-internal attribution tags (v0.4.49) ────────────────────────
+
+def internal_tag_for(row, rule: CategorizationRule | None = None) -> str:
+    """The internal attribution tag the winning rule assigns this transaction,
+    or '' — a PURE read, no writes.
+
+    Separate from JE generation on purpose: the tag is a property of which rule
+    MATCHED, not of whether a Journal Entry was successfully built, so it can be
+    recomputed for a whole account's history (the backfill) without touching JE
+    state. Passing `rule` skips re-evaluation when the caller already has the
+    winner."""
+    if rule is None:
+        rule = evaluate_rules(row)[0]
+    if rule is None:
+        return ''
+    return (getattr(rule, 'bb_internal_tag', '') or '').strip()
+
+
+def apply_internal_tag(row, rule: CategorizationRule | None = None) -> str:
+    """Stamp the matched rule's internal tag onto `row` (no commit). Returns
+    the tag written.
+
+    Only writes when the tag actually changes, so this never dirties a row —
+    and therefore never bumps `updated_at` — for a no-op. A row that matches a
+    rule carrying no tag is CLEARED to '', which is what keeps the backfill a
+    pure function of the current rule set: re-running it, or running it after a
+    rule's tag is removed, converges rather than leaving a stale tag behind."""
+    tag = internal_tag_for(row, rule)
+    if (row.bb_internal_tag or '') != tag:
+        row.bb_internal_tag = tag
+    return tag
+
+
+def backfill_internal_tags(account_id: str | None = None) -> dict:
+    """Recompute `bb_internal_tag` on every stored transaction from the current
+    rules — the retroactive path, so adding a tag to a rule can label history.
+
+    TOUCHES ONLY THE TAG COLUMN. It never builds, posts, or alters a Journal
+    Entry: tagging and JE generation are independent, and a rule added purely to
+    attribute variance must not retro-post accounting entries for a year of old
+    transactions. Idempotent — the tag is a pure function of the rules, so a
+    second run changes nothing. Never raises; returns
+    {'examined', 'tagged', 'cleared', 'unchanged'}."""
+    stats = {'examined': 0, 'tagged': 0, 'cleared': 0, 'unchanged': 0}
+    q = BankTransaction.query.filter(BankTransaction.removed.is_(False))
+    if account_id:
+        q = q.filter(BankTransaction.account_id == account_id)
+    for row in q.all():
+        stats['examined'] += 1
+        before = row.bb_internal_tag or ''
+        after = apply_internal_tag(row)
+        if before == after:
+            stats['unchanged'] += 1
+        elif after:
+            stats['tagged'] += 1
+        else:
+            stats['cleared'] += 1
+    db.session.commit()
+    return stats
 
 
 # ── two-mode offset accounts (v0.4.0.3) ────────────────────────────────
@@ -970,6 +1032,13 @@ def generate_journal_entry(client, row, *, supplier_name=None,
                        + ('' if rule else ' — no match'))
     if rule is None:
         return None  # no rule matched → leave for manual reconciliation
+
+    # v0.4.49 · stamp the internal attribution tag the moment the rule is known
+    # to match — BEFORE any of the JE machinery below, because a rule matching
+    # is what earns the tag and JE generation is a separate concern that may
+    # legitimately skip or fail. Bank-Bridge-internal; it goes nowhere near the
+    # JE payload built later in this function.
+    apply_internal_tag(row, rule)
 
     # v0.4.0 multi-entity: the JE books to the Company that owns the
     # transaction's Bank Account (per-account/Item choice → default).

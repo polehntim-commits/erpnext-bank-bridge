@@ -208,5 +208,45 @@ class IntercompanyMigrationTests(MigrationBase):
         self.assertEqual(BankTransaction.query.all(), [])
 
 
+class InternalTagMigrationTests(MigrationBase):
+    """v0.4.49 · bb_internal_tag on both categorization_rules and
+    bank_transactions. Additive, backfilling to '' — an upgrade adds two empty
+    columns and changes no behaviour until an operator sets a tag."""
+
+    V049_COLUMNS = (('categorization_rules', 'bb_internal_tag'),
+                    ('bank_transactions', 'bb_internal_tag'))
+
+    def _downgrade(self):
+        with db.engine.begin() as conn:
+            for table, column in self.V049_COLUMNS:
+                conn.execute(
+                    text(f'ALTER TABLE {table} DROP COLUMN {column}'))
+
+    def test_fresh_install_has_the_columns(self):
+        for table, column in self.V049_COLUMNS:
+            self.assertIn(column, self._columns(table))
+
+    def test_upgrade_adds_them_and_query_succeeds(self):
+        self._downgrade()
+        for table, column in self.V049_COLUMNS:
+            self.assertNotIn(column, self._columns(table))
+        migrations.run_migrations()
+        for table, column in self.V049_COLUMNS:
+            self.assertIn(column, self._columns(table),
+                          f'{table}.{column} should be added on upgrade')
+        # The production symptom this guards: a query 500s until the column
+        # exists.
+        from app.models import CategorizationRule
+        self.assertEqual(CategorizationRule.query.all(), [])
+        self.assertEqual(BankTransaction.query.all(), [])
+
+    def test_idempotent(self):
+        self._downgrade()
+        migrations.run_migrations()
+        migrations.run_migrations()
+        for table, column in self.V049_COLUMNS:
+            self.assertIn(column, self._columns(table))
+
+
 if __name__ == '__main__':
     unittest.main()

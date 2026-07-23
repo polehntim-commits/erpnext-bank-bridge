@@ -23,6 +23,7 @@ Pages:
 """
 import hmac
 import logging
+import re
 from datetime import date, datetime, timezone
 from urllib.parse import quote_plus
 
@@ -2478,6 +2479,17 @@ RULES_BODY = """
               placeholder="{{ '{{merchant_name}} - {{offset_short}}' }}">{{ form.description_template or '' }}</textarea>
     <span id="dt-preview" style="display:block;font-size:12px;color:#555;margin-top:3px"></span>
   </label>
+  <label>Internal tag (optional, Bank-Bridge only)
+    <input name="bb_internal_tag" id="bb-internal-tag" autocomplete="off"
+           value="{{ form.bb_internal_tag or '' }}"
+           style="width:100%"
+           placeholder="e.g. owner_distribution, member_distribution, family_support, advisory_fee, internal_sweep">
+    <span style="display:block;font-size:11px;color:#888;margin-top:3px">
+      Never sent to ERPNext. Used only for reconciliation attribution and the
+      audit trail — it tags matching transactions so the reconciliation view
+      can explain a period's variance.
+    </span>
+  </label>
   <button type="submit" class="primary">{{ 'Save changes' if form.id else 'Add rule' }}</button>
   {% if form.id %}<a href="/admin/rules" class="secondary" style="text-decoration:none;display:inline-block;margin-left:8px">Cancel edit</a>{% endif %}
 </form>
@@ -2517,6 +2529,10 @@ RULES_BODY = """
     <form method="post" action="/admin/rules/rollup_match_counts" style="display:inline;margin:0">
       <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px"
               title="Recount matches now instead of waiting for the daily rollup.">↻ refresh match counts</button>
+    </form>
+    <form method="post" action="/admin/rules/backfill_tags" style="display:inline;margin:0 0 0 6px">
+      <button type="submit" class="secondary" style="padding:3px 10px;font-size:12px"
+              title="Re-run every active rule against all historical transactions and update their internal tags. Only the tag column is touched — no Journal Entries are created or changed.">⌕ backfill internal tags</button>
     </form>
     {% if show_archived %}<a href="/admin/rules" style="margin-left:8px">hide history</a>
     {% else %}<a href="/admin/rules?archived=1" style="margin-left:8px">show archived / history</a>{% endif %}
@@ -3166,7 +3182,19 @@ def _rule_form_values():
         'description_template': (request.form.get('description_template') or '').strip(),
         # v0.4.0.1 · optional multi-entity scope. Blank → company-agnostic.
         'applies_to_company': (request.form.get('applies_to_company') or '').strip() or None,
+        # v0.4.49 · optional Bank-Bridge-internal attribution tag. Normalised to
+        # a slug (lowercase, spaces → underscores) so 'Owner Distribution' and
+        # 'owner_distribution' aggregate as one reason in the reconciliation
+        # view. Never sent to ERPNext.
+        'bb_internal_tag': _slug_tag(request.form.get('bb_internal_tag')),
     }
+
+
+def _slug_tag(raw: str) -> str:
+    """A tag input reduced to a stable slug: lowercased, trimmed, inner runs of
+    non-word characters collapsed to single underscores. '' stays ''."""
+    cleaned = re.sub(r'[^a-z0-9]+', '_', (raw or '').strip().lower())
+    return cleaned.strip('_')
 
 
 def _redisplay_form(vals: dict) -> dict:
@@ -3244,6 +3272,28 @@ def rollup_match_counts_route():
     return redirect('/admin/rules?flash=' + quote_plus(
         f"Match counts refreshed: {result['scanned']} rule(s) scanned, "
         f"{result['updated']} updated."))
+
+
+@bp.post('/admin/rules/backfill_tags')
+def backfill_internal_tags_route():
+    """Re-run all active rules against every stored transaction and update the
+    Bank-Bridge-internal tags (v0.4.49).
+
+    ONLY THE TAG COLUMN. This never builds, posts, or alters a Journal Entry —
+    it exists so a rule added purely to attribute variance can label a year of
+    history without retro-posting accounting entries for it. Local-only and
+    idempotent, so it is safe to press repeatedly and works with ERPNext
+    unreachable."""
+    result = categorization.backfill_internal_tags()
+    audit.record('internal_tags_backfilled', subject_type=None, after=result,
+                 notes=(f"examined {result['examined']} transaction(s) — "
+                        f"{result['tagged']} tagged, {result['cleared']} "
+                        f"cleared; no Journal Entries touched"))
+    db.session.commit()
+    return redirect('/admin/rules?flash=' + quote_plus(
+        f"Internal tags backfilled: {result['examined']} transaction(s) "
+        f"examined, {result['tagged']} tagged, {result['cleared']} cleared. "
+        "No Journal Entries were created or changed."))
 
 
 @bp.post('/admin/rules/save')
@@ -5426,8 +5476,15 @@ RECONCILIATION_BODY = """
         <span style="color:#b71c1c;font-weight:600">{{ '%+.2f'|format(a.variance) }}</span>
       {% endif %}
     </td>
-    <td style="font-size:12px">{{ a.variance_reason or
-        ('—' if a.reconciles() else 'untagged') }}</td>
+    <td style="font-size:12px">
+      {# v0.4.49 · Reason auto-populates from the internal tags carried by this
+         period's transactions (CategorizationRule.bb_internal_tag). A manual
+         variance_reason, when set, still wins. #}
+      {% if a.variance_reason %}{{ a.variance_reason }}
+      {% elif tag_reasons.get(a.id) %}{{ tag_reasons[a.id] }}
+      {% elif a.reconciles() %}—
+      {% else %}untagged{% endif %}
+    </td>
     <td style="font-size:11px;color:#666">{{ a.parser_version or '—' }}</td>
   </tr>
   {% endfor %}
@@ -5723,7 +5780,7 @@ def reconciliation_page(account_id: str = ''):
         return _page(RECONCILIATION_BODY, page='reconciliation', accounts=[],
                      account=PlaidAccount(account_id=''), anchors=[],
                      summary=stmts.anchor_summary(''), total_transactions=0.0,
-                     labels={}, flash_msg=flash_msg)
+                     labels={}, tag_reasons={}, flash_msg=flash_msg)
     account_id = (account_id or request.args.get('account_id', '')).strip()
 
     # A bookmark or an older link may point at the CASH-SERVICES side of a
@@ -5756,8 +5813,13 @@ def reconciliation_page(account_id: str = ''):
     labels = {a.account_id: stmts.account_label(
         a, partners.get((a.paired_account_id or '').strip()))
         for a in accounts}
+    # v0.4.49 · the Reason column: internal tags carried by each period's
+    # transactions, keyed by anchor id.
+    tag_reasons = {an.id: stmts.period_tag_summary(
+        account, an.period_start, an.period_end) for an in anchors}
     return _page(RECONCILIATION_BODY, page='reconciliation', accounts=accounts,
                  account=account, anchors=anchors, labels=labels,
+                 tag_reasons=tag_reasons,
                  summary=stmts.anchor_summary(account.account_id),
                  flash_msg=flash_msg,
                  total_transactions=round(
