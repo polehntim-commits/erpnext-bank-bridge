@@ -2001,7 +2001,20 @@ def match_all_statements() -> dict:
     rows but was never stored (a standalone call) gets its rows stored on
     demand, from a lazy read."""
     from .models import StatementTransaction
-    totals = {'statements': 0, 'matched': 0, 'ambiguous': 0, 'no_match': 0}
+    totals = {'statements': 0, 'matched': 0, 'ambiguous': 0, 'no_match': 0,
+              'duplicate': 0}
+    # v0.5.7 · START FROM DB TRUTH, not the caller's identity map. This runs at
+    # the tail of the reparse pipeline, right after store_statement_transactions
+    # has DELETE+INSERTed the StatementTransaction rows for ~26 statements in
+    # this same session. A persistent ST row that a caller loaded-and-modified
+    # before that delete leaves a pending UPDATE against a row that no longer
+    # exists; the first autoflush inside the match loop (the candidate / sibling
+    # BankTransaction reads) then fails with StaleDataError ("expected to update
+    # 1 row(s); 0 were matched") and that statement's match cycle aborts.
+    # Expiring here discards those stale in-memory references — pending INSERTs
+    # (freshly stored rows) are untouched — so the loop reloads every row from
+    # the database it is about to reconcile against.
+    db.session.expire_all()
     # Only statements that actually have Activity Detail rows are worth a pass.
     ids = {r.statement_id for r in
            StatementTransaction.query.with_entities(
@@ -2018,8 +2031,8 @@ def match_all_statements() -> dict:
                 continue
             totals['statements'] += 1
             result = match_statement_to_bank_transactions(st)
-            for key in ('matched', 'ambiguous', 'no_match'):
-                totals[key] += result[key]
+            for key in ('matched', 'ambiguous', 'no_match', 'duplicate'):
+                totals[key] += result.get(key, 0)
         except Exception:  # pragma: no cover - never break the epilogue
             db.session.rollback()
             log.warning('statement-transaction match failed for %s',

@@ -246,6 +246,65 @@ class MatcherTest(StatementsBase):
         result = stmts.match_statement_to_bank_transactions(st)
         self.assertEqual(result['duplicate'], 0)
 
+    def test_match_all_survives_a_stale_statement_transaction_reference(self):
+        """v0.5.7 · the reparse pipeline DELETE+INSERTs ST rows in the same
+        session it then matches in. When a persistent ST row is deleted while
+        the session still holds a dirty reference to it, the match loop's first
+        autoflush raised StaleDataError ('expected to update 1 row(s); 0 were
+        matched') and aborted that statement. match_all_statements must expire
+        the identity map first and complete cleanly."""
+        from sqlalchemy import delete as sa_delete
+        from sqlalchemy.orm import Session
+        st = self._statement(activity_pdf(
+            ['VISA CHECK CARD MERCHANT A06/03 Cash -274.99']))
+        stmts.store_statement_transactions(st)
+        db.session.commit()
+        row = StatementTransaction.query.first()
+        # Delete the underlying row out-of-band (a second session), then dirty
+        # the now-orphaned identity-map object: a pending UPDATE against a row
+        # that no longer exists — exactly the production StaleDataError setup.
+        other = Session(bind=db.session.get_bind())
+        other.execute(sa_delete(StatementTransaction).where(
+            StatementTransaction.id == row.id))
+        other.commit(); other.close()
+        row.match_status = 'matched'
+        result = stmts.match_all_statements()   # must NOT raise
+        self.assertIn('duplicate', result)
+        # And it did the work: re-stored the row and gave it a terminal status.
+        rows = StatementTransaction.query.all()
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertTrue(r.match_status, f'ST {r.id} left in limbo')
+
+    def test_match_all_aggregates_the_duplicate_counter(self):
+        """The per-statement 'duplicate' count is summed into the batch total
+        (Tim observed it was being dropped)."""
+        cash2 = self._acct('cash2', 'BROKERAGE CASH 2', '3194', 'depository')
+        self.cash.superseded_by_account_id = cash2.account_id
+        db.session.commit()
+        st = self._statement(activity_pdf(
+            ['VISA CHECK CARD MERCHANT A06/01 Cash -52.98']))
+        self._bank('dupA', 52.98, date(2026, 5, 29), name='MERCHANT A',
+                   account_id='cash')
+        self._bank('dupB', 52.98, date(2026, 5, 29), name='MERCHANT A',
+                   account_id='cash2')
+        stmts.store_statement_transactions(st)
+        db.session.commit()
+        result = stmts.match_all_statements()
+        self.assertGreaterEqual(result['duplicate'], 1)
+
+    def test_match_all_leaves_no_row_in_limbo(self):
+        """Every ST row ends with a terminal status — none stuck mid-process."""
+        st = self._statement(activity_pdf(
+            ['VISA CHECK CARD MERCHANT A06/03 Cash -274.99']))
+        self._bank('b1', 274.99, date(2026, 6, 5), name='MERCHANT A')
+        stmts.match_all_statements()
+        rows = StatementTransaction.query.all()
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertIn(r.match_status,
+                          ('matched', 'ambiguous', 'no_match', 'duplicate'))
+
 
 class AnchorEffectiveDateTest(StatementsBase):
     """The payoff: a transaction the bank and Plaid date into different months
