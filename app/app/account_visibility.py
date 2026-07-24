@@ -32,7 +32,8 @@ import os
 
 from flask import current_app
 
-from .models import PlaidAccount, PlaidItem
+from . import db
+from .models import BankTransaction, PlaidAccount, PlaidItem
 
 log = logging.getLogger('bankbridge.account_visibility')
 
@@ -178,3 +179,35 @@ def summary() -> dict:
             'total_sandbox': len(sandbox),
             'showing': showing,
             'company': sandbox_company()}
+
+
+# ── re-link twin visibility (v0.5.8) ────────────────────────────────────────
+# When a bank is re-linked Plaid mints a NEW account_id for the same physical
+# account and marks the old row `superseded_by_account_id -> new`. Both rows
+# then carry the overlap-period transactions with DIFFERENT
+# plaid_transaction_ids — genuine twins. The anchor engine already collapses
+# them (statements.dedupe_across_accounts); these helpers give the SAME
+# collapse to user-facing aggregations (merchant counts, dashboard totals),
+# which otherwise show "<merchant>: 2 transactions" for one real purchase.
+#
+# The chosen collapse is "hide the retired account entirely": a row on an
+# account with `superseded_by_account_id` set is pre-relink bookkeeping, and
+# the active row is the one a merchant total should reflect. Cleaner than a
+# per-row fingerprint pass, and it is what an operator means by a merchant
+# count. NOT for reconciliation (which spans both rows via supersede_chain) or
+# for raw data views where both twins are legitimately distinct rows.
+
+def superseded_account_ids():
+    """A subquery of the account_ids of RETIRED PlaidAccounts — those pointing
+    at a re-linked replacement via `superseded_by_account_id`. Returned as a
+    query (not a materialized list) so it composes as an IN/NOT IN subselect."""
+    return (db.session.query(PlaidAccount.account_id)
+            .filter(PlaidAccount.superseded_by_account_id.isnot(None)))
+
+
+def visible_bank_transactions_query():
+    """`BankTransaction.query` with rows on retired (superseded) accounts
+    excluded — the base every USER-FACING aggregation should start from so a
+    re-link twin is counted once, not twice."""
+    return BankTransaction.query.filter(
+        BankTransaction.account_id.notin_(superseded_account_ids()))

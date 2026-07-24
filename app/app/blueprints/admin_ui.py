@@ -366,7 +366,11 @@ DASHBOARD_BODY = """
 
 
 def _counts() -> dict:
-    total_txn = BankTransaction.query.count()
+    # v0.5.8 · the headline "total transactions" KPI is a user-facing
+    # aggregation, so it counts each re-link twin once (retired-account rows
+    # excluded). The posted/pending breakdowns below key off ERPNext push state,
+    # not merchant identity, so they stay on the raw mirror.
+    total_txn = av.visible_bank_transactions_query().count()
     posted = BankTransaction.query.filter(
         BankTransaction.posted_at.isnot(None),
         BankTransaction.removed.is_(False)).count()

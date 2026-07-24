@@ -401,13 +401,20 @@ class BankTransaction(db.Model):
         can show a real dollar figure; `category` is the merchant's most common
         Plaid category (for the Name suggestion). Non-removed rows only."""
         from sqlalchemy import func
+        # v0.5.8 · exclude rows on RETIRED (re-linked) accounts so a twin
+        # counts once. Same collapse account_visibility.visible_bank_
+        # transactions_query gives, inlined here because models cannot import
+        # that module (it imports models). See dedupe_across_accounts.
+        superseded = (db.session.query(PlaidAccount.account_id)
+                      .filter(PlaidAccount.superseded_by_account_id.isnot(None)))
         rows = (db.session.query(
                     cls.merchant_name,
                     func.count(cls.id),
                     func.coalesce(func.sum(func.abs(cls.amount)), 0.0))
                 .filter(cls.merchant_name.isnot(None),
                         cls.merchant_name != '',
-                        cls.removed.is_(False))
+                        cls.removed.is_(False),
+                        cls.account_id.notin_(superseded))
                 .group_by(cls.merchant_name)
                 .order_by(func.count(cls.id).desc(), cls.merchant_name.asc())
                 .limit(limit).all())
@@ -422,7 +429,8 @@ class BankTransaction(db.Model):
                         cls.merchant_name, cls.category, func.count(cls.id))
                     .filter(cls.merchant_name.in_(names),
                             cls.category.isnot(None), cls.category != '',
-                            cls.removed.is_(False))
+                            cls.removed.is_(False),
+                            cls.account_id.notin_(superseded))
                     .group_by(cls.merchant_name, cls.category)
                     .order_by(func.count(cls.id).desc()).all())
         dominant = {}
@@ -438,9 +446,12 @@ class BankTransaction(db.Model):
         [{'path', 'count'}]. The stored string (a 'A > B > C' path or a raw PFC
         label) is preserved verbatim — the UI shows the full hierarchy."""
         from sqlalchemy import func
+        superseded = (db.session.query(PlaidAccount.account_id)  # v0.5.8
+                      .filter(PlaidAccount.superseded_by_account_id.isnot(None)))
         rows = (db.session.query(cls.category, func.count(cls.id))
                 .filter(cls.category.isnot(None), cls.category != '',
-                        cls.removed.is_(False))
+                        cls.removed.is_(False),
+                        cls.account_id.notin_(superseded))
                 .group_by(cls.category)
                 .order_by(func.count(cls.id).desc(), cls.category.asc())
                 .limit(limit).all())
