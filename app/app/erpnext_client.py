@@ -240,6 +240,21 @@ class ERPNextClient:
             json_body=doc)
         return out.get('data', out)
 
+    def delete_doc(self, doctype, name) -> bool:
+        """DELETE one document. Returns True on success, True on a 404 (already
+        gone — delete is idempotent), and raises otherwise. Frappe refuses to
+        delete a SUBMITTED document (docstatus 1) with a validation error, which
+        propagates — a caller that must not touch submitted docs should check
+        docstatus first."""
+        try:
+            self.request(
+                'DELETE', f'/api/resource/{self._seg(doctype)}/{self._seg(name)}')
+        except ERPNextAPIError as e:
+            if e.status_code == 404:
+                return True
+            raise
+        return True
+
     def list_docs(self, doctype, *, filters=None, fields=None,
                   limit_page_length=0, order_by=None):
         """GET a filtered list → list of dicts. `limit_page_length=0` asks

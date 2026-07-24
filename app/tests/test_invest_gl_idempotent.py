@@ -105,27 +105,8 @@ class EnsureLeafTest(unittest.TestCase):
         # one failed create; recovered by re-reading, not a second create.
         self.assertEqual(len(c.create_calls), 1)
 
-
-class MarketableSecuritiesNumberingTest(unittest.TestCase):
-    def setUp(self):
-        self._orig = invest_je._root_group
-        invest_je._root_group = lambda c, company, rt: 'Assets - OML'
-
-    def tearDown(self):
-        invest_je._root_group = self._orig
-
-    def test_tickered_leaf_carries_no_shared_number(self):
-        c = FakeAcctClient()
-        invest_je.marketable_securities_account(c, 'OML', 'TESTAA')
-        invest_je.marketable_securities_account(c, 'OML', 'TESTBB')
-        # neither per-ticker create claims an account_number → no collision.
-        for call in c.create_calls:
-            self.assertNotIn('account_number', call)
-        self.assertEqual(len(c.create_calls), 2)
-
-    def test_no_ticker_fallback_keeps_1320_1(self):
-        c = FakeAcctClient()
-        invest_je.marketable_securities_account(c, 'OML', None)
-        self.assertEqual(c.create_calls[0].get('account_number'), '1320.1')
-        self.assertEqual(c.create_calls[0]['account_name'],
-                         'Marketable Securities - Other')
+# NOTE the per-ticker numbering behaviour these tests once covered was replaced
+# in v0.5.11 (marketable_securities_account now buckets by security_type into
+# the 181X asset-type leaves); see test_invest_account_structure.MappingTest.
+# The ensure_leaf collision/race resilience above is version-independent and
+# stays here.

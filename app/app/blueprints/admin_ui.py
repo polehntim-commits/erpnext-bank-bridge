@@ -1576,6 +1576,37 @@ def set_invest_je_posting(item_id):
     return redirect('/admin/accounts?flash=' + quote_plus(msg))
 
 
+@bp.post('/admin/rebuild_investment_accounts')
+def rebuild_investment_accounts():
+    """One-shot cleanup of the v0.5.10 per-ticker Marketable Securities sprawl
+    (v0.5.11): delete the DRAFT investment JEs and the orphan per-ticker leaves
+    so a re-post rebuilds against the six 181X asset-type accounts. Touches only
+    drafts + empty accounts; aborts on any submitted JE."""
+    from .. import invest_je
+    if not erps.is_configured():
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'ERPNext is not configured.'))
+    try:
+        client = erpnext_bank.get_client()
+        result = invest_je.rebuild_investment_accounts(client)
+    except (ERPNextConfigError, ERPNextError) as e:
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            f'Rebuild failed: {e}'))
+    if result.get('aborted'):
+        msg = f'Rebuild ABORTED: {result.get("reason", "")} (nothing deleted).'
+    else:
+        msg = (f'Rebuild done — {result["drafts_deleted"]} draft JE(s) deleted, '
+               f'{result["accounts_deleted"]} orphan account(s) + '
+               f'{result["groups_deleted"]} group(s) removed'
+               + (f', {result["skipped_nonzero"]} kept (non-empty)'
+                  if result['skipped_nonzero'] else '')
+               + '. Re-run investment posting to rebuild against 181X.')
+    audit.record('invest_accounts_rebuilt', subject_type='Account',
+                 subject_id='marketable_securities',
+                 after=result, notes='v0.5.11 per-ticker cleanup')
+    return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
 @bp.post('/api/items/<plaid_item_id>/disconnect')
 def disconnect_item(plaid_item_id):
     """Disconnect a linked bank: call Plaid /item/remove, then mark the Item

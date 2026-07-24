@@ -156,7 +156,7 @@ class ClearingTests(InvestJEBase):
         client = self._client()
         gje = invest_je.generate_investment_je(client, txn)
         lines = self._lines(self._je_for(client, gje))
-        ms = 'Marketable Securities - TEST-AAPL - EC'
+        ms = 'Stocks - EC'
         clearing = 'Cash Clearing - Brokerage - EC'
         self.assertEqual(lines[ms], (10000.0, 0.0))
         self.assertEqual(lines[clearing], (0.0, 10000.0))
@@ -216,7 +216,7 @@ class SellTests(InvestJEBase):
         gje = invest_je.generate_investment_je(client, sell)
         lines = self._lines(self._je_for(client, gje))
         self.assertEqual(lines['Cash Clearing - Brokerage - EC'], (12000.0, 0.0))
-        self.assertEqual(lines['Marketable Securities - TEST-AAPL - EC'],
+        self.assertEqual(lines['Stocks - EC'],
                          (0.0, 8000.0))
         self.assertEqual(lines['Realized Capital Gains - EC'], (0.0, 4000.0))
         # And it balances.
@@ -235,7 +235,7 @@ class SellTests(InvestJEBase):
         gje = invest_je.generate_investment_je(client, sell)
         lines = self._lines(self._je_for(client, gje))
         self.assertEqual(lines['Realized Capital Losses - EC'], (2000.0, 0.0))
-        self.assertEqual(lines['Marketable Securities - TEST-AAPL - EC'],
+        self.assertEqual(lines['Stocks - EC'],
                          (0.0, 8000.0))
         self.assertEqual(sum(d for d, _ in lines.values()),
                          sum(c for _, c in lines.values()))

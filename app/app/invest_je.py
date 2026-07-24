@@ -100,10 +100,17 @@ def _root_group(client: ERPNextClient, company: str, root_type: str) -> str | No
 
 
 def ensure_leaf(client: ERPNextClient, company: str, account_name: str,
-                root_type: str, *, account_number: str = '') -> str | None:
-    """Find (or create) a posting leaf named `account_name` under the company's
-    `root_type` root; return its docname, or None when there is no Chart of
-    Accounts to anchor to.
+                root_type: str, *, account_number: str = '',
+                parent_account: str | None = None) -> str | None:
+    """Find (or create) a posting leaf named `account_name`; return its docname,
+    or None when there is no anchor group to create it under.
+
+    `parent_account` (v0.5.11) is the group the leaf hangs under. When given it
+    is used verbatim — NEVER falling back to the root — so a leaf can be nested
+    exactly (e.g. the 181X asset-type leaves under 1810 - Marketable Securities).
+    When omitted, the leaf lands under the company's `root_type` root, the
+    pre-v0.5.11 behaviour. The caller is responsible for the parent existing;
+    marketable_securities_account builds the 1800→1810 chain first.
 
     Idempotent: an existing leaf with the same account_name + company is reused,
     so a re-run never duplicates. The created docname is read back from the
@@ -112,10 +119,10 @@ def ensure_leaf(client: ERPNextClient, company: str, account_name: str,
                               is_group=0)
     if existing:
         return existing[0]['name']
-    root = _root_group(client, company, root_type)
+    root = parent_account or _root_group(client, company, root_type)
     if not root:
-        log.info('company %r has no %s root — cannot create %r', company,
-                 root_type, account_name)
+        log.info('company %r has no anchor group for %r — cannot create',
+                 company, account_name)
         return None
     doc = {'account_name': account_name, 'parent_account': root,
            'company': company, 'root_type': root_type, 'is_group': 0}
@@ -159,23 +166,98 @@ def ensure_leaf(client: ERPNextClient, company: str, account_name: str,
     return name
 
 
-def marketable_securities_account(client, company, ticker) -> str | None:
-    """`Marketable Securities - <ticker>` (Asset). Per-security so the balance
-    sheet shows each holding without hand-built accounts. Falls back to a
-    generic leaf when the security has no ticker (some funds/private placements)."""
-    label = (ticker or '').strip().upper()
-    if not label:
-        # The generic fallback leaf keeps its historical number (1320.1) — it is
-        # the ONE per-security leaf that legitimately owns it.
-        return ensure_leaf(client, company, 'Marketable Securities - Other',
-                           'Asset', account_number='1320.1')
-    # v0.5.10 · a PER-TICKER leaf carries NO account_number. Before v0.5.10 every
-    # ticker asked for the same 1320.1, so once 'Other' (or the first ticker)
-    # claimed it, every other ticker's create failed with 'Account Number 1320.1
-    # already used'. The leaves are distinct by name and hang under the numbered
-    # 1320 group; they do not each need their own number.
-    return ensure_leaf(client, company, f'Marketable Securities - {label}',
-                       'Asset')
+def ensure_group(client, company, account_name: str, parent_account: str, *,
+                 account_number: str | int | None = None) -> str | None:
+    """Find (or create) an is_group=1 Account named `account_name` DIRECTLY under
+    `parent_account`; return its docname (v0.5.11).
+
+    Matches on (account_name, parent_account) rather than name alone, so a group
+    of the same name at a DIFFERENT place in the tree (the stale, wrongly-parented
+    '1320 - Marketable Securities' from v0.5.10) is never mistaken for this one.
+    Tolerant of a create race the same way ensure_leaf is."""
+    for g in _find_accounts(client, company, account_name=account_name,
+                            is_group=1):
+        if (g.get('parent_account') or '') == parent_account:
+            return g['name']
+    try:
+        return _create_group_account(client, account_name, parent_account,
+                                     company, account_number=account_number)
+    except ERPNextError:
+        for g in _find_accounts(client, company, account_name=account_name,
+                                is_group=1):
+            if (g.get('parent_account') or '') == parent_account:
+                return g['name']
+        raise
+
+
+def _investments_group(client, company) -> str | None:
+    """The '1800 - Investments' asset group, creating it under the Asset root if
+    a chart somehow lacks it. None when there is no Chart of Accounts at all."""
+    existing = _find_accounts(client, company, account_name='Investments',
+                              is_group=1)
+    if existing:
+        return existing[0]['name']
+    root = _asset_root(client, company)
+    if not root:
+        return None
+    return ensure_group(client, company, 'Investments', root,
+                        account_number='1800')
+
+
+def _marketable_securities_group(client, company) -> str | None:
+    """The '1320 - Marketable Securities' group under 1800 - Investments
+    (v0.5.11). Tim's chart already has this group holding the brokerage balance,
+    so ensure_group MATCHES it by (name, parent=Investments) and reuses it — the
+    six 1321-1326 asset-type leaves hang under it. Only created (as 1320) if a
+    chart somehow lacks it."""
+    inv = _investments_group(client, company)
+    if not inv:
+        return None
+    return ensure_group(client, company, 'Marketable Securities', inv,
+                        account_number='1320')
+
+
+# security_type (Plaid Security.type) → (account_number, leaf name) under the
+# existing 1320 - Marketable Securities group. Plaid prints multi-word types
+# with spaces ('mutual fund', 'fixed income'); the lookup normalises spaces to
+# underscores so both spellings map. Anything unrecognised (including a blank
+# type) buckets into Stocks — the safe default that keeps a real holding on the
+# balance sheet rather than dropping it.
+_SECURITY_TYPE_ACCOUNTS = {
+    'equity': ('1321', 'Stocks'),
+    'etf': ('1322', 'ETFs'),
+    'mutual_fund': ('1323', 'Mutual Funds'),
+    'fixed_income': ('1324', 'Fixed Income'),
+    'preferred': ('1325', 'Preferreds'),
+    'derivative': ('1326', 'Options'),
+    'option': ('1326', 'Options'),
+}
+_DEFAULT_SECURITY_ACCOUNT = ('1321', 'Stocks')
+
+
+def _norm_security_type(security_type: str | None) -> str:
+    return (security_type or '').strip().lower().replace(' ', '_')
+
+
+def marketable_securities_account(client, company, ticker,
+                                  security_type=None) -> str | None:
+    """The asset-TYPE Marketable Securities leaf a holding belongs on (v0.5.11).
+
+    v0.5.10 created one leaf PER TICKER — 103 of them on the live install, all
+    stranded at the Chart-of-Accounts root. v0.5.11 buckets by `security_type`
+    into six leaves (1321 Stocks / 1322 ETFs / 1323 Mutual Funds / 1324 Fixed
+    Income / 1325 Preferreds / 1326 Options) under the EXISTING 1320 - Marketable
+    Securities group (itself under 1800 - Investments), so the balance sheet
+    stays clean. `ticker` is retained for signature compatibility but no longer
+    selects the account. Returns None when the chart has no Investments anchor to
+    nest under."""
+    group = _marketable_securities_group(client, company)
+    if not group:
+        return None
+    number, leaf_name = _SECURITY_TYPE_ACCOUNTS.get(
+        _norm_security_type(security_type), _DEFAULT_SECURITY_ACCOUNT)
+    return ensure_leaf(client, company, leaf_name, 'Asset',
+                       account_number=number, parent_account=group)
 
 
 def cash_clearing_account(client, company) -> str | None:
@@ -350,12 +432,14 @@ def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
         elif kind == 'buy':              # buy-to-close: cost of closing
             accounts = [_dr(loss, amount), _cr(cash, amount)]
     elif kind == 'buy':
-        ms = marketable_securities_account(client, company,
-                                           security and security.ticker_symbol)
+        ms = marketable_securities_account(
+            client, company, security and security.ticker_symbol,
+            security and security.type)
         accounts = [_dr(ms, amount), _cr(cash, amount)]
     elif kind == 'sell':
-        ms = marketable_securities_account(client, company,
-                                           security and security.ticker_symbol)
+        ms = marketable_securities_account(
+            client, company, security and security.ticker_symbol,
+            security and security.type)
         basis, _method, plan = cost_basis_for_sell(txn, qty)
         gain = round(amount - basis, 2)
         lines = [_dr(cash, amount), _cr(ms, basis)]
@@ -485,6 +569,84 @@ def _record_error(txn: SecurityTransaction, message: str) -> GeneratedJournalEnt
     db.session.commit()
     log.warning('investment JE failed for %s: %s', itx, message)
     return gje
+
+
+GL_ENTRY_DT = 'GL Entry'
+
+
+def _account_is_empty(client, account_docname: str) -> bool:
+    """True when an Account has NO posted GL activity — safe to delete. A draft
+    (docstatus 0) Journal Entry produces no GL Entry, so the per-ticker leaves,
+    whose JEs were all drafts, read empty; a submitted entry would leave a GL
+    row and this returns False, protecting real balances."""
+    gl = client.list_docs(GL_ENTRY_DT,
+                          filters=[['account', '=', account_docname]],
+                          fields=['name'], limit_page_length=1)
+    return not gl
+
+
+def rebuild_investment_accounts(client: ERPNextClient,
+                                company: str | None = None) -> dict:
+    """One-shot cleanup of the v0.5.10 per-ticker sprawl (v0.5.11).
+
+    Deletes the DRAFT investment Journal Entries and the 103 stranded
+    'Marketable Securities - <ticker>' leaves (plus the 'Other' leaf), so a
+    re-run of post_investments_for_account rebuilds everything against the six
+    1321-1326 asset-type leaves under the EXISTING 1320 group. The 1320 group
+    itself — which holds the real brokerage balance — is NEVER touched.
+
+    SAFETY. Touches ONLY draft (docstatus 0) JEs and ONLY empty accounts. If it
+    encounters a SUBMITTED investment JE it aborts immediately without deleting
+    anything further — submitted entries are real ledger history. An account
+    with any GL activity is skipped, not deleted. Idempotent: a second run finds
+    nothing left and reports zeros.
+
+    Returns {'drafts_deleted','accounts_deleted','groups_deleted',
+    'skipped_nonzero','aborted','reason'}."""
+    stats = {'drafts_deleted': 0, 'accounts_deleted': 0, 'groups_deleted': 0,
+             'skipped_nonzero': 0, 'aborted': False, 'reason': ''}
+    companies = ([company] if company else sorted({
+        owning_company_for_account_id(a.account_id)
+        for a in PlaidAccount.query.filter(
+            PlaidAccount.type == 'investment').all()} - {None, ''}))
+    if not companies:
+        return stats
+
+    # 1. Draft investment JEs → cancel/delete in ERPNext, drop the GJE row.
+    drafts = (GeneratedJournalEntry.query
+              .filter(GeneratedJournalEntry.plaid_investment_transaction_id
+                      .isnot(None),
+                      GeneratedJournalEntry.erpnext_journal_entry_name
+                      .isnot(None),
+                      GeneratedJournalEntry.state == 'pending_review').all())
+    for gje in drafts:
+        je = client.get_doc(JOURNAL_ENTRY_DT, gje.erpnext_journal_entry_name)
+        if je is not None and int(je.get('docstatus') or 0) == 1:
+            stats['aborted'] = True
+            stats['reason'] = (f'submitted JE {gje.erpnext_journal_entry_name} '
+                               '— aborted, deleted nothing further')
+            db.session.rollback()
+            return stats
+        if je is not None:
+            client.delete_doc(JOURNAL_ENTRY_DT, gje.erpnext_journal_entry_name)
+        db.session.delete(gje)
+        stats['drafts_deleted'] += 1
+    db.session.commit()
+
+    # 2. The orphan per-ticker LEAVES (+ 'Other'), balance-checked. The filter
+    #    is is_group=0, so the 1320 GROUP that holds the real balance can never
+    #    match here — it is deliberately never a deletion candidate.
+    for comp in companies:
+        for a in _find_accounts(client, comp, is_group=0):
+            if not (a.get('account_name') or '').startswith(
+                    'Marketable Securities - '):
+                continue
+            if not _account_is_empty(client, a['name']):
+                stats['skipped_nonzero'] += 1
+                continue
+            client.delete_doc(ACCOUNT_DT, a['name'])
+            stats['accounts_deleted'] += 1
+    return stats
 
 
 def post_investments_for_account(client: ERPNextClient, account_id: str) -> dict:
