@@ -351,10 +351,20 @@ def cost_basis_for_sell(txn: SecurityTransaction, sold_qty: float) -> tuple:
         basis += take * float(lot.cost_basis_per_share)
         plan.append((lot.id, round(take, 6)))
         remaining -= take
+    # v0.5.12 · the fall-back basis for shares NO lot covers is valued at
+    # PROCEEDS-per-share (amount / sold_qty), NOT txn.price. For the brokerage's
+    # cash-sweep / money-market shares Plaid reports a price scaled ~100× off the
+    # cash (e.g. qty 40000 × "price" 99.60 = $3.98M against $39.8k of actual
+    # proceeds), so the old `price × sold_qty` fabricated a $3.94M basis and a
+    # $3.94M phantom loss. Proceeds are the reliable figure; valuing the
+    # uncovered shares at proceeds/share yields zero realized gain on them,
+    # which is the correct conservative treatment when cost basis is unknown.
+    proceeds = abs(float(txn.amount or 0.0))
+    proceeds_per_share = (proceeds / sold_qty) if sold_qty else 0.0
     if remaining > 0.0000001:
         if basis == 0.0:
-            return round(float(txn.price or 0.0) * sold_qty, 2), 'no_basis', []
-        basis += remaining * float(txn.price or 0.0)
+            return round(proceeds, 2), 'no_basis', []
+        basis += remaining * proceeds_per_share
         return round(basis, 2), 'fifo_incomplete', plan
     return round(basis, 2), 'fifo', plan
 
@@ -452,11 +462,22 @@ def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
         accounts = [_dr(advisory_fees_account(client, company), amount),
                     _cr(cash, amount)]
     elif kind == 'cash':
-        # A dividend or interest RECEIVED (Plaid amount negative = cash in).
+        # v0.5.12 · ONLY genuine income posts. A `cash` SecurityTransaction is a
+        # dividend or interest RECEIVED — BUT Plaid also types the brokerage
+        # CASH-SWEEP movements ('deposit'/'withdrawal', the "BANK DEPOSIT SWEEP"
+        # in and out of the sweep fund) as `cash`. Those are the sweep itself,
+        # already carried by the companion BankTransaction; the pre-v0.5.12 code
+        # booked EVERY non-interest cash row as Dividend Income, which on the
+        # live data was hundreds of deposits + withdrawals totalling millions of
+        # phantom dividend income against a single genuine dividend. Post only
+        # rows whose subtype actually names dividend or interest; skip the rest.
         sub = (txn.subtype or '').lower()
-        income = (interest_income_account(client, company)
-                  if 'interest' in sub
-                  else dividend_income_account(client, company))
+        if 'interest' in sub:
+            income = interest_income_account(client, company)
+        elif 'dividend' in sub:
+            income = dividend_income_account(client, company)
+        else:
+            return None, []   # deposit / withdrawal / sweep — not income
         accounts = [_dr(cash, amount), _cr(income, amount)]
     else:
         return None, []  # transfer, cancel, unrecognized → not posted

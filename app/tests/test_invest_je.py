@@ -422,3 +422,112 @@ class MigrationTests(InvestJEBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class MathTests(InvestJEBase):
+    """v0.5.12 · the Phase-D JE arithmetic, incl. the two bugs that blew up
+    Tim's P&L (cash-sweep rows booked as dividend income; sweep-fund sells
+    fabricating basis from price×qty). Synthetic securities only."""
+
+    CLEARING = 'Cash Clearing - Brokerage - EC'
+    MS = 'Stocks - EC'
+    GAINS = 'Realized Capital Gains - EC'
+    LOSSES = 'Realized Capital Losses - EC'
+    DIV = 'Dividend Income - EC'
+    INT = 'Interest Income - EC'
+    ADV = 'Advisory & Management Fees - EC'
+    PREM = 'Options Premium Income - EC'
+
+    def _lot(self, per_share, shares=100.0, sid='sec-aapl'):
+        db.session.add(RetainedLot(
+            security_id=sid, account_id='brk', purchase_date=date(2026, 1, 1),
+            cost_basis_per_share=per_share, shares_original=shares,
+            shares_remaining=shares))
+        db.session.commit()
+
+    def _built(self, txn):
+        client = self._client()
+        gje = invest_je.generate_investment_je(client, txn)
+        return (self._lines(self._je_for(client, gje)) if gje
+                and gje.erpnext_journal_entry_name else None), gje
+
+    def test_buy(self):
+        self._security()
+        lines, _ = self._built(self._txn('t', 'buy', 10000.0, qty=100, price=100.0))
+        self.assertEqual(lines[self.MS], (10000.0, 0.0))
+        self.assertEqual(lines[self.CLEARING], (0.0, 10000.0))
+
+    def test_sell_at_gain_books_profit_only(self):
+        self._security()
+        self._lot(80.0)                         # basis $8,000 for 100 shares
+        lines, _ = self._built(self._txn('t', 'sell', 12000.0, qty=100, price=120.0))
+        self.assertEqual(lines[self.CLEARING], (12000.0, 0.0))
+        self.assertEqual(lines[self.MS], (0.0, 8000.0))       # cost, not proceeds
+        self.assertEqual(lines[self.GAINS], (0.0, 4000.0))    # gain-over-cost only
+        self.assertNotIn(self.LOSSES, lines)
+
+    def test_sell_at_loss(self):
+        self._security()
+        self._lot(150.0)                        # basis $15,000
+        lines, _ = self._built(self._txn('t', 'sell', 12000.0, qty=100, price=120.0))
+        self.assertEqual(lines[self.CLEARING], (12000.0, 0.0))
+        self.assertEqual(lines[self.MS], (0.0, 15000.0))
+        self.assertEqual(lines[self.LOSSES], (3000.0, 0.0))
+        self.assertNotIn(self.GAINS, lines)
+
+    def test_dividend(self):
+        self._security()
+        lines, _ = self._built(self._txn('t', 'cash', -50.0, subtype='dividend'))
+        self.assertEqual(lines[self.CLEARING], (50.0, 0.0))
+        self.assertEqual(lines[self.DIV], (0.0, 50.0))
+
+    def test_interest(self):
+        self._security()
+        lines, _ = self._built(self._txn('t', 'cash', -10.0, subtype='interest'))
+        self.assertEqual(lines[self.CLEARING], (10.0, 0.0))
+        self.assertEqual(lines[self.INT], (0.0, 10.0))
+
+    def test_advisory_fee(self):
+        self._security()
+        lines, _ = self._built(self._txn('t', 'fee', -3894.0, subtype='fee'))
+        self.assertEqual(lines[self.ADV], (3894.0, 0.0))
+        self.assertEqual(lines[self.CLEARING], (0.0, 3894.0))
+
+    def test_options_premium_sell_to_open(self):
+        self._security(sid='sec-opt', ticker='TEST-OPT', is_option=True)
+        lines, _ = self._built(self._txn('t', 'sell', 500.0, qty=1, price=5.0,
+                                         sid='sec-opt'))
+        self.assertEqual(lines[self.CLEARING], (500.0, 0.0))
+        self.assertEqual(lines[self.PREM], (0.0, 500.0))
+
+    # ── BUG 1: cash-sweep movements must NOT post as income ──────────────────
+    def test_cash_deposit_is_not_posted(self):
+        self._security()
+        _, gje = self._built(self._txn('t', 'cash', -100000.0, subtype='deposit'))
+        self.assertIsNone(gje)                  # skipped, no JE, no income
+        self.assertEqual(GeneratedJournalEntry.query.count(), 0)
+
+    def test_cash_withdrawal_is_not_posted(self):
+        self._security()
+        _, gje = self._built(self._txn('t', 'cash', 100000.0, subtype='withdrawal'))
+        self.assertIsNone(gje)
+
+    # ── BUG 2: no-basis sell uses PROCEEDS, never price×qty ──────────────────
+    def test_sell_with_no_lots_books_zero_gain(self):
+        self._security()
+        # No RetainedLot for this security → no_basis path.
+        lines, _ = self._built(self._txn('t', 'sell', 12000.0, qty=100, price=120.0))
+        self.assertEqual(lines[self.CLEARING], (12000.0, 0.0))
+        self.assertEqual(lines[self.MS], (0.0, 12000.0))      # basis = proceeds
+        self.assertNotIn(self.GAINS, lines)                   # zero gain
+        self.assertNotIn(self.LOSSES, lines)
+
+    def test_sweep_fund_sell_does_not_fabricate_a_loss(self):
+        """The exact live bug: qty 40000 × 'price' 99.60 = $3.98M, but proceeds
+        are only $39,840. Basis must track proceeds, so NO phantom loss."""
+        self._security(sid='sec-mmf', ticker='TEST-MMF')
+        basis, method, _ = invest_je.cost_basis_for_sell(
+            self._txn('t', 'sell', 39840.0, qty=40000, price=99.60, sid='sec-mmf'),
+            40000.0)
+        self.assertEqual(method, 'no_basis')
+        self.assertEqual(basis, 39840.0)        # proceeds, NOT 3,984,000
