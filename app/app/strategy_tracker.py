@@ -253,7 +253,12 @@ def _record_cycle(buy, sell, *, retain_ratio_actual, status,
     if sell is not None and status == 'complete':
         proceeds = abs(sell.amount) if sell.amount else abs(
             sell.quantity * sell.price)
-        cost_of_sold = abs(sell.quantity) * buy.price
+        # v0.5.14 · cost per unit is amount ÷ quantity, never price — exact for
+        # bonds (priced per $100 face) as well as equities. See invest_je.
+        buy_qty = abs(float(buy.quantity or 0.0))
+        cost_per_unit = (abs(float(buy.amount or 0.0)) / buy_qty
+                         if buy_qty else float(buy.price or 0.0))
+        cost_of_sold = abs(sell.quantity) * cost_per_unit
         realized = round(proceeds - cost_of_sold, 2)
     cycle = TradedCycle(
         security_id=buy.security_id,
@@ -276,11 +281,16 @@ def _record_cycle(buy, sell, *, retain_ratio_actual, status,
 def _record_retained_lot(buy, retained_qty, cycle, *, strategy_tag) -> None:
     """Create a RetainedLot row for the kept shares of a 5:4 cycle (or
     an open position being tracked as an implicit retained lot)."""
+    # v0.5.14 · cost_basis_per_share is amount ÷ quantity (== price for equities,
+    # but correct for bonds priced per $100 face). See invest_je.cost_basis_for_sell.
+    _bq = abs(float(buy.quantity or 0.0))
+    cost_per_unit = (abs(float(buy.amount or 0.0)) / _bq if _bq
+                     else float(buy.price or 0.0))
     lot = RetainedLot(
         security_id=buy.security_id,
         account_id=buy.account_id,
         purchase_date=buy.date,
-        cost_basis_per_share=buy.price,
+        cost_basis_per_share=cost_per_unit,
         shares_original=retained_qty,
         shares_remaining=retained_qty,
         source_cycle_id=cycle.id if cycle is not None else None,

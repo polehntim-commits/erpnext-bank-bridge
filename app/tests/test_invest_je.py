@@ -225,6 +225,7 @@ class SellTests(InvestJEBase):
 
     def test_a_sell_at_a_loss_hits_the_loss_account(self):
         self._security()
+        self._txn('t-buy', 'buy', 8000.0, qty=100, price=80.0)   # $80/unit cost
         sell = self._txn('t-sell', 'sell', 6000.0, qty=100, price=60.0)
         db.session.add(TradedCycle(
             security_id='sec-aapl', buy_transaction_id='t-buy',
@@ -591,3 +592,72 @@ class ForceRegenTests(InvestJEBase):
         self.assertEqual(n, 1)
         self.assertEqual(GeneratedJournalEntry.query.count(), 1)   # only the live one
         self.assertEqual(GeneratedJournalEntry.query.first().state, 'pending_review')
+
+
+class BondBasisTests(InvestJEBase):
+    """v0.5.14 · cost basis is amount÷quantity (universal), and a fixed-income
+    maturity books accreted discount as Interest Income, not a capital gain.
+    Synthetic T-bill only (no real CUSIP / issuer)."""
+
+    INT = 'Interest Income - EC'
+    GAINS = 'Realized Capital Gains - EC'
+    FI = 'Fixed Income - EC'
+    CLEARING = 'Cash Clearing - Brokerage - EC'
+
+    def _bond(self, sid='sec-tbill'):
+        s = Security(security_id=sid, ticker_symbol='',
+                     name='US Treasury Bill (synthetic)', type='fixed income')
+        db.session.add(s); db.session.commit()
+        return s
+
+    def _cycle(self, buy_itx, sell_itx, sid='sec-tbill'):
+        c = TradedCycle(security_id=sid, buy_transaction_id=buy_itx,
+                        sell_transaction_id=sell_itx,
+                        buy_date=date(2026, 1, 1), buy_qty=1000000.0,
+                        buy_price=99.0, cycle_status='complete')
+        db.session.add(c); db.session.commit()
+        return c
+
+    def test_bond_basis_uses_amount_over_quantity_not_price(self):
+        self._bond()
+        # Synthetic bill: buy $1,000,000 face at 99.0 per $100 → paid $990,000.
+        self._txn('b', 'buy', 990000.0, qty=1000000.0, price=99.0, sid='sec-tbill')
+        # Partial sell of 10,000 face for $9,970.
+        sell = self._txn('s', 'sell', -9970.0, qty=-10000.0, price=99.7,
+                         sid='sec-tbill')
+        self._cycle('b', 's')
+        basis, method, _ = invest_je.cost_basis_for_sell(sell, 10000.0)
+        self.assertEqual(method, 'specific_id')
+        # amount/qty basis = 0.99 × 10,000 = $9,900 — NOT price×qty = $990,000.
+        self.assertEqual(basis, 9900.0)
+        self.assertLess(basis, 10000.0)         # never more than face
+
+    def test_tbill_maturity_books_interest_income_not_gain(self):
+        self._bond()
+        self._txn('b', 'buy', 99000.0, qty=100000.0, price=99.0, sid='sec-tbill')
+        # Matures at face: sell 100,000 for $100,000.
+        sell = self._txn('s', 'sell', -100000.0, qty=-100000.0, price=100.0,
+                         sid='sec-tbill')
+        self._cycle('b', 's')
+        client = self._client()
+        gje = invest_je.generate_investment_je(client, sell)
+        lines = self._lines(self._je_for(client, gje))
+        self.assertEqual(lines[self.CLEARING], (100000.0, 0.0))   # DR Cash face
+        self.assertEqual(lines[self.FI], (0.0, 99000.0))          # CR MS at cost
+        self.assertEqual(lines[self.INT], (0.0, 1000.0))          # accreted → INTEREST
+        self.assertNotIn(self.GAINS, lines)                       # not a capital gain
+
+    def test_equity_gain_still_books_realized_gains(self):
+        # Regression: an equity sale at a gain is NOT interest income.
+        self._security()                        # type='equity'
+        self._txn('b', 'buy', 8000.0, qty=100.0, price=80.0)
+        sell = self._txn('s', 'sell', -12000.0, qty=-100.0, price=120.0)
+        c = TradedCycle(security_id='sec-aapl', buy_transaction_id='b',
+                        sell_transaction_id='s', buy_date=date(2026, 1, 1),
+                        buy_qty=100.0, buy_price=80.0, cycle_status='complete')
+        db.session.add(c); db.session.commit()
+        client = self._client()
+        gje = invest_je.generate_investment_je(client, sell)
+        lines = self._lines(self._je_for(client, gje))
+        self.assertEqual(lines[self.GAINS], (0.0, 4000.0))
+        self.assertNotIn(self.INT, lines)

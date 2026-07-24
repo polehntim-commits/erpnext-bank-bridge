@@ -314,6 +314,22 @@ def cash_side_account(client, account: PlaidAccount, company: str) -> str | None
 
 # ── cost basis ───────────────────────────────────────────────────────────────
 
+def _buy_cost_per_unit(buy_transaction_id: str | None) -> float | None:
+    """The cost per unit of a BUY, as amount ÷ quantity (v0.5.14) — the universal
+    per-unit basis that is exact for equities AND bonds. None when the buy row is
+    absent or carries no quantity, so the caller can fall back."""
+    if not buy_transaction_id:
+        return None
+    buy = (SecurityTransaction.query
+           .filter_by(plaid_investment_transaction_id=buy_transaction_id).first())
+    if buy is None:
+        return None
+    qty = abs(float(buy.quantity or 0.0))
+    if qty == 0.0:
+        return None
+    return abs(float(buy.amount or 0.0)) / qty
+
+
 def cost_basis_for_sell(txn: SecurityTransaction, sold_qty: float) -> tuple:
     """(cost_basis, method, plan) for a sell of `sold_qty` shares. PURE — reads
     the lots but does NOT mutate them; `plan` is the FIFO consumption to apply
@@ -321,20 +337,30 @@ def cost_basis_for_sell(txn: SecurityTransaction, sold_qty: float) -> tuple:
     failure never leaves inventory consumed for a sale that didn't book.
 
     SPECIFIC IDENTIFICATION first: when a TradedCycle names this sell, the cost
-    is the cycle's buy price times the quantity sold — the 5:4 strategy's every
-    sell is a matched cycle, so this is the ordinary path (empty plan).
+    is the matched BUY's cost-per-unit times the quantity sold.
 
-    FIFO FALLBACK against RetainedLot rows, oldest purchase first. When the lots
-    cannot cover the whole sale, the uncovered shares take the sale price as
-    their basis (zero realized gain on that portion), marked 'fifo_incomplete'
-    so the gap is visible rather than silently booked as pure gain.
+    v0.5.14 · COST-PER-UNIT IS amount ÷ quantity, NEVER price. Plaid quotes an
+    equity price per share (so price == amount/qty) but a BOND price per $100 of
+    face while quantity is in face DOLLARS — so `price × qty` overstates a bond's
+    basis ~100× (a $10,931 T-bill sale matched to a lot priced 98.78 booked
+    $1,086,567 basis and a $1.08M phantom loss). Deriving the per-unit cost from
+    the buy's own amount and quantity — both reliable cash figures — is exact for
+    every instrument with no special-casing (Tim's universal rule).
+
+    FIFO FALLBACK against RetainedLot rows, oldest purchase first (their
+    cost_basis_per_share is likewise amount/qty, see strategy_tracker). Shares no
+    lot covers are valued at PROCEEDS per share (zero gain on that portion),
+    marked 'fifo_incomplete'.
 
     `method` is 'specific_id', 'fifo', 'fifo_incomplete', or 'no_basis'."""
     cycle = (TradedCycle.query
              .filter_by(sell_transaction_id=txn.plaid_investment_transaction_id)
              .first())
-    if cycle is not None and cycle.buy_price is not None:
-        return round(float(cycle.buy_price) * sold_qty, 2), 'specific_id', []
+    if cycle is not None:
+        cpu = _buy_cost_per_unit(cycle.buy_transaction_id)
+        if cpu is not None:
+            return round(cpu * sold_qty, 2), 'specific_id', []
+        # else: the matched buy is gone/zero-qty — fall through to FIFO.
 
     lots = (RetainedLot.query
             .filter(RetainedLot.security_id == txn.security_id,
@@ -453,8 +479,17 @@ def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
         basis, _method, plan = cost_basis_for_sell(txn, qty)
         gain = round(amount - basis, 2)
         lines = [_dr(cash, amount), _cr(ms, basis)]
+        # v0.5.14 · a FIXED-INCOME position (T-bill / note) is bought at a
+        # discount and redeemed at face; the positive difference is ACCRETED
+        # DISCOUNT — Interest Income under §1.1275, not a capital gain. Equity
+        # gains stay Realized Capital Gains. A fixed-income sale BELOW cost
+        # (sold early into higher rates) is still a capital loss.
+        is_fixed_income = bool(security
+                               and 'fixed' in (security.type or '').lower())
         if gain > 0:
-            lines.append(_cr(realized_gains_account(client, company), gain))
+            income = (interest_income_account(client, company) if is_fixed_income
+                      else realized_gains_account(client, company))
+            lines.append(_cr(income, gain))
         elif gain < 0:
             lines.append(_dr(realized_losses_account(client, company), -gain))
         accounts = lines
