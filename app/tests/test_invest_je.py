@@ -531,3 +531,63 @@ class MathTests(InvestJEBase):
             40000.0)
         self.assertEqual(method, 'no_basis')
         self.assertEqual(basis, 39840.0)        # proceeds, NOT 3,984,000
+
+
+class ForceRegenTests(InvestJEBase):
+    """v0.5.13 · a bulk-cancel in ERPNext leaves cancelled GJE rows that block
+    their SecurityTransactions from ever regenerating. force=True + the
+    reset helper clear the block; pending/approved stay protected."""
+
+    def _cancelled_gje(self, itx):
+        g = GeneratedJournalEntry(
+            plaid_transaction_id=f'inv:{itx}', plaid_investment_transaction_id=itx,
+            erpnext_journal_entry_name='ACC-JV-OLD', state='cancelled')
+        db.session.add(g)
+        db.session.commit()
+        return g
+
+    def test_force_false_skips_a_cancelled_gje(self):
+        self._security()
+        txn = self._txn('t', 'buy', 10000.0, qty=100, price=100.0)
+        self._cancelled_gje('t')
+        client = self._client()
+        gje = invest_je.generate_investment_je(client, txn)      # force default
+        self.assertEqual(gje.erpnext_journal_entry_name, 'ACC-JV-OLD')  # unchanged
+        self.assertEqual(len(client.created['Journal Entry']), 0)       # no new JE
+
+    def test_force_true_regenerates_over_a_cancelled_gje(self):
+        self._security()
+        txn = self._txn('t', 'buy', 10000.0, qty=100, price=100.0)
+        self._cancelled_gje('t')
+        client = self._client()
+        gje = invest_je.generate_investment_je(client, txn, force=True)
+        self.assertNotEqual(gje.erpnext_journal_entry_name, 'ACC-JV-OLD')  # new JE
+        self.assertEqual(gje.state, 'pending_review')
+        self.assertEqual(len(client.created['Journal Entry']), 1)
+        # one GJE row for this txn, reused (not duplicated)
+        self.assertEqual(GeneratedJournalEntry.query.filter_by(
+            plaid_investment_transaction_id='t').count(), 1)
+
+    def test_force_true_never_disturbs_pending_or_approved(self):
+        self._security()
+        txn = self._txn('t', 'buy', 10000.0, qty=100, price=100.0)
+        g = GeneratedJournalEntry(
+            plaid_transaction_id='inv:t', plaid_investment_transaction_id='t',
+            erpnext_journal_entry_name='ACC-JV-LIVE', state='pending_review')
+        db.session.add(g); db.session.commit()
+        client = self._client()
+        gje = invest_je.generate_investment_je(client, txn, force=True)
+        self.assertEqual(gje.erpnext_journal_entry_name, 'ACC-JV-LIVE')  # untouched
+        self.assertEqual(len(client.created['Journal Entry']), 0)
+
+    def test_reset_cancelled_gjes_deletes_only_cancelled(self):
+        self._security()
+        self._cancelled_gje('a')
+        db.session.add(GeneratedJournalEntry(
+            plaid_transaction_id='inv:b', plaid_investment_transaction_id='b',
+            erpnext_journal_entry_name='JE-B', state='pending_review'))
+        db.session.commit()
+        n = invest_je.reset_cancelled_gjes()
+        self.assertEqual(n, 1)
+        self.assertEqual(GeneratedJournalEntry.query.count(), 1)   # only the live one
+        self.assertEqual(GeneratedJournalEntry.query.first().state, 'pending_review')

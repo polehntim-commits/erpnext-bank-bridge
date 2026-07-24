@@ -341,6 +341,17 @@ def revalue_account(client, account: PlaidAccount, *,
         return _result('skipped', 'investment revaluation is disabled')
     if account is None or not account.balance_only:
         return _result('skipped', 'not a balance-only investment account')
+    # v0.5.13 · Phase D SUPERSEDES mark-to-market. When an account posts
+    # per-security Journal Entries (invest_je), its Marketable Securities leaf is
+    # carried at COST and only a sell realizes the value — GAAP treats a
+    # held-for-sale position as unrealized until then (v0.5.0 spec, Phase D).
+    # Posting an unrealized revaluation on top double-books the movement, which
+    # is exactly the phantom "Unrealized loss … market value revaluation" JEs
+    # this removes. Lazy import avoids an invest_je ↔ revaluation cycle.
+    from . import invest_je
+    if invest_je.posting_enabled(account):
+        return _result('skipped', 'Phase D per-security posting is on — '
+                       'unrealized mark-to-market is not posted')
     gl_account = (account.erpnext_gl_account_name or '').strip()
     if not gl_account:
         # Nothing to revalue against. An investment whose import fell back to a
@@ -424,13 +435,18 @@ def revalue_account(client, account: PlaidAccount, *,
 def eligible_accounts() -> list:
     """Balance-only investment accounts with a GL leaf to revalue. A superseded
     account (v0.4.11) is excluded — its mapping now belongs to its heir, and
-    revaluing both would post the same movement twice."""
-    return (PlaidAccount.query
+    revaluing both would post the same movement twice. v0.5.13 · an account
+    running Phase D per-security posting is also excluded — its value is carried
+    at cost and unrealized movement is deliberately NOT posted (see
+    revalue_account)."""
+    from . import invest_je
+    rows = (PlaidAccount.query
             .filter(PlaidAccount.balance_only.is_(True),
                     PlaidAccount.erpnext_gl_account_name.isnot(None),
                     PlaidAccount.superseded_by_account_id.is_(None))
             .order_by(PlaidAccount.id)
             .all())
+    return [a for a in rows if not invest_je.posting_enabled(a)]
 
 
 def revalue_all(client, *, posting_date: date | None = None) -> dict:

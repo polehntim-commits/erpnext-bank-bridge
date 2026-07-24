@@ -494,8 +494,8 @@ def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
 
 # ── generation, idempotent + gated ───────────────────────────────────────────
 
-def generate_investment_je(client: ERPNextClient,
-                           txn: SecurityTransaction) -> GeneratedJournalEntry | None:
+def generate_investment_je(client: ERPNextClient, txn: SecurityTransaction, *,
+                           force: bool = False) -> GeneratedJournalEntry | None:
     """Post one SecurityTransaction as a Journal Entry, or return the existing
     GeneratedJournalEntry when it is already posted.
 
@@ -504,13 +504,25 @@ def generate_investment_je(client: ERPNextClient,
     per-Item kill switch — returns None without touching ERPNext when posting
     is disabled. Never raises; a failure is recorded on an 'error' row.
 
+    `force=True` (v0.5.13) treats a CANCELLED GJE as if it were absent and
+    regenerates a fresh draft over it. Without this, a SecurityTransaction whose
+    JE was bulk-cancelled in ERPNext is blocked forever — its GJE still carries a
+    (now-cancelled) `erpnext_journal_entry_name`, which the idempotency check
+    reads as "already handled". pending_review and approved states are STILL
+    protected regardless of force, so force never disturbs live drafts or
+    approved entries.
+
     Cost-basis lot decrements (FIFO) and the GJE row commit together, so an
     ERPNext failure rolls the lot consumption back with it."""
     itx = txn.plaid_investment_transaction_id
     existing = (GeneratedJournalEntry.query
                 .filter_by(plaid_investment_transaction_id=itx).first())
     if existing is not None and existing.erpnext_journal_entry_name:
-        return existing
+        if not (force and (existing.state or '') == 'cancelled'):
+            return existing
+        # force + cancelled → fall through and rebuild over this row (the code
+        # below reuses `existing`, overwriting its JE name and state).
+        existing.erpnext_journal_entry_name = None
 
     account = PlaidAccount.query.filter_by(account_id=txn.account_id).first()
     if account is None or not posting_enabled(account):
@@ -670,9 +682,40 @@ def rebuild_investment_accounts(client: ERPNextClient,
     return stats
 
 
-def post_investments_for_account(client: ERPNextClient, account_id: str) -> dict:
+def reset_cancelled_gjes(account_id: str | None = None) -> int:
+    """Delete every CANCELLED investment GeneratedJournalEntry row (v0.5.13),
+    optionally scoped to one account. Returns the count deleted.
+
+    A bulk-cancel in ERPNext leaves the GJE rows behind carrying a cancelled
+    `erpnext_journal_entry_name`, which blocks their SecurityTransactions from
+    ever being regenerated. Clearing those rows lets a plain
+    post_investments_for_account rebuild them from scratch. Touches ONLY
+    state='cancelled' rows — pending_review, approved and error rows are never
+    deleted. Idempotent: a second run finds nothing and returns 0."""
+    q = GeneratedJournalEntry.query.filter(
+        GeneratedJournalEntry.plaid_investment_transaction_id.isnot(None),
+        GeneratedJournalEntry.state == 'cancelled')
+    if account_id:
+        itxs = tuple(
+            t.plaid_investment_transaction_id for t in
+            SecurityTransaction.query.filter_by(account_id=account_id).all())
+        q = q.filter(GeneratedJournalEntry.plaid_investment_transaction_id
+                     .in_(itxs or ('',)))
+    n = 0
+    for gje in q.all():
+        db.session.delete(gje)
+        n += 1
+    db.session.commit()
+    return n
+
+
+def post_investments_for_account(client: ERPNextClient, account_id: str, *,
+                                 force: bool = False) -> dict:
     """Post every not-yet-posted SecurityTransaction for one account. Never
-    raises; returns {'posted', 'skipped', 'failed'}."""
+    raises; returns {'posted', 'skipped', 'failed'}.
+
+    `force=True` (v0.5.13) regenerates over CANCELLED GJEs — see
+    generate_investment_je. pending_review/approved rows stay protected."""
     stats = {'posted': 0, 'skipped': 0, 'failed': 0}
     account = PlaidAccount.query.filter_by(account_id=account_id).first()
     if account is None or not posting_enabled(account):
@@ -683,7 +726,7 @@ def post_investments_for_account(client: ERPNextClient, account_id: str) -> dict
                       SecurityTransaction.id.asc()).all())
     for txn in rows:
         try:
-            gje = generate_investment_je(client, txn)
+            gje = generate_investment_je(client, txn, force=force)
         except Exception:  # pragma: no cover - generate already swallows
             db.session.rollback()
             stats['failed'] += 1

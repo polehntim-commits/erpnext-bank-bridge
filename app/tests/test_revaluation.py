@@ -203,6 +203,46 @@ class BaselineTests(RevaluationBase):
 
 # ── the seeding rule ────────────────────────────────────────────────────────
 
+class PhaseDGuardTests(RevaluationBase):
+    """v0.5.13 · an account running Phase D per-security posting must NOT be
+    mark-to-market revalued — its value is carried at cost and unrealized
+    movement is deliberately not booked (GAAP / v0.5.0 Phase D spec)."""
+
+    def _phase_d_item(self):
+        it = PlaidItem.query.filter_by(item_id='item-abc').first()
+        if it is None:
+            it = PlaidItem(item_id='item-abc',
+                           access_token_encrypted=crypto.encrypt('x'),
+                           institution_name='WF', status='active')
+            db.session.add(it)
+        it.invest_je_posting_enabled = True
+        db.session.commit()
+
+    def test_revalue_account_skips_a_phase_d_account(self):
+        account = self._account(balance=65000.0)
+        self._booked_opening(account)          # a real baseline exists
+        account.balance_current = 90000.0      # a big unrealized move
+        db.session.commit()
+        self._phase_d_item()                   # Phase D posting is ON
+        erp = self._erp()
+        result = revaluation.revalue_account(erp, account)
+        self.assertEqual(result['status'], 'skipped')
+        self.assertIn('Phase D', result['message'])
+        self.assertEqual(erp.creates_of('Journal Entry'), [])   # nothing posted
+
+    def test_eligible_accounts_excludes_phase_d_accounts(self):
+        self._account(balance=65000.0)
+        self.assertEqual(len(revaluation.eligible_accounts()), 1)
+        self._phase_d_item()
+        self.assertEqual(revaluation.eligible_accounts(), [])
+
+    def test_a_non_phase_d_balance_only_account_still_revalues(self):
+        # No Phase D item → the guard is inert, revaluation behaves as before.
+        account = self._account(balance=65000.0)
+        result = revaluation.revalue_account(self._erp(), account)
+        self.assertEqual(result['status'], 'seeded')   # normal first-pass seed
+
+
 class SeedingTests(RevaluationBase):
     def test_the_first_pass_without_a_baseline_posts_nothing(self):
         """THE assertion that makes this safe to ship. Every investment account
