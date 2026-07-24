@@ -36,7 +36,7 @@ os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 from app import create_app, crypto, db  # noqa: E402
 from app import erpnext_accounts, erpnext_settings  # noqa: E402
 from app import opening_balance as obal  # noqa: E402
-from app.models import (BankTransaction, GeneratedJournalEntry,  # noqa: E402
+from app.models import (BankTransaction, GeneratedJournalEntry,  SecurityTransaction,  # noqa: E402
                         PlaidAccount, PlaidItem)
 
 from tests.fakes import FakeERPClient  # noqa: E402
@@ -757,3 +757,49 @@ class TestBackwardCompatibility(OpeningBalanceBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestBackdating(OpeningBalanceBase):
+    """v0.5.16 · the opening-balance JE dates to the day BEFORE the account's
+    earliest transaction, so the Balance Sheet builds from first activity."""
+
+    def _bt(self, tid, when, account_id='acct-1'):
+        db.session.add(BankTransaction(plaid_transaction_id=tid,
+                                       account_id=account_id, amount=1.0,
+                                       date=when, name='TXN'))
+        db.session.commit()
+
+    def test_earliest_activity_date_finds_the_minimum(self):
+        a = self._account()
+        self._bt('a', date(2024, 9, 1))
+        self._bt('b', date(2024, 7, 25))       # earliest
+        self._bt('c', date(2025, 1, 1))
+        self.assertEqual(obal.earliest_activity_date(a), date(2024, 7, 25))
+
+    def test_opening_balance_date_for_backdates_one_day(self):
+        a = self._account()
+        self._bt('a', date(2024, 7, 25))
+        self.assertEqual(obal.opening_balance_date_for(a), date(2024, 7, 24))
+
+    def test_falls_back_to_global_date_with_no_activity(self):
+        a = self._account(account_id='empty')
+        # No transactions → the configured/global date (today by default).
+        self.assertEqual(obal.opening_balance_date_for(a),
+                         obal.opening_balance_date())
+
+    def test_book_uses_the_backdated_date(self):
+        a = self._account(owning_company=COMPANY)
+        self._bt('a', date(2024, 7, 25))
+        erp = self._erp()
+        obal.book_opening_balance(erp, a)
+        doc = self._je(erp)
+        self.assertEqual(doc.get('posting_date'), '2024-07-24')
+
+    def test_security_transactions_count_as_activity(self):
+        a = self._account(account_id='inv', type_='investment',
+                          subtype='brokerage')
+        db.session.add(SecurityTransaction(
+            plaid_investment_transaction_id='s1', account_id='inv',
+            security_id='x', date=date(2023, 3, 2), amount=100.0, type='buy'))
+        db.session.commit()
+        self.assertEqual(obal.opening_balance_date_for(a), date(2023, 3, 1))

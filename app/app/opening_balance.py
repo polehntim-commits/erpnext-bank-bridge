@@ -109,6 +109,34 @@ def equity_account_name() -> str:
             or 'Opening Balance Equity').strip() or 'Opening Balance Equity'
 
 
+def earliest_activity_date(account: PlaidAccount) -> date | None:
+    """The earliest BankTransaction / SecurityTransaction date on this account,
+    or None when it has no activity yet (v0.5.16)."""
+    from datetime import timedelta  # noqa: F401 (kept local, see below)
+    from .models import BankTransaction, SecurityTransaction
+    candidates = []
+    for model in (BankTransaction, SecurityTransaction):
+        d = (db.session.query(db.func.min(model.date))
+             .filter(model.account_id == account.account_id).scalar())
+        if d is not None:
+            candidates.append(d)
+    return min(candidates) if candidates else None
+
+
+def opening_balance_date_for(account: PlaidAccount) -> date:
+    """The posting date for THIS account's opening-balance JE (v0.5.16): the day
+    BEFORE its earliest transaction, so the Balance Sheet shows the account
+    existing from its first activity and building up naturally — rather than
+    reading flat-zero for months and then jumping to full value on the day Bank
+    Bridge started tracking. Falls back to the configured global date
+    (opening_balance_date) when the account has no transactions to anchor to."""
+    from datetime import timedelta
+    earliest = earliest_activity_date(account)
+    if earliest is not None:
+        return earliest - timedelta(days=1)
+    return opening_balance_date()
+
+
 def opening_balance_date() -> date:
     """The posting date for auto-booked opening balances (OPENING_BALANCE_DATE).
 
@@ -514,7 +542,11 @@ def book_opening_balance(client, account: PlaidAccount, *,
     if not company:
         return _result('skipped', 'No owning Company resolved for this account')
 
-    when = posting_date or opening_balance_date()
+    # v0.5.16 · default the posting date to the day before this account's first
+    # transaction (opening_balance_date_for), not the global "today". An
+    # explicit posting_date (statement/computed anchor above, or a caller) still
+    # wins.
+    when = posting_date or opening_balance_date_for(account)
     try:
         equity = ensure_opening_balance_equity_account(client, company)
     except (ERPNextAPIError, ERPNextError) as e:
@@ -569,6 +601,83 @@ def book_opening_balance(client, account: PlaidAccount, *,
     return _result('booked',
                    f'Opening balance {entry.amount:.2f}{detail} booked as '
                    f'{je_name} — pending review', entry)
+
+
+def _signed_amount_from_je(account: PlaidAccount, je: dict,
+                           abs_amount: float) -> float:
+    """Recover the signed Plaid balance that produced an opening-balance JE, so
+    a re-book lands the account's GL leaf on the SAME debit/credit side. The
+    leaf is debited iff (asset opened positive) or (liability opened negative);
+    reading which side it is on in the existing JE tells us the sign to pass
+    back to book_opening_balance (v0.5.16)."""
+    gl = (account.erpnext_gl_account_name or '').strip()
+    leaf_debited = any(
+        (r.get('account') == gl) and float(r.get('debit_in_account_currency')
+                                            or r.get('debit') or 0.0) > 0
+        for r in (je.get('accounts') or []))
+    # book_opening_balance debits the leaf when opening_balance_direction is
+    # True; that direction is opens_by_debit flipped by a negative balance. So
+    # the sign that reproduces `leaf_debited` is:
+    positive_debits = opens_by_debit(account)   # sign +amount would debit?
+    want_positive = (leaf_debited == positive_debits)
+    return abs_amount if want_positive else -abs_amount
+
+
+def redate_opening_balances(client, account_id: str | None = None) -> dict:
+    """Re-post existing opening-balance JEs at the per-account backdated date
+    (v0.5.16), for one account or all. Cancels/deletes the old JE and books a
+    fresh Draft at opening_balance_date_for(account) with the SAME amount, then
+    leaves it in pending_review. Idempotent: a JE already on the target date is
+    left alone. Never raises; returns {'redated','unchanged','skipped'}."""
+    stats = {'redated': 0, 'unchanged': 0, 'skipped': 0}
+    if client is None:
+        return stats
+    q = PlaidAccount.query
+    if account_id:
+        q = q.filter(PlaidAccount.account_id == account_id)
+    for account in q.all():
+        entry = existing_entry(account)
+        if entry is None or not entry.erpnext_journal_entry_name:
+            continue
+        target = opening_balance_date_for(account)
+        try:
+            je = client.get_doc(JOURNAL_ENTRY_DT, entry.erpnext_journal_entry_name)
+        except (ERPNextAPIError, ERPNextError):
+            stats['skipped'] += 1
+            continue
+        if je is None:
+            stats['skipped'] += 1
+            continue
+        if (je.get('posting_date') or '') == target.isoformat():
+            stats['unchanged'] += 1
+            continue
+        # Re-book at the SAME amount, only the date changes. `entry.amount` is
+        # the absolute figure; the JE tells us which side the account's GL leaf
+        # was on, so we can hand book_opening_balance a signed value that
+        # reproduces the original debit/credit direction exactly.
+        signed = _signed_amount_from_je(account, je, float(entry.amount or 0.0))
+        try:
+            if int(je.get('docstatus') or 0) == 1:
+                client.call_method('frappe.client.cancel',
+                                   params={'doctype': JOURNAL_ENTRY_DT,
+                                           'name': entry.erpnext_journal_entry_name},
+                                   http_method='POST')
+            else:
+                client.delete_doc(JOURNAL_ENTRY_DT,
+                                  entry.erpnext_journal_entry_name)
+        except (ERPNextAPIError, ERPNextError):
+            db.session.rollback()
+            stats['skipped'] += 1
+            continue
+        db.session.delete(entry)
+        db.session.commit()
+        res = book_opening_balance(client, account, amount=signed,
+                                   posting_date=target, force=True)
+        if res.get('status') == 'booked':
+            stats['redated'] += 1
+        else:
+            stats['skipped'] += 1
+    return stats
 
 
 def book_if_enabled(client, account: PlaidAccount) -> dict | None:
