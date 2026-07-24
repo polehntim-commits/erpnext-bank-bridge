@@ -390,7 +390,11 @@ class TestMatchCounts(AuthoringBase):
         rule_stats.rollup_match_counts()
         body = self.client.get('/admin/rules').get_data(as_text=True)
         self.assertIn('Matches', body)
-        self.assertIn('<td class="num"><b>1</b></td>', body)
+        # v0.5.9 · the column now shows Historical | Active. Historical (the
+        # audit lifetime count) renders bold; the split header is present.
+        self.assertIn('hist | active', body)
+        self.assertIn('<b>1</b>', body)
+        self.assertIn('active', body)
 
     def test_zero_match_rule_is_flagged(self):
         self._rule(name='Dead rule')

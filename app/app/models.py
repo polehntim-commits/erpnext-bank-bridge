@@ -710,6 +710,13 @@ class CategorizationRule(db.Model):
     bb_internal_tag = db.Column(db.Text, default='')
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+    # v0.5.9 · WHEN this rule was last switched ON — the origin for the
+    # "currently active" match count (matches generated since this instant,
+    # 0 while the rule is OFF). Set at creation (a new rule is born active) and
+    # re-stamped on every OFF→ON toggle, so the count answers "is this rule
+    # doing anything NOW", separate from the lifetime `match_count`. Backfills
+    # to created_at for pre-v0.5.9 rows ("always been active").
+    activated_at = db.Column(db.DateTime, default=_now, nullable=True)
 
     @classmethod
     def merchants_with_rules(cls) -> list:
@@ -744,6 +751,8 @@ class CategorizationRule(db.Model):
             'bb_internal_tag': self.bb_internal_tag or '',
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'activated_at': (self.activated_at.isoformat()
+                             if self.activated_at else None),
         }
 
 

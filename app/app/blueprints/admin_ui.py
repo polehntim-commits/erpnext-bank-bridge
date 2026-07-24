@@ -2621,7 +2621,7 @@ RULES_BODY = """
   <tr><th class="num">#</th><th class="num">Prio</th><th>Name</th><th>Match</th><th>Offset account</th><th>Dir</th>
       <th>Company</th><th>Party</th>
       <th class="num"><a href="{{ matches_sort_url }}" style="text-decoration:none"
-         title="Sort by how many transactions each rule has matched">Matches{{ matches_sort_arrow }}</a></th>
+         title="Historical = lifetime JEs this rule generated (the audit number, sorted on). Active = JEs since it was last switched ON (0 while OFF).">Matches{{ matches_sort_arrow }}<br><span style="font-size:10px;font-weight:400;color:#888">hist | active</span></a></th>
       <th>Active</th><th></th></tr>
   {% for r in rules %}
   <tr>
@@ -2633,7 +2633,19 @@ RULES_BODY = """
     <td style="font-size:12px">{{ r.offset_direction or 'auto' }}</td>
     <td style="font-size:12px">{% if r.applies_to_company %}{{ r.applies_to_company }}{% else %}<span style="color:#999">all</span>{% endif %}</td>
     <td style="font-size:12px">{% if r.skip_party %}<span class="pill pill-muted" title="This rule books a transfer between accounts you own — the generated Journal Entry carries no Party.">no party</span>{% else %}{{ (r.party_type or '') }}{% if r.party_name %}: {{ r.party_name }}{% endif %}{% endif %}</td>
-    <td class="num">{% if r.match_count %}<b>{{ r.match_count }}</b>{% else %}<span class="pill pill-muted" title="This rule has never matched a transaction. Either nothing it targets has synced yet, or its match value / Company scope is too narrow — try it against a real description in “Test a rule” above.">0</span>{% endif %}</td>
+    {# v0.5.9 · two counts. Historical (bold, the audit lifetime number) stays
+       even when the rule is OFF; Active (green) is matches since it was last
+       switched ON, and reads "— (off)" muted while the rule is OFF. #}
+    <td class="num" style="font-size:12px;white-space:nowrap">
+      <span title="Lifetime JEs this rule has generated — the audit number, unaffected by toggling.">
+        {% if r.match_count %}<b>{{ r.match_count }}</b>{% else %}<b style="color:#999" title="This rule has never matched a transaction. Either nothing it targets has synced yet, or its match value / Company scope is too narrow — try it against a real description in “Test a rule” above.">0</b>{% endif %}</span>
+      <br>
+      {% if r.active %}
+      <span style="color:#2e9e5b" title="JEs generated since this rule was last switched ON.">{{ active_counts.get(r.id, 0) }} active</span>
+      {% else %}
+      <span style="color:#999" title="Rule is OFF — it fires on nothing, so its active count is zero.">— (off)</span>
+      {% endif %}
+    </td>
     <td>
       <form method="post" action="/admin/rules/toggle" style="margin:0">
         <input type="hidden" name="id" value="{{ r.id }}">
@@ -3142,6 +3154,7 @@ def _rules_page(flash_msg='', test_result=None, test=None, form=None,
     return _page(RULES_BODY, page='rules', rules=live, archived=archived,
                  show_archived=show_archived, cur_company=cur_company,
                  companies=companies,
+                 active_counts=rule_stats.active_match_counts(),
                  match_types=categorization.MATCH_TYPES,
                  offset_directions=categorization.OFFSET_DIRECTIONS,
                  form=form or {'active': True, 'priority': 100},
@@ -3471,6 +3484,10 @@ def toggle_rule():
         if rule is not None:
             before = rule.to_dict()
             rule.active = not rule.active
+            # v0.5.9 · OFF→ON restarts the "currently active" count from now, so
+            # matches accumulated in a prior ON stretch stay historical-only.
+            if rule.active:
+                rule.activated_at = datetime.now(timezone.utc)
             db.session.commit()
             audit.record('rule_updated', subject_type='CategorizationRule',
                          subject_id=rule.id, before=before, after=rule.to_dict(),

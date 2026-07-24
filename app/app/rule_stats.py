@@ -286,6 +286,44 @@ def match_counts() -> dict:
     return dict(resolved)
 
 
+def active_match_counts() -> dict:
+    """{head_rule_id: matches generated SINCE that rule was last switched ON} —
+    the "currently active" count beside the lifetime `match_counts` (v0.5.9).
+
+    A JE counts only when its winning rule (resolved to its live head) is ON
+    *and* the JE was generated at or after the head's `activated_at`. A rule
+    that is OFF, or ON but has generated nothing since it was last activated,
+    reports 0 — which is why the number reads as "is this rule doing anything
+    now". Version-resolved and cycle-guarded exactly like `match_counts`; the
+    per-JE timestamp comparison is why this iterates rows rather than counting
+    in SQL. Pure read."""
+    by_id = {r.id: r for r in CategorizationRule.query.all()}
+    resolved: dict = defaultdict(int)
+    rows = (db.session.query(GeneratedJournalEntry.rule_id,
+                             GeneratedJournalEntry.created_at)
+            .filter(GeneratedJournalEntry.rule_id.isnot(None)))
+    for rule_id, created_at in rows:
+        head = _current_version(rule_id, by_id)
+        if head is None or head not in by_id:
+            continue
+        rule = by_id[head]
+        if not rule.active:
+            continue
+        since = rule.activated_at or rule.created_at
+        created = _naive(created_at)
+        since = _naive(since)
+        if created is not None and since is not None and created >= since:
+            resolved[head] += 1
+    return dict(resolved)
+
+
+def _naive(dt):
+    """Drop tzinfo so a DB-read naive timestamp and an in-session tz-aware one
+    (SQLite returns naive; a just-set attribute is aware) compare without
+    raising. Both are UTC by construction (models._now)."""
+    return dt.replace(tzinfo=None) if (dt is not None and dt.tzinfo) else dt
+
+
 def rollup_match_counts() -> dict:
     """Refresh `CategorizationRule.match_count` for every rule from the local
     GeneratedJournalEntry table.

@@ -121,7 +121,34 @@ def ensure_leaf(client: ERPNextClient, company: str, account_name: str,
            'company': company, 'root_type': root_type, 'is_group': 0}
     if account_number:
         doc['account_number'] = account_number
-    created = client.create_doc(ACCOUNT_DT, doc)
+    try:
+        created = client.create_doc(ACCOUNT_DT, doc)
+    except ERPNextError as e:
+        # v0.5.10 · the create can still fail after the name check above for two
+        # reasons, and neither should abort a backfill:
+        #   1. A CONCURRENT sync created the same-named leaf between our check
+        #      and our create (a check-then-create race).
+        #   2. The account_NUMBER is already used by ANOTHER leaf. Frappe
+        #      enforces per-company number uniqueness, so a caller that reuses a
+        #      number across distinct account_names (the pre-v0.5.10 bug where
+        #      every 'Marketable Securities - <ticker>' asked for 1320.1) hits
+        #      'Account Number NNNN already used' on the second name onward.
+        # Re-check by name first — if it exists now, a race made it and we reuse
+        # it. Otherwise retry ONCE without the colliding number: the leaf is
+        # still creatable, the number simply belongs to a sibling.
+        raced = _find_accounts(client, company, account_name=account_name,
+                               is_group=0)
+        if raced:
+            log.info("GL Account '%s' already present on retry — reusing '%s'",
+                     account_name, raced[0]['name'])
+            return raced[0]['name']
+        if account_number:
+            log.warning("account_number %s already in use — creating '%s' "
+                        "without a number (%s)", account_number, account_name, e)
+            doc.pop('account_number', None)
+            created = client.create_doc(ACCOUNT_DT, doc)
+        else:
+            raise
     name = created.get('name')
     log.info("created GL Account '%s' under '%s'", name or account_name, root)
     audit.record('invest_gl_account_created', subject_type='Account',
@@ -136,9 +163,19 @@ def marketable_securities_account(client, company, ticker) -> str | None:
     """`Marketable Securities - <ticker>` (Asset). Per-security so the balance
     sheet shows each holding without hand-built accounts. Falls back to a
     generic leaf when the security has no ticker (some funds/private placements)."""
-    label = (ticker or '').strip().upper() or 'Other'
+    label = (ticker or '').strip().upper()
+    if not label:
+        # The generic fallback leaf keeps its historical number (1320.1) — it is
+        # the ONE per-security leaf that legitimately owns it.
+        return ensure_leaf(client, company, 'Marketable Securities - Other',
+                           'Asset', account_number='1320.1')
+    # v0.5.10 · a PER-TICKER leaf carries NO account_number. Before v0.5.10 every
+    # ticker asked for the same 1320.1, so once 'Other' (or the first ticker)
+    # claimed it, every other ticker's create failed with 'Account Number 1320.1
+    # already used'. The leaves are distinct by name and hang under the numbered
+    # 1320 group; they do not each need their own number.
     return ensure_leaf(client, company, f'Marketable Securities - {label}',
-                       'Asset', account_number='1320.1')
+                       'Asset')
 
 
 def cash_clearing_account(client, company) -> str | None:

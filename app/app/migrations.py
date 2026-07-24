@@ -229,6 +229,12 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     ('bank_transactions', 'source_statement_txn_id', 'INTEGER'),
     ('plaid_items', 'statement_derived_backfill_enabled',
      'BOOLEAN DEFAULT true NOT NULL'),
+
+    # v0.5.9 — when a categorization rule was last switched ON, the origin for
+    # its "currently active" match count. Adds NULL; the backfill below stamps
+    # every existing rule with its created_at ("always been active"), so a
+    # pre-v0.5.9 rule's active count equals its historical count on upgrade.
+    ('categorization_rules', 'activated_at', 'TIMESTAMP'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,
@@ -391,8 +397,27 @@ def run_migrations() -> None:
         # not accept a party on. Runs last — it reads each rule's FINAL
         # offset_account, so it must see whatever the two backfills above wrote.
         _migrate_incompatible_party_types()
+        # v0.5.9: seed activated_at = created_at for pre-v0.5.9 rules.
+        _backfill_rule_activated_at()
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)
+
+
+def _backfill_rule_activated_at() -> None:
+    """Give every rule that predates v0.5.9 an `activated_at` of its
+    `created_at` — "this rule has been active since it was created". Idempotent:
+    only touches rows where activated_at is still NULL, so a re-run and a fresh
+    DB (where the column defaults to _now on insert) are both no-ops."""
+    insp = inspect(db.engine)
+    if 'categorization_rules' not in insp.get_table_names():
+        return
+    cols = {c['name'] for c in insp.get_columns('categorization_rules')}
+    if 'activated_at' not in cols:
+        return
+    with db.engine.begin() as conn:
+        conn.execute(text(
+            'UPDATE categorization_rules SET activated_at = created_at '
+            'WHERE activated_at IS NULL'))
 
 
 def _migrate_rule_offset_accounts() -> None:
