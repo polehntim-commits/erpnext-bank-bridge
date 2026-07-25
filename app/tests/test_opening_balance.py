@@ -803,3 +803,68 @@ class TestBackdating(OpeningBalanceBase):
             security_id='x', date=date(2023, 3, 2), amount=100.0, type='buy'))
         db.session.commit()
         self.assertEqual(obal.opening_balance_date_for(a), date(2023, 3, 1))
+
+
+class TestReconstructOpening(OpeningBalanceBase):
+    """v0.5.18 · reverse-walk the opening balance from the transaction ledger:
+    current balance − net Bank/Security movement since the opening date. Manual
+    ERPNext JEs are never in the sum; a negative result aborts."""
+
+    def _bt(self, tid, when, amount, account_id='acct-1'):
+        db.session.add(BankTransaction(plaid_transaction_id=tid,
+                                       account_id=account_id, amount=amount,
+                                       date=when, name='TXN'))
+        db.session.commit()
+
+    def _book(self, account):
+        obal.book_opening_balance(self._erp(), account)   # opening = balance_current
+
+    def test_a_deposit_reduces_the_reconstructed_opening(self):
+        a = self._account(balance=1000.0, owning_company=COMPANY)
+        self._bt('d', date(2024, 7, 25), -300.0)          # $300 IN since D
+        self._book(a)                                     # opening booked at 1000
+        plan = obal.reconstruct_opening_balance('acct-1')
+        self.assertEqual(plan['status'], 'ok')
+        self.assertEqual(plan['proposed_opening'], 700.0)   # 1000 − 300 in
+        self.assertEqual(plan['current_opening'], 1000.0)
+
+    def test_a_withdrawal_raises_the_reconstructed_opening(self):
+        a = self._account(balance=1000.0, owning_company=COMPANY)
+        self._bt('w', date(2024, 7, 25), 300.0)           # $300 OUT since D
+        self._book(a)
+        plan = obal.reconstruct_opening_balance('acct-1')
+        self.assertEqual(plan['proposed_opening'], 1300.0)  # it held more at open
+
+    def test_negative_result_aborts(self):
+        a = self._account(balance=100.0, owning_company=COMPANY)
+        self._bt('d', date(2024, 7, 25), -300.0)          # $300 in, but only 100 now
+        self._book(a)
+        plan = obal.reconstruct_opening_balance('acct-1')
+        self.assertEqual(plan['status'], 'abort_negative')
+        self.assertLess(plan['proposed_opening'], 0)
+
+    def test_a_manual_je_does_not_affect_the_walk(self):
+        # Only Bank/Security transactions count; a booked GJE (proxy for a manual
+        # retroactive ERPNext JE) is not in the movement sum.
+        a = self._account(balance=1000.0, owning_company=COMPANY)
+        self._bt('d', date(2024, 7, 25), -300.0)
+        self._book(a)
+        db.session.add(GeneratedJournalEntry(
+            plaid_transaction_id='manual-land', erpnext_journal_entry_name='JE-9',
+            state='approved', amount=250000.0))
+        db.session.commit()
+        plan = obal.reconstruct_opening_balance('acct-1')
+        self.assertEqual(plan['proposed_opening'], 700.0)   # land JE ignored
+
+    def test_skipped_without_an_opening_entry(self):
+        self._account(balance=1000.0, owning_company=COMPANY)
+        plan = obal.reconstruct_opening_balance('acct-1')
+        self.assertEqual(plan['status'], 'skipped')
+
+    def test_admin_route_dry_run(self):
+        a = self._account(balance=1000.0, owning_company=COMPANY)
+        self._bt('d', date(2024, 7, 25), -300.0)
+        self._book(a)
+        client = self.app.test_client()
+        resp = client.post('/admin/reconstruct_openings')   # dry-run (no apply)
+        self.assertIn(resp.status_code, (302, 303))          # redirects with flash

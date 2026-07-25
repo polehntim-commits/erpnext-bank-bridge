@@ -680,6 +680,82 @@ def redate_opening_balances(client, account_id: str | None = None) -> dict:
     return stats
 
 
+def reconstruct_opening_balance(account_id: str) -> dict:
+    """Compute the historically-correct opening balance from the TRANSACTION
+    LEDGER (v0.5.18): current balance − the net Bank+Security movement since the
+    opening date. PURE — computes, never applies.
+
+    Only Plaid-sourced movement counts. Manual retroactive ERPNext JEs (a land
+    sale, a prior-period adjustment) are deliberately NOT in the sum — Bank
+    Bridge doesn't own them, and counting them would subtract value it never
+    discovered through Plaid (constraint #1). The pair-aware
+    `anchor_transaction_sum` is used for a paired brokerage so its securities and
+    its companion's cash aren't double-counted (the v0.4.48 rule, constraint #2).
+
+    Returns {'status', 'account_mask', 'date', 'current_balance',
+    'net_since_date', 'current_opening', 'proposed_opening', 'delta'}. status is
+    'ok', 'abort_negative' (the reverse-walk would open the account below zero —
+    keep the existing entry, constraint #3), or 'skipped'."""
+    from . import statements as stmts
+    account = PlaidAccount.query.filter_by(account_id=account_id).first()
+    if account is None:
+        return {'status': 'skipped', 'reason': 'no such account'}
+    entry = existing_entry(account)
+    if entry is None or not entry.erpnext_journal_entry_name:
+        return {'status': 'skipped', 'reason': 'no opening balance booked',
+                'account_mask': account.mask}
+    when = opening_balance_date_for(account)
+    current = round(float(account.balance_current or 0.0), 2)
+    if (account.paired_account_id or '').strip():
+        net = stmts.anchor_transaction_sum(account, when, date.today())
+    else:
+        net = -stmts.signed_movement(account, when, date.today())
+    proposed = round(current - net, 2)
+    out = {'account_mask': account.mask, 'date': when.isoformat(),
+           'current_balance': current, 'net_since_date': round(net, 2),
+           'current_opening': round(float(entry.amount or 0.0), 2),
+           'proposed_opening': proposed,
+           'delta': round(proposed - float(entry.amount or 0.0), 2)}
+    out['status'] = 'abort_negative' if proposed < 0 else 'ok'
+    return out
+
+
+def apply_reconstructed_opening(client, account_id: str) -> dict:
+    """Re-book an account's opening-balance JE at its reconstructed amount
+    (v0.5.18), keeping the date. Rollback-safe: a proposal that would open the
+    account below zero is refused and the existing entry left untouched. Returns
+    the reconstruct_opening_balance dict plus 'applied' (bool)."""
+    plan = reconstruct_opening_balance(account_id)
+    if plan.get('status') != 'ok' or client is None:
+        plan['applied'] = False
+        return plan
+    account = PlaidAccount.query.filter_by(account_id=account_id).first()
+    entry = existing_entry(account)
+    target = date.fromisoformat(plan['date'])
+    try:
+        je = client.get_doc(JOURNAL_ENTRY_DT, entry.erpnext_journal_entry_name)
+        if je is not None:
+            if int(je.get('docstatus') or 0) == 1:
+                client.call_method('frappe.client.cancel',
+                                   params={'doctype': JOURNAL_ENTRY_DT,
+                                           'name': entry.erpnext_journal_entry_name},
+                                   http_method='POST')
+            else:
+                client.delete_doc(JOURNAL_ENTRY_DT,
+                                  entry.erpnext_journal_entry_name)
+        db.session.delete(entry)
+        db.session.commit()
+    except (ERPNextAPIError, ERPNextError):
+        db.session.rollback()
+        plan['applied'] = False
+        return plan
+    res = book_opening_balance(client, account,
+                               amount=plan['proposed_opening'],
+                               posting_date=target, force=True)
+    plan['applied'] = res.get('status') == 'booked'
+    return plan
+
+
 def book_if_enabled(client, account: PlaidAccount) -> dict | None:
     """The import-path hook: book this account's opening balance when
     AUTO_BOOK_OPENING_BALANCE is on. Returns the result dict, or None when the

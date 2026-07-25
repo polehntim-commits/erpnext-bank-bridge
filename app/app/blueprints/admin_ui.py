@@ -1607,6 +1607,55 @@ def rebuild_investment_accounts():
     return redirect('/admin/accounts?flash=' + quote_plus(msg))
 
 
+@bp.post('/admin/reconstruct_openings')
+def reconstruct_openings():
+    """Reverse-walk historical opening balances from the transaction ledger
+    (v0.5.18). Kill-switched by construction — nothing fires until this POST.
+    DRY-RUN by default (surfaces proposed vs current per account); pass
+    `apply=1` (and optionally `account_id=<id>` to scope) to actually re-book.
+    Rollback-safe: an account whose reverse-walk goes negative is left as-is."""
+    from .. import opening_balance as obal
+    if not erps.is_configured():
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'ERPNext is not configured.'))
+    account_id = (request.form.get('account_id') or '').strip()
+    do_apply = (request.form.get('apply') or '') in ('1', 'true', 'yes')
+    accounts = ([PlaidAccount.query.filter_by(account_id=account_id).first()]
+                if account_id else PlaidAccount.query.all())
+    client = None
+    if do_apply:
+        try:
+            client = erpnext_bank.get_client()
+        except (ERPNextConfigError, ERPNextError) as e:
+            return redirect('/admin/accounts?flash=' + quote_plus(
+                f'Reconstruct failed: {e}'))
+    lines, changed, aborted = [], 0, 0
+    for account in [a for a in accounts if a is not None]:
+        plan = (obal.apply_reconstructed_opening(client, account.account_id)
+                if do_apply
+                else obal.reconstruct_opening_balance(account.account_id))
+        if plan.get('status') == 'skipped':
+            continue
+        if plan.get('status') == 'abort_negative':
+            aborted += 1
+        elif plan.get('delta'):
+            changed += 1
+        lines.append(f"••{plan.get('account_mask','?')}: "
+                     f"{plan.get('current_opening')} → "
+                     f"{plan.get('proposed_opening')} "
+                     f"[{plan.get('status')}"
+                     + (', applied' if plan.get('applied') else '') + ']')
+    verb = 'Applied' if do_apply else 'Dry-run'
+    msg = (f'{verb}: {changed} would change, {aborted} aborted (negative). '
+           + ' | '.join(lines[:8]))
+    audit.record('opening_balances_reconstructed', subject_type='Account',
+                 subject_id='reverse_walk',
+                 after={'apply': do_apply, 'changed': changed,
+                        'aborted': aborted},
+                 notes='v0.5.18 opening-balance reverse-walk')
+    return redirect('/admin/accounts?flash=' + quote_plus(msg[:900]))
+
+
 @bp.post('/api/items/<plaid_item_id>/disconnect')
 def disconnect_item(plaid_item_id):
     """Disconnect a linked bank: call Plaid /item/remove, then mark the Item
