@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: MIT
+"""MCP server configuration (v0.6.0).
+
+Two independent gates protect the AI-operable surface:
+
+  1. THE ENDPOINT ITSELF is off unless `BB_MCP_AUTH_TOKEN` is set in the
+     environment (an Umbrel env override). No token → /mcp returns 404, i.e.
+     the feature does not exist. The token is never persisted to disk or the
+     database; it lives only in the process environment, so a leaked DATA_DIR
+     or a DB dump cannot expose it.
+
+  2. EACH MUTATING TOOL has its own kill switch, persisted under DATA_DIR the
+     same way strategy_settings/plaid_settings are, and every one DEFAULTS OFF.
+     A fresh install exposes the read-only tools and nothing else; an operator
+     must deliberately flip a switch on /admin/mcp before the AI can change
+     anything. Read tools are never gated (they cannot alter the books).
+
+The split is deliberate: the token decides *whether an AI can talk to Bank
+Bridge at all* (an ops/network decision, hence env), while the kill switches
+decide *what it may change* (a per-capability trust decision, hence a settings
+file the operator edits in the UI).
+"""
+import json
+import logging
+import os
+
+from flask import current_app
+
+log = logging.getLogger('bankbridge.mcp_settings')
+
+_FILENAME = 'mcp_settings.json'
+
+# One kill switch per MUTATING tool. ALL default False — the read-only tools
+# carry no entry here because they are never gated.
+_DEFAULTS = {
+    'create_rule': False,
+    'set_variance_tag': False,
+    'trigger_reparse': False,
+    'rebuild_anchors': False,
+    'pair_accounts': False,
+    'enable_je_posting': False,
+    'disable_je_posting': False,
+}
+
+_FIELDS = tuple(_DEFAULTS.keys())
+
+_ENV_TOKEN = 'BB_MCP_AUTH_TOKEN'
+
+
+def auth_token() -> str:
+    """The bearer token the /mcp endpoint requires, from the environment.
+    Empty string when unset — which disables the endpoint entirely."""
+    return (os.environ.get(_ENV_TOKEN) or '').strip()
+
+
+def is_enabled() -> bool:
+    """Whether the MCP endpoint exists at all (a token is configured)."""
+    return bool(auth_token())
+
+
+def masked_token() -> str:
+    """The token with all but its last four characters hidden, for display on
+    /admin/mcp. Never renders the token itself."""
+    tok = auth_token()
+    if not tok:
+        return ''
+    if len(tok) <= 4:
+        return '•' * len(tok)
+    return '•' * (len(tok) - 4) + tok[-4:]
+
+
+def _path() -> str:
+    return os.path.join(current_app.config['DATA_DIR'], _FILENAME)
+
+
+def load() -> dict:
+    """Current kill-switch state — defaults (all OFF) overlaid with persisted
+    JSON. Always returns every key in _FIELDS as a bool."""
+    out = dict(_DEFAULTS)
+    try:
+        with open(_path()) as fh:
+            persisted = json.load(fh) or {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return out
+    for k in _FIELDS:
+        if k in persisted:
+            out[k] = bool(persisted[k])
+    return out
+
+
+def is_tool_enabled(tool_name: str) -> bool:
+    """Whether a MUTATING tool is permitted. A read-only tool (no entry in
+    _FIELDS) is always permitted; a mutating tool defaults OFF."""
+    if tool_name not in _FIELDS:
+        return True
+    return bool(load().get(tool_name, False))
+
+
+def save(updates: dict) -> dict:
+    """Merge kill-switch `updates` into the persisted file and write back.
+    Only whitelisted _FIELDS are persisted, so a stale form cannot pollute it."""
+    current = load()
+    for k in _FIELDS:
+        if k in updates:
+            current[k] = bool(updates[k])
+    os.makedirs(os.path.dirname(_path()), exist_ok=True)
+    tmp = _path() + '.tmp'
+    with open(tmp, 'w') as fh:
+        json.dump(current, fh, indent=2, sort_keys=True)
+    os.replace(tmp, _path())
+    return current

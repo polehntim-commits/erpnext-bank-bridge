@@ -2044,3 +2044,40 @@ class RiskControlCheck(db.Model):
                     self.sector_concentration_limit_pct,
                 'bitcoin_allocation_pct': self.bitcoin_allocation_pct,
                 'violations': list(self.violations or [])}
+
+
+class AiActionLog(db.Model):
+    """One row per MCP tool call — read AND write (v0.6.0).
+
+    The MCP server (app/blueprints/mcp_server.py) lets an AI client query and,
+    behind per-tool kill switches, mutate Bank Bridge directly instead of a
+    human relaying `docker exec` snippets. That direct surface needs a faithful,
+    append-only trail: every call records what tool ran, the arguments it ran
+    with, a short human-readable result summary, and the caller's IP. Never
+    updated, never deleted — the same discipline as AuditEvent — so an operator
+    can reconstruct exactly what the AI did and when.
+
+    `args` and `result_summary` hold whatever the tool was given and produced.
+    They CAN contain real figures/masks — this is a live operational record, not
+    a fixture, and is deliberately excluded from anything the PII grep guards.
+    `ok` is False when the tool was blocked (kill switch off) or errored, so a
+    denied mutation is as visible as a successful one."""
+    __tablename__ = 'ai_action_log'
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=_now, index=True)
+    tool_name = db.Column(db.String(80), nullable=False, index=True)
+    args = db.Column(db.Text, default='')          # JSON-encoded arguments
+    result_summary = db.Column(db.Text, default='')
+    caller_ip = db.Column(db.String(64), default='')
+    ok = db.Column(db.Boolean, default=True, index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'timestamp': self.created_at.isoformat() if self.created_at else None,
+            'tool_name': self.tool_name,
+            'args': self.args or '',
+            'result_summary': self.result_summary or '',
+            'caller_ip': self.caller_ip or '',
+            'ok': bool(self.ok),
+        }

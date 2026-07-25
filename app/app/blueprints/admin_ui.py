@@ -44,6 +44,7 @@ from .. import erpnext_bank
 from .. import erpnext_settings as erps
 from .. import intercompany
 from .. import loans
+from .. import mcp_settings
 from .. import opening_balance as obal
 from .. import plaid_settings as ps
 from .. import reconnect
@@ -176,6 +177,7 @@ NAV_HTML = """
   <a href="/admin/sync_log" class="{{ 'active' if page == 'sync_log' else '' }}">Sync Log</a>
   <a href="/admin/plaid_settings" class="{{ 'active' if page == 'plaid_settings' else '' }}">Plaid</a>
   <a href="/admin/erpnext_settings" class="{{ 'active' if page == 'erpnext_settings' else '' }}">ERPNext</a>
+  <a href="/admin/mcp" class="{{ 'active' if page == 'mcp' else '' }}">MCP</a>
   {% if nav_companies %}
   <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
     <span style="color:#8fbfa5;font-size:12px">Current Company:</span>
@@ -7796,3 +7798,130 @@ def advisory_toggle(agreement_id):
                  notes=f'{switch} {"enabled" if enabled else "disabled"}')
     return redirect(f'/admin/advisory/{agreement_id}?flash='
                     + quote_plus(f'{switch} is now {"ON" if enabled else "OFF"}.'))
+
+
+# ── MCP server admin (v0.6.0) ────────────────────────────────────────────────
+_MCP_BODY = """
+<h2>MCP server <span style="font-size:13px;font-weight:400;color:#777">
+  Model Context Protocol — the AI-operable surface</span></h2>
+{% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
+{% if test_result %}
+<div class="{{ 'banner-ok' if test_result.ok else 'banner-warn' }}">
+  <b>Test connection:</b> {{ test_result.detail }}</div>
+{% endif %}
+
+<div class="card" style="margin:0 0 16px">
+  <h3 style="margin-top:0">Endpoint</h3>
+  {% if enabled %}
+  <p><span class="pill pill-ok">enabled</span> — POST JSON-RPC 2.0 to
+     <code>/mcp</code> with header
+     <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+  <p style="font-size:13px;color:#555">Token (from <code>BB_MCP_AUTH_TOKEN</code>):
+     <code>{{ masked_token }}</code> — LAN-only; never funnelled.</p>
+  <form method="post" action="/admin/mcp/test" style="margin:8px 0 0">
+    <button type="submit" class="secondary">Test connection (tools/list)</button>
+  </form>
+  {% else %}
+  <p><span class="pill pill-muted">disabled</span> — set the environment variable
+     <code>BB_MCP_AUTH_TOKEN</code> (an Umbrel env override) and restart. Until
+     then <code>/mcp</code> returns 404 and no AI can reach Bank Bridge.</p>
+  {% endif %}
+</div>
+
+<div class="card" style="margin:0 0 16px">
+  <h3 style="margin-top:0">Mutating-tool kill switches</h3>
+  <p style="font-size:13px;color:#555">Read-only tools are always available.
+    Each MUTATING tool is OFF until you turn it on here — an AI cannot change
+    anything a switch below leaves off.</p>
+  <form method="post" action="/admin/mcp/toggle">
+    <table>
+      <tr><th>Tool</th><th>What it changes</th><th>State</th></tr>
+      {% for key, desc in switches %}
+      <tr>
+        <td><code>{{ key }}</code></td>
+        <td style="font-size:13px;color:#555">{{ desc }}</td>
+        <td>
+          <label style="margin:0"><input type="checkbox" name="{{ key }}"
+            {{ 'checked' if switch_state[key] else '' }}
+            style="width:auto"> {{ 'ON' if switch_state[key] else 'OFF' }}</label>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    <button type="submit" class="primary" style="margin-top:10px">Save switches</button>
+  </form>
+</div>
+
+<div class="card" style="margin:0">
+  <h3 style="margin-top:0">Recent AI activity <span style="font-size:12px;
+    font-weight:400;color:#888">(AiActionLog — read AND write, newest first)</span></h3>
+  <table>
+    <tr><th>When</th><th>Tool</th><th>OK</th><th>Result</th><th>Caller</th></tr>
+    {% for r in recent %}
+    <tr>
+      <td style="font-size:12px;white-space:nowrap">{{ r.timestamp or '—' }}</td>
+      <td><code>{{ r.tool_name }}</code></td>
+      <td>{% if r.ok %}<span class="pill pill-ok">ok</span>{% else %}<span class="pill pill-err">blocked/err</span>{% endif %}</td>
+      <td style="font-size:12px;max-width:360px">{{ r.result_summary }}</td>
+      <td style="font-size:12px">{{ r.caller_ip }}</td>
+    </tr>
+    {% endfor %}
+    {% if not recent %}<tr><td colspan="5" style="color:#888">No AI activity yet.</td></tr>{% endif %}
+  </table>
+</div>
+"""
+
+# One-line "what it changes" per mutating tool, shown beside its switch.
+_MCP_SWITCH_DESC = {
+    'create_rule': 'Create a categorization rule',
+    'set_variance_tag': 'Write a variance reason onto an anchor',
+    'trigger_reparse': 'Re-parse stored PDFs + full reconcile pipeline',
+    'rebuild_anchors': 'Rebuild the anchor chain',
+    'pair_accounts': 'Pair a brokerage with its cash-services account',
+    'enable_je_posting': 'Turn ON investment JE posting for an item',
+    'disable_je_posting': 'Turn OFF investment JE posting for an item',
+}
+
+
+def _mcp_page(flash_msg='', test_result=None):
+    from ..models import AiActionLog
+    state = mcp_settings.load()
+    recent = [r.to_dict() for r in AiActionLog.query
+              .order_by(AiActionLog.created_at.desc()).limit(25).all()]
+    return _page(_MCP_BODY, page='mcp',
+                 enabled=mcp_settings.is_enabled(),
+                 masked_token=mcp_settings.masked_token(),
+                 switches=list(_MCP_SWITCH_DESC.items()),
+                 switch_state=state, recent=recent,
+                 flash_msg=flash_msg, test_result=test_result)
+
+
+@bp.get('/admin/mcp')
+def mcp_page():
+    return _mcp_page(flash_msg=request.args.get('flash', ''))
+
+
+@bp.post('/admin/mcp/toggle')
+def mcp_toggle():
+    # A checkbox absent from the POST means unchecked → OFF.
+    updates = {k: (k in request.form) for k in _MCP_SWITCH_DESC}
+    mcp_settings.save(updates)
+    on = [k for k, v in updates.items() if v]
+    return redirect('/admin/mcp?flash=' + quote_plus(
+        'Kill switches saved. ON: ' + (', '.join(on) if on else 'none')))
+
+
+@bp.post('/admin/mcp/test')
+def mcp_test():
+    """Exercise the server in-process (no network) so the operator can confirm
+    it answers without minting a token round-trip."""
+    if not mcp_settings.is_enabled():
+        return _mcp_page(test_result={
+            'ok': False,
+            'detail': 'Disabled — set BB_MCP_AUTH_TOKEN and restart.'})
+    from .mcp_server import _tools_list
+    tools = _tools_list()['tools']
+    return _mcp_page(test_result={
+        'ok': True,
+        'detail': f'{len(tools)} tools advertised: '
+                  + ', '.join(t['name'] for t in tools)})

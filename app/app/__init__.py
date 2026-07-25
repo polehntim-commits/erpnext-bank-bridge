@@ -13,7 +13,7 @@ from flask_sqlalchemy import SQLAlchemy
 
 from config import Config
 
-__version__ = '0.5.18'
+__version__ = '0.6.0'
 db = SQLAlchemy()
 
 
@@ -68,6 +68,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     # disable the background scheduler. Production callers pass nothing.
     if test_config:
         app.config.update(test_config)
+    app.config['APP_VERSION'] = __version__
 
     os.makedirs(app.config['DATA_DIR'], exist_ok=True)
     # Reset any cached Fernet instance so a test-overridden DATA_DIR gets its
@@ -86,9 +87,13 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     db.init_app(app)
 
-    from .blueprints import admin_ui, api
+    from .blueprints import admin_ui, api, mcp_server
     app.register_blueprint(admin_ui.bp)
     app.register_blueprint(api.bp)
+    # v0.6.0 — the MCP (Model Context Protocol) endpoint at /mcp. The route is
+    # always registered, but /mcp answers 404 until BB_MCP_AUTH_TOKEN is set
+    # (see mcp_settings), so a token-less install exposes no AI surface at all.
+    app.register_blueprint(mcp_server.bp)
     # v0.4.8 — the Plaid-facing routes moved under /bankbridge/. Keep the
     # pre-v0.4.8 paths answering (permanent redirects) so an install whose Plaid
     # dashboard still points at /plaid/oauth_return doesn't break mid-upgrade.
