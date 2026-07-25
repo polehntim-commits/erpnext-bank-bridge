@@ -661,3 +661,60 @@ class BondBasisTests(InvestJEBase):
         lines = self._lines(self._je_for(client, gje))
         self.assertEqual(lines[self.GAINS], (0.0, 4000.0))
         self.assertNotIn(self.INT, lines)
+
+
+class ContributionRoutingTests(InvestJEBase):
+    """v0.5.15 (Option A) · owner-contribution / member-distribution tags route
+    the JE cash leg to 1099 Cash Clearing (netting the sec-side), with the
+    equity offset (3200/3201) supplied by the operator's rule. Sweep routing
+    needs no code — an operator rule with offset_account=1099 already works."""
+
+    def _client_eq(self, **kw):
+        chart = [
+            {'account_name': 'Assets', 'root_type': 'Asset', 'is_group': 1,
+             'parent_account': '', 'name': 'Assets - EC'},
+            {'account_name': 'Income', 'root_type': 'Income', 'is_group': 1,
+             'parent_account': '', 'name': 'Income - EC'},
+            {'account_name': 'Expenses', 'root_type': 'Expense', 'is_group': 1,
+             'parent_account': '', 'name': 'Expenses - EC'},
+            {'account_name': 'Equity', 'root_type': 'Equity', 'is_group': 1,
+             'parent_account': '', 'name': 'Equity - EC'},
+        ]
+        kw.setdefault('chart_accounts', chart)
+        return FakeERPClient(**kw)
+
+    def _row(self, tag, account_id='cash'):
+        return type('R', (), {'bb_internal_tag': tag,
+                              'account_id': account_id})()
+
+    def test_member_contributions_account_is_created_under_equity(self):
+        name = invest_je.member_contributions_account(self._client_eq(), COMPANY)
+        self.assertIn('Member Contributions', name)
+
+    def test_owner_contribution_routes_bank_leg_to_cash_clearing(self):
+        from app import categorization
+        leg = categorization._contribution_bank_leg(
+            self._client_eq(), self._row('owner_contribution'), COMPANY)
+        self.assertEqual(leg, 'Cash Clearing - Brokerage - EC')
+
+    def test_member_distribution_also_routes(self):
+        from app import categorization
+        leg = categorization._contribution_bank_leg(
+            self._client_eq(), self._row('member_distribution'), COMPANY)
+        self.assertEqual(leg, 'Cash Clearing - Brokerage - EC')
+
+    def test_untagged_row_keeps_its_normal_bank_gl(self):
+        from app import categorization
+        self.assertIsNone(categorization._contribution_bank_leg(
+            self._client_eq(), self._row(''), COMPANY))
+
+    def test_contribution_tag_on_an_unpaired_account_is_not_overridden(self):
+        from app import categorization
+        db.session.add(PlaidAccount(
+            account_id='plain', item_id='item-om', name='PLAIN CHECKING',
+            mask='7777', type='depository', subtype='checking',
+            owning_company=COMPANY))
+        db.session.commit()
+        self.assertIsNone(categorization._contribution_bank_leg(
+            self._client_eq(), self._row('owner_contribution', 'plain'),
+            COMPANY))

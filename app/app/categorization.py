@@ -558,6 +558,38 @@ def bank_gl_account_for(row) -> str:
     return ((acct.erpnext_gl_account_name or '').strip() if acct else '')
 
 
+# v0.5.15 · the two internal tags whose JE cash leg is routed to Cash Clearing
+# (external owner capital in/out of a brokerage) rather than the account's own
+# bank GL.
+CONTRIBUTION_TAGS = ('owner_contribution', 'member_distribution')
+
+
+def _contribution_bank_leg(client, row, company: str) -> str | None:
+    """Cash Clearing docname when this transaction is a tagged owner
+    contribution / member distribution on a paired-brokerage companion account,
+    else None (v0.5.15). None leaves build_journal_entry on its normal bank GL."""
+    tag = (getattr(row, 'bb_internal_tag', '') or '').strip()
+    if tag not in CONTRIBUTION_TAGS:
+        return None
+    account_id = getattr(row, 'account_id', None)
+    if not account_id:
+        return None
+    acct = PlaidAccount.query.filter_by(account_id=account_id).first()
+    if acct is None:
+        return None
+    # Its own account is a brokerage with a cash companion, OR it IS the
+    # companion of some paired brokerage — either way a Cash Clearing bridge is
+    # the right cash leg.
+    is_companion = (
+        (acct.paired_account_id or '').strip()
+        or PlaidAccount.query.filter_by(
+            paired_account_id=acct.account_id).first() is not None)
+    if not is_companion:
+        return None
+    from . import invest_je
+    return invest_je.cash_clearing_account(client, company)
+
+
 def build_journal_entry(rule: CategorizationRule, row, company: str, *,
                         supplier_name=None, remark: str = '',
                         bank_account: str | None = None,
@@ -1117,9 +1149,20 @@ def generate_journal_entry(client, row, *, supplier_name=None,
                              notes=f'rule “{rule.name}” — no “{logical}” under '
                                    f'{company}')
                 return gje
+        # v0.5.15 (Option A) · OWNER CONTRIBUTION / MEMBER DISTRIBUTION routing.
+        # A transaction Tim tags 'owner_contribution' or 'member_distribution'
+        # (via a rule's bb_internal_tag) is external capital moving in/out of the
+        # brokerage — its cash leg belongs on 1099 Cash Clearing (netting the
+        # sec-side that debited/credited Clearing on the trades that capital
+        # funded), NOT on the account's own bank GL. The offset stays the rule's
+        # equity account (3200 Member Contributions / 3201 Member Distribution)
+        # and the operator's offset_direction decides the sign. Only overridden
+        # for a paired-brokerage companion, where a Cash Clearing bridge exists.
+        bank_override = _contribution_bank_leg(client, row, company)
         doc = build_journal_entry(rule, row, company,
                                   supplier_name=supplier_name, remark=remark,
                                   offset_account_override=offset_override,
+                                  bank_account=bank_override,
                                   party_override=(party or ''),
                                   party_type_override=(party_type or ''))
         # v0.4.0.2 retroactive guard: refuse to post a JE that references a GL

@@ -292,6 +292,16 @@ def advisory_fees_account(client, company) -> str | None:
                        account_number='5700')
 
 
+def member_contributions_account(client, company) -> str | None:
+    """`Member Contributions` (Equity, 3200) — the owner's capital paid INTO the
+    brokerage to fund net securities purchases (v0.5.15). Distributions OUT use
+    the pre-existing `Member Distribution` (3201); this only creates the
+    contribution side. Credit-normal equity, found-or-created under the Equity
+    root."""
+    return ensure_leaf(client, company, 'Member Contributions', 'Equity',
+                       account_number='3200')
+
+
 def dividend_income_account(client, company) -> str | None:
     return ensure_leaf(client, company, 'Dividend Income', 'Income',
                        account_number='4230')
