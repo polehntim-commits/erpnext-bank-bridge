@@ -894,10 +894,10 @@ class McpToolTest(SidecarBase):
             tool_name='get_public_url_status', ok=True).count())
 
 
-class VersionTest(unittest.TestCase):
-    def test_version_is_bumped(self):
-        import app as app_pkg
-        self.assertEqual('0.7.1', app_pkg.__version__)
+# The current-version pin lives in tests/test_version.py — see the note there.
+# It used to sit in whichever suite was newest, which meant every release left a
+# stale assertion in the previous release's file (this one failed exactly that
+# way on the 0.7.1 → 0.7.2 bump).
 
 
 if __name__ == '__main__':  # pragma: no cover

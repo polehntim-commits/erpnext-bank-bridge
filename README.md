@@ -2411,6 +2411,45 @@ full configs of all three options.
 > (`generate_password_hash`). The Plaid callback and JSON API are **never** gated
 > by this — only `/admin` is.
 
+## Connecting an AI client to the MCP server (v0.7.2)
+
+The MCP server (v0.6.0) exposes Bank Bridge's read tools — and, behind per-tool
+kill switches, its mutating ones — to an AI client. **`/admin/mcp` now generates
+the client config for you**, so there is no hand-editing of
+`claude_desktop_config.json`.
+
+**Claude Desktop.** The page detects your OS, shows the config file path, and
+renders the server entry with the token masked. **Copy config JSON** or
+**Download config file** hands over the real thing; merge the `bankbridge` entry
+into any existing `mcpServers` object rather than replacing the file, then fully
+quit and reopen Claude Desktop.
+
+**Claude Code.** One command, shown with a copy button:
+
+```bash
+claude mcp add --transport http bankbridge http://umbrel.local:5202/mcp \
+  --header "Authorization: Bearer $BB_MCP_AUTH_TOKEN"
+```
+
+Two things about the generated config are deliberate and worth knowing:
+
+- **The URL is your LAN address, never the Tailscale Funnel URL.** `/mcp` sits
+  outside the `/bankbridge/` Funnel prefix on purpose (v0.6.0), and the Funnel
+  publishes only the OAuth callback path — so `https://<funnel-host>/mcp` is not
+  reachable, and publishing it would put the AI-operable surface on the public
+  Internet. Claude Desktop runs on your own machine on the same LAN, so the LAN
+  URL is the correct target, not a compromise.
+- **The bearer header is split across `args` and `env`.** Claude Desktop on
+  Windows (and Cursor) fail to escape spaces inside `args` when invoking `npx`,
+  which mangles `Authorization: Bearer …`. `mcp-remote`'s own README prescribes
+  the space-free `Authorization:${AUTH_HEADER}` used here, with the value in
+  `env`.
+
+The real token is never rendered into the page — the preview is masked and both
+buttons fetch it from `/admin/mcp/claude_desktop_config.json`, which 404s when
+`BB_MCP_AUTH_TOKEN` is unset. With MCP disabled the widget is a grey card telling
+you which variable to set.
+
 ## Public URL setup via Tailscale Funnel
 
 Plaid OAuth banks redirect your browser to an `https://` URL that has to be

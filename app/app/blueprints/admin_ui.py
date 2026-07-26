@@ -39,6 +39,7 @@ from .. import account_visibility as av
 from .. import statements as stmts_mod
 from .. import audit
 from .. import categorization
+from .. import claude_desktop
 from .. import counterparty
 from .. import crypto
 from .. import db
@@ -8234,6 +8235,92 @@ _MCP_BODY = """
   <b>Test connection:</b> {{ test_result.detail }}</div>
 {% endif %}
 
+{# ── v0.7.2 · Connect an AI client ──────────────────────────────────────── #}
+{% if enabled %}
+<div class="card" style="background:#fff;border:1px solid #ccc;
+     border-radius:6px;padding:16px;margin:0 0 16px">
+  <h3 style="margin-top:0">Connect to Claude Desktop</h3>
+
+  <p style="margin:0 0 4px;font-size:13px;color:#555">Config file
+    {% if cd.os_label %}for <b>{{ cd.os_label }}</b>{% endif %}:</p>
+  <p style="margin:0 0 2px"><code>{{ cd.config_path or '(unknown OS — see the
+    list below)' }}</code></p>
+  <p style="font-size:12px;color:#888;margin:0 0 14px">(default location; may
+    differ on your install)
+    {% if not cd.config_path %}
+    <br>macOS: <code>{{ cd.all_paths.macos }}</code>
+    <br>Windows: <code>{{ cd.all_paths.windows }}</code>
+    <br>Linux: <code>{{ cd.all_paths.linux }}</code>
+    {% endif %}</p>
+
+  <p style="margin:0 0 4px;font-size:13px;color:#555">Server entry
+    <span class="pill pill-muted">token masked below</span></p>
+  <pre style="background:#f4f4f4;border:1px solid #ddd;border-radius:4px;
+    padding:10px;font-size:12px;overflow-x:auto;margin:0 0 4px"><code>{{ cd.preview_json }}</code></pre>
+  <p style="font-size:12px;color:#888;margin:0 0 12px"><b>Copy</b> and
+    <b>Download</b> below include the real token — it is masked here so it never
+    ends up in a screenshot or a saved page.</p>
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+    <button type="button" class="primary" id="cdCopyBtn"
+      data-src="/admin/mcp/claude_desktop_config.json">Copy config JSON</button>
+    {# An <a>, not a <button>, so the browser's own download machinery handles
+       the save. BASE_CSS scopes `.secondary` to button elements, so the
+       button look is inlined here rather than widening that selector. #}
+    <a href="/admin/mcp/claude_desktop_config.json" download
+       style="background:#fff;color:#333;border:1px solid #bbb;padding:8px 16px;
+       border-radius:4px;cursor:pointer;text-decoration:none;
+       display:inline-block;font-size:14px">Download config file</a>
+  </div>
+
+  <ol style="font-size:14px;line-height:1.7;margin:14px 0 0;padding-left:22px">
+    <li><b>Save the JSON to the file path above.</b> If that file already exists,
+      merge the <code>{{ cd.server_key }}</code> entry into your existing
+      <code>mcpServers</code> object — don't replace the whole file, or you will
+      drop every other MCP server you have configured.</li>
+    <li><b>Fully quit Claude Desktop and reopen it</b>
+      {% if cd.quit_hint %}— {{ cd.quit_hint }}{% endif %}. The config is read
+      once at startup.</li>
+    <li>In a new chat, ask for something like <i>"ask bankbridge for the
+      reconciliation status of an account"</i>. The
+      <code>{{ cd.server_key }}__*</code> tools should be available.
+      {% if not any_mutating_on %}Read-only tools work immediately; every
+      mutating tool stays blocked until you turn its kill switch on below.
+      {% endif %}</li>
+  </ol>
+
+  <h3 style="margin:20px 0 6px">Connect from Claude Code</h3>
+  <p style="margin:0 0 6px;font-size:13px;color:#555">Claude Code speaks HTTP MCP
+    natively, so there is no <code>mcp-remote</code> and no file to edit — one
+    command in your terminal:</p>
+  <pre style="background:#f4f4f4;border:1px solid #ddd;border-radius:4px;
+    padding:10px;font-size:12px;overflow-x:auto;margin:0 0 8px"><code>{{ cd.preview_command }}</code></pre>
+  <button type="button" class="secondary" id="cdCmdCopyBtn"
+    data-src="/admin/mcp/claude_desktop_config.json?format=claude_code"
+    >Copy command</button>
+
+  <p style="font-size:12px;color:#888;margin:14px 0 0">
+    <b>The URL is your LAN address on purpose.</b> Claude Desktop runs on your
+    own machine, on the same network as this Umbrel, so
+    <code>{{ cd.url }}</code> is the right target.
+    {% if cd.funnel_hostname %}Your Tailscale Funnel
+    (<code>{{ cd.funnel_hostname }}</code>) is deliberately <i>not</i> used:
+    the Funnel publishes only the Plaid OAuth callback path, so
+    <code>/mcp</code> is not reachable through it — and publishing it would put
+    the AI-operable surface on the public Internet.
+    {% endif %}</p>
+</div>
+{% else %}
+<div class="card" style="background:#f4f4f4;border:1px solid #ddd;
+     border-radius:6px;padding:16px;margin:0 0 16px;color:#666">
+  <h3 style="margin-top:0;color:#666">Connect to Claude Desktop</h3>
+  <p style="margin:0;font-size:14px">MCP is not enabled, so there is nothing to
+    connect to yet. Set <code>BB_MCP_AUTH_TOKEN</code> (see <b>Endpoint</b>
+    below) and restart the app — the connection details and a one-click config
+    download appear here once a token exists.</p>
+</div>
+{% endif %}
+
 <div class="card" style="margin:0 0 16px">
   <h3 style="margin-top:0">Endpoint</h3>
   {% if enabled %}
@@ -8293,6 +8380,52 @@ _MCP_BODY = """
     {% if not recent %}<tr><td colspan="5" style="color:#888">No AI activity yet.</td></tr>{% endif %}
   </table>
 </div>
+
+<script>
+(function () {
+  // Both buttons FETCH their text rather than carrying it in a data attribute:
+  // the payload contains the real bearer token, and the whole point of the
+  // masked preview is that the token is not in this page's source.
+  function wire(id) {
+    var btn = document.getElementById(id);
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      var was = btn.textContent;
+      var done = function (ok) {
+        btn.textContent = ok ? 'Copied \\u2713' : 'Copy failed \\u2014 use Download';
+        setTimeout(function () { btn.textContent = was; }, 2000);
+      };
+      fetch(btn.getAttribute('data-src'), {credentials: 'same-origin'})
+        .then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.text();
+        })
+        .then(function (text) {
+          // The admin UI is normally plain http on the LAN, where
+          // navigator.clipboard does not exist (it needs a secure context).
+          if (navigator.clipboard && window.isSecureContext) {
+            return navigator.clipboard.writeText(text)
+              .then(function () { done(true); }, function () { done(false); });
+          }
+          var ta = document.createElement('textarea');
+          ta.value = text;
+          ta.setAttribute('readonly', '');
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          var ok = false;
+          try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+          document.body.removeChild(ta);
+          done(ok);
+        })
+        .catch(function () { done(false); });
+    });
+  }
+  wire('cdCopyBtn');
+  wire('cdCmdCopyBtn');
+})();
+</script>
 """
 
 # One-line "what it changes" per mutating tool, shown beside its switch.
@@ -8311,17 +8444,75 @@ _MCP_SWITCH_DESC = {
 }
 
 
+def _claude_desktop_context() -> dict:
+    """Everything the v0.7.2 connect widget renders.
+
+    Only ever called for the page; the real token is not part of this — the
+    preview values are masked and the buttons fetch the live config from
+    /admin/mcp/claude_desktop_config.json."""
+    token = mcp_settings.auth_token()
+    url = claude_desktop.mcp_url(request.host, request.scheme)
+    os_name = claude_desktop.detect_os(request.headers.get('User-Agent'))
+    # Shown only to explain why the Funnel is NOT the URL — see claude_desktop.
+    sidecar = funnel.detect()
+    return {
+        'url': url,
+        'os_name': os_name,
+        'os_label': claude_desktop.OS_LABELS.get(os_name, ''),
+        'config_path': claude_desktop.config_path_for(os_name),
+        'all_paths': claude_desktop.CONFIG_PATHS,
+        'quit_hint': claude_desktop.QUIT_HINTS.get(os_name, ''),
+        'server_key': claude_desktop.SERVER_KEY,
+        'preview_json': claude_desktop.preview_json(url, token),
+        'preview_command': claude_desktop.preview_claude_code_command(url, token),
+        'funnel_hostname': sidecar.get('hostname') or '',
+    }
+
+
 def _mcp_page(flash_msg='', test_result=None):
     from ..models import AiActionLog
     state = mcp_settings.load()
     recent = [r.to_dict() for r in AiActionLog.query
               .order_by(AiActionLog.created_at.desc()).limit(25).all()]
+    enabled = mcp_settings.is_enabled()
     return _page(_MCP_BODY, page='mcp',
-                 enabled=mcp_settings.is_enabled(),
+                 enabled=enabled,
                  masked_token=mcp_settings.masked_token(),
                  switches=list(_MCP_SWITCH_DESC.items()),
                  switch_state=state, recent=recent,
+                 cd=_claude_desktop_context() if enabled else {},
+                 any_mutating_on=any(state.values()),
                  flash_msg=flash_msg, test_result=test_result)
+
+
+@bp.get('/admin/mcp/claude_desktop_config.json')
+def claude_desktop_config():
+    """The client config, with the REAL bearer token — the one place it is
+    served. Backs both the Copy buttons (fetched) and Download (saved).
+
+    404 when no token is configured, matching /mcp itself: with the feature off
+    there is no config to hand out. Reachable only behind the admin blueprint's
+    LAN/Basic-Auth boundary, exactly like the rest of /admin.
+
+    `?format=claude_code` returns the CLI one-liner as text/plain instead."""
+    if not mcp_settings.is_enabled():
+        return jsonify({'error': 'not found'}), 404
+    token = mcp_settings.auth_token()
+    url = claude_desktop.mcp_url(request.host, request.scheme)
+    if (request.args.get('format') or '') == 'claude_code':
+        return Response(
+            claude_desktop.claude_code_command(url, token) + '\n',
+            mimetype='text/plain',
+            # No attachment disposition: this one is meant for the clipboard.
+            headers={'Cache-Control': 'no-store'})
+    return Response(
+        claude_desktop.config_json(url, token) + '\n',
+        mimetype='application/json',
+        headers={'Content-Disposition':
+                 'attachment; filename=claude_desktop_config.json',
+                 # A bearer token must not sit in a shared HTTP cache, nor be
+                 # re-served after the operator rotates BB_MCP_AUTH_TOKEN.
+                 'Cache-Control': 'no-store'})
 
 
 @bp.get('/admin/mcp')
