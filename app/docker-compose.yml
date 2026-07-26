@@ -54,6 +54,12 @@ services:
       PLAID_SECRET: ${PLAID_SECRET:-}
       PLAID_ENV: ${PLAID_ENV:-sandbox}
       PLAID_REDIRECT_URI: ${PLAID_REDIRECT_URI:-http://umbrel.local:5202/bankbridge/plaid/oauth_return}
+      # v0.7.0 — the public hostname fronting this app, once Tailscale Funnel is
+      # serving port 5202 (e.g. `umbrel.tail1234.ts.net`). Set it and the
+      # public-URL wizard on /admin/plaid_settings auto-detects; leave blank and
+      # the wizard walks you through setting the Funnel up. See
+      # docs/tailscale-funnel.md.
+      TAILSCALE_FUNNEL_HOSTNAME: ${TAILSCALE_FUNNEL_HOSTNAME:-}
       # ERPNext — blank by default; configure at /admin/erpnext_settings.
       ERPNEXT_URL: ${ERPNEXT_URL:-http://umbrel.local:5300}
       ERPNEXT_API_KEY: ${ERPNEXT_API_KEY:-}

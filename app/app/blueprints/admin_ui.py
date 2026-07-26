@@ -5,7 +5,10 @@ Unauthenticated + LAN-only (the Umbrel trust boundary).
 Pages:
   /  and  /admin        — dashboard (health, counts, recent sync log)
   /admin/plaid_settings — Plaid Client ID / secrets / environment / webhook +
-                          sync frequency (cost-aware presets)
+                          sync frequency (cost-aware presets), plus the v0.7.0
+                          public-URL wizard that gets an operator a
+                          publicly-reachable HTTPS redirect URI for Plaid OAuth
+                          (see app/funnel.py)
   /admin/link_bank      — Plaid Link entry point
   /admin/accounts       — map each Plaid account → ERPNext Bank Account
   /admin/accounts/cleanup — ERPNext Bank Accounts no live Plaid account claims,
@@ -42,6 +45,7 @@ from .. import db
 from .. import erpnext_accounts
 from .. import erpnext_bank
 from .. import erpnext_settings as erps
+from .. import funnel
 from .. import intercompany
 from .. import loans
 from .. import mcp_settings
@@ -4695,7 +4699,8 @@ PLAID_SETTINGS_BODY = """
       <b>Developers → Keys</b>.</li>
     <li>Add the redirect URI <code>{{ s.redirect_uri }}</code> under
       <b>Developers → API → Allowed redirect URIs</b> (required for OAuth banks
-      like Wells Fargo).</li>
+      like Wells Fargo). It has to be a <b>public</b> <code>https://</code> URL —
+      <a href="#public-url">set one up below</a>.</li>
     <li>Start in <b>sandbox</b> to test the flow; switch to <b>production</b>
       once your Plaid app is approved for the institutions you need.</li>
   </ul>
@@ -4767,16 +4772,227 @@ PLAID_SETTINGS_BODY = """
 </p>
 """
 
+# ── v0.7.0 · public-URL (Tailscale Funnel) wizard ────────────────────────────
+# Appended to PLAID_SETTINGS_BODY below rather than living on a page of its own:
+# the value it produces IS the `redirect_uri` field in the form above, and an
+# operator who has just been told "add your redirect URI to Plaid" should not
+# have to go looking for where to get one.
+_FUNNEL_SECTION = """
+{# The paste-a-URL form, as a macro so one definition serves both states —
+   prominent in State B, tucked into a <details> in State A. A macro rather than
+   a pre-rendered string in the context: that would arrive HTML-escaped (Jinja
+   autoescaping is on) and render the markup as visible text. Both buttons submit
+   this form; `formaction` picks which endpoint handles it. #}
+{% macro manual_entry_form() %}
+<form class="card" method="post" action="/admin/plaid_settings/funnel/save"
+      style="margin:12px 0">
+  <label>Manual entry — paste your Tailscale Funnel URL
+    <input name="hostname" value="{{ pub.saved_hostname }}"
+      placeholder="https://umbrel.tail1234.ts.net">
+  </label>
+  <p style="font-size:12px;color:#888;margin:0 0 10px">Hostname or full URL,
+    either is fine — <code>umbrel.tail1234.ts.net</code>,
+    <code>https://umbrel.tail1234.ts.net</code>, or the whole redirect URI. We
+    normalize it and append <code>{{ pub.oauth_return_path }}</code>.</p>
+  <div style="display:flex;gap:10px;flex-wrap:wrap">
+    <button type="submit" formaction="/admin/plaid_settings/funnel/test"
+      class="secondary">Test URL</button>
+    <button type="submit" class="primary">Save as Plaid Redirect URI</button>
+  </div>
+</form>
+{% endmacro %}
 
-@bp.get('/admin/plaid_settings')
-def plaid_settings_page():
+<h2 id="public-url">Plaid Redirect URI — Public URL Setup</h2>
+
+{% if pub.probe %}
+<div class="{{ 'banner-ok' if pub.probe.ok else 'banner-warn' }}">
+  <b>URL test:</b> {{ pub.probe.detail }}
+  {% if pub.probe.url %}<br><span style="font-size:12px">Tested
+    <code>{{ pub.probe.url }}</code></span>{% endif %}
+</div>
+{% endif %}
+
+{% if pub.conflict %}
+<div class="banner-warn">
+  <h3>Two different hostnames are configured</h3>
+  <p style="margin:0;font-size:13px"><code>{{ pub.env_var }}</code> says
+    <b>{{ pub.env_hostname }}</b>, but the hostname saved here is
+    <b>{{ pub.saved_hostname }}</b>. The environment variable wins, because it
+    describes the machine's current Funnel. If the saved one is the right one now,
+    clear <code>{{ pub.env_var }}</code> from your Umbrel app override; if it is
+    stale, overwrite it under <b>Change the public hostname</b> below.</p>
+</div>
+{% endif %}
+
+{% if pub.state == 'configured' %}
+{# ── State A — a public hostname is known ─────────────────────────────── #}
+<div class="card" style="background:#fff;border:1px solid #ccc;
+     border-radius:6px;padding:16px;margin:12px 0">
+  <p style="margin:0 0 4px;font-size:13px;color:#555">Detected public URL
+    <span class="pill pill-ok">{{ 'from ' + pub.env_var if pub.source == 'env'
+      else 'saved here' }}</span></p>
+  <p style="margin:0 0 14px;font-size:20px"><code>{{ pub.base_url }}</code></p>
+
+  <p style="margin:0 0 4px;font-size:13px;color:#555"><b>Register this exact
+    string</b> in the Plaid dashboard under
+    <b>Developers → API → Allowed redirect URIs</b>:</p>
+  <p style="margin:0 0 4px"><code id="funnelRedirectUri"
+     style="font-size:15px;word-break:break-all">{{ pub.redirect_uri }}</code></p>
+  {% if pub.redirect_uri_matches %}
+  <p style="margin:0 0 12px;font-size:13px"><span class="pill pill-ok">already saved
+    as this install's Plaid Redirect URI</span></p>
+  {% else %}
+  <p style="margin:0 0 12px;font-size:13px"><span class="pill pill-warn">not yet
+    saved</span> — this install currently uses
+    <code>{{ pub.current_redirect_uri or '(none)' }}</code></p>
+  {% endif %}
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+    <form method="post" action="/admin/plaid_settings/funnel/use" style="margin:0">
+      <input type="hidden" name="hostname" value="{{ pub.hostname }}">
+      <button type="submit" class="primary">Use this as Plaid Redirect URI</button>
+    </form>
+    <button type="button" class="secondary" id="funnelCopyBtn"
+      data-copy="{{ pub.redirect_uri }}">Copy Plaid dashboard URL</button>
+    <form method="post" action="/admin/plaid_settings/funnel/test" style="margin:0">
+      <input type="hidden" name="hostname" value="{{ pub.hostname }}">
+      <button type="submit" class="secondary">Test URL</button>
+    </form>
+    <form method="get" action="/admin/plaid_settings" style="margin:0">
+      <input type="hidden" name="refresh" value="1">
+      <button type="submit" class="secondary">Refresh status</button>
+    </form>
+  </div>
+
+  <p style="font-size:12px;color:#888;margin:12px 0 0">This URL is served by
+    Tailscale Funnel on your Umbrel and terminates HTTPS at Tailscale's edge.
+    Requests reach Bank Bridge on port {{ pub.app_proxy_port }}.</p>
+</div>
+
+<details style="margin:12px 0">
+  <summary style="cursor:pointer;font-size:14px">Change the public hostname</summary>
+  {{ manual_entry_form() }}
+</details>
+
+{% else %}
+{# ── State B — nothing detected ───────────────────────────────────────── #}
+<div class="banner-warn">
+  <h3>No public URL yet</h3>
+  <p style="margin:0;font-size:14px">Plaid OAuth needs a public HTTPS URL — the
+    bank redirects your browser back to it after you log in, so it has to be
+    reachable from the Internet, not just your LAN. Tailscale Funnel is the
+    simplest way to expose your Umbrel-hosted Bank Bridge without opening
+    firewall ports.</p>
+</div>
+
+<div class="card" style="background:#fff;border:1px solid #ccc;
+     border-radius:6px;padding:16px;margin:12px 0">
+  <h3 style="margin-top:0">Run these on your Umbrel host (over SSH)</h3>
+  <ol style="font-size:14px;line-height:1.7;padding-left:22px;margin:0">
+    <li><b>Install Tailscale.</b> Use the Umbrel community app store
+      (recommended — it survives Umbrel updates), or install the daemon
+      directly:<br>
+      <code>curl -fsSL https://tailscale.com/install.sh | sh</code></li>
+    <li><b>Join your tailnet</b> — opens a browser link to authenticate:<br>
+      <code>sudo tailscale up</code></li>
+    <li><b>Expose only the OAuth callback</b> over HTTPS. This is the
+      recommended form: it publishes one path and nothing else, so
+      <code>/admin</code> and Bank Bridge's unauthenticated Plaid write
+      endpoints stay on your LAN:<br>
+      <code>sudo tailscale funnel --bg --https=443 \\<br>
+      &nbsp;&nbsp;--set-path={{ pub.oauth_return_path }} http://127.0.0.1:{{ pub.app_proxy_port }}</code>
+      <div style="font-size:12px;color:#888;margin:4px 0 0">The target carries
+        no path — Tailscale forwards the full request path to the backend rather
+        than stripping the mount prefix.
+        <b>Quick-start alternative:</b> <code>sudo tailscale funnel --bg {{ pub.app_proxy_port }}</code>
+        is one command but publishes the <i>whole</i> app, including your admin
+        UI. Use it to get unstuck, then narrow it to the
+        <code>--set-path</code> form above.</div></li>
+    <li><b>Read off your public hostname:</b><br>
+      <code>sudo tailscale funnel status</code>
+      <div style="font-size:12px;color:#888;margin:4px 0 0">Copy the host part of
+        the <code>https://…</code> line it prints — e.g.
+        <code>umbrel.tail1234.ts.net</code> — and paste it below.</div></li>
+  </ol>
+  <p style="font-size:12px;color:#888;margin:12px 0 0">Prefer not to SSH for
+    this every time? Set <code>{{ pub.env_var }}</code> to that hostname in your
+    Umbrel app override and this page detects it automatically after a restart.
+    Full walkthrough and alternatives (Cloudflare Tunnel, ngrok, port-forward):
+    <code>docs/tailscale-funnel.md</code>.</p>
+</div>
+
+{{ manual_entry_form() }}
+
+<form method="get" action="/admin/plaid_settings" style="margin:12px 0">
+  <input type="hidden" name="refresh" value="1">
+  <button type="submit" class="secondary">Refresh status</button>
+</form>
+{% endif %}
+
+<script>
+(function () {
+  var btn = document.getElementById('funnelCopyBtn');
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    var text = btn.getAttribute('data-copy') || '';
+    var done = function (ok) {
+      var was = btn.textContent;
+      btn.textContent = ok ? 'Copied \\u2713' : 'Copy failed \\u2014 select it manually';
+      setTimeout(function () { btn.textContent = was; }, 2000);
+    };
+    // The admin UI is normally served over plain http on the LAN, where
+    // navigator.clipboard does not exist (it needs a secure context). Fall back
+    // to the execCommand path so the button works there too.
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { done(true); },
+                                              function () { done(false); });
+      return;
+    }
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    done(ok);
+  });
+})();
+</script>
+"""
+
+PLAID_SETTINGS_BODY = PLAID_SETTINGS_BODY + _FUNNEL_SECTION
+
+
+def _plaid_settings_render(flash_msg='', probe_result=None, do_probe=False):
+    """Render /admin/plaid_settings.
+
+    Shared by the GET and by the two funnel POSTs that need to show a result
+    inline (a probe outcome can't survive a redirect without stuffing it in the
+    query string). Detection runs on every render; the network probe only when
+    asked, so an ordinary page load never blocks on a timeout."""
+    pub = funnel.detect(probe_url=do_probe)
+    if probe_result is not None:
+        pub['probe'] = probe_result
     return _page(PLAID_SETTINGS_BODY, page='plaid_settings', s=ps.load(),
                  masked=ps.masked(), configured=ps.is_configured(),
                  sync_presets=sync_config.PRESETS,
                  account_count=(av.visible_accounts_query().count() or 1),
                  price_per_call=current_app.config.get(
                      'PLAID_PRICE_PER_CALL', sync_config.DEFAULT_PRICE_PER_CALL),
-                 flash_msg=request.args.get('flash', ''))
+                 pub=pub, flash_msg=flash_msg)
+
+
+@bp.get('/admin/plaid_settings')
+def plaid_settings_page():
+    # `?refresh=1` is the wizard's "Refresh status" button: re-run detection AND
+    # probe the derived URL. Plain loads skip the probe.
+    return _plaid_settings_render(
+        flash_msg=request.args.get('flash', ''),
+        do_probe=(request.args.get('refresh') or '') == '1')
 
 
 @bp.post('/admin/plaid_settings')
@@ -4796,6 +5012,68 @@ def save_plaid_settings():
             sandbox_secret=sandbox_secret, production_secret=production_secret,
             sync_interval_hours=sync_interval)
     return redirect('/admin/plaid_settings?flash=Saved')
+
+
+# ── v0.7.0 · public-URL wizard actions ───────────────────────────────────────
+
+def _save_redirect_uri(hostname: str, *, remember_hostname: bool) -> str:
+    """Point PLAID_REDIRECT_URI at `hostname`'s OAuth callback. Returns the flash
+    message to show.
+
+    Idempotent: re-saving the value already stored writes the same bytes and
+    reports it, so double-clicking the button is harmless. `remember_hostname`
+    is False for the State A button — a hostname that came from the environment
+    should not be copied into the settings file, or clearing the env var later
+    would leave a phantom behind that looks locally configured."""
+    normalized = funnel.normalize_hostname(hostname)
+    if not normalized:
+        return ('That doesn\'t look like a public hostname. Expected something '
+                'like umbrel.tail1234.ts.net.')
+    uri = funnel.redirect_uri_for(normalized)
+    before = (ps.load().get('redirect_uri') or '').strip()
+    ps.save_public_url(
+        funnel_hostname=normalized if remember_hostname else None,
+        redirect_uri=uri)
+    if before == uri:
+        return f'Plaid Redirect URI is already {uri} — nothing changed.'
+    audit.record('plaid_public_url_saved',
+                 before={'redirect_uri': before},
+                 after={'redirect_uri': uri, 'funnel_hostname': normalized},
+                 notes='public-URL wizard')
+    return (f'Saved {uri} as this install\'s Plaid Redirect URI. Register the '
+            'same string in your Plaid dashboard (Developers → API → Allowed '
+            'redirect URIs) — Plaid compares it exactly.')
+
+
+@bp.post('/admin/plaid_settings/funnel/use')
+def funnel_use_detected():
+    """State A — adopt the detected public URL as the Plaid Redirect URI."""
+    return redirect('/admin/plaid_settings?flash=' + quote_plus(
+        _save_redirect_uri(request.form.get('hostname') or '',
+                           remember_hostname=False)) + '#public-url')
+
+
+@bp.post('/admin/plaid_settings/funnel/save')
+def funnel_save_manual():
+    """State B — the operator pasted a Funnel URL. Remember the hostname (so
+    detection reports State A from now on) and derive the redirect URI."""
+    return redirect('/admin/plaid_settings?flash=' + quote_plus(
+        _save_redirect_uri(request.form.get('hostname') or '',
+                           remember_hostname=True)) + '#public-url')
+
+
+@bp.post('/admin/plaid_settings/funnel/test')
+def funnel_test():
+    """HEAD the callback URL from inside this container and report what came
+    back. Never saves anything — a test the operator runs before committing."""
+    hostname = funnel.normalize_hostname(request.form.get('hostname') or '')
+    if not hostname:
+        return _plaid_settings_render(probe_result={
+            'ok': False, 'reachable': False, 'status': None, 'url': '',
+            'location': '',
+            'detail': 'Enter a hostname or URL to test — e.g. '
+                      'https://umbrel.tail1234.ts.net.'})
+    return _plaid_settings_render(probe_result=funnel.probe(hostname))
 
 
 # ── ERPNext settings ─────────────────────────────────────────────

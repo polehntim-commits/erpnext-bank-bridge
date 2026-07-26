@@ -84,6 +84,17 @@ class Config:
     # Optional — leave blank for the polling pilot. When set, Plaid POSTs
     # transaction-update webhooks here so a sync can fire sooner than 6h.
     PLAID_WEBHOOK_URL = os.environ.get('PLAID_WEBHOOK_URL', '').strip()
+    # ── v0.7.0 · public URL for Plaid OAuth (see app/funnel.py) ───────────
+    # The public hostname that fronts this app — e.g. `umbrel.tail1234.ts.net`
+    # once `tailscale funnel` is serving port 5202 on the Umbrel host. Set it as
+    # an Umbrel app override and the public-URL wizard on /admin/plaid_settings
+    # auto-detects, shows the exact redirect URI to register with Plaid, and can
+    # save it with one click. Leave blank and the wizard walks the operator
+    # through setting the Funnel up, then takes the URL by hand. Bank Bridge
+    # cannot discover this itself: it runs in a container with no access to the
+    # host's tailscaled socket. See docs/tailscale-funnel.md.
+    TAILSCALE_FUNNEL_HOSTNAME = os.environ.get(
+        'TAILSCALE_FUNNEL_HOSTNAME', '').strip()
 
     # ── ERPNext / Bank Transaction bridge ─────────────────────────────────
     # ERPNEXT_URL is Umbrel's app-proxy port for the ERPNext app (both apps on

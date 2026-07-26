@@ -28,8 +28,14 @@ _FILENAME = 'plaid_settings.json'
 # `sync_interval_hours` rides along in this same JSON blob (the sync-frequency
 # picker lives on the Plaid settings page). It's the background poll cadence in
 # hours; 0 = manual only. See app/sync_config.py.
+#
+# v0.7.0 — `funnel_hostname` too: the public hostname an operator pasted into the
+# Manual Entry field of the public-URL wizard (see app/funnel.py). It lives here
+# rather than in a file of its own because it is a Plaid-connection setting —
+# the redirect URI is derived from it — and one settings blob beats two.
 _FIELDS = ('client_id', 'sandbox_secret', 'production_secret',
-           'environment', 'redirect_uri', 'webhook_url', 'sync_interval_hours')
+           'environment', 'redirect_uri', 'webhook_url', 'sync_interval_hours',
+           'funnel_hostname')
 
 
 def _path() -> str:
@@ -51,6 +57,14 @@ def _defaults() -> dict:
         'webhook_url': (c.get('PLAID_WEBHOOK_URL') or '').strip(),
         'sync_interval_hours': sync_config.normalize_interval(
             c.get('SYNC_INTERVAL_HOURS', 24)),
+        # NOT seeded from TAILSCALE_FUNNEL_HOSTNAME on purpose. Every other
+        # field here follows "env seeds, persisted wins" — but for the Funnel
+        # hostname that ordering is backwards: the env var describes the
+        # machine's CURRENT Funnel config, so a persisted value from an older
+        # tailnet name would silently shadow it and produce a redirect URI that
+        # no longer resolves. funnel.detect() reads the env separately and
+        # prefers it, keeping this field purely "what the operator pasted".
+        'funnel_hostname': '',
     }
 
 
@@ -118,10 +132,38 @@ def save(client_id: str, environment: str, redirect_uri: str = '',
     if sync_interval_hours is not None:
         d['sync_interval_hours'] = sync_config.normalize_interval(
             sync_interval_hours)
+    return _write(d)
+
+
+def _write(d: dict) -> dict:
+    """Persist exactly the whitelisted _FIELDS from `d` and return it. Shared by
+    save() and save_public_url() so there is one writer, and a field added to
+    _FIELDS is persisted by both without a second edit."""
     os.makedirs(current_app.config['DATA_DIR'], exist_ok=True)
     with open(_path(), 'w', encoding='utf-8') as f:
-        json.dump({k: d[k] for k in _FIELDS}, f)
+        json.dump({k: d.get(k) for k in _FIELDS}, f)
     return d
+
+
+def save_public_url(funnel_hostname=None, redirect_uri=None) -> dict:
+    """v0.7.0 — persist just the public-URL fields, leaving every other Plaid
+    setting exactly as it was.
+
+    The public-URL wizard on /admin/plaid_settings is a separate form from the
+    credentials form, so it must not carry the client id or the secrets through a
+    round-trip to change one URL. Each argument is only written when it is not
+    None, which makes "save the hostname" and "save the redirect URI" independent
+    and makes re-saving the same value a no-op (idempotent, as the Use-this
+    button needs to be)."""
+    d = load()
+    if funnel_hostname is not None:
+        d['funnel_hostname'] = (funnel_hostname or '').strip()
+    if redirect_uri is not None:
+        d['redirect_uri'] = (redirect_uri or '').strip()
+        # A URL pasted on a pre-v0.4.8 path is normalized on the way in, exactly
+        # as the credentials form does it.
+        _migrate_plaid_urls(d)
+    return _write(d)
 
 
 def sync_interval_hours() -> int:

@@ -24,6 +24,13 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 - **Plaid Link OAuth flow** for secure bank connection — no bank credentials
   ever touch this app; Plaid holds them and returns a token.
+- **Guided public-URL setup** (v0.7.0) — OAuth needs a publicly-reachable HTTPS
+  callback, which on a LAN-only Umbrel means a tunnel. A wizard on
+  `/admin/plaid_settings` detects an existing Tailscale Funnel, shows the exact
+  redirect URI to register with Plaid, saves it in one click, and copies it to
+  the clipboard; if nothing is set up yet it prints the numbered commands and
+  takes the resulting URL by hand. See
+  [Public URL setup](#public-url-setup-via-tailscale-funnel-v070).
 - **Configurable automatic polling** via Plaid's cursor-based
   `/transactions/sync` — pick a cadence from cost-aware presets (hourly →
   monthly, or **manual only**) in the admin UI; **daily by default**. Plus an
@@ -2381,11 +2388,13 @@ extra setup, no auth needed.
 
 **2. Public HTTPS callback (required for production OAuth banks).** Production
 OAuth institutions (Wells Fargo, Chase, etc.) require an **`https://`** redirect
-URI that Plaid can reach from the public Internet. You expose **only** the
-callback paths — `/bankbridge/plaid/*` and `/bankbridge/api/plaid/*` — over HTTPS, while `/admin` and
-everything else stay on the LAN. See
-[Production Deployment](#production-deployment-https-for-plaid-oauth) for three
-ways to do this.
+URI that Plaid can reach from the public Internet. You expose **only** the OAuth
+callback — `/bankbridge/plaid/oauth_return` — over HTTPS, while `/admin` and
+everything else stay on the LAN. Start with the wizard in
+[Public URL setup](#public-url-setup-via-tailscale-funnel-v070) (v0.7.0), which
+walks you through it from the admin UI; see
+[Production Deployment](#production-deployment-https-for-plaid-oauth) for the
+full configs of all three options.
 
 > **When you expose the app publicly, enable admin auth.** Set
 > `ADMIN_BASIC_AUTH_USER` and `ADMIN_BASIC_AUTH_PASS` as a belt-and-suspenders
@@ -2400,6 +2409,70 @@ ways to do this.
 > The password may be stored as plaintext or as a `werkzeug` hash
 > (`generate_password_hash`). The Plaid callback and JSON API are **never** gated
 > by this — only `/admin` is.
+
+## Public URL setup via Tailscale Funnel (v0.7.0)
+
+Plaid OAuth banks redirect your browser to an `https://` URL that has to be
+reachable from the public Internet. Umbrel is LAN-only, so getting that URL used
+to mean an SSH session, four commands, and copying a string into two places
+without a typo. **v0.7.0 puts a guided wizard on `/admin/plaid_settings`** so the
+whole thing happens in the admin UI.
+
+Open **`/admin/plaid_settings`** → *Plaid Redirect URI — Public URL Setup*. It
+renders one of two states.
+
+**A public hostname is known** — it shows the detected public URL, the exact
+redirect URI to register with Plaid, whether that value is already saved on this
+install, and four buttons: **Use this as Plaid Redirect URI** (saves it,
+idempotently), **Copy Plaid dashboard URL** (clipboard, for pasting into Plaid's
+OAuth allowlist), **Test URL**, and **Refresh status**.
+
+**Nothing detected** — it explains why a public URL is needed and prints
+copy-paste-ready, numbered setup commands with your own port and path already
+filled in, then offers a **Manual entry** field: paste what
+`tailscale funnel status` gave you, **Test URL** to check reachability, **Save as
+Plaid Redirect URI** to commit. A bare hostname, an `https://` URL, or the whole
+redirect URI are all accepted and normalized.
+
+The short version of the commands the wizard prints:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh   # or the Umbrel Tailscale app
+sudo tailscale up                                  # authenticate to your tailnet
+
+# Serve ONLY the OAuth callback publicly. --bg persists across reboots.
+sudo tailscale funnel --bg --https=443 \
+  --set-path=/bankbridge/plaid/oauth_return http://127.0.0.1:5202
+
+sudo tailscale funnel status                       # prints your public hostname
+```
+
+> `--set-path` is not optional pedantry. `tailscale funnel --bg 5202` is one
+> command but publishes the *whole* app — `/admin` plus four unauthenticated
+> Plaid write endpoints. See [Restricting Tailscale Funnel to the OAuth callback
+> only](#restricting-tailscale-funnel-to-the-oauth-callback-only).
+
+### Auto-detection
+
+Bank Bridge runs in a container with no access to the host's `tailscaled` socket,
+so it cannot discover the Funnel hostname on its own (bind-mounting the socket
+was considered and rejected for v0.7.0 — container privileges plus
+cross-install fragility). Set **`TAILSCALE_FUNNEL_HOSTNAME`** in your Umbrel app
+override instead and the wizard detects it on the next restart:
+
+```yaml
+services:
+  server:
+    environment:
+      TAILSCALE_FUNNEL_HOSTNAME: "umbrel.tail1234.ts.net"
+```
+
+The env var wins over a hostname saved through Manual Entry — it describes the
+machine's *current* Funnel, so a stale saved value must not shadow it — and when
+the two disagree the wizard shows both rather than hiding the mismatch.
+
+**Deep-dive, alternatives (Cloudflare Tunnel, ngrok, port-forward + DDNS), reboot
+persistence, ACL requirements and troubleshooting: [`docs/tailscale-funnel.md`](docs/tailscale-funnel.md).**
 
 ## Production Deployment (HTTPS for Plaid OAuth)
 
@@ -2983,6 +3056,7 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `PLAID_ENV` | `sandbox` | `sandbox` \| `production` |
 | `PLAID_REDIRECT_URI` | `http://umbrel.local:5202/bankbridge/plaid/oauth_return` | must match the Plaid dashboard |
 | `PLAID_WEBHOOK_URL` | "" | optional; polling is enough |
+| `TAILSCALE_FUNNEL_HOSTNAME` | "" | v0.7.0 · public hostname fronting this app (e.g. `umbrel.tail1234.ts.net`). Set it and the public-URL wizard on `/admin/plaid_settings` auto-detects and can save the redirect URI in one click. Wins over a hostname saved via Manual Entry. See [`docs/tailscale-funnel.md`](docs/tailscale-funnel.md) |
 | `ERPNEXT_URL` | `http://umbrel.local:5300` | ERPNext base URL |
 | `ERPNEXT_API_KEY` / `ERPNEXT_API_SECRET` | "" | System Manager API pair |
 | `ERPNEXT_DEFAULT_COMPANY` | "" | company set on imported Bank Accounts; transaction company comes from the Bank Account |
@@ -3206,6 +3280,10 @@ authoring time~~ (v0.4.6). ~~Disconnect a linked bank from the admin UI via
 Plaid `/item/remove`, retaining all history~~ (v0.4.7). ~~Bank statement PDFs
 with per-month reconciliation against the mirrored transactions, and
 statement-sourced opening balances gated on that reconciliation~~ (v0.4.9).
+~~Guided public-URL setup for Plaid OAuth: Tailscale Funnel detection, the exact
+redirect URI to register, one-click save, clipboard copy and a reachability
+probe, so getting a public HTTPS callback no longer needs an SSH session~~
+(v0.7.0).
 
 ## Compliance and disclosure
 

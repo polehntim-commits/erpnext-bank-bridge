@@ -60,6 +60,11 @@ EVENT_TYPES = (
     # like every event here: the Item row survives the disconnect, so this line
     # is the record of WHO stopped the feed and WHEN.
     'item_disconnected',
+    # v0.7.0 — the OAuth redirect URI / public Funnel hostname changed from the
+    # public-URL wizard. Worth a permanent line: a redirect URI that stops
+    # matching the Plaid dashboard breaks every OAuth bank link at once, and this
+    # is the record of what it was before and who changed it.
+    'plaid_public_url_saved',
 )
 
 SUBJECT_TYPES = ('Supplier', 'CategorizationRule', 'GeneratedJournalEntry',
