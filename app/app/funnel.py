@@ -8,23 +8,31 @@ docs/tailscale-funnel.md). Everything this module does exists to get the
 operator from "I have no public URL" to "this exact string is registered in my
 Plaid dashboard" without an SSH session.
 
-WHY DETECTION IS INDIRECT. Bank Bridge runs in a container with no access to
-the host's `tailscaled` socket, so it cannot ask Tailscale anything. Bind-mounting
-`/var/run/tailscale/tailscaled.sock` was considered and REJECTED for v0.7.0: it
-adds container privileges, and the socket path/permissions vary across Umbrel
-installs, so it would fail differently on every box. Instead we take the
-hostname from one of two places, in this order:
+WHERE THE HOSTNAME COMES FROM, in priority order:
 
+  0. THE SIDECAR (v0.7.1). When Tailscale runs in Bank Bridge's own compose
+     sharing its network namespace, we can ask it directly — and enable Funnel
+     for the operator with one button instead of an SSH session. See
+     app/tailscale_sidecar.py. Highest priority because it is the only source
+     that is measured rather than declared: it reports what the daemon on this
+     box is actually serving right now.
   1. `TAILSCALE_FUNNEL_HOSTNAME` in the environment (an Umbrel app override) —
      the ops-layer answer, set once by whoever configured the Funnel.
   2. `funnel_hostname` persisted in plaid_settings.json — what the operator
      pasted into the Manual Entry field on /admin/plaid_settings.
 
-Env wins because it tracks the machine's actual Funnel config; a stale saved
-value must not shadow it. But the saved value is NEVER silently discarded — when
-the two disagree, detect() reports both and the admin page shows the conflict, so
-a renamed tailnet reads as a visible mismatch rather than a redirect URI that
-mysteriously stopped matching.
+Env beats the persisted value because it tracks the machine's actual Funnel
+config; a stale saved value must not shadow it. But the saved value is NEVER
+silently discarded — when the two disagree, detect() reports both and the admin
+page shows the conflict, so a renamed tailnet reads as a visible mismatch rather
+than a redirect URI that mysteriously stopped matching.
+
+WHY TIERS 1 AND 2 SURVIVED v0.7.1. The sidecar is strictly better when present,
+but it is not always present: an install can front Bank Bridge with Cloudflare
+Tunnel, or run Tailscale on the host in a setup where Funnel does reach port
+5202, or simply not have added the sidecar yet. Every one of those keeps working
+untouched, which is also what makes the 0.7.0 → 0.7.1 upgrade a no-op for an
+operator who has already got a working URL.
 
 WHAT WE NEVER DO IS TRUST A HOSTNAME AS TYPED. Everything is normalized through
 normalize_hostname() and re-validated on read, so the only URL this module can
@@ -42,6 +50,7 @@ from flask import current_app
 
 from . import legacy_paths
 from . import plaid_settings
+from . import tailscale_sidecar
 
 log = logging.getLogger('bankbridge.funnel')
 
@@ -163,27 +172,69 @@ def saved_hostname() -> str:
     return normalize_hostname(plaid_settings.load().get('funnel_hostname'))
 
 
-def detect(probe_url: bool = False) -> dict:
+def sidecar_hostname(sidecar: dict) -> str:
+    """The FQDN the sidecar reports, normalized. '' when there is no sidecar or
+    the LocalAPI read didn't land."""
+    return normalize_hostname(sidecar.get('hostname'))
+
+
+def _mode(sidecar: dict, hostname: str) -> str:
+    """Which of the five wizard states to render.
+
+    Named separately from `state` so v0.7.0's two-state contract survives intact
+    — `state` still answers only "do we have a URL" — while the template gets
+    the finer distinction the sidecar makes possible.
+
+      sidecar_funnel  the sidecar is serving publicly and we know the URL
+      sidecar_ready   authenticated, one button away from public
+      sidecar_unauth  running but no TS_AUTHKEY — the fresh-install state
+      manual          no sidecar, but a hostname from env or Manual Entry
+      none            nothing at all (v0.7.0 State B)"""
+    if not sidecar.get('present'):
+        return 'manual' if hostname else 'none'
+    if not sidecar.get('authenticated'):
+        return 'sidecar_unauth'
+    # Funnel on AND a hostname to show. Funnel on without one lands in
+    # sidecar_ready, whose template explains that it is serving but unnamed —
+    # better than offering a URL we'd have to leave blank.
+    if sidecar.get('funnel_active') and hostname:
+        return 'sidecar_funnel'
+    return 'sidecar_ready'
+
+
+def detect(probe_url: bool = False, sidecar_status: dict | None = None) -> dict:
     """Everything /admin/plaid_settings needs to render the public-URL section.
 
-    `state` is 'configured' when we have a hostname from either source (the
-    spec's State A) and 'unconfigured' otherwise (State B). Set `probe_url` to
-    also HEAD the derived callback — off by default so an ordinary page load
-    never waits on the network, on when the operator clicks Refresh status."""
+    `state` is 'configured' when we have a hostname from any source (the v0.7.0
+    State A) and 'unconfigured' otherwise (State B) — unchanged. `mode` adds the
+    v0.7.1 five-way split; see _mode(). Set `probe_url` to also HEAD the derived
+    callback — off by default so an ordinary page load never waits on the
+    network, on when the operator clicks Refresh status. Pass `sidecar_status` to
+    reuse a reading the caller already took (the enable/disable handlers do, so
+    the page reflects the write they just made)."""
+    sidecar = (tailscale_sidecar.status() if sidecar_status is None
+               else sidecar_status)
+    from_sidecar = sidecar_hostname(sidecar)
     env = env_hostname()
     saved = saved_hostname()
-    hostname = env or saved
-    source = 'env' if env else ('saved' if saved else '')
+    hostname = from_sidecar or env or saved
+    source = ('sidecar' if from_sidecar else
+              'env' if env else 'saved' if saved else '')
     current = (plaid_settings.load().get('redirect_uri') or '').strip()
     derived = redirect_uri_for(hostname)
     out = {
         'state': 'configured' if hostname else 'unconfigured',
+        'mode': _mode(sidecar, hostname),
         'hostname': hostname,
         'source': source,
+        'sidecar': sidecar,
+        'sidecar_hostname': from_sidecar,
         'env_hostname': env,
         'saved_hostname': saved,
-        # Both sources set and disagreeing: env wins, but the operator is told,
-        # because the usual cause is a renamed tailnet and a stale saved value.
+        # env vs saved disagreeing: env wins, but the operator is told, because
+        # the usual cause is a renamed tailnet and a stale saved value. A sidecar
+        # reading is measured rather than declared, so it simply outranks both
+        # and is not part of this comparison.
         'conflict': bool(env and saved and env != saved),
         'base_url': base_url(hostname),
         'redirect_uri': derived,
@@ -197,6 +248,65 @@ def detect(probe_url: bool = False) -> dict:
     if probe_url and derived:
         out['probe'] = probe(hostname)
     return out
+
+
+# ── the two actions, shared by the admin UI and the MCP tools ────────────────
+
+def enable_public_url() -> dict:
+    """Turn on Funnel for the OAuth callback and save the resulting redirect URI.
+
+    Returns {ok, url, hostname, saved, detail, sidecar}. The one interesting
+    failure is partial success: the Funnel is genuinely enabled but the FQDN
+    hasn't surfaced yet (tailscaled substitutes ${TS_CERT_DOMAIN} internally, and
+    the LocalAPI read is best-effort). That reports ok=True with url=None and
+    says to hit Refresh — claiming failure would be wrong and would tempt the
+    operator into enabling it twice."""
+    sidecar = tailscale_sidecar.status(force=True)
+    if not sidecar.get('present'):
+        return {'ok': False, 'url': None, 'hostname': '', 'saved': False,
+                'sidecar': sidecar,
+                'detail': 'No Tailscale sidecar is running in this app. Add the '
+                          'tailscale service to your compose (v0.7.1) or set up '
+                          'a public URL by hand.'}
+    if not sidecar.get('authenticated'):
+        return {'ok': False, 'url': None, 'hostname': '', 'saved': False,
+                'sidecar': sidecar,
+                'detail': 'The Tailscale sidecar is running but not '
+                          'authenticated. Set TS_AUTHKEY in your Umbrel app '
+                          'override and restart the app.'}
+    sidecar = tailscale_sidecar.enable_funnel(APP_PROXY_PORT, OAUTH_RETURN_PATH)
+    hostname = sidecar_hostname(sidecar) or env_hostname() or saved_hostname()
+    if not hostname:
+        return {'ok': True, 'url': None, 'hostname': '', 'saved': False,
+                'sidecar': sidecar,
+                'detail': 'Funnel enabled, but the tailnet hostname is not '
+                          'known yet — it can take a few seconds to appear. '
+                          'Click Refresh status, or paste the hostname below.'}
+    uri = redirect_uri_for(hostname)
+    plaid_settings.save_public_url(redirect_uri=uri)
+    return {'ok': True, 'url': uri, 'hostname': hostname, 'saved': True,
+            'sidecar': sidecar,
+            'detail': f'Public URL enabled and saved as {uri}. Register that '
+                      'exact string in your Plaid dashboard (Developers → API → '
+                      'Allowed redirect URIs).'}
+
+
+def disable_public_url() -> dict:
+    """Stop serving the callback publicly.
+
+    Leaves PLAID_REDIRECT_URI alone on purpose. It is still the string
+    registered in the operator's Plaid dashboard, and blanking it here would
+    turn one reversible click into a two-place re-registration. Disable is for
+    closing the public door for a while, not for forgetting the address."""
+    sidecar = tailscale_sidecar.status(force=True)
+    if not sidecar.get('present'):
+        return {'ok': False, 'sidecar': sidecar,
+                'detail': 'No Tailscale sidecar is running in this app.'}
+    sidecar = tailscale_sidecar.disable_funnel(APP_PROXY_PORT, OAUTH_RETURN_PATH)
+    return {'ok': True, 'sidecar': sidecar,
+            'detail': 'Public URL disabled — the callback is no longer served '
+                      'over the Internet. Your saved Plaid Redirect URI is '
+                      'unchanged, so re-enabling needs no dashboard edit.'}
 
 
 # ── reachability probe ───────────────────────────────────────────────────────

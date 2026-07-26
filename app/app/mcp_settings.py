@@ -40,6 +40,12 @@ _DEFAULTS = {
     'pair_accounts': False,
     'enable_je_posting': False,
     'disable_je_posting': False,
+    # v0.7.1 — these two change what is reachable from the public Internet, so
+    # they are the most consequential switches on this list and default OFF like
+    # the rest. enable_public_url publishes the OAuth callback; disable_public_url
+    # withdraws it, which breaks OAuth re-links until it is turned back on.
+    'enable_public_url': False,
+    'disable_public_url': False,
 }
 
 _FIELDS = tuple(_DEFAULTS.keys())

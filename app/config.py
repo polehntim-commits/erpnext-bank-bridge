@@ -95,6 +95,37 @@ class Config:
     # host's tailscaled socket. See docs/tailscale-funnel.md.
     TAILSCALE_FUNNEL_HOSTNAME = os.environ.get(
         'TAILSCALE_FUNNEL_HOSTNAME', '').strip()
+    # ── v0.7.1 · the Tailscale sidecar (see app/tailscale_sidecar.py) ─────
+    # v0.7.0 asked the operator to run `tailscale funnel` on the host. That is
+    # impossible on an Umbrel using the Tailscale community app: Funnel only
+    # proxies to its own localhost, and that container's localhost is not Bank
+    # Bridge ("only localhost or 127.0.0.1 proxies are currently supported").
+    # v0.7.1 ships Tailscale in Bank Bridge's own compose sharing its network
+    # namespace, so the daemon's 127.0.0.1 IS us — and Funnel becomes one click.
+    #   * master switch. False → no sidecar probing at all, and the wizard
+    #     behaves exactly as it did in v0.7.0. For an install fronted by
+    #     Cloudflare Tunnel or a host-level proxy that doesn't want the probe.
+    TAILSCALE_SIDECAR_ENABLED = _bool('TAILSCALE_SIDECAR_ENABLED', True)
+    #   * where the sidecar serves /healthz (TS_LOCAL_ADDR_PORT in its own env —
+    #     keep the two in sync). Shared localhost, so this is how we tell
+    #     "no sidecar" from "sidecar with no TS_AUTHKEY": 200 = has a tailnet IP,
+    #     503 = running but not logged in, refused = not there.
+    TAILSCALE_LOCAL_ADDR_PORT = os.environ.get(
+        'TAILSCALE_LOCAL_ADDR_PORT', '127.0.0.1:41414').strip() \
+        or '127.0.0.1:41414'
+    #   * the sidecar's LocalAPI unix socket, shared through a volume. Used ONLY
+    #     to learn the tailnet FQDN, which nothing else can tell us. Tailscale
+    #     state this API is undocumented, so every read is best-effort and a
+    #     failure degrades to the env var / paste-it-in paths.
+    TAILSCALE_SOCKET = os.environ.get(
+        'TAILSCALE_SOCKET', '/var/run/tailscale/tailscaled.sock').strip() \
+        or '/var/run/tailscale/tailscaled.sock'
+    #   * the serve config the sidecar watches (its TS_SERVE_CONFIG). Writing
+    #     this file is how Funnel is enabled and disabled — declarative, so it
+    #     survives a sidecar restart, which a LocalAPI POST would not.
+    TAILSCALE_SERVE_CONFIG = os.environ.get(
+        'TAILSCALE_SERVE_CONFIG', '/config/serve.json').strip() \
+        or '/config/serve.json'
 
     # ── ERPNext / Bank Transaction bridge ─────────────────────────────────
     # ERPNEXT_URL is Umbrel's app-proxy port for the ERPNext app (both apps on

@@ -27,7 +27,7 @@ from unittest import mock
 os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 
 from app import create_app, crypto, db  # noqa: E402
-from app import funnel, plaid_settings  # noqa: E402
+from app import funnel, plaid_settings, tailscale_sidecar  # noqa: E402
 from app.models import AuditEvent  # noqa: E402
 
 HOST = 'umbrel.tail1234.ts.net'
@@ -47,6 +47,13 @@ class FunnelBase(unittest.TestCase):
             # Explicit blank so a real TAILSCALE_FUNNEL_HOSTNAME in the
             # developer's environment can't leak into these assertions.
             'TAILSCALE_FUNNEL_HOSTNAME': '',
+            # v0.7.1 — this file is the NO-SIDECAR contract: everything here
+            # asserts the env-var / paste-it-in behaviour v0.7.0 shipped, which
+            # must keep working for an install that has no Tailscale sidecar.
+            # Off explicitly so no test here touches the network probing for one,
+            # and so a developer running a real sidecar can still run this suite.
+            # Sidecar-present behaviour lives in test_tailscale_sidecar.py.
+            'TAILSCALE_SIDECAR_ENABLED': False,
         })
         self.client = self.app.test_client()
         self.ctx = self.app.app_context()
@@ -56,9 +63,13 @@ class FunnelBase(unittest.TestCase):
             os.environ, {'TAILSCALE_FUNNEL_HOSTNAME': ''})
         self._env_patch.start()
         plaid_settings._LOGGED_URL_MIGRATIONS.clear()
+        # The sidecar status cache is module-level, so a reading from a previous
+        # test would otherwise leak into this one.
+        tailscale_sidecar.reset_cache()
 
     def tearDown(self):
         self._env_patch.stop()
+        tailscale_sidecar.reset_cache()
         db.session.remove()
         db.engine.dispose()
         self.ctx.pop()
@@ -168,6 +179,18 @@ class DetectionTest(FunnelBase):
         self.assertEqual('', d['hostname'])
         self.assertEqual('', d['source'])
         self.assertEqual('', d['redirect_uri'])
+
+    def test_with_no_sidecar_the_v070_modes_are_reported(self):
+        """v0.7.1 added `mode` without disturbing `state`. With the sidecar off,
+        the only two reachable modes are the v0.7.0 pair."""
+        self.assertEqual('none', funnel.detect()['mode'])
+        self._set_env_hostname(HOST)
+        self.assertEqual('manual', funnel.detect()['mode'])
+
+    def test_a_disabled_sidecar_is_never_probed(self):
+        with mock.patch.object(tailscale_sidecar, '_health') as health:
+            funnel.detect()
+        health.assert_not_called()
 
     def test_env_var_alone_is_state_a(self):
         self._set_env_hostname(HOST)
@@ -716,10 +739,9 @@ class RefreshStatusTest(FunnelBase):
         self.assertIn('No public URL yet', r.data.decode())
 
 
-class VersionTest(unittest.TestCase):
-    def test_version_is_bumped(self):
-        import app as app_pkg
-        self.assertEqual('0.7.0', app_pkg.__version__)
+# The current-version assertion lives in test_tailscale_sidecar.py (the newest
+# release's suite) — pinning it in two files means every bump edits two files and
+# one of them gets forgotten.
 
 
 if __name__ == '__main__':  # pragma: no cover

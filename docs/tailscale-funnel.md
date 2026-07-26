@@ -3,9 +3,162 @@
 **Applies to:** Bank Bridge v0.7.0 and later
 **Wizard:** `/admin/plaid_settings` → *Plaid Redirect URI — Public URL Setup*
 
-This is the deep-dive. If you just want to get it working, open the wizard on
-`/admin/plaid_settings` and follow the numbered steps it prints — it fills in
-your own port and path and can save the resulting URI for you.
+This is the deep-dive. If you just want to get it working: on **v0.7.1+** supply
+one Tailscale auth key and click one button — see
+[Sidecar mode](#0-sidecar-mode-v071-recommended). Everything after that section
+is the manual path, the alternatives, and the reference material.
+
+---
+
+## 0. Sidecar mode (v0.7.1, recommended)
+
+### Why this exists
+
+v0.7.0 asked you to run `tailscale funnel` on the Umbrel host. On a box using
+Umbrel's Tailscale community app, that cannot work:
+
+```
+error: failed apply web serve: only localhost or 127.0.0.1 proxies are
+currently supported
+```
+
+Funnel will only proxy to **its own** localhost, and Umbrel's Tailscale app runs
+Tailscale in its own container — whose localhost is not Bank Bridge. No flag
+fixes this. The daemon has to be in Bank Bridge's network namespace.
+
+So v0.7.1 ships Tailscale **inside Bank Bridge's own compose**, with
+`network_mode: "service:server"`. The sidecar's `127.0.0.1:5202` is then our own
+gunicorn, and Funnel proxies to it happily.
+
+This is additive. If you already have a working public URL via
+`TAILSCALE_FUNNEL_HOSTNAME` or a pasted hostname, or you front Bank Bridge with
+Cloudflare Tunnel, **nothing changes for you** — those paths are untouched.
+
+### Setup
+
+**One value is required: a Tailscale auth key.**
+
+1. Go to <https://login.tailscale.com/admin/settings/keys> → **Generate auth
+   key**. Make it **reusable** — the sidecar re-authenticates whenever it
+   restarts, and a single-use key would leave it stranded after the first
+   restart.
+2. Set it in your Umbrel app override for `fafo-bank-bridge`:
+
+   ```yaml
+   services:
+     tailscale:
+       environment:
+         TS_AUTHKEY: "tskey-auth-…"
+   ```
+3. Restart the app.
+4. Open `/admin/plaid_settings` → *Plaid Redirect URI — Public URL Setup* and
+   click **Enable Public URL**.
+
+That's it. The button writes the serve config, Tailscale provisions the HTTPS
+certificate, and the resulting redirect URI is saved as your
+`PLAID_REDIRECT_URI`.
+
+5. Click **Copy Plaid dashboard URL** and paste that exact string into the Plaid
+   dashboard under **Developers → API → Allowed redirect URIs**. Bank Bridge
+   cannot do this step for you — it is on Plaid's side.
+
+> **Alternative to the auth key.** If you'd rather not mint one, the wizard also
+> surfaces a **one-time browser login link** when the sidecar is unauthenticated
+> (the daemon reports it as `AuthURL`). Click it, approve the machine in
+> Tailscale, come back and hit **Refresh status**. Convenient, but the link is
+> single-use and changes on every sidecar restart — for something that survives
+> restarts unattended, use the auth key.
+
+### What the wizard shows you, state by state
+
+| State | What you see | What to do |
+| --- | --- | --- |
+| **No sidecar** (`mode: none` / `manual`) | The v0.7.0 guided flow: numbered `tailscale funnel` commands and a Manual Entry field | Add the sidecar, or keep using the manual path |
+| **Sidecar unauthenticated** (`sidecar_unauth`) | "Tailscale sidecar is running but needs authentication", the one-time login link if offered, and the `TS_AUTHKEY` steps | Supply a key or click the link, then Refresh status |
+| **Sidecar ready** (`sidecar_ready`) | "authenticated", the tailnet hostname, and a single **Enable Public URL** button | Click it |
+| **Funnel active** (`sidecar_funnel`) | The public URL, the exact redirect URI, whether it's already saved, and **Use this / Copy / Test URL / Refresh / Disable Funnel** | Copy the URI into your Plaid dashboard |
+
+An unauthenticated sidecar is a **normal, harmless state** — it idles, `/healthz`
+answers 503, and nothing else in Bank Bridge is affected. That is what makes
+upgrading to v0.7.1 safe before you have supplied a key.
+
+### How it works underneath
+
+Three channels, each chosen for a different reason:
+
+| Purpose | Mechanism | Why this one |
+| --- | --- | --- |
+| Enable / disable Funnel | Write the **serve config file** (`TS_SERVE_CONFIG`), which containerboot watches and re-applies | Declarative, so it survives a sidecar restart. A LocalAPI POST is runtime state and would be silently reverted on the next restart. |
+| Is there a sidecar, is it logged in | **`/healthz`** on `TS_LOCAL_ADDR_PORT` (shared localhost) | Documented and precise: 200 = has a tailnet IP, 503 = running but not logged in, refused = absent. No socket, no token. |
+| The tailnet FQDN | **LocalAPI** over a shared unix socket | Nothing else knows it — `${TS_CERT_DOMAIN}` is substituted inside tailscaled. Tailscale state this API is undocumented, so every read is best-effort. |
+
+The serve config Bank Bridge writes:
+
+```json
+{
+  "TCP": { "443": { "HTTPS": true } },
+  "Web": {
+    "${TS_CERT_DOMAIN}:443": {
+      "Handlers": {
+        "/bankbridge/plaid/oauth_return": { "Proxy": "http://127.0.0.1:5202" }
+      }
+    }
+  },
+  "AllowFunnel": { "${TS_CERT_DOMAIN}:443": true }
+}
+```
+
+Note what it does **not** contain: a `/` handler. Only the OAuth callback is
+published; `/admin` and the four unauthenticated Plaid write endpoints stay on
+your LAN. `${TS_CERT_DOMAIN}` keeps the file portable across tailnets, so moving
+the data volume doesn't require editing it.
+
+**Disable Funnel** rewrites the same file with `AllowFunnel: false`. That leaves
+a valid tailnet-only Serve, and deliberately leaves your saved
+`PLAID_REDIRECT_URI` alone — it is still what your Plaid dashboard has
+registered, so re-enabling needs no dashboard edit.
+
+### AI / MCP control
+
+Four MCP tools cover the same ground (see the README's MCP section):
+
+- `get_public_url_status` — read-only; the full tri-state including `auth_url`
+- `test_public_url` — read-only; HEAD the callback
+- `enable_public_url` — **mutating**, kill switch defaults **OFF**
+- `disable_public_url` — **mutating**, kill switch defaults **OFF**
+
+The two mutating tools change what the *public Internet* can reach, so they are
+the most consequential switches on `/admin/mcp`. Both are off until you turn them
+on.
+
+### Sidecar troubleshooting
+
+**Wizard says "needs authentication" after I set `TS_AUTHKEY`.**
+The key is read at container start — restart the app. If it persists, the key was
+probably single-use and already consumed, or expired; generate a reusable one.
+
+**The node appears in Tailscale as a duplicate on every restart.**
+The `${APP_DATA_DIR}/tailscale/state` volume isn't persisting. Node identity
+lives there; without it the sidecar re-registers as a new machine each boot.
+
+**"Sidecar ready" but the hostname is blank.**
+The LocalAPI read didn't land — usually the
+`${APP_DATA_DIR}/tailscale/run:/var/run/tailscale` mount. Harmless: set
+`TAILSCALE_FUNNEL_HOSTNAME` or paste the hostname in Manual Entry and everything
+else works. (Note this mount cannot work on Docker Desktop for Mac, which does
+not carry unix sockets across a bind mount. Umbrel is Linux, where it does.)
+
+**Enable Public URL succeeded but reported no URL.**
+Funnel really is on; the FQDN just hadn't surfaced yet. Click **Refresh status**.
+Don't click Enable again — it's idempotent, but there's nothing to fix.
+
+**Recreating the app breaks the sidecar.**
+`network_mode: "service:server"` means the sidecar lives in the server's network
+namespace, so recreating `server` destroys it. `restart: on-failure` brings the
+sidecar back; if it stays down, restart the app.
+
+**Funnel still refuses.** Funnel is a tailnet-wide ACL capability — see
+[Troubleshooting](#6-troubleshooting) below. The sidecar cannot work around it.
 
 ---
 
@@ -69,15 +222,22 @@ path costs you nothing. Every option below shows the path-restricted form.
 
 | Option | Cost | You need | HTTPS cert | Path restriction | Survives reboot |
 | --- | --- | --- | --- | --- | --- |
-| **Tailscale Funnel** *(recommended)* | Free | Tailscale account | Automatic | Yes (`--set-path`) | Yes (`--bg`) |
+| **Sidecar mode** *(v0.7.1, recommended)* | Free | Tailscale account + an auth key | Automatic | Yes (serve config) | Yes |
+| Tailscale Funnel on the host | Free | Tailscale account, and a host install Funnel can reach port 5202 from | Automatic | Yes (`--set-path`) | Yes (`--bg`) |
 | Cloudflare Tunnel | Free | Cloudflare account + a domain on CF DNS | Automatic | Yes (`ingress` rules) | Yes (as a service) |
 | ngrok | Free tier / paid | ngrok account | Automatic | Partial | Free tier: **no** — URL changes |
 | Port-forward + DDNS | Free | Router access, DDNS provider, certbot | You manage it | Yes (nginx `location =`) | Yes |
 
-**Recommendation: Tailscale Funnel.** No port forwarding, no DNS, no
-certificate management, no inbound firewall hole, a stable hostname, and
-first-class path restriction. Umbrel also ships a Tailscale community app, so
-most operators already have the daemon on the box.
+**Recommendation: sidecar mode** ([§0](#0-sidecar-mode-v071-recommended)). No
+port forwarding, no DNS, no certificate management, no inbound firewall hole, a
+stable hostname, first-class path restriction — and it is the only Tailscale
+option that works on an Umbrel whose Tailscale runs as a separate community app,
+because Funnel only proxies to its own localhost.
+
+**Host-level Tailscale Funnel** (§3) is the v0.7.0 path and still correct if
+Tailscale is installed directly on the host *and* can reach port 5202 as its own
+localhost. If you get `only localhost or 127.0.0.1 proxies are currently
+supported`, you need sidecar mode instead.
 
 **ngrok is a poor fit** for anything but a one-off test: on the free tier the
 URL changes every restart, and a redirect URI that changes means re-registering
@@ -92,7 +252,13 @@ for the nginx config.
 
 ---
 
-## 3. Tailscale Funnel, step by step
+## 3. Host-level Tailscale Funnel, step by step
+
+> This is the **manual** path (v0.7.0). It only works if Tailscale is installed
+> on the host itself and Funnel can reach port 5202 as its own localhost. If
+> Tailscale runs as a separate Umbrel app, use
+> [sidecar mode](#0-sidecar-mode-v071-recommended) — this will fail with
+> `only localhost or 127.0.0.1 proxies are currently supported`.
 
 ### Prerequisites
 

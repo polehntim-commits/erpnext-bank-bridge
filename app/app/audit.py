@@ -65,6 +65,10 @@ EVENT_TYPES = (
     # matching the Plaid dashboard breaks every OAuth bank link at once, and this
     # is the record of what it was before and who changed it.
     'plaid_public_url_saved',
+    # v0.7.1 — the operator closed the public door on the OAuth callback via the
+    # Tailscale sidecar. Paired with plaid_public_url_saved so the trail shows
+    # every window in which the callback was actually reachable from the Internet.
+    'plaid_public_url_disabled',
 )
 
 SUBJECT_TYPES = ('Supplier', 'CategorizationRule', 'GeneratedJournalEntry',

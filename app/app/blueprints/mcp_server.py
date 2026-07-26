@@ -305,6 +305,84 @@ def _disable_je_posting(args: dict):
     return _set_je_posting(args, False)
 
 
+# ── v0.7.1 · the public OAuth callback (Tailscale sidecar) ──────────────────
+def _get_public_url_status(args: dict):
+    """The tri-state the /admin/plaid_settings wizard renders, as data."""
+    from .. import funnel
+    d = funnel.detect()
+    sc = d['sidecar']
+    result = {
+        'mode': d['mode'],
+        'sidecar_present': bool(sc.get('present')),
+        'sidecar_authenticated': bool(sc.get('authenticated')),
+        'funnel_active': bool(sc.get('funnel_active')),
+        'hostname': d['hostname'],
+        'hostname_source': d['source'],
+        'public_url': d['base_url'] or None,
+        'redirect_uri': d['redirect_uri'] or None,
+        'saved_redirect_uri': d['current_redirect_uri'] or None,
+        'redirect_uri_matches': d['redirect_uri_matches'],
+        'localapi_ok': bool(sc.get('localapi_ok')),
+        'backend_state': sc.get('backend_state') or '',
+        # Present only when the sidecar is unauthenticated: a one-time browser
+        # login link. Relaying it is the fastest fix an assistant can offer, and
+        # it is not a credential — it authorizes nothing without the operator
+        # approving this machine in their own Tailscale session.
+        'auth_url': sc.get('auth_url') or None,
+    }
+    return result, (f"mode={result['mode']} funnel_active="
+                    f"{result['funnel_active']} host="
+                    f"{result['hostname'] or '(unknown)'}")
+
+
+def _test_public_url(args: dict):
+    """HEAD the callback and report reachability. Read-only."""
+    from .. import funnel
+    d = funnel.detect()
+    if not d['hostname']:
+        raise ToolError('no public hostname is configured — nothing to test')
+    probe = funnel.probe(d['hostname'])
+    result = {'url': probe['url'], 'ok': probe['ok'],
+              'reachable': probe['reachable'], 'status': probe['status'],
+              'detail': probe['detail'],
+              'funnel_active': bool(d['sidecar'].get('funnel_active'))}
+    return result, f"{probe['url']}: {probe['detail']}"
+
+
+def _enable_public_url(args: dict):
+    """Enable Funnel for the OAuth callback and save the redirect URI."""
+    from .. import audit
+    from .. import funnel
+    r = funnel.enable_public_url()
+    if not r['ok']:
+        raise ToolError(r['detail'])
+    if r.get('saved'):
+        audit.record('plaid_public_url_saved',
+                     after={'redirect_uri': r['url'],
+                            'funnel_hostname': r['hostname'],
+                            'source': 'tailscale_sidecar'},
+                     notes='MCP enable_public_url', actor='mcp')
+    return ({'url': r['url'], 'hostname': r['hostname'],
+             'saved_as_redirect_uri': r['saved'], 'detail': r['detail'],
+             'register_in_plaid_dashboard': r['url']},
+            r['detail'])
+
+
+def _disable_public_url(args: dict):
+    """Withdraw the public callback. Leaves PLAID_REDIRECT_URI in place."""
+    from .. import audit
+    from .. import funnel
+    r = funnel.disable_public_url()
+    if not r['ok']:
+        raise ToolError(r['detail'])
+    audit.record('plaid_public_url_disabled',
+                 before={'funnel_active': True},
+                 after={'funnel_active': False},
+                 notes='MCP disable_public_url', actor='mcp')
+    return ({'funnel_active': False, 'detail': r['detail'],
+             'saved_redirect_uri_unchanged': True}, r['detail'])
+
+
 def _set_je_posting(args: dict, on: bool):
     item = PlaidItem.query.filter_by(item_id=(args.get('item_id') or '')).first()
     if item is None:
@@ -387,6 +465,24 @@ TOOLS = {
             'Read-only.',
             {'agreement_id': {'type': 'integer'}}),
         'handler': _get_advisory_agreement_summary},
+    'get_public_url_status': {
+        **_tool(
+            'Whether the Plaid OAuth callback is reachable from the public '
+            'Internet, and how. Returns mode (sidecar_funnel | sidecar_ready | '
+            'sidecar_unauth | manual | none), whether the Tailscale sidecar is '
+            'present and authenticated, whether Funnel is active, the public '
+            'hostname and the redirect URI Plaid must have registered. '
+            'Read-only.',
+            {}),
+        'handler': _get_public_url_status},
+    'test_public_url': {
+        **_tool(
+            'HEAD the public OAuth callback URL and report whether it answers '
+            '(200), redirects, 404s, or is unreachable. Note an unreachable '
+            'result is inconclusive — a Funnel is reached from the public '
+            'Internet and this probe runs inside the container. Read-only.',
+            {}),
+        'handler': _test_public_url},
 
     'create_rule': {
         **_tool(
@@ -435,6 +531,26 @@ TOOLS = {
             'MUTATING — requires the disable_je_posting kill switch ON.',
             {'item_id': _STR}, required=('item_id',), mutating=True),
         'handler': _disable_je_posting},
+    'enable_public_url': {
+        **_tool(
+            'Publish the Plaid OAuth callback over Tailscale Funnel and save the '
+            'resulting HTTPS URL as this install\'s PLAID_REDIRECT_URI. Only '
+            '/bankbridge/plaid/oauth_return is published; the admin UI and the '
+            'Plaid write endpoints stay on the LAN. The operator must still '
+            'register the returned URL in their Plaid dashboard — that is '
+            'outside this system. MUTATING, and it changes what the INTERNET can '
+            'reach — requires the enable_public_url kill switch ON.',
+            {}, mutating=True),
+        'handler': _enable_public_url},
+    'disable_public_url': {
+        **_tool(
+            'Stop serving the Plaid OAuth callback publicly. Leaves the saved '
+            'PLAID_REDIRECT_URI untouched (it is still what the Plaid dashboard '
+            'has registered), so re-enabling needs no dashboard edit — but OAuth '
+            'bank links cannot complete while it is off. MUTATING — requires the '
+            'disable_public_url kill switch ON.',
+            {}, mutating=True),
+        'handler': _disable_public_url},
 }
 
 

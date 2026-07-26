@@ -4824,12 +4824,116 @@ _FUNNEL_SECTION = """
 </div>
 {% endif %}
 
-{% if pub.state == 'configured' %}
+{% if pub.mode == 'sidecar_unauth' %}
+{# ── State A'' (v0.7.1) — sidecar running, no TS_AUTHKEY ───────────────── #}
+<div class="banner-warn">
+  <h3>Tailscale sidecar is running but needs authentication</h3>
+  <p style="margin:0 0 8px;font-size:14px">The Tailscale container shipped with
+    Bank Bridge started, but it has not joined your tailnet — so it has no public
+    hostname yet. This is the normal state of a fresh install and nothing else is
+    broken by it. There are two ways to fix it.</p>
+
+  {% if pub.sidecar.auth_url %}
+  <p style="margin:12px 0 4px;font-size:14px"><b>Quickest — log in from your
+    browser.</b> The sidecar is offering this one-time link:</p>
+  <p style="margin:0 0 4px"><a href="{{ pub.sidecar.auth_url }}"
+     target="_blank" rel="noopener noreferrer"
+     style="font-size:15px;word-break:break-all">{{ pub.sidecar.auth_url }}</a></p>
+  <p style="font-size:12px;color:#8a5a00;margin:0 0 12px">Opens Tailscale, where
+    you approve this machine. Come back and click <b>Refresh status</b>. Note the
+    link is single-use and changes whenever the sidecar restarts — for something
+    that survives restarts unattended, use an auth key instead.</p>
+  <p style="margin:0 0 4px;font-size:14px"><b>Or — set an auth key</b> (survives
+    restarts, no browser step):</p>
+  {% else %}
+  <p style="margin:12px 0 4px;font-size:14px"><b>Set an auth key:</b></p>
+  {% endif %}
+  <ol style="font-size:14px;line-height:1.7;margin:0;padding-left:22px">
+    <li>Generate one at
+      <code>https://login.tailscale.com/admin/settings/keys</code> →
+      <b>Generate auth key</b>. Make it <b>reusable</b> — the sidecar
+      re-authenticates whenever it restarts.</li>
+    <li>Set it as <code>TS_AUTHKEY</code> in your Umbrel app override for
+      <code>fafo-bank-bridge</code>:
+      <br><code>TS_AUTHKEY: "tskey-auth-…"</code></li>
+    <li>Restart the app, then click <b>Refresh status</b> below.</li>
+  </ol>
+  {% if pub.sidecar.backend_state %}
+  <p style="font-size:12px;color:#8a5a00;margin:10px 0 0">Sidecar reports
+    <code>BackendState: {{ pub.sidecar.backend_state }}</code>.</p>
+  {% endif %}
+  <p style="font-size:12px;color:#8a5a00;margin:10px 0 0">Funnel also has to be
+    permitted for your tailnet (Tailscale admin console → <b>Access controls</b>,
+    the <code>funnel</code> node attribute). See
+    <code>docs/tailscale-funnel.md</code>.</p>
+</div>
+
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0">
+  <form method="get" action="/admin/plaid_settings" style="margin:0">
+    <input type="hidden" name="refresh" value="1">
+    <button type="submit" class="secondary">Refresh status</button>
+  </form>
+</div>
+
+<details style="margin:12px 0">
+  <summary style="cursor:pointer;font-size:14px">Set a public hostname by hand
+    instead</summary>
+  {{ manual_entry_form() }}
+</details>
+
+{% elif pub.mode == 'sidecar_ready' %}
+{# ── State A' (v0.7.1) — authenticated, one click from public ──────────── #}
+<div class="card" style="background:#fff;border:1px solid #ccc;
+     border-radius:6px;padding:16px;margin:12px 0">
+  <p style="margin:0 0 10px;font-size:13px;color:#555">Tailscale sidecar
+    <span class="pill pill-ok">authenticated</span>
+    {% if pub.sidecar.funnel_active %}
+    <span class="pill pill-warn">funnel on, hostname unknown</span>
+    {% else %}<span class="pill pill-muted">not public yet</span>{% endif %}
+    {% if pub.sidecar.hostname %}
+    &nbsp;<code>{{ pub.sidecar.hostname }}</code>{% endif %}
+  </p>
+  {% if pub.sidecar.funnel_active %}
+  <p style="margin:0 0 12px;font-size:14px">Funnel is enabled, but the tailnet
+    hostname hasn't surfaced yet — it can take a few seconds after the sidecar
+    joins. Click <b>Refresh status</b>, or paste the hostname below.</p>
+  {% else %}
+  <p style="margin:0 0 12px;font-size:14px">Your Umbrel is on your tailnet.
+    One click publishes <b>only</b>
+    <code>{{ pub.oauth_return_path }}</code> over HTTPS — the admin UI and the
+    Plaid write endpoints stay on your LAN — and saves the resulting redirect
+    URI here.</p>
+  {% endif %}
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+    <form method="post" action="/admin/plaid_settings/funnel/enable"
+          style="margin:0">
+      <button type="submit" class="primary">Enable Public URL</button>
+    </form>
+    <form method="get" action="/admin/plaid_settings" style="margin:0">
+      <input type="hidden" name="refresh" value="1">
+      <button type="submit" class="secondary">Refresh status</button>
+    </form>
+  </div>
+  <p style="font-size:12px;color:#888;margin:12px 0 0">Requires Funnel to be
+    permitted for your tailnet (Tailscale admin console → <b>Access controls</b>
+    → the <code>funnel</code> node attribute). Tailscale provisions the HTTPS
+    certificate; requests reach Bank Bridge on port {{ pub.app_proxy_port }}.</p>
+</div>
+
+<details style="margin:12px 0">
+  <summary style="cursor:pointer;font-size:14px">Set a public hostname by hand
+    instead</summary>
+  {{ manual_entry_form() }}
+</details>
+
+{% elif pub.state == 'configured' %}
 {# ── State A — a public hostname is known ─────────────────────────────── #}
 <div class="card" style="background:#fff;border:1px solid #ccc;
      border-radius:6px;padding:16px;margin:12px 0">
   <p style="margin:0 0 4px;font-size:13px;color:#555">Detected public URL
-    <span class="pill pill-ok">{{ 'from ' + pub.env_var if pub.source == 'env'
+    <span class="pill pill-ok">{{
+      'served by the Tailscale sidecar' if pub.source == 'sidecar'
+      else 'from ' + pub.env_var if pub.source == 'env'
       else 'saved here' }}</span></p>
   <p style="margin:0 0 14px;font-size:20px"><code>{{ pub.base_url }}</code></p>
 
@@ -4862,11 +4966,22 @@ _FUNNEL_SECTION = """
       <input type="hidden" name="refresh" value="1">
       <button type="submit" class="secondary">Refresh status</button>
     </form>
+    {% if pub.mode == 'sidecar_funnel' %}
+    <form method="post" action="/admin/plaid_settings/funnel/disable"
+          style="margin:0">
+      <button type="submit" class="secondary">Disable Funnel</button>
+    </form>
+    {% endif %}
   </div>
 
   <p style="font-size:12px;color:#888;margin:12px 0 0">This URL is served by
     Tailscale Funnel on your Umbrel and terminates HTTPS at Tailscale's edge.
-    Requests reach Bank Bridge on port {{ pub.app_proxy_port }}.</p>
+    Requests reach Bank Bridge on port {{ pub.app_proxy_port }}.
+    {% if pub.mode == 'sidecar_funnel' %}Only
+    <code>{{ pub.oauth_return_path }}</code> is published; everything else,
+    including the admin UI, stays on your LAN. <b>Disable Funnel</b> closes the
+    public door and leaves your saved Redirect URI alone, so re-enabling needs no
+    Plaid dashboard edit.{% endif %}</p>
 </div>
 
 <details style="margin:12px 0">
@@ -4967,14 +5082,17 @@ _FUNNEL_SECTION = """
 PLAID_SETTINGS_BODY = PLAID_SETTINGS_BODY + _FUNNEL_SECTION
 
 
-def _plaid_settings_render(flash_msg='', probe_result=None, do_probe=False):
+def _plaid_settings_render(flash_msg='', probe_result=None, do_probe=False,
+                           sidecar_status=None):
     """Render /admin/plaid_settings.
 
-    Shared by the GET and by the two funnel POSTs that need to show a result
-    inline (a probe outcome can't survive a redirect without stuffing it in the
-    query string). Detection runs on every render; the network probe only when
-    asked, so an ordinary page load never blocks on a timeout."""
-    pub = funnel.detect(probe_url=do_probe)
+    Shared by the GET and by the funnel POSTs that need to show a result inline
+    (a probe outcome can't survive a redirect without stuffing it in the query
+    string). Detection runs on every render; the network probe only when asked,
+    so an ordinary page load never blocks on a timeout. `sidecar_status` lets a
+    caller that just wrote a serve config hand in its post-write reading rather
+    than racing the 30s status cache."""
+    pub = funnel.detect(probe_url=do_probe, sidecar_status=sidecar_status)
     if probe_result is not None:
         pub['probe'] = probe_result
     return _page(PLAID_SETTINGS_BODY, page='plaid_settings', s=ps.load(),
@@ -5060,6 +5178,34 @@ def funnel_save_manual():
     return redirect('/admin/plaid_settings?flash=' + quote_plus(
         _save_redirect_uri(request.form.get('hostname') or '',
                            remember_hostname=True)) + '#public-url')
+
+
+@bp.post('/admin/plaid_settings/funnel/enable')
+def funnel_enable():
+    """State A' — one click: enable Funnel on the sidecar and save the URI."""
+    result = funnel.enable_public_url()
+    if result.get('saved'):
+        audit.record('plaid_public_url_saved',
+                     after={'redirect_uri': result['url'],
+                            'funnel_hostname': result['hostname'],
+                            'source': 'tailscale_sidecar'},
+                     notes='public-URL wizard — sidecar Funnel enabled')
+    return _plaid_settings_render(flash_msg=result['detail'],
+                                  sidecar_status=result.get('sidecar'))
+
+
+@bp.post('/admin/plaid_settings/funnel/disable')
+def funnel_disable():
+    """Stop serving the callback publicly. Leaves PLAID_REDIRECT_URI alone —
+    see funnel.disable_public_url."""
+    result = funnel.disable_public_url()
+    if result.get('ok'):
+        audit.record('plaid_public_url_disabled',
+                     before={'funnel_active': True},
+                     after={'funnel_active': False},
+                     notes='public-URL wizard — sidecar Funnel disabled')
+    return _plaid_settings_render(flash_msg=result['detail'],
+                                  sidecar_status=result.get('sidecar'))
 
 
 @bp.post('/admin/plaid_settings/funnel/test')
@@ -8158,6 +8304,10 @@ _MCP_SWITCH_DESC = {
     'pair_accounts': 'Pair a brokerage with its cash-services account',
     'enable_je_posting': 'Turn ON investment JE posting for an item',
     'disable_je_posting': 'Turn OFF investment JE posting for an item',
+    'enable_public_url': 'Publish the Plaid OAuth callback to the Internet '
+                         '(Tailscale Funnel)',
+    'disable_public_url': 'Withdraw the public OAuth callback — breaks OAuth '
+                          're-links until re-enabled',
 }
 
 

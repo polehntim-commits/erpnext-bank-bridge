@@ -24,13 +24,14 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 - **Plaid Link OAuth flow** for secure bank connection — no bank credentials
   ever touch this app; Plaid holds them and returns a token.
-- **Guided public-URL setup** (v0.7.0) — OAuth needs a publicly-reachable HTTPS
-  callback, which on a LAN-only Umbrel means a tunnel. A wizard on
-  `/admin/plaid_settings` detects an existing Tailscale Funnel, shows the exact
-  redirect URI to register with Plaid, saves it in one click, and copies it to
-  the clipboard; if nothing is set up yet it prints the numbered commands and
-  takes the resulting URL by hand. See
-  [Public URL setup](#public-url-setup-via-tailscale-funnel-v070).
+- **One-click public URL** (v0.7.0 wizard, v0.7.1 sidecar) — OAuth needs a
+  publicly-reachable HTTPS callback, which on a LAN-only Umbrel means a tunnel.
+  Bank Bridge ships a Tailscale sidecar in its own compose, so supplying one auth
+  key and clicking **Enable Public URL** on `/admin/plaid_settings` publishes
+  *only* the callback path, derives the exact redirect URI, saves it, and copies
+  it for the Plaid dashboard. Without a sidecar the v0.7.0 guided flow still
+  detects an existing Funnel or takes a pasted URL. See
+  [Public URL setup](#public-url-setup-via-tailscale-funnel).
 - **Configurable automatic polling** via Plaid's cursor-based
   `/transactions/sync` — pick a cadence from cost-aware presets (hourly →
   monthly, or **manual only**) in the admin UI; **daily by default**. Plus an
@@ -2391,8 +2392,8 @@ OAuth institutions (Wells Fargo, Chase, etc.) require an **`https://`** redirect
 URI that Plaid can reach from the public Internet. You expose **only** the OAuth
 callback — `/bankbridge/plaid/oauth_return` — over HTTPS, while `/admin` and
 everything else stay on the LAN. Start with the wizard in
-[Public URL setup](#public-url-setup-via-tailscale-funnel-v070) (v0.7.0), which
-walks you through it from the admin UI; see
+[Public URL setup](#public-url-setup-via-tailscale-funnel), which does it from
+the admin UI — one button on v0.7.1; see
 [Production Deployment](#production-deployment-https-for-plaid-oauth) for the
 full configs of all three options.
 
@@ -2410,16 +2411,74 @@ full configs of all three options.
 > (`generate_password_hash`). The Plaid callback and JSON API are **never** gated
 > by this — only `/admin` is.
 
-## Public URL setup via Tailscale Funnel (v0.7.0)
+## Public URL setup via Tailscale Funnel
 
 Plaid OAuth banks redirect your browser to an `https://` URL that has to be
 reachable from the public Internet. Umbrel is LAN-only, so getting that URL used
 to mean an SSH session, four commands, and copying a string into two places
-without a typo. **v0.7.0 puts a guided wizard on `/admin/plaid_settings`** so the
-whole thing happens in the admin UI.
+without a typo. **v0.7.0 put a guided wizard on `/admin/plaid_settings`**;
+**v0.7.1 ships a Tailscale sidecar** that reduces the whole thing to supplying
+one auth key and clicking one button.
 
-Open **`/admin/plaid_settings`** → *Plaid Redirect URI — Public URL Setup*. It
-renders one of two states.
+### First-time Plaid setup (v0.7.1)
+
+1. Generate a **reusable** Tailscale auth key at
+   <https://login.tailscale.com/admin/settings/keys>.
+2. Set `TS_AUTHKEY` on the `tailscale` service in your Umbrel app override for
+   `fafo-bank-bridge`, and restart the app.
+3. Open `/admin/plaid_settings` → *Plaid Redirect URI — Public URL Setup* and
+   click **Enable Public URL**. The redirect URI is derived and saved for you.
+4. Click **Copy Plaid dashboard URL** and paste it into the Plaid dashboard under
+   **Developers → API → Allowed redirect URIs**. Only this step is outside Bank
+   Bridge — and Plaid compares the string exactly, so copy rather than retype.
+5. Enter your Plaid **Client ID** and **Secret** in the form above, pick your
+   environment, and save.
+
+> Don't want to mint a key? When the sidecar is unauthenticated the wizard also
+> shows a **one-time browser login link** — click it, approve the machine, then
+> hit **Refresh status**. It is single-use and changes on every sidecar restart,
+> so the auth key is better for unattended operation.
+
+### Why a sidecar (v0.7.1)
+
+v0.7.0 told the operator to run `tailscale funnel` on the host. On an Umbrel
+using the Tailscale community app that is impossible:
+
+```
+error: failed apply web serve: only localhost or 127.0.0.1 proxies are
+currently supported
+```
+
+Funnel proxies only to **its own** localhost, and that app's container localhost
+is not Bank Bridge. v0.7.1 therefore runs Tailscale in Bank Bridge's own compose
+with `network_mode: "service:server"`, sharing the network namespace — so the
+daemon's `127.0.0.1:5202` *is* our gunicorn.
+
+Funnel is enabled and disabled by writing the serve config file the sidecar
+watches (`TS_SERVE_CONFIG`), which is declarative and so survives a sidecar
+restart. Only `/bankbridge/plaid/oauth_return` is ever published — the admin UI
+and the four unauthenticated Plaid write endpoints stay on your LAN. **Disable
+Funnel** leaves your saved redirect URI in place, so re-enabling needs no Plaid
+dashboard edit.
+
+An unauthenticated sidecar idles harmlessly (`/healthz` answers 503 and the
+wizard explains it), so upgrading to v0.7.1 before supplying a key changes
+nothing. Four MCP tools cover the same ground for AI callers —
+`get_public_url_status`, `test_public_url`, and the kill-switched
+`enable_public_url` / `disable_public_url`.
+
+### The wizard's states
+
+Open **`/admin/plaid_settings`** → *Plaid Redirect URI — Public URL Setup*.
+
+| State | What you see |
+| --- | --- |
+| **Funnel active** | The public URL, the exact redirect URI, whether it's already saved, and **Use this / Copy / Test URL / Refresh / Disable Funnel** |
+| **Sidecar ready** | The tailnet hostname and a single **Enable Public URL** button |
+| **Sidecar unauthenticated** | The `TS_AUTHKEY` steps, plus a one-time browser login link when offered |
+| **No sidecar** | The two original v0.7.0 states below |
+
+Without a sidecar it renders one of the two v0.7.0 states.
 
 **A public hostname is known** — it shows the detected public URL, the exact
 redirect URI to register with Plaid, whether that value is already saved on this
@@ -3056,7 +3115,15 @@ on eligible transactions** button on `/admin/transactions`; it's logged as a
 | `PLAID_ENV` | `sandbox` | `sandbox` \| `production` |
 | `PLAID_REDIRECT_URI` | `http://umbrel.local:5202/bankbridge/plaid/oauth_return` | must match the Plaid dashboard |
 | `PLAID_WEBHOOK_URL` | "" | optional; polling is enough |
-| `TAILSCALE_FUNNEL_HOSTNAME` | "" | v0.7.0 · public hostname fronting this app (e.g. `umbrel.tail1234.ts.net`). Set it and the public-URL wizard on `/admin/plaid_settings` auto-detects and can save the redirect URI in one click. Wins over a hostname saved via Manual Entry. See [`docs/tailscale-funnel.md`](docs/tailscale-funnel.md) |
+| `TAILSCALE_FUNNEL_HOSTNAME` | "" | v0.7.0 · public hostname fronting this app (e.g. `umbrel.tail1234.ts.net`). Set it and the public-URL wizard on `/admin/plaid_settings` auto-detects and can save the redirect URI in one click. Wins over a hostname saved via Manual Entry; the v0.7.1 sidecar, when present, outranks both. See [`docs/tailscale-funnel.md`](docs/tailscale-funnel.md) |
+| `TAILSCALE_SIDECAR_ENABLED` | `true` | v0.7.1 · look for the Tailscale sidecar at all. `false` restores exact v0.7.0 wizard behaviour with no probing — for an install fronted by Cloudflare Tunnel or a host proxy |
+| `TAILSCALE_LOCAL_ADDR_PORT` | `127.0.0.1:41414` | v0.7.1 · where the sidecar serves `/healthz`. Keep in sync with the sidecar's own `TS_LOCAL_ADDR_PORT`. How the app tells "no sidecar" (refused) from "no auth key" (503) from "ready" (200) |
+| `TAILSCALE_SOCKET` | `/var/run/tailscale/tailscaled.sock` | v0.7.1 · the sidecar's LocalAPI socket, shared read-only via a volume. Used **only** to learn the tailnet FQDN; best-effort, and a failure falls back to the two vars above |
+| `TAILSCALE_SERVE_CONFIG` | `/config/serve.json` | v0.7.1 · the serve config the sidecar watches (its `TS_SERVE_CONFIG`). Writing this file is how Funnel is enabled/disabled — declarative, so it survives a sidecar restart |
+
+The sidecar service itself takes one operator-supplied value, `TS_AUTHKEY` (see
+[First-time Plaid setup](#first-time-plaid-setup-v071)); everything else in that
+service is set by the shipped compose.
 | `ERPNEXT_URL` | `http://umbrel.local:5300` | ERPNext base URL |
 | `ERPNEXT_API_KEY` / `ERPNEXT_API_SECRET` | "" | System Manager API pair |
 | `ERPNEXT_DEFAULT_COMPANY` | "" | company set on imported Bank Accounts; transaction company comes from the Bank Account |
@@ -3283,7 +3350,10 @@ statement-sourced opening balances gated on that reconciliation~~ (v0.4.9).
 ~~Guided public-URL setup for Plaid OAuth: Tailscale Funnel detection, the exact
 redirect URI to register, one-click save, clipboard copy and a reachability
 probe, so getting a public HTTPS callback no longer needs an SSH session~~
-(v0.7.0).
+(v0.7.0). ~~A Tailscale sidecar in Bank Bridge's own compose, so Funnel can
+actually reach port 5202 on an Umbrel whose Tailscale is a separate app — public
+URL setup becomes one auth key and one button, with four matching MCP tools~~
+(v0.7.1).
 
 ## Compliance and disclosure
 
