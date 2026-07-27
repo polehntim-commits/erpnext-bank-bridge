@@ -45,6 +45,14 @@ log = logging.getLogger('bankbridge.advisory')
 JOURNAL_ENTRY_DT = 'Journal Entry'
 
 
+class AdvisoryError(Exception):
+    """A registration or amendment was refused for an expected, explainable
+    reason (unknown vocabulary value, a second active agreement on one account,
+    an amendment of a superseded version). Callers translate it into whatever
+    their surface's clean failure is — an MCP tool error, a form message — so
+    nothing here needs to know about HTTP or JSON-RPC."""
+
+
 def _now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -56,6 +64,426 @@ def quarter_label(d: date) -> str:
 
 def quarter_start(d: date) -> date:
     return date(d.year, ((d.month - 1) // 3) * 3 + 1, 1)
+
+
+# ── registration: the agreement as a signed document (v0.7.4) ────────────────
+#
+# Everything above this line assumes an agreement already EXISTS and computes
+# what it owes. This section is the other half: recording the agreement itself —
+# the parties, the mandate, the fee basis, the term — so advisory activity is a
+# first-class entry in the reconciliation ledger and the eventual K-1 / audit
+# trail can name the document that authorized every fee.
+#
+# The vocabularies are closed on purpose. A free-text `objective` or
+# `billing_frequency` reads fine and aggregates to nothing; a fixed set means a
+# report can group by it and an operator's typo is caught at registration rather
+# than discovered in a quarterly.
+
+OBJECTIVES = ('Aggressive Growth', 'Growth', 'Moderate Growth', 'Income',
+              'Capital Preservation', 'Custom')
+FEE_TYPES = ('Percent of AUM', 'Flat Annual', 'Performance', 'Hybrid')
+BILLING_FREQUENCIES = ('Monthly', 'Quarterly', 'Semi-Annual', 'Annual')
+STATUSES = ('active', 'terminated', 'superseded')
+
+# fee_type → the amount(s) the document must actually state for that basis to
+# mean anything. 'Performance' names neither: its rate is `performance_fee_rate`,
+# which registration does not set (see register_agreement's notes).
+_FEE_TYPE_REQUIRES = {
+    'Percent of AUM': ('fee_percent_of_aum',),
+    'Flat Annual': ('fee_flat_annual',),
+    'Hybrid': ('fee_percent_of_aum', 'fee_flat_annual'),
+    'Performance': (),
+}
+
+
+def _as_date(value, field: str) -> date | None:
+    """An ISO 'YYYY-MM-DD' string or a date → date; None/'' → None."""
+    if value in (None, ''):
+        return None
+    if isinstance(value, date):
+        return value
+    from datetime import datetime
+    try:
+        return datetime.strptime(str(value).strip()[:10], '%Y-%m-%d').date()
+    except ValueError:
+        raise AdvisoryError(
+            f'{field} must be an ISO date (YYYY-MM-DD), got {value!r}')
+
+
+def _one_of(value, allowed: tuple, field: str) -> str:
+    """`value` trimmed after checking it against a closed vocabulary. '' passes
+    through — an unstated term is recorded as unstated, never guessed."""
+    v = (value or '').strip()
+    if not v:
+        return ''
+    for a in allowed:
+        if v.lower() == a.lower():
+            return a               # canonical casing, so reports group cleanly
+    raise AdvisoryError(f'{field} must be one of {", ".join(allowed)} — '
+                        f'got {value!r}')
+
+
+def _as_float(value, field: str) -> float | None:
+    if value in (None, ''):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise AdvisoryError(f'{field} must be a number, got {value!r}')
+
+
+def _as_int(value, field: str) -> int | None:
+    if value in (None, ''):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise AdvisoryError(f'{field} must be an integer, got {value!r}')
+
+
+def active_agreement_for_account(account_id: str,
+                                 exclude_id: int | None = None):
+    """The agreement currently governing one Plaid account, or None.
+
+    Walks the table in Python rather than querying `managed_account_ids`,
+    deliberately: the column is JSON with a JSONB variant, the table holds a
+    handful of rows, and a containment query that works on both Postgres and the
+    SQLite the tests run on would cost more than it saves."""
+    for ag in AdvisoryAgreement.query.all():
+        if exclude_id is not None and ag.id == exclude_id:
+            continue
+        if account_id in ag.account_ids() and ag.is_active():
+            return ag
+    return None
+
+
+def _apply_fee_basis(agreement: AdvisoryAgreement, fee_type: str,
+                     pct_of_aum, flat_annual) -> None:
+    """Write the fee basis onto the agreement, including the ENGINE rate.
+
+    `fee_percent_of_aum` is stated the way a document states it (1.0 for 1%);
+    `total_base_fee_rate` is the fraction the daily accrual multiplies by
+    (0.01). Storing both is the point — the first is what a human checks against
+    the PDF, the second is what sample_daily_aum uses, and a conversion done
+    once here cannot drift the way one done at every read would."""
+    agreement.fee_type = fee_type
+    agreement.fee_flat_annual = flat_annual
+    if pct_of_aum is not None:
+        agreement.total_base_fee_rate = round(float(pct_of_aum) / 100.0, 8)
+
+
+def register_agreement(account, *, name: str, client_entity: str,
+                       advisor_entity: str, effective_date,
+                       objective: str = '', investment_horizon_years=None,
+                       fee_type: str = '', fee_percent_of_aum=None,
+                       fee_flat_annual=None, billing_frequency: str = '',
+                       termination_date=None, applies_to_company: str = '',
+                       document_reference: str = '',
+                       actor: str = 'system') -> tuple:
+    """Register one advisory agreement against one managed Plaid account.
+
+    `account` is an already-resolved PlaidAccount (the caller owns mask →
+    account resolution, since that is where the brokerage/cash-companion
+    preference lives). Returns `(agreement, notes)`, where `notes` lists what
+    registration deliberately did NOT configure — see below.
+
+    REFUSES, as an AdvisoryError:
+      * a missing name / client_entity / advisor_entity / effective_date;
+      * an objective, fee_type or billing_frequency outside its vocabulary;
+      * a fee_type whose stated amount is missing (a 'Percent of AUM' agreement
+        with no percent is not a fee basis, it is a blank);
+      * a termination_date on or before the effective_date;
+      * a SECOND active agreement on the same account. One account, one
+        governing agreement: two would make "which terms billed this quarter?"
+        unanswerable, which is the question this record exists to answer. To
+        replace an agreement, terminate the incumbent first (or amend it).
+
+    WHAT REGISTRATION DOES NOT SET, and why each is left alone rather than
+    defaulted to something plausible:
+
+      * The three kill switches (fee_accrual_enabled, performance_fee_enabled,
+        risk_control_alerts_enabled) stay OFF. Registering the terms is not
+        authorizing a posting to the Client's P&L — that opt-in is the boundary
+        this whole module is built around.
+      * `bank_fee_rate` is set to 0.0, so the full stated percent accrues as the
+        Manager's settleable fee. The split between a bank's directly-deducted
+        cut and the Manager's is a term registration has no argument for;
+        leaving the v0.5.2 class default (0.75%) would silently divert three
+        quarters of a 1% fee into a bucket that is never posted.
+      * `performance_fee_rate` is set to 0.0 — an agreement registered without a
+        performance-fee rate earns none, rather than inheriting the 20% class
+        default that no one signed.
+      * The settlement JE accounts (advisory_expense_account, fee_account_id)
+        stay blank, so settle_quarter records the accrual and posts nothing
+        until an operator names the two accounts on /admin/advisory.
+
+    Each of those is returned in `notes` rather than only documented here,
+    because the caller is usually an AI relaying to an operator who needs to
+    know the registration is not yet a billing configuration."""
+    name = (name or '').strip()
+    client_entity = (client_entity or '').strip()
+    advisor_entity = (advisor_entity or '').strip()
+    if not name:
+        raise AdvisoryError('agreement_name is required')
+    if not client_entity:
+        raise AdvisoryError('client_entity is required')
+    if not advisor_entity:
+        raise AdvisoryError('advisor_entity is required')
+
+    eff = _as_date(effective_date, 'effective_date')
+    if eff is None:
+        raise AdvisoryError('effective_date is required (YYYY-MM-DD)')
+    term = _as_date(termination_date, 'termination_date')
+    if term is not None and term <= eff:
+        raise AdvisoryError(
+            f'termination_date {term.isoformat()} is on or before '
+            f'effective_date {eff.isoformat()} — the agreement would never '
+            f'govern anything')
+
+    objective = _one_of(objective, OBJECTIVES, 'objective')
+    fee_type = _one_of(fee_type, FEE_TYPES, 'fee_type')
+    billing_frequency = _one_of(billing_frequency, BILLING_FREQUENCIES,
+                                'billing_frequency')
+    horizon = _as_int(investment_horizon_years, 'investment_horizon_years')
+    pct = _as_float(fee_percent_of_aum, 'fee_percent_of_aum')
+    flat = _as_float(fee_flat_annual, 'fee_flat_annual')
+    _check_fee_basis(fee_type, pct, flat)
+
+    conflict = active_agreement_for_account(account.account_id)
+    if conflict is not None:
+        raise AdvisoryError(
+            f'account {account.mask} is already governed by active advisory '
+            f'agreement #{conflict.id} ({conflict.name!r}). One account has one '
+            f'governing agreement — terminate or amend #{conflict.id} first '
+            f'(update_advisory_agreement with a termination_date)')
+
+    agreement = AdvisoryAgreement(
+        name=name, effective_date=eff, termination_date=term,
+        client_entity=client_entity, advisor_entity=advisor_entity,
+        # manager_name is the v0.5.2 display field the dashboard renders; the
+        # advisor IS the manager for a registered agreement, so it mirrors
+        # advisor_entity rather than sitting blank next to it.
+        manager_name=advisor_entity,
+        client_company=(applies_to_company or '').strip(),
+        managed_account_ids=[account.account_id],
+        objective=objective, investment_horizon_years=horizon,
+        billing_frequency=billing_frequency,
+        document_reference=(document_reference or '').strip(),
+        bank_fee_rate=0.0, performance_fee_rate=0.0,
+        total_base_fee_rate=0.0, status='active')
+    _apply_fee_basis(agreement, fee_type, pct, flat)
+    db.session.add(agreement)
+    db.session.commit()
+
+    notes = _registration_notes(agreement)
+    audit.record('advisory_agreement_registered',
+                 subject_type='AdvisoryAgreement', subject_id=agreement.id,
+                 after=agreement.to_dict(),
+                 notes=f'registered {name!r} on account {account.mask} '
+                       f'({client_entity} / {advisor_entity})',
+                 actor=actor)
+    return agreement, notes
+
+
+def _check_fee_basis(fee_type: str, pct, flat) -> None:
+    """A stated fee_type must carry the amount that makes it a basis."""
+    if not fee_type:
+        return
+    have = {'fee_percent_of_aum': pct, 'fee_flat_annual': flat}
+    missing = [f for f in _FEE_TYPE_REQUIRES.get(fee_type, ())
+               if have.get(f) in (None, 0, 0.0)]
+    if missing:
+        raise AdvisoryError(
+            f"fee_type {fee_type!r} requires {' and '.join(missing)} — "
+            f'a fee basis with no amount is not a fee basis')
+
+
+def _registration_notes(agreement: AdvisoryAgreement) -> list:
+    """What this agreement still needs before it can bill anything. Returned to
+    the caller so an operator sees the gap without reading the source."""
+    notes = []
+    if not agreement.fee_accrual_enabled:
+        notes.append(
+            'fee_accrual_enabled is OFF — daily AUM and the base-fee accrual '
+            'are recorded, but no settlement Journal Entry is posted until an '
+            'operator opts in on /admin/advisory')
+    if not (agreement.advisory_expense_account or '').strip() \
+            or not (agreement.fee_account_id or '').strip():
+        notes.append(
+            'no settlement accounts configured (advisory_expense_account / '
+            'fee_account_id) — set them on /admin/advisory before enabling '
+            'fee posting')
+    if not float(agreement.bank_fee_rate or 0.0):
+        notes.append(
+            'bank_fee_rate is 0.0 — the full stated rate accrues as the '
+            "Manager's settleable fee. Set a bank cut on /admin/advisory if "
+            'the advisor deducts part of the fee directly')
+    if not float(agreement.performance_fee_rate or 0.0):
+        notes.append(
+            'performance_fee_rate is 0.0 — no performance fee is computed for '
+            'this agreement')
+    if not (agreement.document_reference or '').strip():
+        notes.append(
+            'no document_reference — this record is not linked to a signed '
+            'document in ERPNext')
+    # The accrual engine is percent-of-AUM only (sample_daily_aum multiplies AUM
+    # by total_base_fee_rate). A flat or performance-only basis is REGISTERED
+    # correctly and accrues nothing daily, which an operator must be told
+    # outright rather than discover from a quarter of zeroes.
+    if (agreement.fee_type or '') in ('Flat Annual', 'Performance'):
+        notes.append(
+            f'fee_type is {agreement.fee_type!r} — the daily accrual engine '
+            f'computes percent-of-AUM fees only, so this agreement accrues '
+            f'nothing automatically; its fee is recorded by hand')
+    return notes
+
+
+# MCP/UI argument name → model attribute, for an amendment's patch. Deliberately
+# NOT a superset of the model: `managed_account_ids` is absent because moving an
+# agreement onto a different account is a new agreement, not an amendment, and
+# the one-active-per-account rule could not be honestly enforced across a
+# clone-and-supersede that also changed the account.
+AMENDABLE = {
+    'agreement_name': 'name',
+    'client_entity': 'client_entity',
+    'advisor_entity': 'advisor_entity',
+    'objective': 'objective',
+    'investment_horizon_years': 'investment_horizon_years',
+    'fee_type': 'fee_type',
+    'fee_percent_of_aum': 'total_base_fee_rate',   # converted, see _apply_fee_basis
+    'fee_flat_annual': 'fee_flat_annual',
+    'billing_frequency': 'billing_frequency',
+    'effective_date': 'effective_date',
+    'termination_date': 'termination_date',
+    'applies_to_company': 'client_company',
+    'document_reference': 'document_reference',
+    'status': 'status',
+}
+
+# Columns a new VERSION does NOT inherit — the row's identity and its place in
+# the history chain. Everything else is read off the table rather than spelled
+# out, so a column a future release adds is carried across an amendment instead
+# of being silently reset to its default (the same reasoning as _RULE_CLONE_SKIP
+# in the MCP blueprint).
+_AGREEMENT_CLONE_SKIP = frozenset({'id', 'created_at', 'updated_at',
+                                   'superseded_by', 'status'})
+
+# The child tables whose rows follow the LIVE agreement across an amendment.
+_AGREEMENT_CHILDREN = (DailyAUM, AdvisoryFeeAccrual, PerformanceSnapshot,
+                       HighWaterMark, RiskControlCheck)
+
+
+def amend_agreement(agreement: AdvisoryAgreement, patch: dict,
+                    actor: str = 'system') -> tuple:
+    """Amend one agreement by CLONE-AND-SUPERSEDE. Returns `(new, old, applied)`.
+
+    An amendment writes a NEW row carrying the amended terms and marks the old
+    one `status='superseded'` with `superseded_by` pointing forward. Nothing is
+    mutated in place, so the terms that governed a past fee posting stay exactly
+    readable — which is the whole reason a fee record cites an agreement id.
+
+    THE HISTORY MOVES, THE TERMS DO NOT. Every child row (daily AUM, accruals,
+    performance snapshots, high-water marks, risk checks) is re-pointed to the
+    new id, so the live agreement carries its full history and its dashboard
+    keeps rendering. The superseded row is left holding only its terms and its
+    dates — which is precisely what it is for. To ask "under what terms was the
+    2026-Q2 fee accrued?", follow the accrual's date back through the version
+    chain, not the accrual's foreign key.
+
+    REFUSES an amendment of a SUPERSEDED version (it is history and governs
+    nothing — amend its successor), an empty patch, and every vocabulary/date
+    violation register_agreement refuses."""
+    if (agreement.status or '') == 'superseded':
+        raise AdvisoryError(
+            f'agreement #{agreement.id} is superseded — it is a historical '
+            f'version and governs nothing. Amend the one that superseded it'
+            + (f' (#{agreement.superseded_by})' if agreement.superseded_by
+               else ''))
+    clean = {k: v for k, v in (patch or {}).items() if k in AMENDABLE}
+    if not clean:
+        raise AdvisoryError(
+            'nothing to amend — pass at least one field '
+            f"({', '.join(sorted(AMENDABLE))})")
+
+    for field in ('effective_date', 'termination_date'):
+        if field in clean:
+            clean[field] = _as_date(clean[field], field)
+    if 'objective' in clean:
+        clean['objective'] = _one_of(clean['objective'], OBJECTIVES,
+                                     'objective')
+    if 'fee_type' in clean:
+        clean['fee_type'] = _one_of(clean['fee_type'], FEE_TYPES, 'fee_type')
+    if 'billing_frequency' in clean:
+        clean['billing_frequency'] = _one_of(
+            clean['billing_frequency'], BILLING_FREQUENCIES,
+            'billing_frequency')
+    if 'status' in clean:
+        clean['status'] = _one_of(clean['status'], STATUSES, 'status')
+        if clean['status'] == 'superseded':
+            raise AdvisoryError(
+                "status 'superseded' is set by an amendment, not by one — pass "
+                "'terminated' to end the agreement, or amend the terms")
+    if 'investment_horizon_years' in clean:
+        clean['investment_horizon_years'] = _as_int(
+            clean['investment_horizon_years'], 'investment_horizon_years')
+    if 'fee_percent_of_aum' in clean:
+        clean['fee_percent_of_aum'] = _as_float(clean['fee_percent_of_aum'],
+                                                'fee_percent_of_aum')
+    if 'fee_flat_annual' in clean:
+        clean['fee_flat_annual'] = _as_float(clean['fee_flat_annual'],
+                                             'fee_flat_annual')
+
+    # The resulting terms, not the incoming ones: an amendment that changes
+    # fee_type and its amount in one call must be checked against the pair it
+    # LANDS on, and one that changes only the amount against the type already
+    # stored.
+    eff = clean.get('effective_date', agreement.effective_date)
+    term = clean.get('termination_date', agreement.termination_date)
+    if eff and term and term <= eff:
+        raise AdvisoryError(
+            f'termination_date {term.isoformat()} is on or before '
+            f'effective_date {eff.isoformat()}')
+    fee_type = clean.get('fee_type', agreement.fee_type or '')
+    pct = clean.get('fee_percent_of_aum',
+                    round(float(agreement.total_base_fee_rate or 0.0) * 100, 6))
+    flat = clean.get('fee_flat_annual', agreement.fee_flat_annual)
+    _check_fee_basis(fee_type, pct, flat)
+
+    before = agreement.to_dict()
+    vals = {c.name: getattr(agreement, c.name)
+            for c in AdvisoryAgreement.__table__.columns
+            if c.name not in _AGREEMENT_CLONE_SKIP}
+    for key, attr in AMENDABLE.items():
+        if key in clean and key != 'fee_percent_of_aum':
+            vals[attr] = clean[key]
+    vals['status'] = clean.get('status', 'active')
+    # A JSON/JSONB column must be COPIED, not shared: handing the same list
+    # object to two rows makes a later mutation of one silently rewrite the
+    # other's history.
+    vals['managed_account_ids'] = list(agreement.account_ids())
+    vals['risk_control_config'] = dict(agreement.risk_control_config or {})
+
+    new = AdvisoryAgreement(**vals)
+    if 'fee_percent_of_aum' in clean or 'fee_type' in clean \
+            or 'fee_flat_annual' in clean:
+        _apply_fee_basis(new, fee_type, clean.get('fee_percent_of_aum'), flat)
+    db.session.add(new)
+    db.session.flush()                     # assign new.id
+    for model in _AGREEMENT_CHILDREN:
+        (model.query.filter_by(agreement_id=agreement.id)
+         .update({'agreement_id': new.id}, synchronize_session=False))
+    agreement.status = 'superseded'
+    agreement.superseded_by = new.id
+    db.session.commit()
+
+    applied = sorted(clean)
+    audit.record('advisory_agreement_amended',
+                 subject_type='AdvisoryAgreement', subject_id=new.id,
+                 before=before, after=new.to_dict(),
+                 notes=f'agreement #{agreement.id} superseded by #{new.id} '
+                       f"({', '.join(applied)})",
+                 actor=actor)
+    return new, agreement, applied
 
 
 # ── AUM sampling + base-fee accrual ──────────────────────────────────────────

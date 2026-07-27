@@ -243,19 +243,47 @@ def _list_unmatched_statement_transactions(args: dict):
             'count': len(rows)}, f'{account.mask}: {len(rows)} no_match line(s)'
 
 
+def _agreement_summary(ag) -> dict:
+    """One agreement's dashboard, JSON-safe. `advisory.dashboard` hands back the
+    live model under 'agreement' (the admin template renders attributes off it);
+    over the wire that has to be its to_dict(), or json.dumps(default=str)
+    serializes the whole record as a repr string. The shared helper is what
+    makes create/update return the SAME shape get_advisory_agreement_summary
+    does, rather than something merely similar."""
+    from .. import advisory
+    d = dict(advisory.dashboard(ag))
+    d['agreement'] = ag.to_dict()
+    return d
+
+
 def _get_advisory_agreement_summary(args: dict):
     from ..models import AdvisoryAgreement
     from .. import advisory
     aid = args.get('agreement_id')
     if aid:
-        ag = AdvisoryAgreement.query.get(int(aid))
+        ag = db.session.get(AdvisoryAgreement, int(aid))
         if ag is None:
             raise ToolError(f'no advisory agreement id {aid}')
-        return advisory.dashboard(ag), f'agreement {aid} dashboard'
+        return _agreement_summary(ag), f'agreement {aid} dashboard'
     ags = AdvisoryAgreement.query.all()
     out = [{'id': a.id, 'name': getattr(a, 'name', ''),
-            'aum': advisory.agreement_aum(a)} for a in ags]
+            'aum': advisory.agreement_aum(a),
+            'status': a.status, 'is_active': a.is_active(),
+            'client_entity': a.client_entity or '',
+            'advisor_entity': a.advisor_entity or '',
+            'managed_account_masks': _masks_for(a)} for a in ags]
     return {'agreements': out, 'count': len(out)}, f'{len(out)} agreement(s)'
+
+
+def _masks_for(agreement) -> list:
+    """The 4-digit masks of an agreement's managed accounts. Masks are the
+    handle every other tool here takes, so an agreement listing that gave only
+    opaque account_ids would not compose with them."""
+    out = []
+    for aid in agreement.account_ids():
+        acct = PlaidAccount.query.filter_by(account_id=aid).first()
+        out.append((acct.mask if acct else '') or aid)
+    return out
 
 
 # ── mutating tools (each gated by a kill switch, all default OFF) ────────────
@@ -414,6 +442,71 @@ def _update_rule(args: dict):
              'updated_fields': sorted(patch)},
             f'rule #{old.id} → #{new_rule.id} '
             f"({', '.join(sorted(patch))})")
+
+
+# ── v0.7.4 · advisory-agreement registration ────────────────────────────────
+def _create_advisory_agreement(args: dict):
+    """Register an advisory agreement against one managed Plaid account.
+
+    The mask → account resolution happens HERE (via _account_by_mask, the same
+    helper every other tool uses, so the brokerage/cash-companion preference is
+    identical) and the terms validation in advisory.register_agreement, which
+    the admin UI can reach without importing a blueprint."""
+    from .. import advisory
+    account = _account_by_mask(args.get('plaid_account_mask'))
+    try:
+        agreement, notes = advisory.register_agreement(
+            account,
+            name=args.get('agreement_name'),
+            client_entity=args.get('client_entity'),
+            advisor_entity=args.get('advisor_entity'),
+            effective_date=args.get('effective_date'),
+            objective=args.get('objective'),
+            investment_horizon_years=args.get('investment_horizon_years'),
+            fee_type=args.get('fee_type'),
+            fee_percent_of_aum=args.get('fee_percent_of_aum'),
+            fee_flat_annual=args.get('fee_flat_annual'),
+            billing_frequency=args.get('billing_frequency'),
+            termination_date=args.get('termination_date'),
+            applies_to_company=args.get('applies_to_company'),
+            document_reference=args.get('document_reference'),
+            actor='mcp')
+    except advisory.AdvisoryError as e:
+        raise ToolError(str(e))
+    result = {'created_agreement_id': agreement.id,
+              'managed_account_mask': account.mask,
+              'not_yet_configured': notes,
+              'summary': _agreement_summary(agreement)}
+    return result, (f'registered agreement #{agreement.id} '
+                    f'{agreement.name!r} on account {account.mask}')
+
+
+def _update_advisory_agreement(args: dict):
+    """Amend one agreement NON-DESTRUCTIVELY — clone-and-supersede, the same
+    shape update_rule uses, so the terms that governed a past fee posting stay
+    reconstructible. Returns the NEW id and the superseded one."""
+    from .. import advisory
+    from ..models import AdvisoryAgreement
+    raw_id = args.get('agreement_id')
+    try:
+        agreement_id = int(raw_id)
+    except (TypeError, ValueError):
+        raise ToolError(f'agreement_id must be an integer, got {raw_id!r}')
+    old = db.session.get(AdvisoryAgreement, agreement_id)
+    if old is None:
+        raise ToolError(f'no advisory agreement id {agreement_id}')
+    patch = {k: args[k] for k in advisory.AMENDABLE if k in args}
+    try:
+        new, superseded, applied = advisory.amend_agreement(old, patch,
+                                                            actor='mcp')
+    except advisory.AdvisoryError as e:
+        raise ToolError(str(e))
+    result = {'updated_agreement_id': new.id,
+              'superseded_agreement_id': superseded.id,
+              'amended_fields': applied,
+              'summary': _agreement_summary(new)}
+    return result, (f'agreement #{superseded.id} → #{new.id} '
+                    f"({', '.join(applied)})")
 
 
 def _set_variance_tag(args: dict):
@@ -683,6 +776,114 @@ TOOLS = {
              'tag': _STR, 'applies_to_company': _STR},
             required=('rule_id',), mutating=True),
         'handler': _update_rule},
+    'create_advisory_agreement': {
+        **_tool(
+            'Register an investment advisory agreement — the write side of '
+            'get_advisory_agreement_summary. Records the signed terms (both '
+            'legal parties, objective, horizon, fee basis, billing cadence, '
+            'effective/termination dates, and a Governance Document reference) '
+            'against ONE managed brokerage account, identified by its 4-digit '
+            'plaid_account_mask. '
+            'REFUSES: an unknown mask; a mask already governed by an active '
+            'agreement (one account has one governing agreement — terminate or '
+            'amend the incumbent with update_advisory_agreement first); an '
+            'objective / fee_type / billing_frequency outside its vocabulary; a '
+            'fee_type whose amount is missing (Percent of AUM needs '
+            'fee_percent_of_aum, Flat Annual needs fee_flat_annual, Hybrid '
+            'needs both); a termination_date on or before the effective_date. '
+            'DOES NOT BILL ANYTHING. Registration records terms; it leaves the '
+            "agreement's three kill switches OFF, its settlement accounts "
+            'blank, and its bank-fee and performance-fee rates at 0.0, so no '
+            'Journal Entry can be posted until an operator configures those on '
+            '/admin/advisory. The returned not_yet_configured list names each '
+            'gap — relay it. '
+            'REVERSIBLE: an agreement is superseded or terminated, never '
+            'deleted, and nothing already posted is rewritten. '
+            'fee_percent_of_aum is stated as a document states it — 1.0 means '
+            '1% annualized. MUTATING — requires the create_advisory_agreement '
+            'kill switch to be ON.',
+            {'agreement_name': _STR,
+             'client_entity': {
+                 'type': 'string',
+                 'description': 'Legal client entity, e.g. "Orchard Meadow, '
+                                'LLC" — the party whose assets are managed.'},
+             'advisor_entity': {
+                 'type': 'string',
+                 'description': 'Legal advisor entity, e.g. "Wells Fargo '
+                                'Advisors LLC".'},
+             'plaid_account_mask': {
+                 'type': 'string',
+                 'description': 'The 4-digit brokerage mask, e.g. "9401". Must '
+                                'match a linked Plaid account (see '
+                                'get_account_topology).'},
+             'objective': {'type': 'string',
+                           'description': 'Aggressive Growth | Growth | '
+                                          'Moderate Growth | Income | Capital '
+                                          'Preservation | Custom'},
+             'investment_horizon_years': {'type': 'integer'},
+             'fee_type': {'type': 'string',
+                          'description': 'Percent of AUM | Flat Annual | '
+                                         'Performance | Hybrid'},
+             'fee_percent_of_aum': {
+                 'type': 'number',
+                 'description': 'Annualized percent, e.g. 1.0 for 1%.'},
+             'fee_flat_annual': {'type': 'number'},
+             'billing_frequency': {'type': 'string',
+                                   'description': 'Monthly | Quarterly | '
+                                                  'Semi-Annual | Annual'},
+             'effective_date': {'type': 'string', 'description': 'YYYY-MM-DD'},
+             'termination_date': {'type': 'string',
+                                  'description': 'YYYY-MM-DD; omit for '
+                                                 'open-ended'},
+             'applies_to_company': {
+                 'type': 'string',
+                 'description': 'ERPNext Company docname the fee entries are '
+                                'scoped to.'},
+             'document_reference': {
+                 'type': 'string',
+                 'description': 'Governance Document doc_id or filename in '
+                                'ERPNext — links this record to the signed PDF.'}},
+            required=('agreement_name', 'client_entity', 'advisor_entity',
+                      'plaid_account_mask', 'effective_date'), mutating=True),
+        'handler': _create_advisory_agreement},
+    'update_advisory_agreement': {
+        **_tool(
+            'Amend one advisory agreement, changing ONLY the fields you pass '
+            '(agreement_name, client_entity, advisor_entity, objective, '
+            'investment_horizon_years, fee_type, fee_percent_of_aum, '
+            'fee_flat_annual, billing_frequency, effective_date, '
+            'termination_date, applies_to_company, document_reference, status). '
+            'NON-DESTRUCTIVE: like update_rule this writes a NEW agreement '
+            'version and marks the old one superseded (returns the new id in '
+            'updated_agreement_id and the old one in superseded_agreement_id), '
+            'so the terms that governed any past fee accrual stay readable — '
+            'expect the id to CHANGE. The fee/AUM/performance history follows '
+            'the NEW id, so the live dashboard is unbroken; the superseded row '
+            'keeps only its terms and dates. '
+            'REFUSES: an unknown id; a SUPERSEDED version (history — amend its '
+            'successor); an empty patch; status="superseded" (that is set by an '
+            'amendment, not passed to one — pass "terminated" to end the '
+            'agreement); and every vocabulary, date-order and fee-basis rule '
+            'create_advisory_agreement enforces. '
+            'The managed account CANNOT be changed — an agreement over a '
+            'different account is a new agreement. Already-posted fee Journal '
+            'Entries are NOT rewritten. MUTATING — requires the '
+            'update_advisory_agreement kill switch to be ON.',
+            {'agreement_id': {'type': 'integer'},
+             'agreement_name': _STR, 'client_entity': _STR,
+             'advisor_entity': _STR, 'objective': _STR,
+             'investment_horizon_years': {'type': 'integer'},
+             'fee_type': _STR, 'fee_percent_of_aum': {'type': 'number'},
+             'fee_flat_annual': {'type': 'number'}, 'billing_frequency': _STR,
+             'effective_date': {'type': 'string', 'description': 'YYYY-MM-DD'},
+             'termination_date': {'type': 'string',
+                                  'description': 'YYYY-MM-DD; ends the '
+                                                 'agreement'},
+             'applies_to_company': _STR, 'document_reference': _STR,
+             'status': {'type': 'string',
+                        'description': 'active | terminated'}},
+            required=('agreement_id',), mutating=True),
+        'handler': _update_advisory_agreement},
     'set_variance_tag': {
         **_tool(
             'Set the human-readable variance_reason on one statement anchor. '

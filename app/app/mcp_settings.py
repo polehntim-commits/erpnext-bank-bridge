@@ -40,6 +40,17 @@ _DEFAULTS = {
     # switch it off entirely). An operator who trusts an AI to propose new rules
     # has not thereby trusted it to rewrite the working ones.
     'update_rule': False,
+    # v0.7.4 — registering an advisory agreement records TERMS, not a posting:
+    # the agreement's own three switches still gate every JE. It is nonetheless
+    # a separate switch from create_rule and defaults OFF like the rest, because
+    # the record it writes is what a K-1 and an audit trail cite — an AI that
+    # may propose categorization rules has not thereby been trusted to state
+    # what two parties agreed to. Amending is separate again, on the same
+    # reasoning create_rule/update_rule are split: a new agreement governs an
+    # account nothing else governed, while an amendment restates the terms an
+    # existing fee history already accrued under.
+    'create_advisory_agreement': False,
+    'update_advisory_agreement': False,
     'set_variance_tag': False,
     'trigger_reparse': False,
     'rebuild_anchors': False,

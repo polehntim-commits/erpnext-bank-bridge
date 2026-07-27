@@ -1805,13 +1805,51 @@ class AdvisoryAgreement(db.Model):
     covers; `risk_control_config` a JSON dict of the position-sizing limits the
     daily compliance check enforces. Fee RATES are stored so a report reproduces
     the exact math the agreement was billed under, even after a later amendment
-    changes them."""
+    changes them.
+
+    v0.7.4 adds the REGISTRATION fields — the terms as written on the signed
+    document (parties, objective, fee basis, billing cadence, term dates, the
+    Governance Document reference) — so an agreement is a first-class record in
+    the reconciliation ledger rather than a set of rates someone typed into the
+    fee engine. Every one is additive and blank on an upgrading install, which
+    reads as "registered before v0.7.4 recorded this" and changes no fee math:
+    the engines key off `total_base_fee_rate` / `performance_fee_rate` exactly
+    as before."""
     __tablename__ = 'advisory_agreements'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(255), nullable=False, default='')
     effective_date = db.Column(db.Date, nullable=True)
+    # v0.7.4 · the day the agreement stops governing. NULL = open-ended, which
+    # is what every pre-v0.7.4 agreement is.
+    termination_date = db.Column(db.Date, nullable=True)
     client_company = db.Column(db.String(140), nullable=False, default='')
     manager_name = db.Column(db.String(255), nullable=False, default='')
+    # v0.7.4 · the two LEGAL parties, as named on the document. Distinct from
+    # `client_company` (an ERPNext Company docname, which is a bookkeeping
+    # handle) and from `manager_name` (a display name): "Orchard Meadow, LLC"
+    # and "Wells Fargo Advisors LLC" are what a K-1 or an audit asks for.
+    client_entity = db.Column(db.String(255), default='')
+    advisor_entity = db.Column(db.String(255), default='')
+    # v0.7.4 · the mandate. `objective` and `investment_horizon_years` are the
+    # stated investment policy; the risk limits that ENFORCE it live in
+    # risk_control_config.
+    objective = db.Column(db.String(40), default='')
+    investment_horizon_years = db.Column(db.Integer, nullable=True)
+    # v0.7.4 · the fee BASIS as written, alongside the rates the engine uses.
+    # `fee_type` says which of the two amounts below is load-bearing;
+    # `billing_frequency` is the cadence the document states, which is NOT the
+    # accrual cadence (accrual is daily, always) but the settlement one.
+    fee_type = db.Column(db.String(30), default='')
+    fee_flat_annual = db.Column(db.Float, nullable=True)
+    billing_frequency = db.Column(db.String(20), default='')
+    # v0.7.4 · the signed PDF this record stands for — a Governance Document
+    # doc_id or filename in ERPNext. Blank means the terms here are unbacked by
+    # a stored document, which an audit trail should be able to see.
+    document_reference = db.Column(db.String(255), default='')
+    # v0.7.4 · clone-and-supersede history, mirroring categorization_rules:
+    # an amendment writes a NEW row and points the old one here, so the terms
+    # that governed a past fee posting stay readable. NULL = never amended.
+    superseded_by = db.Column(db.Integer, nullable=True)
     managed_account_ids = db.Column(
         MutableList.as_mutable(db.JSON().with_variant(JSONB, 'postgresql')),
         default=list)
@@ -1848,17 +1886,50 @@ class AdvisoryAgreement(db.Model):
     def account_ids(self) -> list:
         return list(self.managed_account_ids or [])
 
+    def is_active(self, on=None) -> bool:
+        """Whether this row is the agreement currently governing its accounts
+        (v0.7.4).
+
+        THREE ways to stop being active, and they mean different things:
+        `status` != 'active' (withdrawn, or superseded by an amendment), a
+        `termination_date` on or before `on`, and — implicitly — being a
+        superseded version. A FUTURE `effective_date` still counts as active:
+        an agreement signed today and effective next quarter already owns its
+        account, so registering a second one against that account is the
+        conflict this predicate exists to catch."""
+        from datetime import date as _date
+        on = on or _date.today()
+        if (self.status or 'active') != 'active':
+            return False
+        return not (self.termination_date and self.termination_date <= on)
+
     def to_dict(self):
         return {
             'id': self.id, 'name': self.name,
             'effective_date': self.effective_date.isoformat()
             if self.effective_date else None,
+            'termination_date': self.termination_date.isoformat()
+            if self.termination_date else None,
             'client_company': self.client_company,
+            'client_entity': self.client_entity or '',
+            'advisor_entity': self.advisor_entity or '',
             'manager_name': self.manager_name,
+            'objective': self.objective or '',
+            'investment_horizon_years': self.investment_horizon_years,
+            'fee_type': self.fee_type or '',
+            'fee_flat_annual': self.fee_flat_annual,
+            'billing_frequency': self.billing_frequency or '',
+            'document_reference': self.document_reference or '',
+            'superseded_by': self.superseded_by,
+            'is_active': self.is_active(),
             'managed_account_ids': self.account_ids(),
             'fee_account_id': self.fee_account_id or '',
             'advisory_expense_account': self.advisory_expense_account or '',
             'total_base_fee_rate': self.total_base_fee_rate,
+            # v0.7.4 · the same number the registration form takes, so a
+            # create/update round-trips: 1.0 here is 0.01 above.
+            'fee_percent_of_aum': round(
+                float(self.total_base_fee_rate or 0.0) * 100.0, 6),
             'bank_fee_rate': self.bank_fee_rate,
             'manager_base_fee_rate': self.manager_base_fee_rate,
             'performance_fee_rate': self.performance_fee_rate,

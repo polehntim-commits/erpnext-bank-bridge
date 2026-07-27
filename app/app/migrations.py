@@ -245,6 +245,33 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # Company's own default, so every existing rule keeps posting identically
     # until an operator sets one.
     ('categorization_rules', 'cost_center', 'VARCHAR(140)'),
+
+    # v0.7.4 — advisory-agreement REGISTRATION. Ten additive columns on
+    # advisory_agreements, a table v0.5.2 created (so create_all() will not
+    # touch it on an upgrading install and each column must be listed here).
+    #
+    # Every one backfills to NULL/'' and there is NO data backfill, which is the
+    # correct reading: an agreement registered before v0.7.4 recorded no legal
+    # parties, no stated objective, no fee BASIS and no document reference —
+    # blank says exactly that, where inventing a value (e.g. copying
+    # client_company into client_entity) would fabricate a term nobody signed.
+    #
+    # None of them changes fee math. The engines in advisory.py key off
+    # `total_base_fee_rate` and `performance_fee_rate`, both untouched here, so
+    # an upgrading install accrues and settles precisely as it did before.
+    # `termination_date` NULL = open-ended and `superseded_by` NULL = never
+    # amended, so is_active() answers True for every existing agreement — the
+    # pre-v0.7.4 state, where "active" had no way to be anything else.
+    ('advisory_agreements', 'termination_date', 'DATE'),
+    ('advisory_agreements', 'client_entity', "VARCHAR(255) DEFAULT ''"),
+    ('advisory_agreements', 'advisor_entity', "VARCHAR(255) DEFAULT ''"),
+    ('advisory_agreements', 'objective', "VARCHAR(40) DEFAULT ''"),
+    ('advisory_agreements', 'investment_horizon_years', 'INTEGER'),
+    ('advisory_agreements', 'fee_type', "VARCHAR(30) DEFAULT ''"),
+    ('advisory_agreements', 'fee_flat_annual', 'DOUBLE PRECISION'),
+    ('advisory_agreements', 'billing_frequency', "VARCHAR(20) DEFAULT ''"),
+    ('advisory_agreements', 'document_reference', "VARCHAR(255) DEFAULT ''"),
+    ('advisory_agreements', 'superseded_by', 'INTEGER'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,

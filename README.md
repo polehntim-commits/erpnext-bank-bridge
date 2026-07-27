@@ -1635,6 +1635,73 @@ the same boundary as v0.5.0/v0.5.1. Every JE carries `company =
 client_company`. `/admin/advisory/<id>` renders the stored figures with the
 three toggles inline.
 
+### Registering an agreement (v0.7.4)
+
+v0.5.2 gave the four engines everything they need to *compute* an agreement's
+fees, and nothing that records the **agreement itself**. An operator typed a
+couple of rates into the fee engine and the document those rates came from lived
+in a drawer. v0.7.4 makes the agreement a first-class record: the two legal
+parties, the mandate, the fee basis as written, the billing cadence, the term
+dates, and a reference to the signed PDF stored in ERPNext — so advisory
+activity is something the reconciliation ledger tracks, and a K-1 or an audit
+can name the document that authorized every fee.
+
+Ten additive columns on `advisory_agreements`, all blank on an upgrading
+install:
+
+| Field | Notes |
+|-------|-------|
+| `client_entity` / `advisor_entity` | the **legal parties** as named on the document (e.g. `Orchard Meadow, LLC` and `Wells Fargo Advisors LLC`). Distinct from `client_company`, which is an ERPNext Company docname — a bookkeeping handle, not a party |
+| `objective` | Aggressive Growth / Growth / Moderate Growth / Income / Capital Preservation / Custom |
+| `investment_horizon_years` | the stated horizon |
+| `fee_type` | Percent of AUM / Flat Annual / Performance / Hybrid — which stated amount is load-bearing |
+| `fee_flat_annual` | the flat amount, for a basis that has one |
+| `billing_frequency` | Monthly / Quarterly / Semi-Annual / Annual — the **settlement** cadence the document states. Accrual is daily regardless |
+| `termination_date` | NULL = open-ended |
+| `document_reference` | Governance Document doc_id or filename in ERPNext |
+| `superseded_by` | the amendment chain, NULL until amended |
+
+The percent-of-AUM rate is stated the way the document states it — **1.0 means
+1%** — and converted once, on write, into the `total_base_fee_rate` (`0.01`) the
+daily accrual multiplies by. Both are stored: the first is what a human checks
+against the PDF, the second is what the engine uses, and a conversion done once
+cannot drift the way one done at every read would.
+
+**One account, one governing agreement.** Registration refuses a second active
+agreement on a mask that already has one, because two would make *which terms
+billed this quarter?* unanswerable — the question the record exists to answer.
+Terminate or amend the incumbent first. An agreement counts as active until its
+`status` leaves `active` or its `termination_date` passes; a *future*
+`effective_date` is still active, since an agreement signed today and effective
+next quarter already owns its account.
+
+**Registering terms is not authorizing a posting.** A new agreement arrives with
+its three kill switches OFF, no settlement accounts, `bank_fee_rate = 0.0` and
+`performance_fee_rate = 0.0` — so nothing can hit the Client's P&L until an
+operator configures it on `/admin/advisory`. The two rates are zeroed rather
+than left at the v0.5.2 class defaults deliberately: inheriting the 0.75% bank
+cut would silently divert three quarters of a registered 1% fee into a bucket
+that is never posted, and inheriting the 20% performance rate would apply a fee
+nobody signed. The tool returns a `not_yet_configured` list naming every gap.
+
+**Amendments clone and supersede**, exactly like a rule edit: the amended terms
+go on a **new row**, the old one is marked `superseded` and points forward, so
+the terms that governed a past fee accrual stay readable — **the id changes**,
+and both are returned. The fee/AUM/performance history follows the *new* id so
+the live dashboard is unbroken, leaving the superseded row holding only its
+terms and dates. To ask *under what terms was 2026-Q2 accrued?*, walk the
+version chain by date. The managed account cannot be amended — an agreement over
+a different account is a new agreement, not an amendment.
+
+Both tools are MCP-only for now (`create_advisory_agreement`,
+`update_advisory_agreement`), each behind its own kill switch, both **OFF by
+default** and separate from `create_rule`'s: an AI trusted to propose
+categorization rules has not thereby been trusted to state what two parties
+agreed to. `get_advisory_agreement_summary` is the read side and now returns the
+agreement as structured JSON (it previously serialized the model object into a
+repr string), with each listed agreement carrying its managed account **masks**,
+`status` and `is_active` so it composes with the mask-keyed tools.
+
 ## Investment transactions as Journal Entries (v0.5.1, Phase D)
 
 Every `SecurityTransaction` on a brokerage account can post as a Journal Entry
@@ -2302,6 +2369,7 @@ skip it entirely.
 | `generated_journal_entries` | per-JE state record (state, rule, JE docname) — v0.3.0 |
 | `intercompany_transfer_pairs` | detected transfer between two owned Companies: both legs, both Companies, confidence, both JE docnames, state — v0.4.1 |
 | `plaid_statements` | one bank-issued statement: Plaid's statement id (UNIQUE — the idempotency guard), period, opening/closing balances parsed from the PDF (NULL when unreadable), stored PDF path — v0.4.9; plus the ERPNext `Bank Statement` docname and last sync time, NULL until uploaded — v0.4.10 |
+| `advisory_agreements` | one Investment Management Agreement: managed accounts, fee rates, hurdle/high-water settings, the three kill switches — v0.5.2; plus the **registered terms** (both legal parties, objective + horizon, fee basis, billing cadence, effective/termination dates, Governance Document reference) and the `superseded_by` amendment chain (v0.7.4) |
 | `audit_events` | **permanent, append-only** audit trail of every action (before/after JSON, actor, IP) — v0.3.0 |
 | `plaid_sync_log` | HTTP-level action log (plaid_pull / erpnext_push / erpnext_supplier_auto_create, counts, errors); `subject_id` cross-links to `audit_events` |
 | `plaid_link_state` | short-lived link-token bookkeeping for the OAuth handoff |

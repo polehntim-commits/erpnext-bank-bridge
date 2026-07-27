@@ -8450,6 +8450,12 @@ _MCP_SWITCH_DESC = {
     'create_rule': 'Create a categorization rule',
     'update_rule': 'Edit an existing rule (offset account, cost center, '
                    'priority, on/off) — writes a new version, archives the old',
+    'create_advisory_agreement': 'Register an advisory agreement (terms, fee '
+                                 'basis, parties) against one brokerage '
+                                 'account — posts nothing on its own',
+    'update_advisory_agreement': 'Amend an advisory agreement (fee rate, '
+                                 'termination date) — writes a new version, '
+                                 'supersedes the old',
     'set_variance_tag': 'Write a variance reason onto an anchor',
     'trigger_reparse': 'Re-parse stored PDFs + full reconcile pipeline',
     'rebuild_anchors': 'Rebuild the anchor chain',
