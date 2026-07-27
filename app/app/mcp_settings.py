@@ -34,6 +34,12 @@ _FILENAME = 'mcp_settings.json'
 # carry no entry here because they are never gated.
 _DEFAULTS = {
     'create_rule': False,
+    # v0.7.3 — editing an existing rule is a SEPARATE switch from creating one,
+    # deliberately: a new rule only affects transactions it newly matches, while
+    # an update re-points a rule that is already categorizing traffic (and can
+    # switch it off entirely). An operator who trusts an AI to propose new rules
+    # has not thereby trusted it to rewrite the working ones.
+    'update_rule': False,
     'set_variance_tag': False,
     'trigger_reparse': False,
     'rebuild_anchors': False,

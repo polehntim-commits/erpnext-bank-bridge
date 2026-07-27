@@ -663,6 +663,22 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
             bank_line['debit_in_account_currency'] = amt
         accounts = [party_line, bank_line]
 
+    # v0.7.3 · the rule's Cost Center rides the CATEGORIZED side — `party_line`,
+    # which is the offset line in the v0.3.1 path and the (non-bank)
+    # debit_account line in the deprecated one. The BANK side is deliberately
+    # left alone: it is a balance-sheet account whose activity belongs to no
+    # value-chain segment, and stamping one there would attribute the movement
+    # of cash rather than the cost it paid for.
+    #
+    # An UNSET cost_center writes NO key at all, which is the whole fallback
+    # chain: ERPNext then applies the offset Account's default cost center, or
+    # failing that the Company's, server-side. Writing a guessed value here
+    # would OVERRIDE those defaults — so "leave it blank" is not a gap in the
+    # chain, it is how the rest of the chain gets to run.
+    cost_center = (getattr(rule, 'cost_center', None) or '').strip()
+    if cost_center:
+        party_line['cost_center'] = cost_center
+
     # `party_override` follows the same convention as offset_account_override:
     # None means "the caller didn't resolve a party, use the legacy precedence",
     # while ANY string — including '' — is authoritative. That distinction is

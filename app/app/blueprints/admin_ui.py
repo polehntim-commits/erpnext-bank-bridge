@@ -2538,6 +2538,16 @@ RULES_BODY = """
            Safari collapsed mid-type); options fed by /api/rules/known_accounts -->
       <div id="oa-dd" style="display:none;position:absolute;left:0;right:0;z-index:20;background:#fff;border:1px solid #ccc;border-top:none;border-radius:0 0 4px 4px;max-height:240px;overflow:auto;box-shadow:0 4px 12px rgba(0,0,0,.12)"></div>
     </label>
+    <label style="flex:1;min-width:170px">Cost center <span style="font-weight:400;color:#888">— optional</span>
+      <input name="cost_center" id="cost-center" autocomplete="off" value="{{ form.cost_center or '' }}"
+             title="ERPNext Cost Center written onto the OFFSET line only (the bank line never gets one). Leave blank to let ERPNext apply the account's or company's own default."
+             placeholder="Harvest - OML">
+      <span style="display:block;font-weight:400;font-size:11px;color:#888;margin-top:3px">
+        Offset line only. Blank = ERPNext's own default.
+      </span>
+    </label>
+  </div>
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:1;min-width:160px">Direction
       <select name="offset_direction"
               title="The account for the categorized side. The bank side is automatically determined from the transaction's linked Plaid account. Direction defaults to auto (withdrawal → offset is debit; deposit → offset is credit).">
@@ -3336,6 +3346,13 @@ def _rule_form_values():
         # v0.3.1 · bank-agnostic offset side.
         'offset_account': (request.form.get('offset_account') or '').strip(),
         'offset_direction': direction,
+        # v0.7.3 · the Cost Center for the offset line. This field must be READ
+        # BACK from the form even though nothing but the editor writes it: an
+        # edit CLONES the rule from these values (see save_rule), so a field
+        # missing here is a field silently cleared on every admin save of a
+        # rule an operator (or the MCP create_rule/update_rule tools) had
+        # costed. Blank → None = write no cost center.
+        'cost_center': (request.form.get('cost_center') or '').strip() or None,
         # Deprecated pre-v0.3.1 pair — still accepted for backwards compat so a
         # legacy form/caller keeps working during the transition.
         'debit_account': (request.form.get('debit_account') or '').strip(),
@@ -8431,6 +8448,8 @@ _MCP_BODY = """
 # One-line "what it changes" per mutating tool, shown beside its switch.
 _MCP_SWITCH_DESC = {
     'create_rule': 'Create a categorization rule',
+    'update_rule': 'Edit an existing rule (offset account, cost center, '
+                   'priority, on/off) — writes a new version, archives the old',
     'set_variance_tag': 'Write a variance reason onto an anchor',
     'trigger_reparse': 'Re-parse stored PDFs + full reconcile pipeline',
     'rebuild_anchors': 'Rebuild the anchor chain',

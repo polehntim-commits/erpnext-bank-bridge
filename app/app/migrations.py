@@ -235,6 +235,16 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # every existing rule with its created_at ("always been active"), so a
     # pre-v0.5.9 rule's active count equals its historical count on upgrade.
     ('categorization_rules', 'activated_at', 'TIMESTAMP'),
+
+    # v0.7.3 — per-rule ERPNext Cost Center for the JE's offset line. Adds
+    # NULL and there is NO backfill, deliberately: NULL means "write no cost
+    # center", which leaves ERPNext free to apply the Account's or Company's
+    # own default exactly as it did before this column existed. Stamping a
+    # value here — even the Company default — would turn a server-side default
+    # into a per-rule override and freeze it against any later change to the
+    # Company's own default, so every existing rule keeps posting identically
+    # until an operator sets one.
+    ('categorization_rules', 'cost_center', 'VARCHAR(140)'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,

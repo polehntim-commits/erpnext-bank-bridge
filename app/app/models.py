@@ -615,6 +615,28 @@ class CategorizationRule(db.Model):
     offset_account = db.Column(db.String(255), default='')
     # auto | always_debit | always_credit
     offset_direction = db.Column(db.String(20), default='auto')
+    # v0.7.3 · the ERPNext Cost Center docname written onto the OFFSET line of
+    # this rule's generated Journal Entry ('Harvest - OML'). NULL/'' = don't
+    # write one, which is the pre-v0.7.3 behaviour and stays the default for
+    # every existing rule.
+    #
+    # OFFSET LINE ONLY. The bank side is a balance-sheet account whose activity
+    # belongs to no value-chain segment, and ERPNext's own default would land
+    # every bank line on the Company default anyway; segmenting the categorized
+    # side is the entire point (a Coastal Farm & Ranch purchase is a Crop
+    # Protection cost, the checking account it left is not).
+    #
+    # LEFT BLANK, NOT DEFAULTED, when unset: ERPNext applies the Account's or
+    # the Company's own default cost center server-side, and that server-side
+    # default is a better answer than anything this app could guess — writing
+    # a value here would OVERRIDE it. See categorization.build_journal_entry.
+    #
+    # Stored verbatim, not resolved per-Company like a Mode B offset account
+    # (see `applies_to_company`): a cost center is chosen against one Company's
+    # own tree, so a Company-agnostic rule carrying a Company-suffixed cost
+    # center is the operator's explicit choice and ERPNext is the authority
+    # that rejects it if wrong.
+    cost_center = db.Column(db.String(140), nullable=True)
     # DEPRECATED (pre-v0.3.1) — kept one release for backwards compat.
     debit_account = db.Column(db.String(255), default='')
     credit_account = db.Column(db.String(255), default='')
@@ -738,6 +760,7 @@ class CategorizationRule(db.Model):
             'match_value': self.match_value,
             'offset_account': self.offset_account or '',
             'offset_direction': self.offset_direction or 'auto',
+            'cost_center': self.cost_center or '',
             'debit_account': self.debit_account,
             'credit_account': self.credit_account,
             'party_type': self.party_type, 'party_name': self.party_name,

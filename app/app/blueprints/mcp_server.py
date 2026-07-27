@@ -213,6 +213,11 @@ def _list_rules(args: dict):
         'id': r.id, 'name': r.name, 'priority': r.priority,
         'active': bool(r.active), 'match_type': r.match_type,
         'match_value': r.match_value, 'offset_account': r.offset_account or '',
+        # v0.7.3 · '' means the rule writes NO cost center and ERPNext applies
+        # its own Account/Company default — NOT that the offset line lands
+        # uncosted. An AI auditing value-chain coverage needs that distinction
+        # to be visible, which is why the field is listed even when empty.
+        'cost_center': r.cost_center or '',
         'bb_internal_tag': r.bb_internal_tag or '',
         'applies_to_company': r.applies_to_company or None,
     } for r in rules]
@@ -254,16 +259,161 @@ def _get_advisory_agreement_summary(args: dict):
 
 
 # ── mutating tools (each gated by a kill switch, all default OFF) ────────────
+def _checked_cost_center(raw, company: str = '') -> str:
+    """`raw` trimmed, after refusing a Cost Center ERPNext positively denies
+    (v0.7.3). '' passes straight through — it means "write no cost center".
+
+    Validation is BEST-EFFORT BY DESIGN. An unconfigured or unreachable ERPNext
+    yields no verdict and the value is accepted: refusing an operator's input
+    because of a transient outage is a worse failure than storing a cost center
+    ERPNext will itself reject at JE time. Only a positive denial — ERPNext
+    answered and has no such leaf Cost Center — refuses here."""
+    cc = (raw or '').strip()
+    if not cc:
+        return ''
+    from .. import erpnext_bank
+    from .. import erpnext_settings
+    if not erpnext_settings.is_configured():
+        return cc
+    try:
+        client = erpnext_bank.get_client()
+    except Exception:
+        return cc                      # unreachable → no verdict, accept
+    if erpnext_bank.cost_center_exists(client, cc, company) is False:
+        raise ToolError(
+            f'{cc!r} is not a Cost Center this ERPNext will accept on a '
+            f'Journal Entry line (unknown, or a group node). Check the exact '
+            f'docname — cost centers are Company-suffixed, e.g. "Harvest - OML".')
+    return cc
+
+
 def _create_rule(args: dict):
     rule = CategorizationRule(
         match_type=(args.get('match_type') or 'merchant_contains'),
         match_value=(args.get('match_value') or ''),
         offset_account=(args.get('offset_account') or ''),
+        # v0.7.3 · optional; '' (the pre-v0.7.3 behaviour) leaves the JE line
+        # blank so ERPNext applies its own Account/Company default. A new rule
+        # is always Company-agnostic here — create_rule takes no scope — so the
+        # lookup is unscoped, which only widens the bare-name fallback.
+        cost_center=(_checked_cost_center(args.get('cost_center')) or None),
         bb_internal_tag=(args.get('tag') or ''),
         name=(args.get('name') or args.get('match_value') or 'AI rule'))
     db.session.add(rule)
     db.session.commit()
     return {'created_rule': rule.to_dict()}, f'created rule {rule.id}'
+
+
+# Every column a new rule VERSION inherits from the one it supersedes is
+# whatever isn't listed here, read off the table rather than spelled out — so a
+# column added by a future release is carried across an update instead of being
+# silently reset to its default (the failure mode a hand-written field list
+# invites, and the reason update_rule doesn't have one).
+#
+# The exclusions are the row's identity and history (`id`, timestamps,
+# `superseded_by`, `archived`) plus the two counters that belong to a version
+# rather than a rule: `match_count` re-accrues via the rollup, which walks
+# `superseded_by` forward and credits the live rule, and `activated_at`
+# re-stamps to now — matching what an edit through /admin/rules already does.
+_RULE_CLONE_SKIP = frozenset({'id', 'created_at', 'updated_at',
+                              'superseded_by', 'archived', 'match_count',
+                              'activated_at'})
+
+# MCP argument name → model attribute, for update_rule's patch. `tag` keeps the
+# name create_rule already uses for bb_internal_tag.
+_RULE_UPDATABLE = {
+    'name': 'name',
+    'match_type': 'match_type',
+    'match_value': 'match_value',
+    'offset_account': 'offset_account',
+    'cost_center': 'cost_center',
+    'active': 'active',
+    'priority': 'priority',
+    'tag': 'bb_internal_tag',
+    'applies_to_company': 'applies_to_company',
+}
+
+
+def _update_rule(args: dict):
+    """Patch one rule NON-DESTRUCTIVELY — the same clone-and-supersede an edit
+    on /admin/rules performs, so the version that generated a past JE stays
+    readable. Returns the NEW rule (a new id) and the archived old one."""
+    from .. import audit
+    from .. import categorization
+    raw_id = args.get('rule_id')
+    try:
+        rule_id = int(raw_id)
+    except (TypeError, ValueError):
+        raise ToolError(f'rule_id must be an integer, got {raw_id!r}')
+    old = db.session.get(CategorizationRule, rule_id)
+    if old is None:
+        raise ToolError(f'no rule id {rule_id}')
+    if old.archived:
+        raise ToolError(
+            f'rule {rule_id} is archived — it is a historical version and will '
+            f'never fire again. Update the rule that superseded it'
+            + (f' (id {old.superseded_by})' if old.superseded_by else ''))
+
+    patch = {attr: args[key] for key, attr in _RULE_UPDATABLE.items()
+             if key in args}
+    if not patch:
+        raise ToolError('nothing to update — pass at least one field '
+                        f"({', '.join(sorted(_RULE_UPDATABLE))})")
+
+    vals = {c.name: getattr(old, c.name)
+            for c in CategorizationRule.__table__.columns
+            if c.name not in _RULE_CLONE_SKIP}
+    before = old.to_dict()
+
+    if 'match_type' in patch:
+        mt = (patch['match_type'] or '').strip()
+        if mt not in categorization.MATCH_TYPES:
+            raise ToolError(
+                f'unknown match_type {mt!r} — one of '
+                f"{', '.join(categorization.MATCH_TYPES)}")
+        patch['match_type'] = mt
+    if 'priority' in patch:
+        try:
+            patch['priority'] = int(patch['priority'])
+        except (TypeError, ValueError):
+            raise ToolError(f"priority must be an integer, got "
+                            f"{patch['priority']!r}")
+    if 'active' in patch:
+        patch['active'] = bool(patch['active'])
+    if 'applies_to_company' in patch:
+        patch['applies_to_company'] = (
+            (patch['applies_to_company'] or '').strip() or None)
+    if 'cost_center' in patch:
+        # Validated against the company the rule will have AFTER the patch, not
+        # the one it had before — an update that re-scopes and re-costs a rule
+        # in one call must be checked against its new scope.
+        company = (patch.get('applies_to_company')
+                   if 'applies_to_company' in patch
+                   else vals.get('applies_to_company')) or ''
+        # '' → None: an explicit empty string is how a caller CLEARS the cost
+        # center, handing the line back to ERPNext's own defaults.
+        patch['cost_center'] = (
+            _checked_cost_center(patch['cost_center'], company) or None)
+
+    vals.update(patch)
+    new_rule = CategorizationRule(**vals)
+    db.session.add(new_rule)
+    db.session.flush()                 # assign new_rule.id
+    old.active = False
+    old.archived = True
+    old.superseded_by = new_rule.id
+    db.session.commit()
+    audit.record('rule_updated', subject_type='CategorizationRule',
+                 subject_id=new_rule.id, before=before,
+                 after=new_rule.to_dict(),
+                 notes=f'rule #{old.id} superseded by #{new_rule.id} '
+                       f"(MCP update_rule: {', '.join(sorted(patch))})",
+                 actor='mcp')
+    return ({'updated_rule': new_rule.to_dict(),
+             'superseded_rule_id': old.id,
+             'updated_fields': sorted(patch)},
+            f'rule #{old.id} → #{new_rule.id} '
+            f"({', '.join(sorted(patch))})")
 
 
 def _set_variance_tag(args: dict):
@@ -445,8 +595,10 @@ TOOLS = {
     'list_rules': {
         **_tool(
             'List categorization rules (match_type, match_value, offset_account, '
-            'internal tag, priority). Set active_only=false to include inactive '
-            'rules. Read-only.',
+            'cost_center, internal tag, priority). An empty cost_center means '
+            'the rule writes none and ERPNext applies the offset Account\'s or '
+            "the Company's own default — not that the line is uncosted. Set "
+            'active_only=false to include inactive rules. Read-only.',
             {'active_only': _BOOL}),
         'handler': _list_rules},
     'list_unmatched_statement_transactions': {
@@ -486,12 +638,51 @@ TOOLS = {
 
     'create_rule': {
         **_tool(
-            'Create a categorization rule. MUTATING — requires the create_rule '
-            'kill switch to be ON.',
+            'Create a categorization rule. Optionally set cost_center — the '
+            'ERPNext Cost Center docname written onto the OFFSET line of every '
+            'Journal Entry this rule generates (the bank line is never given '
+            'one). REFUSES a cost_center ERPNext positively denies (unknown, or '
+            'a group node); an unreachable ERPNext yields no verdict and the '
+            'value is accepted. Omit cost_center to write none, which leaves '
+            "ERPNext to apply the Account's or Company's own default. "
+            'REVERSIBLE: a rule is archived, never deleted, and only affects '
+            'Journal Entries generated after it. MUTATING — requires the '
+            'create_rule kill switch to be ON.',
             {'match_type': _STR, 'match_value': _STR, 'offset_account': _STR,
+             'cost_center': {
+                 'type': 'string',
+                 'description': 'ERPNext Cost Center docname for the offset '
+                                'line, e.g. "Harvest - OML". Omit for none.'},
              'tag': _STR, 'name': _STR},
             required=('match_type', 'match_value'), mutating=True),
         'handler': _create_rule},
+    'update_rule': {
+        **_tool(
+            'Update one categorization rule, changing ONLY the fields you pass '
+            '(name, match_type, match_value, offset_account, cost_center, '
+            'active, priority, tag, applies_to_company). Pass cost_center="" to '
+            'clear it and hand the offset line back to ERPNext\'s own default. '
+            'NON-DESTRUCTIVE: like an edit in the admin UI this writes a NEW '
+            'rule version and archives the old one (returns the new id in '
+            'updated_rule.id and the archived one in superseded_rule_id), so '
+            'the version that generated any past Journal Entry stays readable — '
+            'expect the id to CHANGE. REFUSES an archived rule (a historical '
+            'version that will never fire again — update its successor), an '
+            'unknown match_type, and a cost_center ERPNext positively denies. '
+            'Already-posted Journal Entries are NOT rewritten; only entries '
+            'generated after this call use the new values. MUTATING — requires '
+            'the update_rule kill switch to be ON.',
+            {'rule_id': {'type': 'integer'},
+             'name': _STR, 'match_type': _STR, 'match_value': _STR,
+             'offset_account': _STR,
+             'cost_center': {
+                 'type': 'string',
+                 'description': 'ERPNext Cost Center docname for the offset '
+                                'line. "" clears it.'},
+             'active': _BOOL, 'priority': {'type': 'integer'},
+             'tag': _STR, 'applies_to_company': _STR},
+            required=('rule_id',), mutating=True),
+        'handler': _update_rule},
     'set_variance_tag': {
         **_tool(
             'Set the human-readable variance_reason on one statement anchor. '

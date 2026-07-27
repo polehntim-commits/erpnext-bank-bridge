@@ -2298,7 +2298,7 @@ skip it entirely.
 | `plaid_accounts` | accounts within an item; ERPNext Bank Account mapping + sync toggle + import status + opening-balance JE link (v0.4.4) |
 | `bank_transactions` | local mirror of Plaid transactions + ERPNext docname/state |
 | `suppliers` | merchant → ERPNext Supplier cache (normalized name, tallies) — v0.3.0 |
-| `categorization_rules` | user rules: match predicate → offset account + direction + party + template (bank side from the txn; v0.3.1) — v0.3.0 |
+| `categorization_rules` | user rules: match predicate → offset account + direction + party + template (bank side from the txn; v0.3.1) + optional Cost Center for the offset line, NULL = let ERPNext apply its own default (v0.7.3) — v0.3.0 |
 | `generated_journal_entries` | per-JE state record (state, rule, JE docname) — v0.3.0 |
 | `intercompany_transfer_pairs` | detected transfer between two owned Companies: both legs, both Companies, confidence, both JE docnames, state — v0.4.1 |
 | `plaid_statements` | one bank-issued statement: Plaid's statement id (UNIQUE — the idempotency guard), period, opening/closing balances parsed from the PDF (NULL when unreadable), stored PDF path — v0.4.9; plus the ERPNext `Bank Statement` docname and last sync time, NULL until uploaded — v0.4.10 |
@@ -3098,6 +3098,48 @@ automatically parties the JE to the `Chevron` Supplier. Review generated JEs at
 > ⚠️ Auto-JE generation is powerful and can write **bad ledger data** if a rule
 > is wrong. It stays OFF until you explicitly opt in, and defaults to inserting
 > **Drafts** (not submitted) so a human reviews before anything hits the books.
+
+#### Cost centers (v0.7.3)
+
+A rule may also name an ERPNext **Cost Center**, which is written onto the
+**offset line** of every Journal Entry that rule generates. That is what turns a
+chart of accounts into a value chain: a Coastal Farm & Ranch purchase and a NAPA
+purchase can both hit `Repairs & Maintenance` while one is attributed to
+`Crop Protection - OML` and the other to `Harvest - OML`, so the segment reports
+answer *what did harvest cost this year* without a second set of accounts.
+
+Three things about it are deliberate:
+
+- **Offset line only.** The bank side never gets a cost center. It is a
+  balance-sheet account whose activity belongs to no segment, and stamping one
+  there would attribute the *movement of cash* rather than the cost it paid for.
+- **Blank means blank, not a default.** A rule without a cost center writes no
+  cost-center field at all, so **ERPNext** applies the offset Account's or the
+  Company's own default server-side — which is a better answer than anything
+  Bank Bridge could guess, and writing a guess here would *override* it. Every
+  rule that existed before v0.7.3 upgrades to blank and keeps posting
+  identically.
+- **Stored verbatim, not resolved per-Company.** Unlike a Company-agnostic
+  rule's offset account (which resolves to each Company's own chart at JE time),
+  a cost center is chosen against one Company's tree. Setting a Company-suffixed
+  cost center on an agnostic rule is an explicit choice, and ERPNext is the
+  authority that rejects it if it is wrong for the booking Company.
+
+Set it in the **Cost center** field on `/admin/rules`, or through the MCP tools
+`create_rule` / `update_rule`. Both **refuse** a cost center ERPNext positively
+denies — unknown, or a group node it will not let you book against — while an
+unconfigured or unreachable ERPNext yields no verdict and the value is accepted
+(a transient outage must not reject valid input; a wrong value is caught at JE
+time either way). `list_rules` reports `cost_center` on every row, so an AI
+client can audit which rules are still uncosted.
+
+`update_rule` (v0.7.3, kill switch **OFF** by default and **separate** from
+`create_rule`'s) patches only the fields you pass. Like an edit on
+`/admin/rules` it is **non-destructive**: it writes a new rule version and
+archives the old one, so the version that generated a past Journal Entry stays
+readable — which means **the rule id changes**, and the response returns both
+the new id and the archived one. Journal Entries already posted are never
+rewritten; only entries generated after the change use the new values.
 
 ## Audit trail (`/admin/audit`, v0.3.0)
 

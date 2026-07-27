@@ -957,6 +957,53 @@ def root_type_for_account(client: ERPNextClient | None, account: str,
     return account_types_for_account(client, account, company)[0]
 
 
+def cost_center_exists(client: ERPNextClient | None, cost_center: str,
+                       company: str = '') -> bool | None:
+    """Whether `cost_center` is a Cost Center docname ERPNext will accept on a
+    Journal Entry line (v0.7.3). TRI-STATE, and the third state is the point:
+
+      * True  — the docname resolves and is not a group node;
+      * False — ERPNext answered and has no such leaf Cost Center;
+      * None  — NO VERDICT (no client, unreachable, or an API error).
+
+    None is deliberately distinct from False. A caller validating an operator's
+    input must refuse a cost center ERPNext positively denies, and must NOT
+    refuse one it merely couldn't check — a transient outage rejecting valid
+    input is a worse failure than a wrong cost center, which ERPNext itself
+    rejects at JE time anyway. Same "positive mismatch only" discipline as the
+    party_type migration.
+
+    A GROUP cost center answers False: ERPNext refuses to book against a group
+    node, so accepting one would produce a rule whose every JE fails.
+
+    `company` narrows the fallback lookup by account_name-style match; an empty
+    company just widens it. Cost Center docnames are Company-suffixed
+    ('Harvest - OML'), so the exact-docname path is the normal one."""
+    name = (cost_center or '').strip()
+    if not name or client is None:
+        return None
+    try:
+        doc = client.get_doc('Cost Center', name)   # None on 404, raises on 5xx
+    except (ERPNextAPIError, ERPNextError):
+        return None                                 # unreachable → no verdict
+    if isinstance(doc, dict) and doc.get('name'):
+        return not bool(doc.get('is_group'))
+    # A 404 is ERPNext ANSWERING "no doc by that name" — but the operator may
+    # have typed the bare cost_center_name, so try that under `company` before
+    # calling it missing (the same fallback account_types_for_account uses for
+    # a logical account name). An empty result HERE is the positive denial.
+    try:
+        filters = [['cost_center_name', '=', name], ['is_group', '=', 0]]
+        want = (company or '').strip()
+        if want:
+            filters.append(['company', '=', want])
+        rows = client.list_docs('Cost Center', filters=filters,
+                                fields=['name'], limit_page_length=1)
+    except (ERPNextAPIError, ERPNextError):
+        return None
+    return bool(rows)
+
+
 def cancel_bank_transaction(client: ERPNextClient, name: str) -> None:
     """Cancel a posted Bank Transaction (Plaid removed / superseded). Tolerates
     an already-cancelled or missing doc."""
