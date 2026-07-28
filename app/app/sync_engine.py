@@ -674,6 +674,65 @@ def retry_row(row_id: int) -> tuple[bool, str]:
         return False, str(e)
 
 
+# ── investment Journal Entries ─────────────────────────────────────────
+
+def post_investment_jes(item: PlaidItem, erp_client) -> dict:
+    """v0.8.2 · emit Journal Entries for the investment transactions this Item's
+    brokerage accounts have already mirrored locally. Returns aggregate
+    {'posted', 'skipped', 'failed'}; never raises.
+
+    THIS IS THE CALL THAT WAS MISSING. `invest_je.post_investments_for_account`
+    has been complete since v0.5.1 and the operator-facing kill switch has been
+    on /admin/accounts just as long, but no production code path ever invoked
+    the writer — only the unit tests did. An Item with
+    `invest_je_posting_enabled=True` therefore mirrored every trade into
+    `security_transactions` and posted exactly nothing to ERPNext, which is
+    indistinguishable from "there were no trades" unless you go read the table.
+
+    Placement is deliberate. It runs here rather than beside the
+    `investments.sync_investments_for_item` pull in `pull_item`, because that
+    function has no ERPNext client — `pull_item(item, plaid_client)` mirrors
+    Plaid locally and nothing more, by design. `sync_item` is the first frame
+    where both halves exist: the transactions are in the DB (pull_item has
+    returned) and `erp_client` is in hand. It runs BEFORE
+    `revaluation.revalue_all` because the two are the same decision seen from
+    opposite sides — revaluation skips mark-to-market on exactly the accounts
+    this posts per-security entries for (see revaluation.revalue_account), and
+    posting the real trades first keeps that ordering readable.
+
+    Fail-soft, twice over: per-account so one brokerage's chart-of-accounts
+    problem can't silence its sibling, and again around the whole pass so no JE
+    failure can fail a sync that has already mirrored transactions correctly."""
+    stats = {'posted': 0, 'skipped': 0, 'failed': 0}
+    if erp_client is None:
+        return stats
+    try:
+        from . import invest_je
+        if not invest_je.posting_enabled(item):
+            return stats
+        accounts = (PlaidAccount.query
+                    .filter(PlaidAccount.item_id == item.item_id,
+                            PlaidAccount.type.in_(('investment', 'brokerage')))
+                    .all())
+        for account in accounts:
+            try:
+                res = invest_je.post_investments_for_account(
+                    erp_client, account.account_id)
+            except Exception:  # noqa: BLE001 - per-account isolation
+                db.session.rollback()
+                log.warning('invest_je posting failed for %s (item=%s)',
+                            account.mask or account.account_id, item.item_id,
+                            exc_info=True)
+                continue
+            for k in stats:
+                stats[k] += (res or {}).get(k, 0)
+    except Exception:  # noqa: BLE001 - outer guard: never fail a sync on JE work
+        db.session.rollback()
+        log.warning('invest_je posting pass failed for %s', item.item_id,
+                    exc_info=True)
+    return stats
+
+
 # ── top-level orchestration ────────────────────────────────────────────
 
 def sync_item(item: PlaidItem, plaid_client: PlaidClient = None,
@@ -690,6 +749,7 @@ def sync_item(item: PlaidItem, plaid_client: PlaidClient = None,
     if erp_client is None:
         erp_client = get_erp_client_or_none()
     push_stats = push_pending(erp_client, item.item_id) if erp_client else {}
+    invest_stats = {'posted': 0, 'skipped': 0, 'failed': 0}
     # v0.4.0: mirror refreshed balances onto balance-only investment accounts'
     # ERPNext Bank Accounts. Best-effort — never fails the sync.
     if erp_client is not None:
@@ -709,6 +769,11 @@ def sync_item(item: PlaidItem, plaid_client: PlaidClient = None,
         except (ERPNextAPIError, ERPNextError):
             log.warning('repointing adopted accounts failed for %s',
                         item.item_id, exc_info=True)
+        # v0.8.2 · post the investment transactions this Item just mirrored as
+        # per-security Journal Entries, when the operator has opted the Item in.
+        # Gated, idempotent and total — see post_investment_jes above for why it
+        # lives here and not next to the investments pull.
+        invest_stats = post_investment_jes(item, erp_client)
         # v0.4.12 · mark investment accounts to market. Runs right after the
         # balance refresh above, because it measures against the balance that
         # refresh just cached. Posts a Draft for the DELTA only, and only when
@@ -729,7 +794,8 @@ def sync_item(item: PlaidItem, plaid_client: PlaidClient = None,
         except Exception:  # pragma: no cover - accrue_all is already total
             log.warning('loan interest accrual failed for %s', item.item_id,
                         exc_info=True)
-    return {'item_id': item.item_id, 'pull': pull_stats, 'push': push_stats}
+    return {'item_id': item.item_id, 'pull': pull_stats, 'push': push_stats,
+            'invest_je': invest_stats}
 
 
 def sync_all(plaid_client: PlaidClient = None, erp_client=None) -> dict:
@@ -765,7 +831,8 @@ def sync_all(plaid_client: PlaidClient = None, erp_client=None) -> dict:
                  notes=f'sync across {len(items)} item(s)')
     results = []
     agg = {'added': 0, 'modified': 0, 'removed': 0, 'posted': 0,
-           'cancelled': 0, 'failed': 0, 'paired': 0, 'pairs_booked': 0}
+           'cancelled': 0, 'failed': 0, 'paired': 0, 'pairs_booked': 0,
+           'invest_je_posted': 0, 'invest_je_failed': 0}
     for item in items:
         try:
             res = sync_item(item, plaid_client, erp_client)
@@ -774,6 +841,12 @@ def sync_all(plaid_client: PlaidClient = None, erp_client=None) -> dict:
                 agg[k] += res.get('pull', {}).get(k, 0)
             for k in ('posted', 'cancelled', 'failed', 'paired', 'pairs_booked'):
                 agg[k] += res.get('push', {}).get(k, 0)
+            # v0.8.2 · kept under distinct keys: an investment JE and a Bank
+            # Transaction push are different documents with different failure
+            # modes, and folding them into one `posted` would make the sync
+            # summary unreadable the first time one of them goes wrong.
+            for k in ('posted', 'failed'):
+                agg[f'invest_je_{k}'] += res.get('invest_je', {}).get(k, 0)
         except (PlaidError, PlaidConfigError) as e:
             log.warning('sync failed for item %s: %s', item.item_id, e)
             results.append({'item_id': item.item_id, 'error': str(e)})

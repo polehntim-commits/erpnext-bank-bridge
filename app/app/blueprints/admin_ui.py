@@ -1564,7 +1564,11 @@ def set_invest_je_posting(item_id):
     The default is OFF and this is the ONLY way to turn it on — a deliberate
     opt-in, because these are real accounting entries that hit the P&L. Nothing
     is posted retroactively by flipping the switch; the next investment sync (or
-    a manual post) is what emits JEs for the transactions already held."""
+    a manual post) is what emits JEs for the transactions already held.
+
+    v0.8.2 · that last sentence became TRUE in v0.8.2. Until then no production
+    code path called `invest_je.post_investments_for_account` at all, so flipping
+    this on changed a flag and nothing else — see `sync_engine.post_investment_jes`."""
     it = PlaidItem.query.filter_by(item_id=item_id).first()
     if it is None:
         return redirect('/admin/accounts?flash=' + quote_plus('Item not found'))

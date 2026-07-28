@@ -25,6 +25,7 @@ import os
 import tempfile
 import unittest
 from datetime import date
+from unittest import mock
 
 os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 
@@ -34,7 +35,7 @@ from app.models import (BankTransaction, GeneratedJournalEntry,  # noqa: E402
                         PlaidAccount, PlaidItem, RetainedLot, Security,
                         SecurityTransaction, TradedCycle)
 
-from tests.fakes import FakeERPClient  # noqa: E402
+from tests.fakes import FakeERPClient, FakePlaidClient  # noqa: E402
 
 COMPANY = 'Orchard Example, LLC'
 
@@ -718,3 +719,100 @@ class ContributionRoutingTests(InvestJEBase):
         self.assertIsNone(categorization._contribution_bank_leg(
             self._client_eq(), self._row('owner_contribution', 'plain'),
             COMPANY))
+
+
+class SyncFlowWiringTests(InvestJEBase):
+    """v0.8.2 · the writer above has been complete since v0.5.1, but until this
+    version no production code path ever called it — an Item with the kill
+    switch ON mirrored every trade into `security_transactions` and posted
+    exactly nothing. These pin the call site in `sync_engine.post_investment_jes`
+    and both of its fail-soft guards, because a silent regression here is
+    indistinguishable from "the operator forgot to opt in"."""
+
+    def _plaid(self):
+        return FakePlaidClient(accounts=[
+            {'account_id': 'brk', 'name': 'BUSINESS BROKERAGE',
+             'official_name': '', 'mask': '9401', 'type': 'investment',
+             'subtype': 'brokerage', 'balance_available': None,
+             'balance_current': 1000.0, 'iso_currency_code': 'USD'},
+            {'account_id': 'cash', 'name': 'BROKERAGE CASH',
+             'official_name': '', 'mask': '3194', 'type': 'depository',
+             'subtype': 'checking', 'balance_available': None,
+             'balance_current': 100.0, 'iso_currency_code': 'USD'},
+        ])
+
+    def _sync(self, poster, erp=NotImplemented):
+        """Run a whole `sync_item` with the JE writer stubbed, so what is under
+        test is the WIRING, not the writer (covered exhaustively above)."""
+        from app import invest_je as ije, sync_engine
+        erp = self._client() if erp is NotImplemented else erp
+        with mock.patch.object(ije, 'post_investments_for_account', poster):
+            return sync_engine.sync_item(self.item, self._plaid(), erp)
+
+    def _recorder(self, seen):
+        def post(client, account_id):
+            seen.append(account_id)
+            return {'posted': 1, 'skipped': 0, 'failed': 0}
+        return post
+
+    def test_sync_posts_investment_jes_when_the_flag_is_on(self):
+        seen = []
+        res = self._sync(self._recorder(seen))
+        self.assertEqual(seen, ['brk'])
+        self.assertEqual(res['invest_je']['posted'], 1)
+
+    def test_the_depository_sibling_is_not_posted_for(self):
+        """The paired cash account carries the BankTransaction half of a trade;
+        posting it here would double-book against Cash Clearing."""
+        seen = []
+        self._sync(self._recorder(seen))
+        self.assertNotIn('cash', seen)
+
+    def test_sync_posts_nothing_when_the_flag_is_off(self):
+        self.item.invest_je_posting_enabled = False
+        db.session.commit()
+        seen = []
+        res = self._sync(self._recorder(seen))
+        self.assertEqual(seen, [])
+        self.assertEqual(res['invest_je'], {'posted': 0, 'skipped': 0,
+                                            'failed': 0})
+
+    def test_sync_posts_nothing_when_erpnext_is_not_configured(self):
+        from app import sync_engine
+        seen = []
+        with mock.patch.object(sync_engine, 'get_erp_client_or_none',
+                               lambda: None):
+            self._sync(self._recorder(seen), erp=None)
+        self.assertEqual(seen, [])
+
+    def test_a_posting_failure_does_not_fail_the_sync(self):
+        def boom(client, account_id):
+            raise RuntimeError('ERPNext exploded')
+        with self.assertLogs('bankbridge.sync', level='WARNING') as logs:
+            res = self._sync(boom)
+        self.assertTrue(any('invest_je posting failed' in m
+                            for m in logs.output), logs.output)
+        # The sync itself still completed and left the Item healthy.
+        self.assertIn('pull', res)
+        self.assertEqual(self.item.status, 'active')
+        self.assertIsNone(self.item.last_error)
+
+    def test_one_bad_account_does_not_block_the_others(self):
+        for aid, mask in (('brk2', '9402'), ('brk3', '9403')):
+            db.session.add(PlaidAccount(
+                account_id=aid, item_id='item-om', name=f'BROKERAGE {mask}',
+                mask=mask, type='investment', subtype='brokerage',
+                owning_company=COMPANY))
+        db.session.commit()
+        seen = []
+
+        def flaky(client, account_id):
+            if account_id == 'brk2':
+                raise RuntimeError('this one is broken')
+            seen.append(account_id)
+            return {'posted': 1, 'skipped': 0, 'failed': 0}
+
+        with self.assertLogs('bankbridge.sync', level='WARNING'):
+            res = self._sync(flaky)
+        self.assertEqual(sorted(seen), ['brk', 'brk3'])
+        self.assertEqual(res['invest_je']['posted'], 2)

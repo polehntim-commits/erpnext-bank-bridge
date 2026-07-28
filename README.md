@@ -1775,6 +1775,21 @@ ERPNext failure never leaves phantom-sold inventory). Every line carries
 nothing to unwind. **Unrealized gains are never posted** — Marketable Securities
 sits at cost until a sell.
 
+**v0.8.2** — **fix**: wire `invest_je.post_investments_for_account` into the
+transaction sync so `invest_je_posting_enabled=True` actually emits Journal
+Entries for investment transactions. The writer, the kill switch and the
+`/admin/accounts` toggle all shipped in v0.5.1, but no production code path ever
+called the writer — only the unit tests did. An opted-in Item therefore mirrored
+every trade into `security_transactions` and posted **nothing** to ERPNext,
+which looks exactly like "there were no trades" unless you go read the table.
+`sync_engine.post_investment_jes` now runs once per Item per sync, after the
+Plaid pull has landed the transactions and before mark-to-market revaluation
+(which skips these accounts by the same flag). Gated, idempotent, and fail-soft
+per-account and again around the whole pass — a JE problem can never fail a sync
+that has already mirrored transactions correctly. Nothing is posted for an Item
+whose switch is off, and the first sync after flipping it on **backfills** every
+transaction already held. No schema change, no new kill switches.
+
 ## Reconciliation status in ERPNext (v0.5.0)
 
 A bookkeeper opens the ERPNext **Bank Statement** record and sees *this period
