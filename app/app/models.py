@@ -1581,23 +1581,33 @@ class SecurityTransaction(db.Model):
 
 
 class TradeLegPairing(db.Model):
-    """One trade's two legs, and whether Bank Bridge can see both (v0.8.0).
+    """One trade's two legs, and whether Bank Bridge can see both (v0.8.1).
 
-    WHAT A TRADE ACTUALLY LOOKS LIKE at Wells Fargo Advisors. Buying $10,000 of
-    a stock in a paired brokerage moves money twice, across two Plaid accounts:
+    WHAT A TRADE ACTUALLY LOOKS LIKE. Buying $10,000 of a stock in a paired
+    brokerage moves money twice — once as securities, once as cash — and WHERE
+    the cash half lands is a property of the custodian. Two shapes, and
+    `pairing_scheme()` names which one matched a given row:
 
-      * the SECURITY leg — a SecurityTransaction on the brokerage account, from
-        /investments/transactions/get, carrying the security, quantity, price
-        and the trade's cash impact;
-      * the CASH leg — a BankTransaction on the "Brokerage Cash Services"
-        companion, from /transactions/sync, where the settlement actually
-        debits the sweep, T+1 or T+2 later.
+      * 'wf_same_account' — WELLS FARGO ADVISORS, and what OML's live data
+        shows. Both legs arrive on the brokerage account from
+        /investments/transactions/get: a `type=buy` row for the security
+        movement, and a second `type=cash` row carrying the SAME security_id,
+        date and magnitude for the settlement. The cash-services companion
+        carries none of it.
+      * 'cross_account' — the SECURITY leg as above, and the CASH leg as an
+        'Increase/Decrease from Brokerage activity' BankTransaction on the
+        companion, from /transactions/sync, T+1 or T+2 later.
 
-    `invest_je` books both against `Cash Clearing - Brokerage`, from opposite
-    sides, so a complete pair nets the clearing account to zero. That is the
-    whole design (see invest_je's module docstring) and it works — as long as
-    both legs exist. When one is missing, its half of the pair posts alone and
-    the clearing account carries the difference forever.
+    v0.8.0 recognised only the second shape, so against Wells Fargo every trade
+    read as an orphan — 1,208 of them on ••9401 — and the imbalance that fell
+    out was the account's aggregate cash flow rather than a diagnostic. v0.8.1
+    tries same-account first and falls back to cross-account.
+
+    `invest_je` books both legs against `Cash Clearing - Brokerage`, from
+    opposite sides, so a complete pair nets the clearing account to zero. That
+    is the whole design (see invest_je's module docstring) and it works — as
+    long as both legs exist. When one is missing, its half of the pair posts
+    alone and the clearing account carries the difference forever.
 
     WHY THIS IS A TABLE. `invest_je.clearing_imbalance` already computes the
     NET of that failure — one number, over all history, for one account. What it
@@ -1617,17 +1627,19 @@ class TradeLegPairing(db.Model):
     here would assert a failure mode that account cannot have.
 
     EITHER LEG CAN BE THE ORPHAN, and a row is keyed on whichever one exists.
-    That is not symmetry for its own sake — it is the two failure modes the
-    live data actually shows, and they have opposite signs:
+    That is not symmetry for its own sake — they are two genuinely different
+    failure modes with opposite signs:
 
-      * ••6030's clearing sits at **+$297,358.90** — security legs Bank Bridge
-        holds whose settlement never appeared on the companion.
-      * ••9401's sits at **-$985,015.56** — the mirror image: companion cash
-        movements with no security leg to explain them, which is what an Item
-        whose /investments/transactions/get was never granted looks like.
+      * a security leg whose settlement never appeared (missing_leg='cash');
+      * a brokerage-activity sweep on the companion with no security leg to
+        explain it (missing_leg='security') — what an Item whose
+        /investments/transactions/get was never granted looks like.
 
-    A table keyed only on trades could not represent the second at all, and
-    ••9401 is the larger number of the two.
+    A table keyed only on trades could not represent the second at all. Note
+    that ONLY the companion's brokerage-activity lines qualify: the
+    cash-services account is a real checking account, and v0.8.0 reporting its
+    debit-card traffic as orphaned trade legs is most of where ••9401's
+    -$985,015.56 came from.
 
     `delta` is `expected_cash_amount - actual_cash_amount`, both CASH IN
     POSITIVE, and it is defined that way so that
@@ -1698,6 +1710,22 @@ class TradeLegPairing(db.Model):
     def is_paired(self) -> bool:
         return bool(self.security_txn_id) and bool(self.cash_txn_id)
 
+    def pairing_scheme(self) -> str:
+        """Which of the two custodian shapes matched this row (v0.8.1):
+        'wf_same_account' | 'cross_account' | 'unpaired'.
+
+        DERIVED from `cash_source` rather than stored. The information is
+        already in the row — a cash leg found on the brokerage itself is a
+        plaid_investment_transaction_id and says cash_source='security'; one
+        found on the companion is a plaid_transaction_id and says 'bank' — so a
+        column would be a second copy of a fact, free to disagree with the first
+        after a partial migration. A patch release that needs no schema change
+        is also a patch release an operator can roll back."""
+        if not self.is_paired():
+            return 'unpaired'
+        return ('wf_same_account' if (self.cash_source or 'bank') == 'security'
+                else 'cross_account')
+
     def to_dict(self):
         return {
             'id': self.id, 'account_id': self.account_id,
@@ -1715,6 +1743,7 @@ class TradeLegPairing(db.Model):
             'delta': self.delta or 0.0,
             'status': self.status or 'unpaired',
             'paired': self.is_paired(),
+            'pairing_scheme': self.pairing_scheme(),
             'paired_at': self.paired_at.isoformat() if self.paired_at else None,
             'notes': self.notes or '',
         }

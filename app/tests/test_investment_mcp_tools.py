@@ -516,16 +516,55 @@ class ListUnpairedTradesTest(InvestToolBase):
         self.assertIsNotNone(row['days_since_transaction'])
 
     def test_companion_cash_with_no_trade_surfaces_too(self):
-        """The larger of the two live imbalances is made of these."""
+        """A brokerage sweep on the companion with no security leg behind it —
+        what an Item that never pulled its investments feed looks like."""
         from app import trade_pairing
         self._cash_txn('bank-wire', amount=-278000.0, when=date(2026, 2, 20),
-                       name='WIRE IN')
+                       name='Increase from Brokerage activity')
         trade_pairing.rebuild('brk-1')
         row = self._ok('list_unpaired_trades',
                        {'account_mask': '9401'})['unpaired'][0]
         self.assertEqual('security', row['missing_leg'])
+        self.assertEqual('unpaired', row['pairing_scheme'])
         self.assertEqual(278000.0, row['actual_cash_amount'])
         self.assertEqual(-278000.0, row['delta'])
+
+    def test_ordinary_companion_traffic_is_not_listed_as_a_trade_leg(self):
+        """v0.8.1 · the cash-services companion is a real checking account, and
+        v0.8.0 read every debit-card purchase on it as an orphaned trade leg —
+        most of where ••9401's -$985,015.56 came from. A grocery bill never had
+        a security leg, so it is not a finding."""
+        from app import trade_pairing
+        t = self._cash_txn('bank-groceries', amount=84.19,
+                           when=date(2026, 2, 20), name='TRADER JOES #402')
+        t.merchant_name = "Trader Joe's"
+        t.category = 'Food and Drink > Groceries'
+        db.session.commit()
+        trade_pairing.rebuild('brk-1')
+        out = self._ok('list_unpaired_trades', {'account_mask': '9401'})
+        self.assertEqual(0, out['count'])
+        self.assertEqual(0.0, out['unpaired_total'])
+        self.assertTrue(out['totals_agree'])
+
+    def test_a_wells_fargo_same_account_pair_does_not_surface(self):
+        """v0.8.1 · both legs on the brokerage — a `type=buy` row and a
+        `type=cash` row with the same security_id, date and magnitude, both
+        POSITIVE because cash left and the custodian says so twice."""
+        from app import trade_pairing
+        self._trade(amount=1000.0, when=date(2026, 3, 10))
+        db.session.add(SecurityTransaction(
+            plaid_investment_transaction_id='inv-cash', account_id='brk-1',
+            security_id='sec-aapl', date=date(2026, 3, 10), name='cash',
+            quantity=0.0, amount=1000.0, price=0.0, type='cash',
+            subtype='withdrawal'))
+        db.session.commit()
+        stats = trade_pairing.rebuild('brk-1')
+        self.assertEqual(1, stats['paired_same_account'])
+        out = self._ok('list_unpaired_trades', {'account_mask': '9401'})
+        self.assertEqual(0, out['count'])
+        self.assertEqual(0.0, out['unpaired_total'])
+        self.assertEqual(1, out['summary']['paired_same_account'])
+        self.assertEqual(0, out['summary']['paired_cross_account'])
 
     def test_a_paired_trade_does_not_surface(self):
         from app import trade_pairing

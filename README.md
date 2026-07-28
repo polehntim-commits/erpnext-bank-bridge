@@ -2021,13 +2021,14 @@ findings.
 Clearing account sits from zero. It is correct and it is unactionable — nobody
 can chase −$985,015.56. The new `trade_leg_pairings` table decomposes it.
 
-A trade at a paired Wells-Fargo-style brokerage moves money twice: a **security
-leg** on the brokerage (`/investments/transactions/get`) and a **cash leg** on
-its cash-services companion (`/transactions/sync`), booked to Cash Clearing from
-opposite sides so a complete pair nets to zero. Pairing matches them on exact
-amount within **three business days**, preferring the later of two equal
-candidates (settlement follows a trade) and never letting one cash leg claim two
-trades.
+A trade moves money twice — once as securities, once as cash — booked to Cash
+Clearing from opposite sides so a complete pair nets to zero. Pairing matches
+the two on amount within **three business days**, preferring the later of two
+equal candidates (settlement follows a trade) and never letting one cash leg
+claim two trades. **Where the cash half lands depends on the custodian**, and
+v0.8.1 recognises both shapes — see [Trade leg pairing: the Wells Fargo
+pattern](#trade-leg-pairing-the-wells-fargo-pattern-v081) below, which corrects
+the numbers quoted in the rest of this section.
 
 **Either leg can be the orphan**, and that is not symmetry for its own sake.
 The two live imbalances have *opposite signs*, and under this table's `delta`
@@ -2120,7 +2121,102 @@ implementation would *mislead* rather than fail:
   pairing matches its definition deliberately so the Σ-delta identity holds. If
   the cash-services account is ever used for ordinary spending, both numbers
   move together, and that is a worthwhile future narrowing rather than a bug
-  introduced now.
+  introduced now. **It was: v0.8.1 narrows it, because the cash-services
+  account *is* used for ordinary spending.**
+
+## Trade leg pairing: the Wells Fargo pattern (v0.8.1)
+
+v0.8.0's pairing shipped against a model of Wells Fargo Advisors, not against
+its data. Run on OML, `list_unpaired_trades` reported **1,208 unpaired security
+legs on ••9401** and a −$985,015.56 clearing imbalance; ••6030 read 313 security
++ 181 cash and +$297,358.90. Every one of those numbers was an artifact.
+
+### What the data actually shows
+
+Pulling June 2025 on ••9401 — 66 investment rows — the shape is **two rows per
+trade, both on the brokerage account**:
+
+| id | type | subtype | security | amount | account |
+|---|---|---|---|---|---|
+| `VNBm7Y0XwP…` | `buy` | `buy` | TLT | **+$35.47** | ••9401 |
+| `ONwrJYbyg7…` | `cash` | `withdrawal` | TLT | **+$35.47** | ••9401 |
+
+One trade, recorded twice: the security movement and the cash settlement, same
+`security_id`, same date, same magnitude. Nothing lands on the ••3194 companion
+— which holds debit-card purchases and transfers, not trade settlements.
+
+v0.8.0 looked only for *security leg on brokerage / cash leg on companion*. That
+is a real pattern at some custodians and it is not what Wells Fargo surfaces
+through Plaid, so every WFA trade read as an orphan and every companion grocery
+bill read as an orphaned cash leg.
+
+### The two shapes, and the order they are tried in
+
+Each row now reports a `pairing_scheme`:
+
+| scheme | where the legs are | matched on |
+|---|---|---|
+| `wf_same_account` | both on the brokerage, from `/investments/transactions/get` | exact `security_id`, `|amount|`, `iso_currency_code`, ±3 business days |
+| `cross_account` | security on the brokerage, cash on the companion | exact amount, ±3 business days (v0.8.0 behaviour, unchanged) |
+| `unpaired` | one leg only | — |
+
+Same-account is tried **first**, because it is the bank we integrate with;
+cross-account remains the fallback, so a custodian that really does split the
+legs still pairs. Amount matching runs an **exact pass over every leg before**
+a second pass with a penny of tolerance — run as one pass, a rounding-apart
+partner can take a leg that another matched to the cent, and the orphan that
+falls out is an artifact of iteration order rather than a finding.
+
+**The sign trap.** WFA reports *both* halves of a buy as **positive** — the
+security leg positive because cash left, the settlement leg positive for the
+same reason. Taken at face value that reads as $70.94 leaving on a $35.47 trade.
+Direction is therefore read off `subtype` (`withdrawal` = out, `deposit` = in)
+rather than off the sign; any other subtype falls back to Plaid's sign and must
+then *agree* with the security leg before the two can pair, so a dividend paying
+cash in cannot settle a buy that paid cash out.
+
+A `type=cash` row with **no `security_id`** is a plain deposit or withdrawal that
+never had a trade behind it. It can never pair, and it stays a legitimate
+unpaired row — it *is* a brokerage cash movement with no counterpart.
+
+### Ordinary companion traffic is not a trade leg
+
+The cash-services companion is a real checking account. Only its
+**brokerage-activity** lines (`Increase`/`Decrease from Brokerage activity` —
+see `COMPANION_CASH_LEG_MARKERS`) are candidates to match or findings to report;
+a debit-card purchase never had a security leg and never will. v0.8.0 counted
+every one as an orphan, which is most of where ••9401's −$985k came from.
+
+### `clearing_imbalance` had to move with it
+
+Under the same-account shape the old scalar counted **both** halves of every WFA
+trade on the security side and then subtracted the companion's entire cash flow
+— double-counting each trade and charging the cardholder's groceries to Cash
+Clearing. Pairing the halves without fixing the scalar would have left the
+itemisation right and the headline wrong.
+
+So `invest_je.clearing_imbalance` now **delegates** to
+`trade_pairing.projected_clearing_imbalance`, which computes it from the same
+source tables by the same pairing rules. The identity
+
+```
+Σ delta over an account's rows  ==  invest_je.clearing_imbalance(account)
+```
+
+holds **by construction** rather than by agreement — there is only one
+calculation left, so the two cannot drift. It still reads no ERPNext and no
+`trade_leg_pairings`: a stale or never-built table makes `totals_agree` false,
+never the headline number wrong.
+
+### What did not change
+
+Anchor variance (`variance = closing − opening − transaction_sum`),
+`mark_to_market_delta`, the `portfolio_*` identity fields, and
+`security_flow_sum` — which aggregates *all* investment transactions for a
+period regardless of pairing, and so is unaffected. No new tables, no migration,
+no new kill switches. `pairing_scheme` is derived from the existing
+`cash_source` column rather than stored, so a patch release stays a patch
+release an operator can roll back.
 
 ## Bank Statement doctype (v0.4.10)
 

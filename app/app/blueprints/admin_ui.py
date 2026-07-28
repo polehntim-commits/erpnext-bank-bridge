@@ -5505,9 +5505,9 @@ STATEMENTS_BODY = """
   {% endif %}
   {% if group.clearing_imbalance and group.clearing_imbalance|abs > 0.005 %}
   <br><span class="warn" style="font-size:12px">&#9888; Cash Clearing off by
-    {{ '%+.2f'|format(group.clearing_imbalance) }} — a trade's security and
-    companion cash legs don't match; the clearing account won't net to zero
-    until it's resolved.</span>
+    {{ '%+.2f'|format(group.clearing_imbalance) }} — one or more trades are
+    missing a leg, on this account or on its cash companion; the clearing
+    account won't net to zero until it's resolved.</span>
   {% endif %}
   {% if group.anchor_periods %}
   <br><span style="font-size:12px">

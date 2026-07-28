@@ -701,6 +701,11 @@ def _list_unpaired_trades(args: dict):
             'expected_cash_amount': r.expected_cash_amount,
             'actual_cash_amount': r.actual_cash_amount,
             'missing_leg': r.missing_leg or '',
+            # v0.8.1 · 'wf_same_account' | 'cross_account' | 'unpaired'. Always
+            # the last of the three on THIS list (it is the unpaired list), and
+            # returned anyway so the field means the same thing here as it does
+            # in `summary` and in a row's to_dict().
+            'pairing_scheme': r.pairing_scheme(),
             'delta': r.delta,
             'days_since_transaction': trade_pairing.days_since(r),
             'security_txn_id': r.security_txn_id,
@@ -1032,7 +1037,14 @@ def _rebuild_anchors(args: dict):
         log.warning('trade-leg pairing rebuild failed', exc_info=True)
     return ({'rebuild': result, 'trade_leg_pairing': pairing},
             f"anchors written: {result.get('written', 0)}"
-            + (f", trade legs paired: {pairing['paired']}" if pairing else ''))
+            # v0.8.1 · the same-account/cross-account split, because "paired:
+            # 604" alone cannot tell an operator whether the Wells Fargo rule
+            # fired or the fallback quietly carried the whole account.
+            + (f", trade legs paired: {pairing['paired']} "
+               f"({pairing['paired_same_account']} same-account, "
+               f"{pairing['paired_cross_account']} cross-account), "
+               f"unpaired: {pairing['unpaired_security']} security / "
+               f"{pairing['unpaired_cash']} cash" if pairing else ''))
 
 
 def _pair_accounts(args: dict):
@@ -1342,22 +1354,29 @@ TOOLS = {
     'list_unpaired_trades': {
         **_tool(
             'The itemisation of a paired brokerage\'s Cash Clearing imbalance '
-            '— every movement missing its other leg. A trade at a paired '
-            'Wells-Fargo-style brokerage moves money twice: a SECURITY leg on '
-            'the brokerage (from investments/transactions/get) and a CASH leg '
-            'on its cash-services companion (from transactions/sync), booked '
-            'to Cash Clearing from opposite sides so a complete pair nets to '
-            'zero. Each row here is a leg with no partner within 3 business '
-            'days: date, security and ticker, action (buy/sell/fee/cash), '
-            'expected vs actual cash amount, `missing_leg` naming which side is '
-            'absent ("cash" = a trade whose settlement never appeared; '
-            '"security" = companion cash with no trade to explain it, which is '
-            'what an Item that never pulled its investments feed looks like), '
-            'delta, and days_since_transaction so slow settlement is '
-            'distinguishable from a permanent gap. `unpaired_total` sums the '
-            'deltas and equals reported_clearing_imbalance by construction; '
-            'totals_agree=false means the pairing table is stale and a fresh '
-            'sync or rebuild_anchors is needed. REFUSES an account with no '
+            '— every movement missing its other leg. A trade moves money twice, '
+            'once as securities and once as cash, and WHERE the cash half lands '
+            'depends on the custodian. Wells Fargo Advisors puts BOTH legs on '
+            'the brokerage account (a type=buy row and a type=cash settlement '
+            'row with the same security_id, date and magnitude); other '
+            'custodians put the security leg on the brokerage and the cash leg '
+            'on the cash-services companion as an "Increase/Decrease from '
+            'Brokerage activity" line. Pairing tries same-account first, then '
+            'falls back to cross-account, both within 3 business days. Each row '
+            'here is a leg that matched neither way: date, security and ticker, '
+            'action (buy/sell/fee/cash), expected vs actual cash amount, '
+            '`missing_leg` naming which side is absent ("cash" = a trade whose '
+            'settlement never appeared; "security" = a companion brokerage-'
+            'activity line with no trade to explain it, which is what an Item '
+            'that never pulled its investments feed looks like), '
+            '`pairing_scheme`, delta, and days_since_transaction so slow '
+            'settlement is distinguishable from a permanent gap. Ordinary '
+            'companion traffic (debit-card purchases, transfers) is NOT listed '
+            '— it never had a security leg, so it is not an orphaned trade leg. '
+            '`unpaired_total` sums the deltas and equals '
+            'reported_clearing_imbalance by construction; totals_agree=false '
+            'means the pairing table is stale and a fresh sync or '
+            'rebuild_anchors is needed. REFUSES an account with no '
             'cash-services companion — an unpaired investment account gets '
             'both legs in one Plaid row and cannot have this problem. '
             'Read-only.',

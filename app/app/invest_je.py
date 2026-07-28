@@ -789,36 +789,32 @@ def post_investments_for_account(client: ERPNextClient, account_id: str, *,
 
 def clearing_imbalance(account_id: str) -> float:
     """How far a paired brokerage's Cash Clearing account is from zero, in
-    dollars (v0.5.1).
+    dollars (v0.5.1, corrected v0.8.1).
 
-    Every SecurityTransaction's cash leg posts to clearing, and every companion
-    'Brokerage activity' BankTransaction posts the OTHER clearing leg — so a
-    consistent set nets to zero. This projects that net WITHOUT reading ERPNext:
-    the security side's cash-in-positive total minus the companion's
-    cash-in-positive total. Zero means every trade has its matching companion
-    movement; a non-zero result is a mismatched pair worth investigating.
+    Each half of a trade posts to clearing from the opposite side, so a complete
+    pair nets to zero and only the UNPAIRED remainder is left sitting there.
+    This projects that remainder WITHOUT reading ERPNext: Σ over the legs
+    `trade_pairing` could not match, cash-in-positive. Zero means every trade
+    Bank Bridge can see has both its legs; a non-zero result is a worklist, and
+    `list_unpaired_trades` is that worklist itemised.
 
-    0.0 for an unpaired account (no clearing account, nothing to balance)."""
-    from .models import BankTransaction
-    from . import statements as stmts
-    account = PlaidAccount.query.filter_by(account_id=account_id).first()
-    partner_id = (account.paired_account_id or '').strip() if account else ''
-    if not partner_id:
-        return 0.0
-    # Security side: cash-in-positive is -amount (Plaid amount positive = out).
-    # Only the types we actually post to clearing count.
-    posted_types = ('buy', 'sell', 'fee', 'cash')
-    sec = (SecurityTransaction.query
-           .filter(SecurityTransaction.account_id.in_(
-               tuple(stmts.supersede_chain(account_id))),
-                   SecurityTransaction.type.in_(posted_types))
-           .all())
-    security_cash_in = -sum(float(t.amount or 0.0) for t in sec)
-    partner_ids = stmts.supersede_chain(partner_id)
-    companion = (BankTransaction.query
-                 .filter(BankTransaction.account_id.in_(tuple(partner_ids)),
-                         BankTransaction.pending.is_(False),
-                         BankTransaction.removed.is_(False))
-                 .all())
-    companion_cash_in = -sum(float(t.amount or 0.0) for t in companion)
-    return round(security_cash_in - companion_cash_in, 2)
+    0.0 for an unpaired account (no clearing account, nothing to balance).
+
+    v0.8.1 · DELEGATED to `trade_pairing.projected_clearing_imbalance`, which
+    computes it from the same source tables by the same leg-pairing rules the
+    itemisation uses. Until v0.8.1 this function had its own arithmetic —
+    every clearing-typed security row's cash-in, minus every companion row's —
+    and against Wells Fargo Advisors that arithmetic was wrong twice over. WFA
+    puts BOTH halves of a trade on the brokerage account (a `buy` row and a
+    `cash` settlement row, same security, same amount), so the security-side sum
+    counted every trade twice; and the companion is an ordinary checking account
+    whose debit-card traffic has no security leg by nature, so subtracting all
+    of it charged the cardholder's groceries to Cash Clearing. ••9401's
+    -$985,015.56 was mostly those two artifacts.
+
+    Keeping the sum here and pairing over there would have left the scalar and
+    its own itemisation disagreeing, with no way for an operator to know which
+    to believe. One calculation, in the module that owns the pairing rules, is
+    the only arrangement where they cannot drift."""
+    from . import trade_pairing
+    return trade_pairing.projected_clearing_imbalance(account_id)
