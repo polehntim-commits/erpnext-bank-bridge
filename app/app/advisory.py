@@ -35,6 +35,7 @@ from flask import current_app
 
 from . import audit
 from . import db
+from . import erpnext_accounts
 from .models import (AdvisoryAgreement, AdvisoryFeeAccrual, DailyAUM,
                      GeneratedJournalEntry, HighWaterMark, HurdleRateSample,
                      PerformanceSnapshot, PlaidAccount, RiskControlCheck,
@@ -489,25 +490,44 @@ def amend_agreement(agreement: AdvisoryAgreement, patch: dict,
 # ── AUM sampling + base-fee accrual ──────────────────────────────────────────
 
 def account_market_value(account_id: str) -> float:
-    """The market value of one managed account: its security holdings at the
-    last institution price, PLUS its cash sweep balance. A brokerage account's
-    cash lives on a paired companion, so that companion's balance is included
-    when the account names one."""
-    total = 0.0
-    for h in SecurityHolding.query.filter_by(account_id=account_id).all():
-        if h.institution_value is not None:
-            total += float(h.institution_value)
-        elif h.quantity and h.institution_price:
-            total += float(h.quantity) * float(h.institution_price)
+    """The market value of one managed account, PLUS the cash on its paired
+    companion. A brokerage account's cash lives on a separate companion
+    account, so that companion's balance is added when the account names one.
+
+    The account's OWN value is holdings-or-balance, never both (v0.7.5). Plaid
+    defines `balances.current` on an investment account as the account's total
+    market value — the priced holdings plus settled cash — so summing the
+    SecurityHolding rows AND balance_current counts every position twice. That
+    is what v0.5.2 did, and it roughly doubled the AUM every base fee accrues
+    off. Holdings win when we have them: they are per-position and dated, where
+    balance_current is one cached scalar from the last accounts pull. With no
+    holdings (a custodian Plaid returns none for, or an install without the
+    `investments` product) balance_current is all there is, and reporting it
+    beats collapsing the account to zero.
+
+    Non-investment accounts are unaffected: a depository or credit account has
+    no holdings to double, and its balance_current stays authoritative even if
+    a stray SecurityHolding row is somehow filed against it."""
     account = PlaidAccount.query.filter_by(account_id=account_id).first()
-    if account is not None:
-        total += float(account.balance_current or 0.0)
-        partner_id = (account.paired_account_id or '').strip()
-        if partner_id:
-            partner = PlaidAccount.query.filter_by(
-                account_id=partner_id).first()
-            if partner is not None:
-                total += float(partner.balance_current or 0.0)
+    if account is None:
+        return 0.0
+
+    holdings = SecurityHolding.query.filter_by(account_id=account_id).all()
+    if holdings and erpnext_accounts.is_investment(account):
+        total = 0.0
+        for h in holdings:
+            if h.institution_value is not None:
+                total += float(h.institution_value)
+            elif h.quantity and h.institution_price:
+                total += float(h.quantity) * float(h.institution_price)
+    else:
+        total = float(account.balance_current or 0.0)
+
+    partner_id = (account.paired_account_id or '').strip()
+    if partner_id:
+        partner = PlaidAccount.query.filter_by(account_id=partner_id).first()
+        if partner is not None:
+            total += float(partner.balance_current or 0.0)
     return round(total, 2)
 
 

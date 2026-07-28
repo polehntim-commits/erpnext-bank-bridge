@@ -1702,6 +1702,42 @@ agreement as structured JSON (it previously serialized the model object into a
 repr string), with each listed agreement carrying its managed account **masks**,
 `status` and `is_active` so it composes with the mask-keyed tools.
 
+### AUM double-count fix (v0.7.5)
+
+Plaid defines `balances.current` on an **investment** account as that account's
+total market value — the priced holdings *plus* settled cash. v0.5.2's
+`account_market_value` summed the account's `SecurityHolding` rows **and** its
+`balance_current`, which counts every position twice. A brokerage reported
+roughly double its real value, and because the base fee accrues off AUM, every
+daily accrual on an investment account was about double too.
+
+The rule from v0.7.5 is **holdings or balance, never both**:
+
+| Account | Own value | Companion |
+|---|---|---|
+| investment/brokerage **with** holdings | sum of holdings | + companion `balance_current` |
+| investment/brokerage **without** holdings | `balance_current` | + companion `balance_current` |
+| depository / credit / loan | `balance_current` | + companion `balance_current` |
+
+Holdings win where we have them — they are per-position and dated, where
+`balance_current` is a single scalar cached from the last accounts pull. Where
+Plaid returns no holdings (a custodian it doesn't cover, or an install without
+the `investments` product) `balance_current` is all there is, and reporting it
+beats collapsing the account to zero. The **paired cash companion is unchanged**
+and still added: it is a separate account holding its own cash, not a component
+of the brokerage's balance. Investment classification uses the same
+`is_investment` predicate as the rest of the app, so a `type='brokerage'`
+custodian is covered, not just `type='investment'`.
+
+**Operators: any `DailyAUM` row recorded before v0.7.5 against an investment
+account holds the doubled figure**, as does any `AdvisoryFeeAccrual` derived
+from it. Sampling is idempotent per `(agreement, date)`, so re-running
+`sample_daily_aum` for an affected day **overwrites** the row with the corrected
+value rather than double-accruing — but it prices holdings at *today's*
+institution price, not that day's. Re-sample only where the restatement is worth
+more than the as-of accuracy, and settle a quarter only after deciding which.
+An install that has never sampled (no `DailyAUM` rows) needs no action.
+
 ## Investment transactions as Journal Entries (v0.5.1, Phase D)
 
 Every `SecurityTransaction` on a brokerage account can post as a Journal Entry
