@@ -6098,12 +6098,40 @@ RECONCILIATION_BODY = """
     <b style="color:{{ '#b71c1c' if summary.gaps else '#1b5e20' }}">
       {{ summary.gaps }}</b><br>
     <span style="font-size:12px;color:#666">chain gaps</span></div>
+  {% if total_mark_to_market is not none %}
+  {# v0.8.0 · shown only for an account whose statements state a total account
+     value — i.e. a brokerage. A depository account has no securities to
+     reprice and an always-0.00 tile would be noise. #}
+  <div class="kpi">
+    <b style="color:{{ '#1b5e20' if total_mark_to_market >= 0 else '#b71c1c' }}">
+      {{ '%+.2f'|format(total_mark_to_market) }}</b><br>
+    <span style="font-size:12px;color:#666"
+          title="Change in total account value attributable to market prices, not to money moving. Explained, not unexplained — it is deliberately NOT part of variance.">
+      market movement</span></div>
+  {% endif %}
 </div>
+
+{% if total_mark_to_market is not none %}
+<p style="font-size:13px;color:#666;margin-top:0">
+  <b>Market movement is an explanation, not a variance.</b> The
+  <b>Variance</b> column tests <em>cash</em> only — anchored opening plus
+  mirrored transactions against the bank's anchored closing — and market prices
+  do not move cash, so a repricing can never appear there. The three portfolio
+  columns are the separate bridge from one month's <b>total account value</b> to
+  the next: cash moved, some of it turned into securities (<b>Securities
+  flow</b>), and the rest was <b>Market</b>.
+</p>
+{% endif %}
 
 <table>
   <tr><th>Period</th><th class="num">Anchored opening</th>
       <th class="num">Transactions</th><th class="num">Computed closing</th>
       <th class="num">Anchored closing</th><th class="num">Variance</th>
+      {% if total_mark_to_market is not none %}
+      <th class="num" title="Total account value — cash plus securities at market — as the statement states it at each end of the period.">Portfolio Δ</th>
+      <th class="num" title="Cash that turned into securities this period (negative = net buying). Already inside Transactions; shown here as a component of the portfolio bridge, not added to it twice.">Securities flow</th>
+      <th class="num" title="The remainder: change in total account value that was price movement rather than money arriving or leaving.">Market</th>
+      {% endif %}
       <th>Reason</th><th>Parser</th></tr>
   {% for a in anchors %}
   <tr {% if a.chain_gap_from_prior %}style="border-top:3px solid #f5a623"{% endif %}>
@@ -6129,6 +6157,20 @@ RECONCILIATION_BODY = """
         <span style="color:#b71c1c;font-weight:600">{{ '%+.2f'|format(a.variance) }}</span>
       {% endif %}
     </td>
+    {% if total_mark_to_market is not none %}
+    {# v0.8.0 · the portfolio bridge. Deliberately rendered AFTER Variance and
+       in muted weight: these explain total account value and must never read
+       as a second reconciliation verdict. #}
+    <td class="num" style="color:#555">
+      {{ '%+.2f'|format(a.portfolio_delta())
+         if a.portfolio_delta() is not none else '—' }}</td>
+    <td class="num" style="color:#555">
+      {{ '%+.2f'|format(a.security_flow_sum)
+         if a.security_flow_sum else '0.00' }}</td>
+    <td class="num" style="color:#555">
+      {{ '%+.2f'|format(a.mark_to_market_delta)
+         if a.mark_to_market_delta is not none else '—' }}</td>
+    {% endif %}
     <td style="font-size:12px">
       {# v0.4.49 · Reason auto-populates from the internal tags carried by this
          period's transactions (CategorizationRule.bb_internal_tag). A manual
@@ -6148,6 +6190,11 @@ RECONCILIATION_BODY = """
     <td class="num">—</td><td class="num">—</td>
     <td class="num" style="color:{{ '#b71c1c' if summary.variance|abs > 0.005 else '#1b5e20' }}">
       {{ '%+.2f'|format(summary.variance) }}</td>
+    {% if total_mark_to_market is not none %}
+    <td class="num">—</td>
+    <td class="num" style="color:#555">{{ '%+.2f'|format(total_security_flow) }}</td>
+    <td class="num" style="color:#555">{{ '%+.2f'|format(total_mark_to_market) }}</td>
+    {% endif %}
     <td colspan="2"></td>
   </tr>
 </table>
@@ -6433,6 +6480,7 @@ def reconciliation_page(account_id: str = ''):
         return _page(RECONCILIATION_BODY, page='reconciliation', accounts=[],
                      account=PlaidAccount(account_id=''), anchors=[],
                      summary=stmts.anchor_summary(''), total_transactions=0.0,
+                     total_mark_to_market=None, total_security_flow=0.0,
                      labels={}, tag_reasons={}, flash_msg=flash_msg)
     account_id = (account_id or request.args.get('account_id', '')).strip()
 
@@ -6470,11 +6518,24 @@ def reconciliation_page(account_id: str = ''):
     # transactions, keyed by anchor id.
     tag_reasons = {an.id: stmts.period_tag_summary(
         account, an.period_start, an.period_end) for an in anchors}
+    # v0.8.0 · the portfolio bridge, shown only when this account's statements
+    # actually state a total account value. None (not 0.0) is the "don't render
+    # these columns" signal, and it is the honest one: a depository account
+    # holds no securities, so a 0.00 market-movement figure would be an
+    # assertion about prices rather than the absence of one.
+    priced = [a for a in anchors if a.mark_to_market_delta is not None]
+    total_mark_to_market = (round(sum(float(a.mark_to_market_delta)
+                                      for a in priced), 2)
+                            if priced else None)
     return _page(RECONCILIATION_BODY, page='reconciliation', accounts=accounts,
                  account=account, anchors=anchors, labels=labels,
                  tag_reasons=tag_reasons,
                  summary=stmts.anchor_summary(account.account_id),
                  flash_msg=flash_msg,
+                 total_mark_to_market=total_mark_to_market,
+                 total_security_flow=round(
+                     sum(float(a.security_flow_sum or 0.0)
+                         for a in anchors), 2),
                  total_transactions=round(
                      sum(float(a.transaction_sum or 0.0) for a in anchors), 2))
 
@@ -6490,10 +6551,17 @@ def reconciliation_csv(account_id: str):
     account = PlaidAccount.query.filter_by(account_id=account_id).first()
     buf = io.StringIO()
     writer = csv.writer(buf)
+    # v0.8.0 · the four portfolio columns are APPENDED, after every column that
+    # was already here and in the same order as before. A CPA's spreadsheet (or
+    # a diff against the second ERPNext instance) keyed on column position keeps
+    # working; the new fields are simply further right, and blank on every
+    # account that states no total value.
     writer.writerow(['period_start', 'period_end', 'anchored_opening',
                      'transaction_sum', 'computed_closing', 'anchored_closing',
                      'variance', 'variance_reason', 'chain_gap_from_prior',
-                     'parser_version'])
+                     'parser_version',
+                     'portfolio_opening', 'portfolio_closing',
+                     'security_flow_sum', 'mark_to_market_delta'])
     for a in anchors:
         writer.writerow([
             a.period_start or '', a.period_end or '',
@@ -6503,7 +6571,12 @@ def reconciliation_csv(account_id: str):
             '' if a.anchored_closing is None else f'{a.anchored_closing:.2f}',
             '' if a.variance is None else f'{a.variance:.2f}',
             a.variance_reason or '', 'yes' if a.chain_gap_from_prior else '',
-            a.parser_version or ''])
+            a.parser_version or '',
+            '' if a.portfolio_opening is None else f'{a.portfolio_opening:.2f}',
+            '' if a.portfolio_closing is None else f'{a.portfolio_closing:.2f}',
+            f'{float(a.security_flow_sum or 0.0):.2f}',
+            ('' if a.mark_to_market_delta is None
+             else f'{a.mark_to_market_delta:.2f}')])
     # Reuse the statement store's own path sanitiser rather than a second
     # opinion on what a safe filename is — this value reaches a
     # Content-Disposition header.
@@ -6535,8 +6608,26 @@ def rebuild_anchors():
         db.session.rollback()
         return redirect('/admin/reconciliation?flash=' + quote_plus(
             f'Anchor rebuild failed: {e}'))
+    # v0.8.0 · refresh the trade-leg pairings alongside. They are DERIVED (see
+    # trade_pairing), so the manual "rebuild" an operator reaches for when a
+    # number looks stale should refresh them too — otherwise
+    # list_unpaired_trades keeps reporting totals_agree=false and the only fix
+    # is waiting for the next sync. Fail-soft: a diagnostic table must never
+    # be able to fail the anchor rebuild that already succeeded.
+    pairing = None
+    try:
+        from .. import trade_pairing
+        pairing = trade_pairing.rebuild(account_id or None)
+    except Exception:  # pragma: no cover - fail-soft
+        db.session.rollback()
+        log.warning('trade-leg pairing rebuild failed', exc_info=True)
     msg = (f"Anchored {result['written']} period(s) across "
            f"{result['accounts']} account(s).")
+    if pairing and pairing['accounts']:
+        unpaired = pairing['unpaired_security'] + pairing['unpaired_cash']
+        msg += (f" Paired {pairing['paired']} trade leg(s); {unpaired} "
+                f"unpaired, leaving {pairing['imbalance']:+.2f} in Cash "
+                "Clearing.")
     if result['variances']:
         msg += (f" {result['variances']} period(s) show a variance the "
                 "transaction feed doesn't explain.")

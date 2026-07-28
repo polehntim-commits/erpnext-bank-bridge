@@ -272,6 +272,34 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     ('advisory_agreements', 'billing_frequency', "VARCHAR(20) DEFAULT ''"),
     ('advisory_agreements', 'document_reference', "VARCHAR(255) DEFAULT ''"),
     ('advisory_agreements', 'superseded_by', 'INTEGER'),
+
+    # v0.8.0 — the PORTFOLIO BRIDGE on statement anchors. Four additive columns
+    # on `statement_anchors`, a table v0.4.43 created (so create_all() will not
+    # touch it on an upgrading install and each must be listed here). The new
+    # `trade_leg_pairings` TABLE needs no line — create_all() builds a missing
+    # table, the same situation as v0.4.43's statement_anchors itself.
+    #
+    # THE CASH IDENTITY IS UNTOUCHED. Not one of the four is read by
+    # `reconciles()`, by `anchor_variance_total`, or by anything that decides
+    # whether a period is explained: `variance` still equals `anchored_closing -
+    # (anchored_opening + transaction_sum)` exactly as it did in v0.7.5. So an
+    # upgrading install's reconciliation verdicts are bit-identical before and
+    # after this migration, and the four columns only ADD an explanation of
+    # total account value beside them.
+    #
+    # `mark_to_market_delta` and both portfolio figures backfill to NULL — "this
+    # anchor was built before v0.8.0 and says nothing about market movement",
+    # which is exactly true and is why NULL rather than 0.0 (see the model). The
+    # next `rebuild_statement_anchors` fills them in from statement figures
+    # already held, so there is nothing to fetch and nothing to undo.
+    # `security_flow_sum` takes DEFAULT 0.0 NOT NULL to match `transaction_sum`
+    # beside it: it is a SUM, and a period with no trades really did have zero
+    # of them.
+    ('statement_anchors', 'portfolio_opening', 'DOUBLE PRECISION'),
+    ('statement_anchors', 'portfolio_closing', 'DOUBLE PRECISION'),
+    ('statement_anchors', 'security_flow_sum',
+     'DOUBLE PRECISION DEFAULT 0.0 NOT NULL'),
+    ('statement_anchors', 'mark_to_market_delta', 'DOUBLE PRECISION'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,

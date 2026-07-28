@@ -1934,6 +1934,194 @@ for new statements every `STATEMENTS_PULL_INTERVAL_DAYS` (default 30); one
 already stored is never re-downloaded, and one whose PDF has gone missing is
 fetched again.
 
+## Investment reconciliation (v0.8.0)
+
+Two brokerage accounts reported **Movement: 0.00** on all thirteen of their
+statement periods, and their Cash Clearing accounts sat at **+$297,358.90** and
+**−$985,015.56**. This release explains both, adds the market as a first-class
+component of a brokerage period, and ships seven read-only MCP tools so the next
+diagnosis of this kind doesn't need a human relaying screenshots.
+
+### The Movement 0.00 bug: one endpoint silencing another
+
+`/investments/transactions/get` has been wired since v0.4.28, and
+`signed_movement` has folded its cash flows into brokerage reconciliation since
+v0.4.38. Neither was the problem. `sync_investments_for_item` called
+`/investments/holdings/get` **first** and `return`ed early whenever it answered
+`{}` — so an Item that returned no priced positions never had its transactions
+requested at all. Two independent endpoints, one able to silence the other.
+
+`{}` from the holdings endpoint means *product not enabled, not requested at
+Link time, **or** no priced positions* — and the third case is ordinary. A
+fully-liquidated account, or one whose custodian Plaid doesn't price, lands in
+the same hole: `security_transactions` stays empty, so `transaction_sum` is
+0.00, so every period reports the whole month as unexplained.
+
+From v0.8.0 the two calls are independent. Each reports for itself
+(`holdings_skipped` / `txns_skipped` on the returned stats), and only **both**
+declining produces the product-unavailable verdict. A pull that reached neither
+endpoint still declines to stamp `investments_synced_at`, so the next pull
+doesn't narrow its window on the strength of a call that failed.
+
+### Mark-to-market: an explanation, *not* a variance
+
+A brokerage statement states two balances — cash-and-sweep, and total account
+value — and the gap between them is the securities at market. Anchors have
+always reconciled the **cash** side, for the reason `_anchor_values` has
+documented since v0.4.43: the transaction mirror records cash events and has no
+record of the market, so anchoring on total value would fail every brokerage
+period by construction.
+
+That is still true, and v0.8.0 does **not** change it. The cash identity is
+untouched:
+
+```
+computed_closing = anchored_opening + transaction_sum
+variance         = anchored_closing - computed_closing
+```
+
+Folding a price change into `computed_closing` would *manufacture* variance on a
+period that balances to the cent — a repricing doesn't move cash. What was
+genuinely missing is the other half of the statement: an operator watching total
+account value go $312k → $340k had no way to tell money arriving from AAPL going
+up. Four new columns on `StatementAnchor` answer that, as an identity of their
+own:
+
+```
+portfolio_closing - portfolio_opening
+    = (anchored_closing - anchored_opening)   ← cash moved
+    - security_flow_sum                       ← cash became stock
+    + mark_to_market_delta                    ← the market
+```
+
+`security_flow_sum` is the period's buy/sell cash legs, cash-in-positive, taken
+from the **statement's own** "Securities purchased" / "Securities sold and
+redeemed" lines where it prints them and falling back to the mirror where it
+doesn't. That ordering matters: on an install whose investments feed was never
+pulled, reading the trades off the PDF is what lets mark-to-market be computed
+at all rather than silently attributing a year of trading to price movement.
+
+Both cash figures in the calculation are the **bank's**, not `computed_closing`,
+so the number is a property of the statement rather than of how complete our
+mirror happens to be. A period whose cash is off by $278k because Plaid dropped
+a deposit still gets its market movement measured correctly, and the two
+findings stay separable instead of contaminating each other.
+
+`reconciles()` never consults any of it. Depository and credit accounts state no
+total account value, so all four columns stay NULL and nothing about those
+accounts changes. On `/admin/reconciliation` the three portfolio columns render
+after Variance, in muted weight, only for an account that has them — and
+`mark_to_market_delta` is NULL rather than 0.0 when it can't be computed,
+because "no securities to reprice" and "prices didn't move" are different
+findings.
+
+### Trade leg pairing: turning a scalar into a worklist
+
+`invest_je.clearing_imbalance` reports how far a paired brokerage's Cash
+Clearing account sits from zero. It is correct and it is unactionable — nobody
+can chase −$985,015.56. The new `trade_leg_pairings` table decomposes it.
+
+A trade at a paired Wells-Fargo-style brokerage moves money twice: a **security
+leg** on the brokerage (`/investments/transactions/get`) and a **cash leg** on
+its cash-services companion (`/transactions/sync`), booked to Cash Clearing from
+opposite sides so a complete pair nets to zero. Pairing matches them on exact
+amount within **three business days**, preferring the later of two equal
+candidates (settlement follows a trade) and never letting one cash leg claim two
+trades.
+
+**Either leg can be the orphan**, and that is not symmetry for its own sake.
+The two live imbalances have *opposite signs*, and under this table's `delta`
+convention the sign is diagnostic:
+
+| Sign | Dominant orphan | Reading |
+|---|---|---|
+| positive (••6030, **+$297,358.90**) | `missing_leg='cash'` | security legs whose settlement never appeared on the companion |
+| negative (••9401, **−$985,015.56**) | `missing_leg='security'` | companion cash with no trade behind it |
+
+Run `list_unpaired_trades` on each to confirm the composition — the sign
+indicates which orphan *dominates*, not that an account has only one kind. A
+table keyed only on trades could not represent the negative case at all, and it
+is the larger of the two. It is also what an Item that never pulled its
+investments feed would look like, which is the two halves of this release
+meeting in the middle.
+
+Every row's `delta` is `expected − actual`, cash-in-positive, defined so that
+
+```
+Σ delta over an account's rows  ==  invest_je.clearing_imbalance(account)
+```
+
+**exactly**. A paired row contributes zero, so the Cash Clearing balance
+recomputes from the unpaired rows alone. That identity is asserted in the test
+suite, including that the matched types stay in lockstep with the four
+`invest_je` actually posts through clearing (`buy`, `sell`, `fee`, `cash`) —
+narrowing to buy/sell would be tidier and would silently stop the totals
+agreeing. `list_unpaired_trades` returns both numbers so a caller can see they
+match; `totals_agree: false` means the derived table is stale and a fresh sync
+rebuilds it.
+
+The table is **derived**: rebuilt from the two source tables after every
+investments sync, fail-soft, idempotent, and safe to drop. Paired brokerages
+only — an unpaired investment account gets both legs in one Plaid row, so its
+trades are complete by construction and it has no clearing account to be off.
+
+### The seven MCP tools
+
+All read-only, so none carries a kill switch — the gate on this surface is the
+bearer token, and a tool that cannot write cannot break a period.
+
+| Tool | Answers |
+|---|---|
+| `list_statements` | which periods exist, with cash *and* portfolio figures, variance, mark-to-market, and whether a PDF is really on disk |
+| `get_statement_pdf` | the stored PDF, base64, by `YYYY-MM` or exact `period_end` |
+| `get_statement_extracted_data` | everything the parser recovered, verbatim, plus its provenance and every activity row |
+| `list_plaid_transactions` | the `/transactions/sync` feed — including the **cash companion**, since a paired brokerage holds none of its own |
+| `list_investment_transactions` | the `/investments/transactions/get` feed, with `investments_ever_synced` so an empty result isn't ambiguous |
+| `list_holdings` | current positions, with an honest refusal to fake history |
+| `list_unpaired_trades` | the itemised Cash Clearing imbalance |
+
+Three of them are deliberately built around cases where a plausible
+implementation would *mislead* rather than fail:
+
+- **An empty investment feed is ambiguous.** "No trades this month" and "this
+  Item's feed was never pulled" are opposite findings with identical shape — the
+  second being the one that produced thirteen zeroed periods. So
+  `investments_ever_synced` and `investments_synced_at` ship with every answer.
+- **`list_holdings(as_of=…)` cannot return history.** `security_holdings` is a
+  snapshot table: each pull *replaces* the rows. Passing `as_of` returns the
+  current snapshot with `is_historical: false` and a note pointing at
+  `list_statements`' bank-stated `portfolio_*_value` for historical value.
+  Handing back today's positions labelled as February's would be the worst
+  option available.
+- **`list_unpaired_trades` refuses an unpaired account** rather than returning
+  `[]`, which would read as a clean bill of health for a question that doesn't
+  apply.
+
+### Gotchas worth writing down
+
+- **`investment_transaction.amount` uses the same sign convention as
+  `transactions/get`**: positive means cash *left* the account (a buy). It is
+  not documented as prominently on that endpoint, and getting it backwards
+  inverts every reconciliation. Both feeds' tools return `cash_in_amount`
+  alongside `amount` so nothing downstream has to infer it.
+- **`investments/holdings/get` returning `{}` does not mean "no investments
+  product."** It also covers "no priced positions." Treating the two as one is
+  what caused this release.
+- **Holdings prices are institution prices, not a market feed.**
+  `institution_price` / `institution_value` are what the *custodian* last
+  reported, with their own `institution_price_as_of` date, and
+  `iso_currency_code` sits per holding rather than per account.
+- **`portfolio_*_value` comes from the PDF, not from Plaid.** Plaid ships no
+  total-account-value field; the figures are parsed from the statement's
+  Progress Summary, so an unreadable layout means NULL and `mark_to_market_delta`
+  declines to answer.
+- **`clearing_imbalance` counts *every* companion transaction**, not only
+  brokerage-activity ones. That is pre-existing (v0.5.1) and unchanged here —
+  pairing matches its definition deliberately so the Σ-delta identity holds. If
+  the cash-services account is ever used for ordinary spending, both numbers
+  move together, and that is a worthwhile future narrowing rather than a bug
+  introduced now.
+
 ## Bank Statement doctype (v0.4.10)
 
 Everything above puts statements in *Bank Bridge*. This puts them in **ERPNext**,
@@ -2521,6 +2709,11 @@ The MCP server (v0.6.0) exposes Bank Bridge's read tools — and, behind per-too
 kill switches, its mutating ones — to an AI client. **`/admin/mcp` now generates
 the client config for you**, so there is no hand-editing of
 `claude_desktop_config.json`.
+
+Read tools are never gated: the gate on that surface is the bearer token, and a
+tool that cannot write cannot be the thing that breaks a period. v0.8.0's seven
+investment-reconciliation tools are all read-only for that reason — see
+[Investment reconciliation](#investment-reconciliation-v080).
 
 **Claude Desktop.** The page detects your OS, shows the config file path, and
 renders the server entry with the token masked. **Copy config JSON** or

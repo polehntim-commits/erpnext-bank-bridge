@@ -4,12 +4,23 @@
 and `security_transactions` tables (v0.4.28 · Phase A step 2 of the v0.5.0
 lot tracker).
 
+THE TWO ENDPOINTS ARE INDEPENDENT (v0.8.0), and that is load-bearing rather
+than incidental. Until v0.8.0 the transactions pull sat behind an early
+`return` taken whenever holdings answered `{}` — so one endpoint's silence
+spoke for the other's. `{}` from holdings means *product not enabled, not
+requested at Link time, **or** no priced positions*, and the third case is
+ordinary: a fully-liquidated account, or a custodian Plaid doesn't price, then
+lost its entire trade history too. Downstream that surfaced as every brokerage
+statement period reporting Movement 0.00, because `signed_movement` had no
+SecurityTransactions to sum. Each call now reports for itself, and only both
+declining means the Item lacks the product.
+
 Fail-soft by design, mirroring how loans.py handles liabilities:
 
   * An Item without the `investments` product returns {} from the Plaid
-    wrappers; this module treats that as "no investment data on this Item"
-    and skips silently. Bank Bridge's existing transaction sync continues
-    to run.
+    wrappers; this module treats that as "no investment data from THAT
+    endpoint" and carries on. Bank Bridge's existing transaction sync
+    continues to run either way.
   * Any individual holding or transaction that can't be upserted (e.g. its
     referenced account_id doesn't exist locally yet) is logged at INFO and
     skipped; the rest of the batch persists.
@@ -70,12 +81,15 @@ def sync_investments_for_item(item: PlaidItem, plaid_client: PlaidClient,
     return stats. Never raises — every failure mode returns something.
 
     Stats: {'holdings': int, 'txns_added': int, 'txns_modified': int,
-    'securities': int, 'skipped': str|None}. `skipped` is set when the
-    whole call was a no-op (product unavailable, no investment accounts,
-    etc.); zero-count with skipped=None means "ran successfully, nothing
-    new to store"."""
+    'securities': int, 'skipped': str|None, 'holdings_skipped': str|None,
+    'txns_skipped': str|None}. `skipped` is set only when the WHOLE call was a
+    no-op; zero-count with skipped=None means "ran successfully, nothing new to
+    store". The two per-endpoint `*_skipped` keys (v0.8.0) name which half
+    declined and why — see the holdings branch below for why that distinction
+    is load-bearing."""
     stats = {'holdings': 0, 'txns_added': 0, 'txns_modified': 0,
-             'securities': 0, 'skipped': None}
+             'securities': 0, 'skipped': None, 'holdings_skipped': None,
+             'txns_skipped': None}
 
     # Only Items that actually hold investment accounts are worth calling
     # for. Plaid returns 0-length holdings arrays on other Items, so the
@@ -93,38 +107,77 @@ def sync_investments_for_item(item: PlaidItem, plaid_client: PlaidClient,
     # Security records the subsequent transactions will reference. Doing
     # holdings before transactions means the FK reference on
     # SecurityTransaction.security_id is guaranteed to resolve.
+    #
+    # v0.8.0 · AN EMPTY HOLDINGS RESPONSE NO LONGER ABORTS THE PULL. It used to
+    # `return` here, which made /investments/transactions/get conditional on
+    # /investments/holdings/get answering — two independent endpoints, one of
+    # which could silence the other. The failure that produces is exactly the
+    # one this release was opened to explain: every brokerage period reporting
+    # Movement 0.00, because `security_transactions` was empty, because a
+    # holdings call that answered {} meant the transactions call was never
+    # made. A fully-liquidated account (no positions, a year of trades) lands
+    # in the same hole.
+    #
+    # `_pull_investment_transactions` reports the same product-unavailable
+    # condition for itself, so a genuinely unavailable Item still says so — it
+    # just says it from the endpoint that was actually asked, and one
+    # endpoint's silence no longer speaks for the other.
+    securities_by_id = {}
     holdings_payload = plaid_client.investments_holdings_get(access_token)
     if not holdings_payload:
-        stats['skipped'] = ('investments product unavailable for this Item '
-                            '(not enabled on Plaid application, or not '
-                            'requested at Link time)')
-        return stats
+        stats['holdings_skipped'] = (
+            'investments/holdings/get returned nothing for this Item '
+            '(product not enabled on the Plaid application, not requested at '
+            'Link time, or the Item holds no priced positions)')
+    else:
+        for s in holdings_payload.get('securities', []) or []:
+            row = _upsert_security(s)
+            if row is not None:
+                securities_by_id[s.get('security_id')] = row
+                stats['securities'] += 1
 
-    securities_by_id = {}
-    for s in holdings_payload.get('securities', []) or []:
-        row = _upsert_security(s)
-        if row is not None:
-            securities_by_id[s.get('security_id')] = row
-            stats['securities'] += 1
-
-    for h in holdings_payload.get('holdings', []) or []:
-        row = _upsert_holding(h)
-        if row is not None:
-            stats['holdings'] += 1
+        for h in holdings_payload.get('holdings', []) or []:
+            row = _upsert_holding(h)
+            if row is not None:
+                stats['holdings'] += 1
 
     # ── Transactions next: paginated backfill or delta pull depending on
-    # whether this Item has been synced before.
+    # whether this Item has been synced before. Attempted unconditionally, per
+    # the note above.
     txn_stats = _pull_investment_transactions(item, plaid_client, access_token,
                                               securities_by_id)
     stats['txns_added'] += txn_stats['added']
     stats['txns_modified'] += txn_stats['modified']
     stats['securities'] += txn_stats['securities_upserted']
+    stats['txns_skipped'] = txn_stats.get('skipped')
+
+    if stats['holdings_skipped'] and stats['txns_skipped']:
+        # BOTH endpoints declined — that, and only that, is an Item without the
+        # investments product. Reported through the aggregate key callers and
+        # the admin UI already read, so the pre-v0.8.0 message survives for the
+        # case it was actually describing.
+        stats['skipped'] = ('investments product unavailable for this Item '
+                            '(not enabled on Plaid application, or not '
+                            'requested at Link time)')
+        return stats
 
     # Stamp the successful-completion timestamp so the next sync's window
     # narrows appropriately.
     from datetime import datetime, timezone
     item.investments_synced_at = datetime.now(timezone.utc)
     db.session.commit()
+
+    # v0.8.0 · re-derive the trade-leg pairings these rows change. Fail-soft and
+    # deliberately last: pairing is a DERIVED analysis (see trade_pairing), so a
+    # failure costs a stale diagnostic table and nothing else, and it must never
+    # be able to lose an ingest that already committed above.
+    try:
+        from . import trade_pairing
+        trade_pairing.rebuild()
+    except Exception:  # pragma: no cover - fail-soft
+        db.session.rollback()
+        log.warning('trade-leg pairing rebuild failed after investments sync',
+                    exc_info=True)
 
     return stats
 
@@ -133,9 +186,17 @@ def _pull_investment_transactions(item: PlaidItem, plaid_client: PlaidClient,
                                   access_token: str,
                                   known_securities: dict) -> dict:
     """Paginated pull of /investments/transactions/get. Returns
-    {'added', 'modified', 'securities_upserted'}. Fail-soft: on any
-    PlaidError mid-page the completed pages remain persisted."""
-    stats = {'added': 0, 'modified': 0, 'securities_upserted': 0}
+    {'added', 'modified', 'securities_upserted', 'skipped'}. Fail-soft: on any
+    PlaidError mid-page the completed pages remain persisted.
+
+    v0.8.0 · `skipped` carries WHY the endpoint produced nothing, distinguishing
+    the three cases that used to be one silent zero: the product is unavailable
+    on this Item (the wrapper answers {}), the call errored mid-backfill, or it
+    answered normally with no transactions in the window. Only the first two are
+    a finding, and a caller that cannot tell them apart from an empty period
+    cannot diagnose a Movement 0.00 column."""
+    stats = {'added': 0, 'modified': 0, 'securities_upserted': 0,
+             'skipped': None}
     end = date.today()
     last_synced = getattr(item, 'investments_synced_at', None)
     if last_synced is None:
@@ -153,8 +214,19 @@ def _pull_investment_transactions(item: PlaidItem, plaid_client: PlaidClient,
         except PlaidError as e:  # pragma: no cover - fail-soft
             log.warning('investments_transactions_get failed at offset=%d '
                         'for %s: %s', offset, item.item_id, e)
+            stats['skipped'] = (f'investments/transactions/get failed at '
+                                f'offset {offset}: {e}')
             break
         if not page:
+            # The wrapper returns {} for an Item without the investments
+            # product (plaid_client.investments_transactions_get logs and
+            # swallows), which on the first page means nothing was ever asked
+            # for — not that the window was quiet.
+            if offset == 0:
+                stats['skipped'] = (
+                    'investments/transactions/get returned nothing for this '
+                    'Item (product not enabled on the Plaid application, or '
+                    'not requested at Link time)')
             break
         # Every page ships the same securities list; upsert defensively so
         # newly-appearing securities land even if this run's holdings pull

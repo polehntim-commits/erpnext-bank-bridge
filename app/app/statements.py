@@ -1774,9 +1774,127 @@ def _partner_by_name(account: PlaidAccount, candidates: list):
     return None
 
 
+def mirrored_security_flow(account: PlaidAccount, start: date | None,
+                           end: date | None) -> float:
+    """Σ of the buy/sell cash legs the MIRROR holds for [start, end],
+    normalised CASH IN POSITIVE (v0.8.0).
+
+    A net buy is therefore NEGATIVE — cash left the account and came back as
+    stock. Only `type` in (buy, sell): a dividend, a fee or a transfer moves
+    cash without converting it into a position, so counting them here would
+    charge the difference to market movement, which is the one thing this
+    number exists to isolate.
+
+    Walks the whole SUPERSEDE CHAIN, and dedupes across it, for the same
+    reason `signed_movement` does — a re-linked account's trades live on the
+    retired row and neither row alone is the account.
+
+    Pairing is deliberately NOT consulted, unlike `signed_movement`. That
+    function skips a paired brokerage's SecurityTransactions because the
+    companion's bank feed already carries their CASH, and counting both would
+    double the cash. Here the question is the opposite one — how much value
+    left cash and became securities — and the security leg is the only record
+    of that on either account."""
+    if start is None or end is None:
+        return 0.0
+    from .models import SecurityTransaction
+    account_ids = supersede_chain(account.account_id)
+    rows = (SecurityTransaction.query
+            .filter(SecurityTransaction.account_id.in_(tuple(account_ids)),
+                    SecurityTransaction.date >= start,
+                    SecurityTransaction.date <= end,
+                    SecurityTransaction.type.in_(('buy', 'sell')))
+            .all())
+    if len(account_ids) > 1:
+        rows = dedupe_across_accounts(rows)
+    return round(-sum(float(t.amount or 0.0) for t in rows), 2)
+
+
+def security_flow_for_period(statement: PlaidStatement, account: PlaidAccount,
+                             start: date | None,
+                             end: date | None) -> tuple[float, str]:
+    """(cash converted into securities this period, where the figure came
+    from) — CASH IN POSITIVE, so a net buy is negative (v0.8.0).
+
+    THE STATEMENT WINS whenever it states EITHER figure. Wells Fargo's Cash
+    flow summary prints 'Securities purchased' and 'Securities sold and
+    redeemed' as bank-asserted totals for the period, and they are strictly
+    better than summing our own mirror for the reason this whole sprint exists:
+    the mirror is only as complete as the /investments/transactions/get pull,
+    and on an Item where the `investments` product was never granted it is
+    EMPTY. Reading the trades off the PDF is what lets mark-to-market be
+    computed at all on such an install, rather than silently attributing a year
+    of trading to price movement.
+
+    EITHER, not both, because a month with buying and no selling prints one
+    line and omits the other — requiring both would discard a good figure
+    whenever the account only traded one way, which on a Buy-5-Sell-4 book is
+    most months. A missing line reads as 0.0, which is what it means.
+
+    Falls back to `mirrored_security_flow` only when the statement states
+    NEITHER (a layout the parser can't read, or a period with no cash-flow
+    summary at all). Returns source 'statement' | 'mirror' so a caller — and
+    the reconciliation UI — can say which."""
+    metadata = statement.metadata_dict()
+    purchased = metadata.get('securities_purchased')
+    sold = metadata.get('securities_sold')
+    if purchased is not None or sold is not None:
+        # Both are already cash-in-positive as WF prints them (purchases
+        # negative, sales positive), which is the convention _movement_totals
+        # normalises the mirror to — so they add directly with no sign handling.
+        return (round(float(purchased or 0.0) + float(sold or 0.0), 2),
+                'statement')
+    return mirrored_security_flow(account, start, end), 'mirror'
+
+
+def mark_to_market_delta(cash_opening, cash_closing, portfolio_opening,
+                         portfolio_closing, security_flow) -> float | None:
+    """How much of the period's change in TOTAL ACCOUNT VALUE was price
+    movement rather than money arriving or leaving (v0.8.0). None when either
+    portfolio figure or either cash figure is missing.
+
+    A brokerage statement's front page states two balances — cash-and-sweep,
+    and total account value — and the gap between them is the securities at
+    market. Everything that moves total value is therefore one of three things,
+    and this solves for the third:
+
+        (P_close - P_open)        total value moved this much …
+          = (C_close - C_open)    … of which this was cash arriving/leaving
+          - security_flow         … this was cash turning into stock (or back)
+          + mark_to_market        … and the remainder was the market
+
+    Check the signs on a buy of $1,000 with flat prices: total value is
+    unchanged (0), cash fell $1,000, `security_flow` is -1,000 (cash out).
+    0 - (-1000) + (-1000) = 0 — no market movement, which is right. A $200
+    price rise with no trades: 200 - 0 + 0 = 200. A $50 cash dividend: total
+    value and cash both rise $50, flow is 0, so 50 - 50 + 0 = 0 — income is
+    not appreciation, and this correctly declines to call it that.
+
+    BOTH CASH FIGURES ARE THE BANK'S, not `computed_closing`. That keeps this
+    number a property of the STATEMENT rather than of how complete our mirror
+    happens to be: an account whose cash variance is $278k because Plaid
+    dropped a deposit still gets its market movement measured correctly, and
+    the two findings stay separable instead of contaminating each other."""
+    if portfolio_opening is None or portfolio_closing is None:
+        return None
+    if cash_opening is None or cash_closing is None:
+        return None
+    return round((float(portfolio_closing) - float(portfolio_opening))
+                 - (float(cash_closing) - float(cash_opening))
+                 + float(security_flow or 0.0), 2)
+
+
 def _anchor_values(statement: PlaidStatement, account: PlaidAccount) -> dict:
     """The arithmetic for one statement, before it is compared to its
-    predecessor."""
+    predecessor.
+
+    Two independent statements, not one. The CASH identity (opening +
+    transaction_sum = computed_closing, and `variance` where it doesn't) is
+    unchanged from v0.4.43 and is what `reconciles()` reads. The v0.8.0
+    PORTFOLIO bridge beside it explains total account value and is never
+    allowed to touch `variance` — a market move does not move cash, so folding
+    one into a cash identity would invent a discrepancy on a period that
+    balances exactly. See StatementAnchor."""
     metadata = statement.metadata_dict()
     # The CASH side, not total account value. On a brokerage statement those
     # are different numbers and only cash can be reconciled against a
@@ -1794,9 +1912,20 @@ def _anchor_values(statement: PlaidStatement, account: PlaidAccount) -> dict:
                 if opening is not None else None)
     variance = (round(float(closing) - computed, 2)
                 if closing is not None and computed is not None else None)
+    # v0.8.0 · the portfolio bridge. `portfolio_*_value` is NULL on every
+    # depository and credit statement (they state no total account value), so
+    # those accounts get flow 0.0 and mark_to_market NULL and are entirely
+    # unaffected — which is correct: they hold no securities to reprice.
+    p_open = statement.portfolio_opening_value
+    p_close = statement.portfolio_closing_value
+    flow, _source = security_flow_for_period(
+        statement, account, statement.period_start, statement.period_end)
+    mtm = mark_to_market_delta(opening, closing, p_open, p_close, flow)
     return {'anchored_opening': opening, 'anchored_closing': closing,
             'transaction_sum': txn_sum, 'computed_closing': computed,
             'variance': variance,
+            'portfolio_opening': p_open, 'portfolio_closing': p_close,
+            'security_flow_sum': flow, 'mark_to_market_delta': mtm,
             'parser_version': statement.parser_version()}
 
 

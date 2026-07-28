@@ -1236,6 +1236,49 @@ class StatementAnchor(db.Model):
     transaction_sum = db.Column(db.Float, nullable=False, default=0.0)
     computed_closing = db.Column(db.Float, nullable=True)
     variance = db.Column(db.Float, nullable=True)
+    # ── v0.8.0 · the PORTFOLIO bridge, alongside the cash identity above ─────
+    #
+    # The four columns above reconcile CASH and nothing else — `anchored_opening`
+    # and `anchored_closing` are the statement's cash-and-sweep figures, and the
+    # identity `opening + transaction_sum = computed_closing` is exact because
+    # every term is a cash movement. That is deliberate and stays untouched:
+    # market prices do not move cash, so folding a price change into
+    # `computed_closing` would MANUFACTURE variance on a period that reconciles
+    # perfectly. (It is the one change v0.8.0's brief asked for that would have
+    # made the number worse; see the README.)
+    #
+    # What was genuinely missing is the other half of a brokerage statement. An
+    # operator reading the front page sees TOTAL ACCOUNT VALUE go from $312k to
+    # $340k and has no way to tell how much of that was money arriving and how
+    # much was AAPL going up. These four columns answer that, as an identity of
+    # their own:
+    #
+    #     portfolio_closing - portfolio_opening
+    #         = (anchored_closing - anchored_opening)   ← the cash leg
+    #         - security_flow_sum                       ← cash converted to stock
+    #         + mark_to_market_delta                    ← price movement
+    #
+    # `portfolio_opening`/`portfolio_closing` are the bank's own stated total
+    # account value (PlaidStatement.portfolio_*_value), denormalized here so the
+    # bridge renders without a join. NULL on a depository statement, which has
+    # no such figure, and on any brokerage layout the parser couldn't read.
+    #
+    # `security_flow_sum` is Σ of the period's buy/sell cash legs, normalised
+    # CASH IN POSITIVE like `transaction_sum` — so a net buy is NEGATIVE (cash
+    # left the account and became stock). It is a component of the bridge, not
+    # of the cash identity: those same buys are already inside
+    # `transaction_sum`, and adding them anywhere else would double-count.
+    #
+    # `mark_to_market_delta` is the residual — the price-change contribution,
+    # the only term nothing else in this app records. NULL (not 0.0) when it
+    # cannot be computed, because "no portfolio figures on this statement" and
+    # "prices did not move" are different findings and a depository account
+    # should not claim the second. `reconciles()` never consults it: a cash
+    # period reconciles or it doesn't, regardless of what the market did.
+    portfolio_opening = db.Column(db.Float, nullable=True)
+    portfolio_closing = db.Column(db.Float, nullable=True)
+    security_flow_sum = db.Column(db.Float, nullable=False, default=0.0)
+    mark_to_market_delta = db.Column(db.Float, nullable=True)
     # Why the bank saw money Plaid didn't. NULL until someone says. The
     # vocabulary is deliberately small to start ('unknown'); an operator tags
     # these in the UI as the real categories reveal themselves, and a premature
@@ -1251,8 +1294,21 @@ class StatementAnchor(db.Model):
 
     def reconciles(self, tolerance: float = 0.005) -> bool:
         """Whether the bank's closing balance and the mirror's arithmetic agree.
-        A period with no variance needs no explanation."""
+        A period with no variance needs no explanation.
+
+        Reads `variance` ONLY. The v0.8.0 portfolio columns are an explanation
+        of total account value, not a second reconciliation, and a period whose
+        cash is off by $278k does not become reconciled because the market also
+        moved."""
         return self.variance is not None and abs(self.variance) <= tolerance
+
+    def portfolio_delta(self) -> float | None:
+        """Total account value's change over the period, or None when the
+        statement didn't state one of the two figures."""
+        if self.portfolio_opening is None or self.portfolio_closing is None:
+            return None
+        return round(float(self.portfolio_closing)
+                     - float(self.portfolio_opening), 2)
 
     def to_dict(self):
         return {
@@ -1268,6 +1324,14 @@ class StatementAnchor(db.Model):
             'variance_reason': self.variance_reason or '',
             'chain_gap_from_prior': bool(self.chain_gap_from_prior),
             'parser_version': self.parser_version or '',
+            # v0.8.0 · the portfolio bridge. Emitted always (not only for
+            # brokerages) so a consumer can tell "this account has no portfolio
+            # figures" from "this key isn't in this build's output".
+            'portfolio_opening': self.portfolio_opening,
+            'portfolio_closing': self.portfolio_closing,
+            'portfolio_delta': self.portfolio_delta(),
+            'security_flow_sum': self.security_flow_sum or 0.0,
+            'mark_to_market_delta': self.mark_to_market_delta,
         }
 
 
@@ -1513,6 +1577,146 @@ class SecurityTransaction(db.Model):
             'amount': self.amount, 'price': self.price, 'fees': self.fees,
             'type': self.type, 'subtype': self.subtype,
             'iso_currency_code': self.iso_currency_code,
+        }
+
+
+class TradeLegPairing(db.Model):
+    """One trade's two legs, and whether Bank Bridge can see both (v0.8.0).
+
+    WHAT A TRADE ACTUALLY LOOKS LIKE at Wells Fargo Advisors. Buying $10,000 of
+    a stock in a paired brokerage moves money twice, across two Plaid accounts:
+
+      * the SECURITY leg — a SecurityTransaction on the brokerage account, from
+        /investments/transactions/get, carrying the security, quantity, price
+        and the trade's cash impact;
+      * the CASH leg — a BankTransaction on the "Brokerage Cash Services"
+        companion, from /transactions/sync, where the settlement actually
+        debits the sweep, T+1 or T+2 later.
+
+    `invest_je` books both against `Cash Clearing - Brokerage`, from opposite
+    sides, so a complete pair nets the clearing account to zero. That is the
+    whole design (see invest_je's module docstring) and it works — as long as
+    both legs exist. When one is missing, its half of the pair posts alone and
+    the clearing account carries the difference forever.
+
+    WHY THIS IS A TABLE. `invest_je.clearing_imbalance` already computes the
+    NET of that failure — one number, over all history, for one account. What it
+    cannot say is WHICH trades are responsible, and one scalar is not something
+    an operator can act on: "-$985,015.56" is a fact, not a worklist. This table
+    is the per-trade decomposition, so `list_unpaired_trades` can hand back the
+    dozen dates and securities that actually need chasing. It is DERIVED — every
+    row is rebuildable from SecurityTransaction plus BankTransaction by
+    `trade_pairing.rebuild`, and nothing else reads from it — so it can be
+    dropped and recomputed at any time without losing information.
+
+    ONLY PAIRED BROKERAGES HAVE ROWS HERE. An UNPAIRED investment account gets
+    both legs in the same /investments/transactions/get row (Plaid's `amount` IS
+    the cash impact), so its trades are self-pairing by construction and there
+    is nothing to match — `invest_je` settles those straight against the
+    account's own GL leaf, and `clearing_imbalance` returns 0.0 for them. A row
+    here would assert a failure mode that account cannot have.
+
+    EITHER LEG CAN BE THE ORPHAN, and a row is keyed on whichever one exists.
+    That is not symmetry for its own sake — it is the two failure modes the
+    live data actually shows, and they have opposite signs:
+
+      * ••6030's clearing sits at **+$297,358.90** — security legs Bank Bridge
+        holds whose settlement never appeared on the companion.
+      * ••9401's sits at **-$985,015.56** — the mirror image: companion cash
+        movements with no security leg to explain them, which is what an Item
+        whose /investments/transactions/get was never granted looks like.
+
+    A table keyed only on trades could not represent the second at all, and
+    ••9401 is the larger number of the two.
+
+    `delta` is `expected_cash_amount - actual_cash_amount`, both CASH IN
+    POSITIVE, and it is defined that way so that
+
+        Σ delta over an account's rows  ==  invest_je.clearing_imbalance()
+
+    exactly. A paired row contributes 0 (the legs agree); an orphan security
+    leg contributes its full expected amount; an orphan cash leg contributes
+    the negation of what actually moved. The scalar an operator sees on
+    /admin/statements is therefore the sum of this table, and
+    `list_unpaired_trades` is that scalar's itemisation — which is the point,
+    because "-$985,015.56" is a fact and a list of dates is a worklist."""
+    __tablename__ = 'trade_leg_pairings'
+    id = db.Column(db.Integer, primary_key=True)
+    # The BROKERAGE account, always — even on a row keyed to a companion cash
+    # leg, whose own account is in `cash_account_id`. The brokerage is what
+    # owns the clearing relationship and what every mask-keyed tool resolves
+    # to, so anchoring both orphan kinds to it is what lets one query answer
+    # "what is wrong with 9401".
+    account_id = db.Column(db.String(120),
+                           db.ForeignKey('plaid_accounts.account_id'),
+                           nullable=False, index=True)
+    cash_account_id = db.Column(db.String(120), nullable=True, index=True)
+    # Plaid's `type` on the security leg, verbatim: 'buy' | 'sell' | 'fee' |
+    # 'cash'. Named for the two that dominate, but NOT restricted to them —
+    # the set is exactly the types invest_je posts through clearing, and
+    # narrowing it to buy/sell would break the Σ-delta identity above by
+    # dropping every advisory fee and dividend from the reckoning. '' on a row
+    # keyed to an orphan cash leg, which has no security type.
+    buy_or_sell = db.Column(db.String(10), default='', index=True)
+    security_id = db.Column(db.String(120), nullable=True, index=True)
+    # The two legs. NULLABLE and UNIQUE, both of them: NULL says "this leg is
+    # the one that is missing", and UNIQUE is the idempotency guard that makes
+    # `trade_pairing.rebuild` converge on a re-run rather than accumulating a
+    # second opinion about the same movement. Postgres and SQLite both treat
+    # NULLs as distinct in a unique index, so any number of orphans coexist.
+    #
+    # A FK on the Plaid-issued investment id rather than the local row id,
+    # matching how GeneratedJournalEntry keys an investment JE.
+    security_txn_id = db.Column(
+        db.String(120),
+        db.ForeignKey('security_transactions.plaid_investment_transaction_id'),
+        unique=True, nullable=True, index=True)
+    # A `plaid_transaction_id` when cash_source='bank' (every row today), or a
+    # `plaid_investment_transaction_id` when 'security'. Deliberately NOT a FK:
+    # it points into one of two tables, and which one `cash_source` says.
+    cash_txn_id = db.Column(db.String(120), unique=True, nullable=True,
+                            index=True)
+    cash_source = db.Column(db.String(20), default='bank')
+    # '' when paired, else which side is absent: 'cash' | 'security'.
+    missing_leg = db.Column(db.String(20), default='', index=True)
+    trade_date = db.Column(db.Date, nullable=True, index=True)
+    cash_date = db.Column(db.Date, nullable=True)
+    # Both CASH IN POSITIVE (a buy expects a NEGATIVE cash leg). `expected` is
+    # 0.0 on an orphan cash leg — nothing expected it — and `actual` is NULL
+    # exactly when `cash_txn_id` is.
+    expected_cash_amount = db.Column(db.Float, nullable=False, default=0.0)
+    actual_cash_amount = db.Column(db.Float, nullable=True)
+    delta = db.Column(db.Float, nullable=False, default=0.0)
+    # paired | unpaired. Un-constrained, like plaid_sync_log's status, so a
+    # third state ('ambiguous', say) never needs a constraint migration.
+    status = db.Column(db.String(20), default='unpaired', index=True)
+    paired_at = db.Column(db.DateTime, nullable=True)
+    notes = db.Column(db.Text, default='')
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def is_paired(self) -> bool:
+        return bool(self.security_txn_id) and bool(self.cash_txn_id)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'account_id': self.account_id,
+            'cash_account_id': self.cash_account_id,
+            'buy_or_sell': self.buy_or_sell or '',
+            'security_id': self.security_id,
+            'security_txn_id': self.security_txn_id,
+            'cash_txn_id': self.cash_txn_id,
+            'cash_source': self.cash_source or 'bank',
+            'missing_leg': self.missing_leg or '',
+            'trade_date': self.trade_date.isoformat() if self.trade_date else None,
+            'cash_date': self.cash_date.isoformat() if self.cash_date else None,
+            'expected_cash_amount': self.expected_cash_amount or 0.0,
+            'actual_cash_amount': self.actual_cash_amount,
+            'delta': self.delta or 0.0,
+            'status': self.status or 'unpaired',
+            'paired': self.is_paired(),
+            'paired_at': self.paired_at.isoformat() if self.paired_at else None,
+            'notes': self.notes or '',
         }
 
 

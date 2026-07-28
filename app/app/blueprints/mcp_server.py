@@ -92,6 +92,73 @@ def _paired_mask(account: PlaidAccount) -> str:
     return (partner.mask if partner else '') or ''
 
 
+# ── v0.8.0 · shared argument coercion for the investment toolkit ────────────
+def _iso_date(value, field: str, *, required: bool = True):
+    """An ISO 'YYYY-MM-DD' argument as a date. Raises ToolError with the field
+    name on anything else — a tool that silently treats an unparseable bound as
+    "no bound" answers a question nobody asked."""
+    raw = (value or '').strip() if isinstance(value, str) else value
+    if not raw:
+        if required:
+            raise ToolError(f'{field} is required (YYYY-MM-DD)')
+        return None
+    if isinstance(raw, date):
+        return raw
+    try:
+        return date.fromisoformat(str(raw)[:10])
+    except (TypeError, ValueError):
+        raise ToolError(f'{field} must be YYYY-MM-DD, got {value!r}')
+
+
+def _statement_for(account: PlaidAccount, period: str) -> PlaidStatement:
+    """The stored statement for one account and period. `period` is either
+    'YYYY-MM' (the month the period STARTS in) or an exact 'YYYY-MM-DD'
+    matching `period_end`.
+
+    Both spellings because both are natural from different directions: an
+    operator reading /admin/statements says "February", while a caller chaining
+    off get_reconciliation_status already holds the anchor's exact period_end.
+    Raises ToolError naming the periods that DO exist, so a near miss is one
+    round-trip to fix rather than a guessing game."""
+    raw = (period or '').strip()
+    rows = (PlaidStatement.query
+            .filter(PlaidStatement.plaid_account_id == account.account_id)
+            .order_by(PlaidStatement.period_start.desc().nullslast()).all())
+    if not raw:
+        raise ToolError('period is required (YYYY-MM or YYYY-MM-DD)')
+    match = None
+    if len(raw) > 7:                       # an exact period_end
+        want = _iso_date(raw, 'period')
+        match = next((s for s in rows if s.period_end == want), None)
+    else:
+        start, _end = _period_bounds(raw)
+        match = next((s for s in rows if s.period_start == start), None)
+    if match is None:
+        available = [s.period_label() for s in rows if s.period_start][:24]
+        raise ToolError(
+            f'no statement for account {account.mask} in period {raw!r}. '
+            f"Stored periods: {', '.join(available) or '(none)'}")
+    return match
+
+
+def _cash_chain(account: PlaidAccount) -> list:
+    """The account_ids whose BankTransactions belong to this account's cash
+    side — its own supersede chain plus, for a PAIRED brokerage, its
+    cash-services companion's.
+
+    The pairing is included because on the Wells Fargo Advisors layout the
+    brokerage account holds ZERO BankTransactions by construction (every cash
+    movement lands on the companion; see PlaidAccount.paired_account_id). A
+    transaction listing for ••9401 that honoured only its own account_id would
+    return an empty array and read as "Plaid sent nothing", which is the exact
+    misreading this sprint exists to end."""
+    ids = list(stmts.supersede_chain(account.account_id))
+    partner_id = (account.paired_account_id or '').strip()
+    if partner_id:
+        ids += [a for a in stmts.supersede_chain(partner_id) if a not in ids]
+    return ids
+
+
 # ── read-only tools ─────────────────────────────────────────────────────────
 def _get_reconciliation_status(args: dict):
     account = _account_by_mask(args.get('account_mask'))
@@ -241,6 +308,430 @@ def _list_unmatched_statement_transactions(args: dict):
     } for s in q.order_by(StatementTransaction.posted_date.asc()).all()]
     return {'account_mask': account.mask, 'unmatched': rows,
             'count': len(rows)}, f'{account.mask}: {len(rows)} no_match line(s)'
+
+
+# ── v0.8.0 · the investment reconciliation toolkit (all read-only) ──────────
+#
+# Seven tools that between them let a diagnosis of a brokerage period run
+# end-to-end over MCP: what statements exist, what the PDF says, what the
+# parser got out of it, what Plaid returned on each of its two feeds, what the
+# account holds, and which trades are missing a leg. Every one is read-only, so
+# none carries a kill switch — the gate on this whole surface is the bearer
+# token, and a tool that cannot write cannot be the thing that breaks a period.
+
+def _list_statements(args: dict):
+    account = _account_by_mask(args.get('account_mask'))
+    year = args.get('year')
+    if year is not None:
+        try:
+            year = int(year)
+        except (TypeError, ValueError):
+            raise ToolError(f'year must be an integer, got {year!r}')
+    anchors = {a.statement_id: a
+               for a in stmts.anchors_for_account(account.account_id)}
+    rows = []
+    for st in (PlaidStatement.query
+               .filter(PlaidStatement.plaid_account_id == account.account_id)
+               .order_by(PlaidStatement.period_start.desc().nullslast(),
+                         PlaidStatement.id.desc()).all()):
+        if year is not None and (st.period_end is None
+                                 or st.period_end.year != year):
+            continue
+        anchor = anchors.get(st.id)
+        rows.append({
+            'statement_id': st.statement_id,
+            'local_statement_id': st.id,
+            'period': st.period_label(),
+            'period_start': (st.period_start.isoformat()
+                             if st.period_start else None),
+            'period_end': (st.period_end.isoformat()
+                           if st.period_end else None),
+            # The CASH figures, which is what the anchor chain reconciles —
+            # NOT total account value, which is the two portfolio_* keys.
+            'anchored_opening': anchor.anchored_opening if anchor else None,
+            'anchored_closing': anchor.anchored_closing if anchor else None,
+            'portfolio_opening_value': st.portfolio_opening_value,
+            'portfolio_closing_value': st.portfolio_closing_value,
+            'transaction_sum': anchor.transaction_sum if anchor else None,
+            'mark_to_market_delta': (anchor.mark_to_market_delta
+                                     if anchor else None),
+            'variance': anchor.variance if anchor else None,
+            'reconciled': bool(anchor and anchor.reconciles()),
+            'chain_gap_from_prior': bool(anchor
+                                         and anchor.chain_gap_from_prior),
+            'has_pdf': stmts.pdf_exists(st),
+            'pdf_bytes': int(st.pdf_bytes or 0),
+            'parse_method': st.parse_method or '',
+            'parse_suspect': bool(st.parse_suspect),
+            'parser_version': st.parser_version(),
+        })
+    return ({'account_mask': account.mask, 'account_id': account.account_id,
+             'year': year, 'statements': rows, 'count': len(rows)},
+            f'{account.mask}: {len(rows)} statement period(s)'
+            + (f' in {year}' if year else ''))
+
+
+# A statement PDF crosses the wire base64-encoded inside a JSON-RPC result, so
+# it costs ~4/3 its size in the response AND lands in the caller's context
+# window. Eight megabytes of PDF is already an unreasonable thing to hand an
+# AI client; past that the useful answer is the path, not the bytes.
+_MAX_PDF_BYTES = 8 * 1024 * 1024
+
+
+def _get_statement_pdf(args: dict):
+    import base64
+    account = _account_by_mask(args.get('account_mask'))
+    st = _statement_for(account, args.get('period'))
+    path = stmts.resolve_pdf_path(st)
+    if not path:
+        raise ToolError(
+            f'no PDF stored for account {account.mask} period '
+            f'{st.period_label()}. The statement row exists (Plaid statement '
+            f'{st.statement_id}) but its download never succeeded or the data '
+            f'volume no longer holds the file — re-run the statements pull.')
+    try:
+        with open(path, 'rb') as fh:
+            data = fh.read()
+    except OSError as e:
+        raise ToolError(f'stored PDF for {st.period_label()} is unreadable '
+                        f'({e.__class__.__name__}): {path}')
+    if len(data) > _MAX_PDF_BYTES:
+        raise ToolError(
+            f'PDF for {st.period_label()} is {len(data)} bytes, over the '
+            f'{_MAX_PDF_BYTES}-byte limit this tool will inline. Read it from '
+            f'{path} directly, or use get_statement_extracted_data for the '
+            f'parsed figures.')
+    import os
+    return ({'account_mask': account.mask, 'period': st.period_label(),
+             'period_start': (st.period_start.isoformat()
+                              if st.period_start else None),
+             'period_end': (st.period_end.isoformat()
+                            if st.period_end else None),
+             'filename': os.path.basename(path),
+             'path': path,
+             'size_bytes': len(data),
+             'content_type': 'application/pdf',
+             'encoding': 'base64',
+             'content_base64': base64.b64encode(data).decode('ascii')},
+            f'{account.mask} {st.period_label()}: {len(data)} byte PDF')
+
+
+def _get_statement_extracted_data(args: dict):
+    """What the PARSER got out of one statement — every figure, every activity
+    row, and the provenance of the parse. Lets a parser error be spotted
+    without downloading and reading the PDF."""
+    account = _account_by_mask(args.get('account_mask'))
+    st = _statement_for(account, args.get('period'))
+    metadata = st.metadata_dict()
+    txns = [{
+        'sequence': s.sequence,
+        'posted_date': s.posted_date.isoformat() if s.posted_date else None,
+        'settle_date': s.settle_date.isoformat() if s.settle_date else None,
+        # As the statement prints it: CASH IN POSITIVE. `plaid_convention_
+        # amount` is the same figure in the opposite sign convention the
+        # BankTransaction mirror uses, spelled out so a caller comparing the
+        # two feeds never has to guess which way round a row is.
+        'amount': s.amount,
+        'plaid_convention_amount': round(-float(s.amount or 0.0), 2),
+        'description': s.description, 'section': s.section,
+        'match_status': s.match_status or '',
+        'matched_bank_transaction_id': s.matched_bank_transaction_id,
+    } for s in (StatementTransaction.query
+                .filter_by(statement_id=st.id)
+                .order_by(StatementTransaction.sequence).all())]
+    anchor = StatementAnchor.query.filter_by(statement_id=st.id).first()
+    return ({
+        'account_mask': account.mask,
+        'period': st.period_label(),
+        'period_start': (st.period_start.isoformat()
+                         if st.period_start else None),
+        'period_end': st.period_end.isoformat() if st.period_end else None,
+        'anchored_opening': anchor.anchored_opening if anchor else None,
+        'anchored_closing': anchor.anchored_closing if anchor else None,
+        'portfolio_opening_value': st.portfolio_opening_value,
+        'portfolio_closing_value': st.portfolio_closing_value,
+        'cash_services_account_number': st.cash_services_account_number,
+        'parse_method': st.parse_method or '',
+        'parse_suspect': bool(st.parse_suspect),
+        'parser_version': st.parser_version(),
+        'parse_layout': metadata.get('layout') or '',
+        'parse_verified': metadata.get('verified'),
+        'fields_failed': metadata.get('fields_failed') or [],
+        # EVERY figure the recognizer recovered, verbatim. Not filtered to a
+        # known list: an unrecognised key is exactly what a caller diagnosing a
+        # parser regression needs to see.
+        'parsed_metadata': metadata,
+        'extracted_transactions': txns,
+        'extracted_transaction_count': len(txns),
+        # Statement parsing recovers FIGURES, not positions — Bank Bridge has
+        # no per-statement holdings extractor, and the Portfolio Detail pages
+        # are not parsed. Holdings come from Plaid's own feed instead; the key
+        # is present and empty so a caller can tell "none extracted" from "this
+        # build doesn't report them", and told where to actually look.
+        'extracted_holdings': [],
+        'extracted_holdings_note':
+            'statement PDFs are parsed for balances and activity rows only; '
+            'positions are not extracted from the Portfolio Detail pages. Use '
+            'list_holdings for positions (sourced from Plaid '
+            'investments/holdings/get).',
+    }, f'{account.mask} {st.period_label()}: {len(txns)} activity row(s), '
+       f'{len(metadata)} parsed field(s)')
+
+
+def _list_plaid_transactions(args: dict):
+    """The standard /transactions/sync feed for one account and window."""
+    account = _account_by_mask(args.get('account_mask'))
+    start = _iso_date(args.get('from_date'), 'from_date')
+    end = _iso_date(args.get('to_date'), 'to_date')
+    if start > end:
+        raise ToolError(f'from_date {start} is after to_date {end}')
+    wanted = (args.get('transaction_type') or '').strip().lower()
+    chain = _cash_chain(account)
+    masks = {a.account_id: (a.mask or '')
+             for a in PlaidAccount.query.filter(
+                 PlaidAccount.account_id.in_(tuple(chain))).all()}
+    eff = stmts._effective_date_col()
+    rows = (BankTransaction.query
+            .filter(BankTransaction.account_id.in_(tuple(chain)),
+                    eff >= start, eff <= end,
+                    BankTransaction.removed.is_(False))
+            .order_by(BankTransaction.date.asc(),
+                      BankTransaction.id.asc()).all())
+    if len(chain) > 1:
+        rows = stmts.dedupe_across_accounts(rows)
+    # The JE (if any) each transaction generated, in one query rather than one
+    # per row — a year of a busy account is a few thousand transactions.
+    from ..models import GeneratedJournalEntry
+    jes = {j.plaid_transaction_id: j for j in GeneratedJournalEntry.query.filter(
+        GeneratedJournalEntry.plaid_transaction_id.in_(
+            tuple(t.plaid_transaction_id for t in rows) or ('',))).all()}
+    out = []
+    for t in rows:
+        category = t.category or ''
+        if wanted and wanted not in category.lower() and wanted not in (
+                t.name or '').lower():
+            continue
+        je = jes.get(t.plaid_transaction_id)
+        out.append({
+            'transaction_id': t.plaid_transaction_id,
+            'account_mask': masks.get(t.account_id, ''),
+            'date': t.date.isoformat() if t.date else None,
+            'effective_date': (t.effective_date().isoformat()
+                               if t.effective_date() else None),
+            # Plaid's convention: POSITIVE means money LEFT the account.
+            'amount': t.amount,
+            'cash_in_amount': round(-float(t.amount or 0.0), 2),
+            'merchant': t.merchant_name or '',
+            'description': t.name or '',
+            'category': category,
+            'pending': bool(t.pending),
+            'source': t.source or 'plaid',
+            'statement_match_status': t.statement_match_status or '',
+            'bb_internal_tag': t.bb_internal_tag or '',
+            'matched_rule': (je.rule_name or '') if je else None,
+            'matched_rule_id': je.rule_id if je else None,
+            'posted_je': je.erpnext_journal_entry_name if je else None,
+            'posted_je_state': je.state if je else None,
+        })
+    return ({'account_mask': account.mask,
+             'account_ids_searched': chain,
+             'paired_cash_mask': _paired_mask(account),
+             'from_date': start.isoformat(), 'to_date': end.isoformat(),
+             'transaction_type': wanted or None,
+             'transactions': out, 'count': len(out)},
+            f'{account.mask} {start}..{end}: {len(out)} bank transaction(s)')
+
+
+def _list_investment_transactions(args: dict):
+    """The /investments/transactions/get feed for one account and window —
+    the feed a brokerage's whole activity lives on."""
+    from ..models import SecurityTransaction, Security
+    account = _account_by_mask(args.get('account_mask'))
+    start = _iso_date(args.get('from_date'), 'from_date')
+    end = _iso_date(args.get('to_date'), 'to_date')
+    if start > end:
+        raise ToolError(f'from_date {start} is after to_date {end}')
+    chain = stmts.supersede_chain(account.account_id)
+    rows = (SecurityTransaction.query
+            .filter(SecurityTransaction.account_id.in_(tuple(chain)),
+                    SecurityTransaction.date >= start,
+                    SecurityTransaction.date <= end)
+            .order_by(SecurityTransaction.date.asc(),
+                      SecurityTransaction.id.asc()).all())
+    if len(chain) > 1:
+        rows = stmts.dedupe_across_accounts(rows)
+    tickers = {s.security_id: s for s in Security.query.filter(
+        Security.security_id.in_(
+            tuple(r.security_id for r in rows if r.security_id) or ('',))
+    ).all()}
+    out = []
+    for t in rows:
+        sec = tickers.get(t.security_id)
+        out.append({
+            'investment_transaction_id': t.plaid_investment_transaction_id,
+            'date': t.date.isoformat() if t.date else None,
+            'name': t.name or '',
+            'type': t.type or '', 'subtype': t.subtype or '',
+            'security_id': t.security_id,
+            'ticker': (sec.ticker_symbol if sec else '') or '',
+            'security_name': (sec.name if sec else '') or '',
+            'quantity': t.quantity, 'price': t.price,
+            # Plaid's convention on this endpoint matches /transactions/sync:
+            # POSITIVE means cash LEFT the account (a buy). Spelled out both
+            # ways so a caller never has to infer it.
+            'amount': t.amount,
+            'cash_in_amount': round(-float(t.amount or 0.0), 2),
+            'fees': t.fees,
+            'iso_currency_code': t.iso_currency_code or 'USD',
+        })
+    item = PlaidItem.query.filter_by(item_id=account.item_id).first()
+    return ({
+        'account_mask': account.mask,
+        'from_date': start.isoformat(), 'to_date': end.isoformat(),
+        'investment_transactions': out, 'count': len(out),
+        # WHY AN EMPTY LIST IS AMBIGUOUS, made unambiguous. Zero rows means
+        # either "no trades in this window" or "this Item's investments feed
+        # was never pulled" — opposite findings with the same shape. The
+        # Item's investments_synced_at settles it, so it ships with the
+        # answer rather than needing a second call.
+        'investments_synced_at': (item.investments_synced_at.isoformat()
+                                  if item and item.investments_synced_at
+                                  else None),
+        'investments_ever_synced': bool(item and item.investments_synced_at),
+    }, f'{account.mask} {start}..{end}: {len(out)} investment transaction(s)')
+
+
+def _list_holdings(args: dict):
+    from ..models import Security, SecurityHolding
+    account = _account_by_mask(args.get('account_mask'))
+    as_of = _iso_date(args.get('as_of'), 'as_of', required=False)
+    chain = stmts.supersede_chain(account.account_id)
+    rows = (SecurityHolding.query
+            .filter(SecurityHolding.account_id.in_(tuple(chain)))
+            .order_by(SecurityHolding.institution_value.desc().nullslast())
+            .all())
+    secs = {s.security_id: s for s in Security.query.filter(
+        Security.security_id.in_(
+            tuple(r.security_id for r in rows) or ('',))).all()}
+    out = []
+    total = 0.0
+    for h in rows:
+        sec = secs.get(h.security_id)
+        total += float(h.institution_value or 0.0)
+        out.append({
+            'security_id': h.security_id,
+            'ticker': (sec.ticker_symbol if sec else '') or '',
+            'name': (sec.name if sec else '') or '',
+            'type': (sec.type if sec else '') or '',
+            'quantity': h.quantity,
+            'institution_price': h.institution_price,
+            'institution_price_as_of': (
+                h.institution_price_as_of.isoformat()
+                if h.institution_price_as_of else None),
+            'institution_value': h.institution_value,
+            'cost_basis': h.cost_basis,
+            'iso_currency_code': h.iso_currency_code or 'USD',
+            'refreshed_at': (h.refreshed_at.isoformat()
+                             if h.refreshed_at else None),
+        })
+    snapshot_dates = [h.institution_price_as_of for h in rows
+                      if h.institution_price_as_of]
+    result = {
+        'account_mask': account.mask,
+        'holdings': out, 'count': len(out),
+        'total_institution_value': round(total, 2),
+        'snapshot_priced_as_of': (max(snapshot_dates).isoformat()
+                                  if snapshot_dates else None),
+        'requested_as_of': as_of.isoformat() if as_of else None,
+        'is_historical': False,
+    }
+    if as_of is not None:
+        # SAY SO rather than quietly ignoring the argument. `security_holdings`
+        # is a snapshot-per-sync table (UNIQUE on account_id + security_id, see
+        # the model) — each pull REPLACES the row, so no position history
+        # exists to serve an as_of from. Answering with the current snapshot
+        # and calling it historical would be the worst option available;
+        # answering with it and saying plainly that it is current is the least
+        # bad, because the current snapshot is usually still what the caller
+        # wanted.
+        result['as_of_note'] = (
+            'Bank Bridge stores holdings as a CURRENT SNAPSHOT ONLY — each '
+            'investments/holdings/get pull replaces the previous rows, so '
+            'there is no position history to serve an as_of date from. The '
+            'holdings below are the latest snapshot, NOT positions as of '
+            f'{as_of.isoformat()}. For historical VALUE, read '
+            'portfolio_opening_value / portfolio_closing_value from '
+            'list_statements — those are the bank\'s own stated total account '
+            'value per period.')
+    return result, (f'{account.mask}: {len(out)} holding(s), '
+                    f'{result["total_institution_value"]:.2f} total'
+                    + (' (current snapshot, not historical)' if as_of else ''))
+
+
+def _list_unpaired_trades(args: dict):
+    """Trades and cash movements missing their other leg — the itemisation of
+    the Cash Clearing imbalance."""
+    from .. import trade_pairing
+    from ..models import Security
+    account = _account_by_mask(args.get('account_mask'))
+    start = _iso_date(args.get('from_date'), 'from_date', required=False)
+    end = _iso_date(args.get('to_date'), 'to_date', required=False)
+    if not (account.paired_account_id or '').strip():
+        raise ToolError(
+            f'account {account.mask} has no cash-services companion, so it has '
+            f'no Cash Clearing account and no trade legs to pair. On an '
+            f'unpaired investment account Plaid returns both legs in one '
+            f'investments/transactions/get row, so every trade is complete by '
+            f'construction — use list_investment_transactions instead.')
+    rows = trade_pairing.pairings_for_account(
+        account.account_id, unpaired_only=True, from_date=start, to_date=end)
+    secs = {s.security_id: s for s in Security.query.filter(
+        Security.security_id.in_(
+            tuple(r.security_id for r in rows if r.security_id) or ('',))
+    ).all()}
+    out = []
+    for r in rows:
+        sec = secs.get(r.security_id)
+        d = {
+            'date': r.trade_date.isoformat() if r.trade_date else None,
+            'security': ((sec.ticker_symbol or sec.name) if sec else '') or '',
+            'security_id': r.security_id,
+            'action': r.buy_or_sell or '',
+            'security_amount': r.expected_cash_amount,
+            'expected_cash_amount': r.expected_cash_amount,
+            'actual_cash_amount': r.actual_cash_amount,
+            'missing_leg': r.missing_leg or '',
+            'delta': r.delta,
+            'days_since_transaction': trade_pairing.days_since(r),
+            'security_txn_id': r.security_txn_id,
+            'cash_txn_id': r.cash_txn_id,
+            'notes': r.notes or '',
+        }
+        out.append(d)
+    summary = trade_pairing.summary(account.account_id)
+    from .. import invest_je
+    try:
+        reported = invest_je.clearing_imbalance(account.account_id)
+    except Exception:  # pragma: no cover - a cross-check must not fail the tool
+        reported = None
+    return ({
+        'account_mask': account.mask,
+        'cash_services_mask': _paired_mask(account),
+        'from_date': start.isoformat() if start else None,
+        'to_date': end.isoformat() if end else None,
+        'unpaired': out, 'count': len(out),
+        'summary': summary,
+        # Σ delta over unpaired rows, which equals clearing_imbalance by
+        # construction (a paired row contributes zero). Both are returned so a
+        # caller can SEE they agree — if they ever don't, the pairing table is
+        # stale and rebuild_anchors/a fresh sync is the fix, and silently
+        # showing only one number would hide that.
+        'unpaired_total': summary['unpaired_total'],
+        'reported_clearing_imbalance': reported,
+        'totals_agree': (reported is not None
+                         and abs(reported - summary['unpaired_total']) <= 0.005),
+    }, f'{account.mask}: {len(out)} unpaired leg(s), '
+       f'{summary["unpaired_total"]:+.2f} in clearing')
 
 
 def _agreement_summary(ag) -> dict:
@@ -528,7 +1019,20 @@ def _rebuild_anchors(args: dict):
     if args.get('account_mask'):
         account_id = _account_by_mask(args.get('account_mask')).account_id
     result = stmts.rebuild_statement_anchors(account_id)
-    return {'rebuild': result}, f"anchors written: {result.get('written', 0)}"
+    # v0.8.0 · the trade-leg pairings are derived from the same source tables
+    # and go stale in the same way, so the tool an operator (or an AI) reaches
+    # for when a number looks wrong refreshes both. Fail-soft — a diagnostic
+    # table must not be able to fail an anchor rebuild that succeeded.
+    pairing = None
+    try:
+        from .. import trade_pairing
+        pairing = trade_pairing.rebuild(account_id)
+    except Exception:  # pragma: no cover - fail-soft
+        db.session.rollback()
+        log.warning('trade-leg pairing rebuild failed', exc_info=True)
+    return ({'rebuild': result, 'trade_leg_pairing': pairing},
+            f"anchors written: {result.get('written', 0)}"
+            + (f", trade legs paired: {pairing['paired']}" if pairing else ''))
 
 
 def _pair_accounts(args: dict):
@@ -703,6 +1207,166 @@ TOOLS = {
                                               'description': 'YYYY-MM'}},
             required=('account_mask',)),
         'handler': _list_unmatched_statement_transactions},
+    # ── v0.8.0 · investment reconciliation toolkit (read-only) ──────────────
+    'list_statements': {
+        **_tool(
+            'Enumerate the statement periods stored for one account (by '
+            '4-digit mask), newest first. Per period: Plaid statement_id, '
+            'period_start/period_end, the anchored CASH opening and closing '
+            '(what the reconciliation chain tests), the bank-stated '
+            'portfolio_opening_value / portfolio_closing_value (TOTAL account '
+            'value, cash plus securities at market — a different and larger '
+            'number on a brokerage, NULL on a depository statement), '
+            'transaction_sum, mark_to_market_delta, variance, whether the '
+            'period reconciles, whether a chain gap precedes it, whether a PDF '
+            'is actually on disk, and the parser version + method that '
+            'produced the figures. Pass year=YYYY to filter. START HERE when '
+            'asked why an account does not reconcile — it names the periods '
+            'every other tool takes. Read-only.',
+            {'account_mask': _STR, 'year': {'type': 'integer'}},
+            required=('account_mask',)),
+        'handler': _list_statements},
+    'get_statement_pdf': {
+        **_tool(
+            'Return the stored statement PDF for one account and period, '
+            'base64-encoded, with its filename, on-disk path and byte size. '
+            '`period` takes either "YYYY-MM" (the month the period starts in) '
+            'or an exact period_end as "YYYY-MM-DD". REFUSES with the list of '
+            'periods that DO exist when the period is unknown; refuses when '
+            'the statement row exists but no PDF was ever downloaded (or the '
+            'data volume no longer holds it); refuses a PDF over 8 MB and '
+            'hands back the path instead. Prefer '
+            'get_statement_extracted_data when you want the figures rather '
+            'than the document — it costs a fraction of the context. '
+            'Read-only.',
+            {'account_mask': _STR,
+             'period': {'type': 'string',
+                        'description': 'YYYY-MM or an exact period_end '
+                                       'YYYY-MM-DD'}},
+            required=('account_mask', 'period')),
+        'handler': _get_statement_pdf},
+    'get_statement_extracted_data': {
+        **_tool(
+            'What Bank Bridge PARSED out of one statement PDF — everything, '
+            'so a parser error can be spotted without opening the document. '
+            'Returns the anchored cash opening/closing, the bank-stated total '
+            'account value at both ends, the cash-services account number, the '
+            'complete parsed_metadata blob VERBATIM (every summary figure the '
+            'recognizer recovered: deposits, withdrawals, dividends, interest, '
+            'fees, securities purchased and sold, realized/unrealized gains …), '
+            'the parse provenance (parser_version, layout, method, verified, '
+            'fields_failed, parse_suspect) and every extracted Activity Detail '
+            'row with its posted date, amount, description, section and match '
+            'status. Amounts on activity rows are CASH IN POSITIVE as the '
+            'statement prints them, with plaid_convention_amount alongside '
+            'for comparison against the transaction feeds. Note holdings are '
+            'NOT extracted from statement PDFs — use list_holdings. `period` '
+            'takes "YYYY-MM" or an exact period_end "YYYY-MM-DD". Read-only.',
+            {'account_mask': _STR,
+             'period': {'type': 'string',
+                        'description': 'YYYY-MM or an exact period_end '
+                                       'YYYY-MM-DD'}},
+            required=('account_mask', 'period')),
+        'handler': _get_statement_extracted_data},
+    'list_plaid_transactions': {
+        **_tool(
+            'Every BankTransaction Bank Bridge holds for one account in a date '
+            'range — the standard /transactions/sync feed. Per row: '
+            'transaction_id, Plaid date AND effective date (the bank\'s own '
+            'statement date when the matcher found one), amount in BOTH sign '
+            'conventions (`amount` is Plaid\'s, POSITIVE = money LEFT the '
+            'account; `cash_in_amount` is the flipped one the statements use), '
+            'merchant, description, category, pending, whether the row came '
+            'from the Plaid feed or was synthesized from a statement, its '
+            'internal tag, the rule that matched it and the Journal Entry it '
+            'generated. For a PAIRED brokerage this searches the CASH '
+            'COMPANION too and labels each row with the mask it came from — '
+            'the brokerage account itself holds zero bank transactions by '
+            'construction, so a listing without the companion would look '
+            'empty. transaction_type is an optional case-insensitive substring '
+            'filter over category and description. Read-only.',
+            {'account_mask': _STR,
+             'from_date': {'type': 'string', 'description': 'YYYY-MM-DD'},
+             'to_date': {'type': 'string', 'description': 'YYYY-MM-DD'},
+             'transaction_type': {
+                 'type': 'string',
+                 'description': 'optional substring filter on Plaid category '
+                                'or description, e.g. "transfer"'}},
+            required=('account_mask', 'from_date', 'to_date')),
+        'handler': _list_plaid_transactions},
+    'list_investment_transactions': {
+        **_tool(
+            'Every investment transaction Bank Bridge holds for one account in '
+            'a date range — the /investments/transactions/get feed, which is '
+            'where a brokerage\'s buys, sells, dividends, interest, fees, '
+            'deposits, withdrawals and transfers actually live. Per row: '
+            'investment_transaction_id, date, name, Plaid type '
+            '(buy/sell/cash/fee/transfer/cancel) and subtype, security_id with '
+            'its resolved ticker and name, quantity, price, fees, and amount '
+            'in BOTH sign conventions (`amount` is Plaid\'s, POSITIVE = cash '
+            'LEFT the account, same convention as the bank feed; '
+            '`cash_in_amount` is the flip). '
+            'AN EMPTY RESULT IS AMBIGUOUS AND THE ANSWER SAYS WHICH: zero rows '
+            'means either no trades in the window or that this Item\'s '
+            'investments feed was never pulled at all, so '
+            'investments_ever_synced and investments_synced_at ship alongside. '
+            'investments_ever_synced=false with a brokerage showing Movement '
+            '0.00 is the signature of an Item that was never granted the '
+            '`investments` product at Link time. Read-only.',
+            {'account_mask': _STR,
+             'from_date': {'type': 'string', 'description': 'YYYY-MM-DD'},
+             'to_date': {'type': 'string', 'description': 'YYYY-MM-DD'}},
+            required=('account_mask', 'from_date', 'to_date')),
+        'handler': _list_investment_transactions},
+    'list_holdings': {
+        **_tool(
+            'Current positions for one investment account, largest by value '
+            'first: security_id, ticker, name, security type, quantity '
+            '(NEGATIVE for a short option position), institution_price and the '
+            'date it was priced, institution_value, cost_basis where the '
+            'custodian reports one, and the total across all positions. '
+            'IMPORTANT — `as_of` CANNOT return historical positions: Bank '
+            'Bridge stores holdings as a current snapshot only (each '
+            'investments/holdings/get pull REPLACES the previous rows), so '
+            'passing as_of returns the latest snapshot with '
+            'is_historical=false and an as_of_note saying so. For historical '
+            'account VALUE use list_statements\' portfolio_opening_value / '
+            'portfolio_closing_value, which are the bank\'s own stated figures '
+            'per period. Read-only.',
+            {'account_mask': _STR,
+             'as_of': {'type': 'string',
+                       'description': 'YYYY-MM-DD. NOTE: no position history '
+                                      'is stored — see the tool description.'}},
+            required=('account_mask',)),
+        'handler': _list_holdings},
+    'list_unpaired_trades': {
+        **_tool(
+            'The itemisation of a paired brokerage\'s Cash Clearing imbalance '
+            '— every movement missing its other leg. A trade at a paired '
+            'Wells-Fargo-style brokerage moves money twice: a SECURITY leg on '
+            'the brokerage (from investments/transactions/get) and a CASH leg '
+            'on its cash-services companion (from transactions/sync), booked '
+            'to Cash Clearing from opposite sides so a complete pair nets to '
+            'zero. Each row here is a leg with no partner within 3 business '
+            'days: date, security and ticker, action (buy/sell/fee/cash), '
+            'expected vs actual cash amount, `missing_leg` naming which side is '
+            'absent ("cash" = a trade whose settlement never appeared; '
+            '"security" = companion cash with no trade to explain it, which is '
+            'what an Item that never pulled its investments feed looks like), '
+            'delta, and days_since_transaction so slow settlement is '
+            'distinguishable from a permanent gap. `unpaired_total` sums the '
+            'deltas and equals reported_clearing_imbalance by construction; '
+            'totals_agree=false means the pairing table is stale and a fresh '
+            'sync or rebuild_anchors is needed. REFUSES an account with no '
+            'cash-services companion — an unpaired investment account gets '
+            'both legs in one Plaid row and cannot have this problem. '
+            'Read-only.',
+            {'account_mask': _STR,
+             'from_date': {'type': 'string', 'description': 'YYYY-MM-DD'},
+             'to_date': {'type': 'string', 'description': 'YYYY-MM-DD'}},
+            required=('account_mask',)),
+        'handler': _list_unpaired_trades},
+
     'get_advisory_agreement_summary': {
         **_tool(
             'Advisory-agreement dashboard data (fees, AUM, performance, risk). '
@@ -900,8 +1564,12 @@ TOOLS = {
     'rebuild_anchors': {
         **_tool(
             'Rebuild the statement-anchor chain for one account (by mask) or '
-            'all accounts. MUTATING — requires the rebuild_anchors kill switch '
-            'ON.',
+            'all accounts, AND re-derive the trade-leg pairings alongside — '
+            'the fix when list_unpaired_trades reports totals_agree=false, or '
+            'when mark_to_market_delta is missing on anchors built before '
+            'v0.8.0. Both are derived from data already held; nothing is '
+            'fetched from Plaid and nothing is posted to ERPNext. MUTATING — '
+            'requires the rebuild_anchors kill switch ON.',
             {'account_mask': _STR}, mutating=True),
         'handler': _rebuild_anchors},
     'pair_accounts': {

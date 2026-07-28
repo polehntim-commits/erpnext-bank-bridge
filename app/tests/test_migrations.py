@@ -250,3 +250,86 @@ class InternalTagMigrationTests(MigrationBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class PortfolioBridgeMigrationTests(MigrationBase):
+    """v0.8.0 · the four portfolio-bridge columns on `statement_anchors`, plus
+    the new `trade_leg_pairings` table.
+
+    The property worth a test of its own is that the migration CANNOT MOVE A
+    RECONCILIATION VERDICT. All four columns are additive and none is read by
+    `reconciles()`, so an anchor row written by v0.7.5 answers identically
+    before and after the upgrade — asserted below against a row carrying the
+    exact figures a pre-v0.8.0 install would hold."""
+
+    V080_COLUMNS = (('statement_anchors', 'portfolio_opening'),
+                    ('statement_anchors', 'portfolio_closing'),
+                    ('statement_anchors', 'security_flow_sum'),
+                    ('statement_anchors', 'mark_to_market_delta'))
+
+    def _downgrade(self):
+        with db.engine.begin() as conn:
+            for table, column in self.V080_COLUMNS:
+                conn.execute(
+                    text(f'ALTER TABLE {table} DROP COLUMN {column}'))
+
+    def test_fresh_install_has_the_columns_and_the_table(self):
+        for table, column in self.V080_COLUMNS:
+            self.assertIn(column, self._columns(table))
+        self.assertIn('trade_leg_pairings',
+                      inspect(db.engine).get_table_names())
+
+    def test_upgrade_adds_them_and_query_succeeds(self):
+        self._downgrade()
+        for table, column in self.V080_COLUMNS:
+            self.assertNotIn(column, self._columns(table))
+        migrations.run_migrations()
+        for table, column in self.V080_COLUMNS:
+            self.assertIn(column, self._columns(table),
+                          f'{table}.{column} should be added on upgrade')
+        # The production symptom this guards: the reconciliation page 500s
+        # until the columns exist, because the model SELECTs all of them.
+        from app.models import StatementAnchor
+        self.assertEqual(StatementAnchor.query.all(), [])
+
+    def test_idempotent(self):
+        self._downgrade()
+        migrations.run_migrations()
+        migrations.run_migrations()
+        for table, column in self.V080_COLUMNS:
+            self.assertIn(column, self._columns(table))
+
+    def test_a_pre_v080_anchor_reconciles_identically_after_the_upgrade(self):
+        """The upgrade adds an explanation of total account value; it must not
+        be able to change whether a period is explained."""
+        from app.models import StatementAnchor
+        anchor = StatementAnchor(
+            account_id='acct-1', statement_id=1, anchored_opening=17600.0,
+            anchored_closing=17650.0, transaction_sum=50.0,
+            computed_closing=17650.0, variance=0.0)
+        db.session.add(anchor)
+        db.session.commit()
+        migrations.run_migrations()
+        db.session.expire_all()
+        row = StatementAnchor.query.one()
+        self.assertTrue(row.reconciles())
+        self.assertEqual(0.0, row.variance)
+        # The new columns default to "says nothing", not to zero.
+        self.assertIsNone(row.mark_to_market_delta)
+        self.assertIsNone(row.portfolio_opening)
+        self.assertIsNone(row.portfolio_delta())
+
+    def test_security_flow_sum_defaults_to_zero_not_null(self):
+        """It is a SUM beside `transaction_sum`, and a period with no trades
+        really did have zero of them — unlike mark_to_market_delta, where 0.0
+        would be a claim about prices."""
+        self._downgrade()
+        migrations.run_migrations()
+        with db.engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO statement_anchors "
+                "(account_id, statement_id, transaction_sum, "
+                " chain_gap_from_prior) VALUES ('a', 99, 0.0, 0)"))
+        from app.models import StatementAnchor
+        row = StatementAnchor.query.filter_by(statement_id=99).one()
+        self.assertEqual(0.0, row.security_flow_sum)
+        self.assertIsNone(row.mark_to_market_delta)
