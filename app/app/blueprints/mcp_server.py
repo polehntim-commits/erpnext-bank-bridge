@@ -1142,6 +1142,149 @@ def _disable_public_url(args: dict):
              'saved_redirect_uri_unchanged': True}, r['detail'])
 
 
+# ── v0.8.4 · the admin actions that were button-only ────────────────────────
+#
+# Every one of these mirrors a POST route on /admin that already had proven
+# logic behind it. Tim ran the OML pipeline end to end on 2026-07-28 and found
+# each of these was a thing only a human at a browser could do — which is
+# exactly the relay tax the MCP server exists to remove. Nothing here reimplements
+# an admin route: the shared work was lifted into the modules that own it
+# (categorization.rerun_rules, invest_je.*) and both surfaces call it.
+
+def _erp_client_or_error():
+    """The ERPNext client, or a ToolError naming the fix. Every mutating tool
+    below needs one and none of them should 500 without it."""
+    from .. import erpnext_bank
+    from .. import erpnext_settings
+    if not erpnext_settings.is_configured():
+        raise ToolError('ERPNext is not configured — set the URL, API key and '
+                        'secret with set_erpnext_config (or on '
+                        '/admin/erpnext_settings) first.')
+    try:
+        return erpnext_bank.get_client()
+    except Exception as e:
+        raise ToolError(f'could not reach ERPNext: {e}')
+
+
+def _rerun_rules(args: dict):
+    from .. import categorization
+    from .. import sync_engine
+    try:
+        stats = categorization.rerun_rules(sync_engine.get_erp_client_or_none())
+    except categorization.JournalEntryGateOff as e:
+        raise ToolError(str(e))
+    return stats, (f"considered {stats['considered']}, matched "
+                   f"{stats['matched']}, generated {stats['generated']}")
+
+
+def _reset_investment_drafts(args: dict):
+    from .. import audit
+    from .. import invest_je
+    client = _erp_client_or_error()
+    account_id = (args.get('account_id') or '').strip() or None
+    result = invest_je.reset_investment_drafts(client, account_id)
+    audit.record('invest_je_drafts_reset', subject_type='GeneratedJournalEntry',
+                 subject_id=account_id or 'all', after=result,
+                 notes='MCP reset_investment_drafts', actor='mcp')
+    if result['aborted']:
+        return result, f"ABORTED: {result['reason']}"
+    return result, (f"{result['tracker_deleted']} tracked + "
+                    f"{result['orphan_deleted']} orphan draft(s) deleted "
+                    f"({result['total_deleted']} total)")
+
+
+def _get_clearing_status(args: dict):
+    from .. import invest_je
+    client = _erp_client_or_error()
+    result = invest_je.clearing_status(client, (args.get('account_id') or '').strip())
+    if 'error' in result:
+        raise ToolError(result['error'])
+    return result, (f"ledger {result['ledger_balance']:,.2f}, projected "
+                    f"{result['projected_imbalance']:,.2f}, "
+                    f"{result['unposted_settlements']} settlement leg(s) "
+                    f"still unposted")
+
+
+def _post_clearing_cleanup_je(args: dict):
+    from .. import invest_je
+    client = _erp_client_or_error()
+    account_id = (args.get('account_id') or '').strip()
+    dry_run = bool(args.get('dry_run', True))
+    status = invest_je.clearing_status(client, account_id)
+    if 'error' in status:
+        raise ToolError(status['error'])
+    # The ordering guard, enforced rather than documented: a cleanup written
+    # while the v0.8.4 backfill still has legs to post corrects an imbalance
+    # that backfill is about to correct again, and the ledger ends up wrong by
+    # the same six figures in the other direction.
+    if not dry_run and status['unposted_settlements']:
+        raise ToolError(
+            f"{status['unposted_settlements']} settlement leg(s) are still "
+            'unposted — run the investment post first (they relieve Cash '
+            'Clearing on their own), then re-check with get_clearing_status. '
+            'Pass dry_run=true to preview the cleanup meanwhile.')
+    result = invest_je.clearing_cleanup_je(client, account_id, dry_run=dry_run)
+    result['unposted_settlements'] = status['unposted_settlements']
+    if result['skipped']:
+        return result, result['skipped']
+    return result, (f"draft {result['journal_entry']} moves "
+                    f"${result['amount']:,.2f} to {result['counter_account']}")
+
+
+def _set_je_gate(args: dict, on: bool):
+    from .. import audit
+    from .. import erpnext_settings
+    before = erpnext_settings.je_generation_enabled()
+    erpnext_settings.set_je_generation(on)
+    audit.record('je_gate_changed', subject_type=None,
+                 before={'auto_generate_journal_entries': before},
+                 after={'auto_generate_journal_entries': on},
+                 notes='MCP ' + ('enable_je_gate' if on else 'disable_je_gate'),
+                 actor='mcp')
+    return ({'auto_generate_journal_entries': on, 'was': before},
+            f"Journal Entry generation {'ON' if on else 'OFF'}")
+
+
+def _enable_je_gate(args: dict):
+    return _set_je_gate(args, True)
+
+
+def _disable_je_gate(args: dict):
+    return _set_je_gate(args, False)
+
+
+def _set_erpnext_config(args: dict):
+    """Set the ERPNext connection. Only the fields PRESENT in `args` change —
+    an omitted api_secret keeps the stored one, exactly as the form does."""
+    from .. import audit
+    from .. import erpnext_settings
+    current = erpnext_settings.load()
+    url = args.get('url')
+    api_key = args.get('api_key')
+    secret = args.get('api_secret')
+    company = args.get('default_company')
+    saved = erpnext_settings.save(
+        current['url'] if url is None else url,
+        current['api_key'] if api_key is None else api_key,
+        None if secret is None else secret,
+        current['default_company'] if company is None else company)
+    changed = [k for k in ('url', 'api_key', 'default_company')
+               if saved[k] != current[k]]
+    if secret is not None:
+        changed.append('api_secret')
+    # The secret is never echoed back, here or anywhere. Same rule the admin
+    # page follows — an MCP transcript is as readable as a screen.
+    result = {'url': saved['url'], 'api_key': saved['api_key'],
+              'default_company': saved['default_company'],
+              'api_secret': erpnext_settings.masked_secret(),
+              'changed_fields': changed,
+              'configured': erpnext_settings.is_configured()}
+    audit.record('erpnext_settings_changed', subject_type=None,
+                 after={'changed_fields': changed, 'url': saved['url']},
+                 notes='MCP set_erpnext_config', actor='mcp')
+    return result, ('changed: ' + (', '.join(changed) if changed else 'nothing'))
+
+
 def _set_je_posting(args: dict, on: bool):
     item = PlaidItem.query.filter_by(item_id=(args.get('item_id') or '')).first()
     if item is None:
@@ -1630,6 +1773,91 @@ TOOLS = {
             'disable_public_url kill switch ON.',
             {}, mutating=True),
         'handler': _disable_public_url},
+    # ── v0.8.4 · the admin surface, as tools ────────────────────────────────
+    'get_clearing_status': {
+        **_tool(
+            "What a paired brokerage's Cash Clearing account ACTUALLY holds in "
+            'ERPNext, what Bank Bridge projects it should hold, and how many '
+            'same-account settlement legs are still unposted. The two numbers '
+            'disagreeing is the v0.8.4 bug: before it, every trade credited '
+            'clearing and its settlement half was dropped, so the projection '
+            'read ~0 while the ledger ran to -$1,011,119.41. Run this BEFORE '
+            'post_clearing_cleanup_je — a non-zero unposted_settlements means '
+            'the backfill, not a cleanup JE, is what fixes the balance. '
+            'Read-only.',
+            {'account_id': _STR}, required=('account_id',)),
+        'handler': _get_clearing_status},
+    'rerun_rules': {
+        **_tool(
+            'Re-run the CURRENT categorization rules over posted, non-removed '
+            'transactions that have no Journal Entry yet, and generate the JEs '
+            'that match. Idempotent — a transaction that already produced a JE '
+            'is skipped, so running twice generates nothing the second time. '
+            'Refuses when Journal Entry generation is switched off, rather than '
+            'reporting a successful run that posted nothing. Returns '
+            '{considered, matched, generated}. MUTATING — requires the '
+            'rerun_rules kill switch ON.',
+            {}, mutating=True),
+        'handler': _rerun_rules},
+    'reset_investment_drafts': {
+        **_tool(
+            'Delete every DRAFT investment Journal Entry — both the ones Bank '
+            "Bridge's tracker names and the ORPHANS it does not (a JE whose "
+            'tracker row was lost to a partial delete, which the pre-v0.8.4 '
+            'reset left standing) — so the next post rebuilds them. ABORTS on '
+            'the first SUBMITTED entry, deleting nothing further: submitted '
+            'entries are real ledger history. Pass account_id to scope it to '
+            'one brokerage. Returns {tracker_deleted, orphan_deleted, '
+            'total_deleted, aborted}. MUTATING — requires the '
+            'reset_investment_drafts kill switch ON.',
+            {'account_id': _STR}, mutating=True),
+        'handler': _reset_investment_drafts},
+    'post_clearing_cleanup_je': {
+        **_tool(
+            'Write ONE DRAFT Journal Entry moving whatever is left in Cash '
+            "Clearing onto the brokerage's own GL leaf. This is the SECOND "
+            'step, not the first: the settlement legs v0.8.4 restored relieve '
+            'clearing by themselves when the investment post re-runs, so this '
+            'REFUSES (unless dry_run) while get_clearing_status still reports '
+            'unposted settlements. dry_run defaults TRUE and returns the '
+            'document it would write — posting a six-figure correction to a '
+            'live ledger should take a deliberate second call. Never submits; '
+            'what it writes is a draft an operator reviews. MUTATING — '
+            'requires the post_clearing_cleanup_je kill switch ON.',
+            {'account_id': _STR,
+             'dry_run': {'type': 'boolean',
+                         'description': 'default true — preview only'}},
+            required=('account_id',), mutating=True),
+        'handler': _post_clearing_cleanup_je},
+    'enable_je_gate': {
+        **_tool(
+            'Turn ON Journal Entry generation for the whole install, '
+            'persistently — the setting that was ERPNEXT_AUTO_GENERATE_'
+            'JOURNAL_ENTRIES and needed a compose edit plus an app recreate to '
+            'flip. Distinct from enable_je_posting, which is the per-Item '
+            'INVESTMENT switch; this is the master gate over the bank-transaction '
+            'rules engine. MUTATING — requires the enable_je_gate kill switch ON.',
+            {}, mutating=True),
+        'handler': _enable_je_gate},
+    'disable_je_gate': {
+        **_tool(
+            'Turn OFF Journal Entry generation for the whole install, '
+            'persistently. Transactions keep syncing and rules keep matching; '
+            'nothing is written to the general ledger. The pause to reach for '
+            'when a rule is posting wrongly. MUTATING — requires the '
+            'disable_je_gate kill switch ON.',
+            {}, mutating=True),
+        'handler': _disable_je_gate},
+    'set_erpnext_config': {
+        **_tool(
+            'Set the ERPNext connection — URL, API key, API secret, default '
+            'Company. Only the fields you PASS are changed; omit api_secret to '
+            'keep the stored one. The secret is never echoed back, only a '
+            'masked preview. Same fields as /admin/erpnext_settings. MUTATING — '
+            'requires the set_erpnext_config kill switch ON.',
+            {'url': _STR, 'api_key': _STR, 'api_secret': _STR,
+             'default_company': _STR}, mutating=True),
+        'handler': _set_erpnext_config},
 }
 
 

@@ -599,9 +599,15 @@ class ClearingIdentityTest(PairingBase):
 
     def test_the_matched_types_match_what_invest_je_posts_to_clearing(self):
         """The identity above holds only while the two type lists agree, so
-        the agreement is asserted rather than left to drift."""
-        posted = ('buy', 'sell', 'fee', 'cash')
-        self.assertEqual(posted, trade_pairing.CLEARING_TYPES)
+        the agreement is asserted rather than left to drift.
+
+        v0.8.4 · compared against invest_je's OWN constant now, not a literal
+        copied into this file. The literal agreed with CLEARING_TYPES for three
+        releases while invest_je silently declined to post the 'cash' leg at
+        all — a restatement of the claim rather than a test of it, and the
+        -$1,011,119.41 in Cash Clearing is what it cost."""
+        self.assertEqual(invest_je.CLEARING_POSTED_TYPES,
+                         trade_pairing.CLEARING_TYPES)
 
     def test_the_summary_partitions_the_total(self):
         self._seed_a_messy_account()

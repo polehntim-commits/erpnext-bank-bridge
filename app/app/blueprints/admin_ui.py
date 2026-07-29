@@ -996,6 +996,32 @@ ACCOUNTS_BODY = """
   <span style="font-size:11px;color:#999">deletes drafts only · the next sync
     re-posts them with the dimensions above</span>
 </form>
+
+{# v0.8.4 · the Cash Clearing repair. Read the status first — it says whether
+   the settlement-leg backfill is what fixes the balance (it usually is) or
+   whether a cleanup entry is genuinely needed. #}
+<div class="card" style="margin:10px 0 0;padding:10px">
+  <b style="font-size:13px">Cash Clearing</b>
+  <p style="font-size:12px;color:#666;margin:4px 0 8px">
+    The bridge between a trade's security leg and its cash settlement. It should
+    sit at zero. Before v0.8.4 the settlement half of a Wells&nbsp;Fargo trade was
+    never posted, so it drifted by the whole value of every buy — re-running the
+    investment post books those halves and walks it back on its own.
+  </p>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+    <form method="post" action="/admin/clearing_status" style="margin:0">
+      <button type="submit" class="secondary" style="padding:4px 10px;font-size:12px">
+        Check Cash Clearing</button>
+    </form>
+    <form method="post" action="/admin/clearing_cleanup" style="margin:0"
+          onsubmit="return confirm('Write a DRAFT Journal Entry moving the leftover Cash Clearing balance onto the brokerage’s own account? Nothing is submitted — you review and post it in ERPNext. This is refused while settlement legs are still unposted, because re-running the investment post fixes those on its own.')">
+      <button type="submit" class="secondary" style="padding:4px 10px;font-size:12px">
+        Write cleanup draft</button>
+      <span style="font-size:11px;color:#999">draft only · refused while the
+        backfill is pending</span>
+    </form>
+  </div>
+</div>
 {% endif %}
 
 <!-- v0.4.7 · disconnect confirmation. One modal for the whole page; the button
@@ -1737,13 +1763,97 @@ def reset_investment_drafts():
     if result['aborted']:
         msg = f'Reset ABORTED: {result["reason"]} (nothing deleted).'
     else:
-        msg = (f'{result["drafts_deleted"]} draft investment JE(s) deleted. '
+        # v0.8.4 · the two counts separately. "642 deleted" while 189 survived
+        # is the report that sent Tim looking for a bug in the delete; "642
+        # tracked + 189 orphaned" is the one that explains itself.
+        msg = (f'{result["total_deleted"]} draft investment JE(s) deleted '
+               f'({result["tracker_deleted"]} tracked, '
+               f'{result["orphan_deleted"]} orphaned). '
                'The next sync re-posts them with the Item\'s cost center and '
                'member.')
     audit.record('invest_je_drafts_reset', subject_type='GeneratedJournalEntry',
                  subject_id=account_id or 'all', after=result,
                  notes='v0.8.3 draft reset before re-post')
     return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
+def _paired_brokerage_ids() -> list:
+    """Every paired brokerage account_id — what the two clearing actions below
+    operate over when the form names none."""
+    return [a.account_id for a in PlaidAccount.query.filter(
+        PlaidAccount.paired_account_id.isnot(None),
+        PlaidAccount.paired_account_id != '').all()]
+
+
+@bp.post('/admin/clearing_status')
+def clearing_status_action():
+    """What Cash Clearing ACTUALLY holds in ERPNext, next to what Bank Bridge
+    projects (v0.8.4). The two disagreeing is the whole v0.8.4 bug: the
+    projection pairs a buy with its settlement row and nets to zero, so it read
+    healthy for three releases while the ledger ran to -$1,011,119.41."""
+    from .. import invest_je
+    if not erps.is_configured():
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'ERPNext is not configured.'))
+    try:
+        client = erpnext_bank.get_client()
+        parts = []
+        for account_id in (request.form.get('account_id', '').strip()
+                           and [request.form['account_id'].strip()]
+                           or _paired_brokerage_ids()):
+            s = invest_je.clearing_status(client, account_id)
+            if 'error' in s:
+                continue
+            parts.append(
+                f"{s['clearing_account'] or 'Cash Clearing'}: ledger "
+                f"${s['ledger_balance']:,.2f}, projected "
+                f"${s['projected_imbalance']:,.2f}, "
+                f"{s['unposted_settlements']} settlement leg(s) unposted"
+                + ('' if s['ready_for_cleanup']
+                   else ' — re-run the investment post first, it relieves '
+                        'clearing on its own'))
+    except (ERPNextConfigError, ERPNextError) as e:
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            f'Could not read Cash Clearing: {e}'))
+    return redirect('/admin/accounts?flash=' + quote_plus(
+        ' · '.join(parts) or 'No paired brokerage accounts.'))
+
+
+@bp.post('/admin/clearing_cleanup')
+def clearing_cleanup_action():
+    """Write the DRAFT cleanup entry for whatever is left in Cash Clearing.
+
+    Refuses while settlement legs are still unposted — a cleanup written
+    mid-backfill corrects an imbalance the backfill is about to correct again,
+    and the ledger ends up wrong by the same amount in the other direction.
+    Never submits: what this writes is a draft the operator reviews."""
+    from .. import invest_je
+    if not erps.is_configured():
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'ERPNext is not configured.'))
+    try:
+        client = erpnext_bank.get_client()
+        parts = []
+        for account_id in _paired_brokerage_ids():
+            status = invest_je.clearing_status(client, account_id)
+            if 'error' in status:
+                continue
+            if status['unposted_settlements']:
+                parts.append(
+                    f"{account_id}: refused — {status['unposted_settlements']} "
+                    'settlement leg(s) still unposted. Re-run the investment '
+                    'post first; it relieves Cash Clearing on its own.')
+                continue
+            r = invest_je.clearing_cleanup_je(client, account_id,
+                                              dry_run=False)
+            parts.append(f"{account_id}: {r['skipped']}" if r['skipped'] else
+                         f"{account_id}: draft {r['journal_entry']} moves "
+                         f"${r['amount']:,.2f} to {r['counter_account']}")
+    except (ERPNextConfigError, ERPNextError) as e:
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            f'Cleanup failed: {e}'))
+    return redirect('/admin/accounts?flash=' + quote_plus(
+        ' · '.join(parts) or 'No paired brokerage accounts.'))
 
 
 @bp.post('/admin/rebuild_investment_accounts')
@@ -2274,38 +2384,13 @@ def rerun_rules():
     transactions that don't yet have a generated Journal Entry. Rule edits never
     retroactively re-run on their own — this is the deliberate opt-in path."""
     erp = sync_engine.get_erp_client_or_none()
-    if erp is None:
-        return redirect('/admin/transactions?flash=' + quote_plus(
-            'ERPNext not configured — cannot generate Journal Entries.'))
-    done = {row.plaid_transaction_id for row in
-            db.session.query(GeneratedJournalEntry.plaid_transaction_id)
-            .filter(GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None))}
-    eligible = (BankTransaction.query
-                .filter(BankTransaction.posted_at.isnot(None),
-                        BankTransaction.removed.is_(False)).all())
-    generated = matched = considered = 0
-    for row in eligible:
-        if row.plaid_transaction_id in done:
-            continue
-        considered += 1
-        gje = categorization.generate_journal_entry(erp, row)
-        if gje is not None:
-            matched += 1
-            if gje.erpnext_journal_entry_name:
-                generated += 1
-    # v0.4.6 · a Rerun is the one moment match counts change in bulk, and the
-    # operator's next stop is the Rules tab to see what stuck. Rolling up inline
-    # (a local read + a write per changed rule) beats showing them a column that
-    # is a day out of date at exactly the moment they're relying on it.
-    rule_stats.rollup_match_counts()
-    audit.record('rules_rerun', subject_type=None,
-                 after={'considered': considered, 'matched': matched,
-                        'generated': generated},
-                 notes=(f'reran current rules on {considered} eligible '
-                        f'transaction(s) → {generated} JE(s)'))
+    try:
+        stats = categorization.rerun_rules(erp)
+    except categorization.JournalEntryGateOff as e:
+        return redirect('/admin/transactions?flash=' + quote_plus(str(e)))
     return redirect('/admin/transactions?flash=' + quote_plus(
-        f'Reran rules on {considered} transaction(s): {generated} '
-        f'Journal Entr(ies) generated.'))
+        f"Reran rules on {stats['considered']} transaction(s): "
+        f"{stats['generated']} Journal Entr(ies) generated."))
 
 
 # ── Categorization rules ─────────────────────────────────────────
@@ -2494,6 +2579,38 @@ def known_accounts_api():
                         'company': rule_company, 'mode': 'specific'})
     return jsonify({'accounts': _logical_account_names(fresh=fresh),
                     'company': '', 'mode': 'logical'})
+
+
+@bp.get('/api/rules/known_cost_centers')
+def known_cost_centers_api():
+    """Autocomplete feed for the rule form's cost_center field (v0.8.4).
+
+    v0.8.3 built `list_cost_centers` for the per-Item investment picker on
+    /admin/accounts and the rule form never got it, so the field that decides
+    which segment a rule's offset line is filed under stayed a bare text box —
+    an operator typing a Company-suffixed docname from memory, with a silent
+    fall back to the Company default when they got it wrong.
+
+    Company-scoped the same way the offset-account feed is: `?company=` is the
+    rule's Applies-to-Company. Empty means an agnostic rule, and every
+    Company's bookable cost centers are offered — the same widening the Mode B
+    account feed does, and for the same reason (the rule resolves per
+    transaction at JE time, so the editor cannot know which chart applies).
+
+    Only LEAF, enabled cost centers, because ERPNext refuses to book against a
+    group node — the picker can only ever offer what `cost_center_exists`
+    would accept, so a picked value can never fail validation on save.
+
+    Best-effort: an unconfigured or unreachable ERPNext yields [], and the
+    field stays free-text exactly as it was."""
+    company = (request.args.get('company') or '').strip()
+    try:
+        rows = erpnext_bank.list_cost_centers(company=company)
+    except (ERPNextConfigError, ERPNextError):
+        return jsonify({'cost_centers': [], 'company': company,
+                        'available': False})
+    return jsonify({'cost_centers': [r['name'] for r in rows],
+                    'company': company, 'available': True})
 
 
 @bp.get('/api/rules/refresh_accounts')
@@ -2701,11 +2818,17 @@ RULES_BODY = """
            Safari collapsed mid-type); options fed by /api/rules/known_accounts -->
       <div id="oa-dd" style="display:none;position:absolute;left:0;right:0;z-index:20;background:#fff;border:1px solid #ccc;border-top:none;border-radius:0 0 4px 4px;max-height:240px;overflow:auto;box-shadow:0 4px 12px rgba(0,0,0,.12)"></div>
     </label>
-    <label style="flex:1;min-width:170px">Cost center <span style="font-weight:400;color:#888">— optional</span>
+    <label style="flex:1;min-width:170px;position:relative">Cost center <span style="font-weight:400;color:#888">— optional</span>
       <input name="cost_center" id="cost-center" autocomplete="off" value="{{ form.cost_center or '' }}"
              title="ERPNext Cost Center written onto the OFFSET line only (the bank line never gets one). Leave blank to let ERPNext apply the account's or company's own default."
              placeholder="Harvest - OML">
-      <span style="display:block;font-weight:400;font-size:11px;color:#888;margin-top:3px">
+      <!-- v0.8.4 · same shared dropdown as the offset-account field, fed by
+           /api/rules/known_cost_centers and re-scoped when Applies-to-Company
+           changes. A typed value the list doesn't hold is still accepted — the
+           free-text fallback advanced operators (and an unreachable ERPNext)
+           depend on. -->
+      <div id="cc-dd" style="display:none;position:absolute;left:0;right:0;z-index:20;background:#fff;border:1px solid #ccc;border-top:none;border-radius:0 0 4px 4px;max-height:240px;overflow:auto;box-shadow:0 4px 12px rgba(0,0,0,.12)"></div>
+      <span id="cc-hint" style="display:block;font-weight:400;font-size:11px;color:#888;margin-top:3px">
         Offset line only. Blank = ERPNext's own default.
       </span>
     </label>
@@ -3113,8 +3236,11 @@ RULES_BODY = """
     }
   }
   var CK = 'bb_known_merchants', CC = 'bb_known_categories',
-      CA = 'bb_known_accounts';
-  var merchants = [], categories = [], accounts = [];
+      CA = 'bb_known_accounts', CCC = 'bb_known_cost_centers';
+  var merchants = [], categories = [], accounts = [], costCenters = [];
+  var cc = document.getElementById('cost-center');
+  var ccDD = document.getElementById('cc-dd');
+  var ccHint = document.getElementById('cc-hint');
 
   function money(n) { return '$' + Math.round(n || 0).toLocaleString(); }
   function esc(s) {
@@ -3152,8 +3278,64 @@ RULES_BODY = """
       }).catch(function () { onData(); });
   }
 
+  // Cost centers are scoped and cached exactly like accounts (v0.8.4) — same
+  // Applies-to-Company drives both, so they refresh together and can never
+  // disagree about which chart the editor is working against.
+  function costCentersCacheKey() { return CCC + '::' + accountCompany(); }
+
+  function loadCostCenters(fresh) {
+    if (!cc) return;
+    var ck = costCentersCacheKey();
+    var have = !fresh && sessionStorage.getItem(ck);
+    if (have) {
+      try { costCenters = JSON.parse(have); } catch (e) { costCenters = []; }
+      updateCostCenterHint(); return;
+    }
+    fetch('/api/rules/known_cost_centers?company=' +
+          encodeURIComponent(accountCompany()))
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        costCenters = (res && res.cost_centers) || [];
+        try { sessionStorage.setItem(ck, JSON.stringify(costCenters)); } catch (e) {}
+        updateCostCenterHint();
+      }).catch(function () { costCenters = []; updateCostCenterHint(); });
+  }
+
+  function updateCostCenterHint() {
+    if (!ccHint) return;
+    if (!costCenters.length) {
+      // Unreachable ERPNext, or a chart with no leaf cost centers. Say so
+      // rather than showing an empty picker that reads as "none exist".
+      ccHint.textContent =
+        'Offset line only. Blank = ERPNext’s own default. ' +
+        '(No cost centers loaded — type one, or check the ERPNext connection.)';
+      return;
+    }
+    var co = accountCompany();
+    ccHint.textContent =
+      'Offset line only. Blank = ERPNext’s own default. Type to search ' +
+      costCenters.length + ' bookable cost center(s)' +
+      (co ? ' in ' + co : ' across all Companies') + '.';
+  }
+
+  if (cc && ccDD) {
+    BankBridgeDropdown.createDropdown({
+      input: cc,
+      menu: ccDD,
+      getOptions: function () { return costCenters; },
+      getLabel: function (x) { return x == null ? '' : String(x); },
+      renderRow: function (x) { return esc(x); },
+      emptyRow: function (q) {
+        var t = (q || '').trim();
+        if (!t) return null;
+        return 'No matches — press <b>Enter</b> to use “' + esc(t) + '” as-is';
+      }
+    });
+  }
+
   function load(force, freshAccounts) {
     loadAccounts(force, freshAccounts);
+    loadCostCenters(freshAccounts);
     var haveM = !force && sessionStorage.getItem(CK);
     var haveC = !force && sessionStorage.getItem(CC);
     if (haveM && haveC) {
@@ -3325,6 +3507,10 @@ RULES_BODY = """
   // logical-name feed (Mode B) when set back to all-Companies (v0.4.0.2/.3).
   if (companySel) companySel.addEventListener('change', function () {
     accounts = []; updateOffsetModeHint(); loadAccounts(false, true);
+    // v0.8.4 · the cost-center feed is scoped by the same select. Re-fetched
+    // rather than filtered client-side: a Company's chart can hold cost centers
+    // this session never loaded.
+    costCenters = []; loadCostCenters(true);
   });
   // Manual "↻ refresh accounts" — for an account created in ANOTHER tab while
   // this editor sat open, which no page-load hook can catch (v0.4.0.6). Drops the
@@ -3419,8 +3605,7 @@ def _rules_page(flash_msg='', test_result=None, test=None, form=None,
                  offset_directions=categorization.OFFSET_DIRECTIONS,
                  form=form or {'active': True, 'priority': 100},
                  test=test or {}, test_result=test_result,
-                 je_engine_on=current_app.config.get(
-                     'ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES', False),
+                 je_engine_on=erps.je_generation_enabled(),
                  supplier_on=current_app.config.get(
                      'ERPNEXT_AUTO_CREATE_SUPPLIERS', True),
                  confirm_party_mismatch=confirm_party_mismatch,
@@ -5452,12 +5637,37 @@ ERPNEXT_SETTINGS_BODY = """
   {% if probe.ok %}✓ {{ probe.detail }}{% else %}<h3>Failed</h3>{{ probe.detail }}{% endif %}
 </div>
 {% endif %}
+
+<h2>Journal Entry generation</h2>
+<div class="card">
+  <p>
+    When this is <b>on</b>, a synced Bank Transaction that matches a
+    categorization rule also gets a Journal Entry written to ERPNext. When it is
+    <b>off</b>, transactions still sync and rules still match — nothing is
+    posted to your general ledger.
+  </p>
+  <p style="color:#666">
+    Currently <b>{{ 'ON' if je_on else 'OFF' }}</b>{% if env_default != je_on %}
+    (overriding the <code>ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES</code>
+    environment default of <b>{{ 'ON' if env_default else 'OFF' }}</b>){% endif %}.
+    This setting persists — it does not need an app restart, and it survives one.
+  </p>
+  <form method="post" action="/admin/erpnext_settings/je_gate" style="margin:0">
+    <input type="hidden" name="enabled" value="{{ '0' if je_on else '1' }}">
+    <button type="submit" class="{{ 'secondary' if je_on else '' }}">
+      Turn Journal Entry generation {{ 'OFF' if je_on else 'ON' }}
+    </button>
+  </form>
+</div>
 """
 
 
 def _erpnext_settings_page(flash_msg='', probe=None):
     return _page(ERPNEXT_SETTINGS_BODY, page='erpnext_settings',
                  s=erps.load(), masked=erps.masked_secret(),
+                 je_on=erps.je_generation_enabled(),
+                 env_default=bool(current_app.config.get(
+                     'ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES', False)),
                  flash_msg=flash_msg, probe=probe)
 
 
@@ -5475,6 +5685,27 @@ def save_erpnext_settings():
     default_company = request.form.get('default_company') or ''
     erps.save(url, api_key, api_secret, default_company)
     return redirect('/admin/erpnext_settings?flash=Saved')
+
+
+@bp.post('/admin/erpnext_settings/je_gate')
+def set_je_gate():
+    """Flip Journal-Entry generation on or off, persistently (v0.8.4).
+
+    Was an environment variable, which on Umbrel meant editing compose and
+    recreating the app to pause posting — so in practice nobody paused it. The
+    env var still seeds the default at first boot; this overrides it."""
+    enabled = (request.form.get('enabled') or '').strip() in ('1', 'true', 'on')
+    before = erps.je_generation_enabled()
+    erps.set_je_generation(enabled)
+    audit.record('je_gate_changed', subject_type=None,
+                 before={'auto_generate_journal_entries': before},
+                 after={'auto_generate_journal_entries': enabled},
+                 notes='Journal Entry generation '
+                       + ('enabled' if enabled else 'disabled'))
+    return redirect('/admin/erpnext_settings?flash=' + quote_plus(
+        'Journal Entry generation is now '
+        + ('ON — matching transactions will post to ERPNext.' if enabled
+           else 'OFF — nothing will post to your general ledger.')))
 
 
 def _doctype_status_line(status: dict) -> str:
@@ -8720,6 +8951,19 @@ _MCP_SWITCH_DESC = {
                          '(Tailscale Funnel)',
     'disable_public_url': 'Withdraw the public OAuth callback — breaks OAuth '
                           're-links until re-enabled',
+    'rerun_rules': 'Re-run the current rules and generate Journal Entries in '
+                   'bulk for transactions that have none',
+    'reset_investment_drafts': 'DELETE every draft investment Journal Entry, '
+                               'tracked and orphaned — aborts on any submitted '
+                               'entry',
+    'post_clearing_cleanup_je': 'Write a draft Journal Entry moving the leftover '
+                                'Cash Clearing balance onto the brokerage’s own '
+                                'account',
+    'enable_je_gate': 'Turn ON Journal Entry generation for the whole install',
+    'disable_je_gate': 'Turn OFF Journal Entry generation for the whole install '
+                       '(pauses all posting; syncing continues)',
+    'set_erpnext_config': 'Change the ERPNext connection — URL, API key/secret, '
+                          'default Company',
 }
 
 

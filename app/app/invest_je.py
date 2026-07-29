@@ -31,6 +31,44 @@ An UNPAIRED brokerage has no companion double-post, so its investment JEs
 settle against its own bank GL leaf directly; clearing is a paired-account
 concept only.
 
+THE SETTLEMENT LEG THAT NEVER POSTED (v0.8.4).
+==============================================
+Everything above assumed the CROSS-ACCOUNT shape — the cash half of a trade
+arriving on the companion as a BankTransaction, which the rules engine books. On
+Wells Fargo Advisors it does not. v0.8.1 established (see trade_pairing) that
+BOTH halves arrive on the brokerage itself: a `type=buy` row for the security
+and a second `type=cash` row, same security and date, for the settlement. The
+companion carries none of it.
+
+But `cash_side_account` still routed every paired trade through Cash Clearing,
+waiting on a companion leg that under this custodian never comes — and the
+`type=cash` settlement row that IS the other half was dropped by v0.5.12's
+"only genuine income posts" guard, which cannot tell a sweep from a settlement.
+So each buy credited Cash Clearing with nothing ever debiting it. On OML's live
+ledger that reached -$1,011,119.41 over 643 entries, against a
+`1362 Wells Fargo Brokerage - 9401` leaf holding exactly zero.
+
+The diagnostics could not see it, which is why it survived three releases:
+`trade_pairing` PAIRS the buy with its settlement row and nets their delta to
+zero, so `clearing_imbalance` reported a healthy ~0 while the ledger ran a
+million dollars out. The model already believed the cash leg posted
+(CLEARING_TYPES has always included 'cash'); only the writer disagreed.
+
+The fix is the missing half, not a new route: a settlement row books
+
+    withdrawal: DR Cash Clearing   CR <brokerage's own GL leaf>
+    deposit:    DR <own GL leaf>   CR Cash Clearing
+
+which nets clearing to zero per trade and leaves the buy as DR Marketable
+Securities / CR brokerage cash — the entry a CPA would have written. A cash row
+with NO security leg (a genuine transfer out of the sweep) still lands in
+clearing and still shows up in `list_unpaired_trades`; that is the bridge doing
+its job, not a leak. Nothing here books to the companion: ••9401's companion is
+••3194, an ordinary checking account that never saw the money.
+
+The historical entries are already SUBMITTED and cannot be reset and re-posted —
+`clearing_cleanup_je` is the repair path for those.
+
 WHAT NEVER HAPPENS HERE. Unrealized gains are not posted (Marketable Securities
 sits at cost until a sell). Nothing posts at all until the operator flips the
 per-Item kill switch (posting_enabled, default FALSE) — these are real P&L
@@ -55,6 +93,22 @@ from .models import (GeneratedJournalEntry, PlaidAccount, PlaidItem, RetainedLot
 log = logging.getLogger('bankbridge.invest_je')
 
 JOURNAL_ENTRY_DT = 'Journal Entry'
+
+# Every SecurityTransaction type whose cash leg routes through Cash Clearing on
+# a PAIRED brokerage. `trade_pairing.CLEARING_TYPES` must equal this exactly —
+# the Σ-delta identity that module documents holds only while the two agree, and
+# v0.8.4 is what that drift cost (see the settlement-leg note below). Asserted
+# equal in the test suite against THIS constant rather than a literal, so the
+# next edit to either list cannot quietly restate the agreement.
+CLEARING_POSTED_TYPES = ('buy', 'sell', 'fee', 'cash')
+
+# Plaid investment `subtype` values on a `type=cash` row that state a cash
+# DIRECTION outright — the same two `trade_pairing._settlement_cash_in` reads,
+# and the only ones a settlement leg is built from. Wells Fargo reports both
+# halves of a buy as POSITIVE amounts, so the sign cannot say which way money
+# moved; the subtype can.
+CASH_SETTLEMENT_OUTFLOW_SUBTYPES = ('withdrawal',)
+CASH_SETTLEMENT_INFLOW_SUBTYPES = ('deposit',)
 
 
 def _now():
@@ -535,6 +589,53 @@ def _remark(txn: SecurityTransaction, security: Security | None) -> str:
     return f'{verb}: {label} ${total:,.2f} — {txn.name or txn.subtype or ""}'.strip()
 
 
+def settlement_leg_accounts(client, txn: SecurityTransaction,
+                            account: PlaidAccount, company: str,
+                            amount: float) -> list | None:
+    """The two lines of a SAME-ACCOUNT cash settlement, or None when this row is
+    not one (v0.8.4 — see the module note).
+
+    Only a PAIRED brokerage gets these. An unpaired investment account carries
+    both halves of a trade in a single /investments/transactions/get row —
+    Plaid's `amount` IS the cash impact — so its trades settle against its own
+    leaf directly and a second row would book the same movement twice. That is
+    the same "self-pairing by construction" trade_pairing declines to write rows
+    for, and it is why this returns None rather than a same-account no-op.
+
+    Only a subtype that STATES a direction gets one. A bare `cash` or a
+    `dividend` has already been handled as income by the caller; anything else
+    unrecognized is left unposted exactly as before, because guessing a
+    direction from Plaid's sign is what v0.8.1 proved cannot be done on this
+    custodian.
+
+    Returns None (not an exception) when the brokerage has no GL leaf of its own
+    to settle against — an account linked but never mapped. The trade's security
+    leg still posts; the operator sees the shortfall in Cash Clearing, which is
+    precisely what that account is for."""
+    if not (account.paired_account_id or '').strip():
+        return None
+    sub = (txn.subtype or '').strip().lower()
+    if sub in CASH_SETTLEMENT_OUTFLOW_SUBTYPES:
+        cash_in = False
+    elif sub in CASH_SETTLEMENT_INFLOW_SUBTYPES:
+        cash_in = True
+    else:
+        return None
+    clearing = cash_clearing_account(client, company)
+    own = (account.erpnext_gl_account_name or '').strip() or None
+    if not clearing or not own:
+        log.warning('no settlement pair for %s (clearing=%r own_gl=%r) — the '
+                    'security leg will sit in Cash Clearing unrelieved',
+                    account.account_id, clearing, own)
+        return None
+    # Cash INTO the sweep relieves a sell's clearing debit; cash OUT relieves a
+    # buy's clearing credit. Either way the brokerage's own leaf moves the way
+    # the money did.
+    if cash_in:
+        return [_dr(own, amount), _cr(clearing, amount)]
+    return [_dr(clearing, amount), _cr(own, amount)]
+
+
 def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
                         account: PlaidAccount, company: str,
                         security: Security | None,
@@ -601,23 +702,39 @@ def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
         accounts = [_dr(advisory_fees_account(client, company), amount),
                     _cr(cash, amount)]
     elif kind == 'cash':
-        # v0.5.12 · ONLY genuine income posts. A `cash` SecurityTransaction is a
-        # dividend or interest RECEIVED — BUT Plaid also types the brokerage
-        # CASH-SWEEP movements ('deposit'/'withdrawal', the "BANK DEPOSIT SWEEP"
-        # in and out of the sweep fund) as `cash`. Those are the sweep itself,
-        # already carried by the companion BankTransaction; the pre-v0.5.12 code
-        # booked EVERY non-interest cash row as Dividend Income, which on the
-        # live data was hundreds of deposits + withdrawals totalling millions of
-        # phantom dividend income against a single genuine dividend. Post only
-        # rows whose subtype actually names dividend or interest; skip the rest.
+        # v0.5.12 · ONLY genuine income posts here. A `cash` SecurityTransaction
+        # is a dividend or interest RECEIVED — BUT Plaid also types the
+        # brokerage CASH-SWEEP movements ('deposit'/'withdrawal', the "BANK
+        # DEPOSIT SWEEP" in and out of the sweep fund) as `cash`. The pre-v0.5.12
+        # code booked EVERY non-interest cash row as Dividend Income, which on
+        # the live data was hundreds of deposits + withdrawals totalling millions
+        # of phantom dividend income against a single genuine dividend. So an
+        # income account is reached only by a subtype that names one.
+        #
+        # v0.8.4 · what v0.5.12 got wrong was the OTHER half of that sentence. It
+        # justified dropping the sweep rows as "already carried by the companion
+        # BankTransaction" — true of a cross-account custodian, false of Wells
+        # Fargo Advisors, where both halves land here and the companion carries
+        # none of it (v0.8.1 established this and this branch was never
+        # revisited). They are not noise to skip; they are the settlement leg,
+        # and it belongs on the brokerage's own account. See `else` below.
         sub = (txn.subtype or '').lower()
         if 'interest' in sub:
-            income = interest_income_account(client, company)
+            accounts = [_dr(cash, amount),
+                        _cr(interest_income_account(client, company), amount)]
         elif 'dividend' in sub:
-            income = dividend_income_account(client, company)
+            accounts = [_dr(cash, amount),
+                        _cr(dividend_income_account(client, company), amount)]
         else:
-            return None, []   # deposit / withdrawal / sweep — not income
-        accounts = [_dr(cash, amount), _cr(income, amount)]
+            # v0.8.4 · NOT income — and, on a paired brokerage, not nothing
+            # either. A 'withdrawal'/'deposit' row is the SETTLEMENT half of a
+            # same-account trade, and dropping it is what let Cash Clearing
+            # accumulate to -$1,011,119.41. It books against the brokerage's own
+            # leaf, never an income account. See the module note.
+            accounts = settlement_leg_accounts(client, txn, account, company,
+                                               amount)
+            if accounts is None:
+                return None, []   # a sweep we still have no direction for
     else:
         return None, []  # transfer, cancel, unrecognized → not posted
 
@@ -841,8 +958,19 @@ def reset_investment_drafts(client: ERPNextClient,
 
     `account_id` scopes it to one brokerage; omitted, it covers every account.
 
-    Returns {'drafts_deleted', 'aborted', 'reason'}."""
-    stats = {'drafts_deleted': 0, 'aborted': False, 'reason': ''}
+    THE ORPHANS (v0.8.4). This pass iterates the TRACKER, so a draft whose
+    GeneratedJournalEntry row is gone is invisible to it — the JE exists in
+    ERPNext and nothing here knows to look. Tim's 2026-07-28 run hit exactly
+    that: 642 drafts deleted, 189 left standing, all of them rows a partial
+    delete earlier the same day had already unlinked. A second sweep now asks
+    ERPNext directly for Bank-Bridge-shaped drafts nothing in the tracker
+    claims, and deletes those too — see `_sweep_orphan_drafts`.
+
+    Returns {'tracker_deleted', 'orphan_deleted', 'total_deleted',
+    'drafts_deleted', 'aborted', 'reason'}. `drafts_deleted` is retained as an
+    alias of the total so pre-v0.8.4 callers and audit rows keep working."""
+    stats = {'drafts_deleted': 0, 'tracker_deleted': 0, 'orphan_deleted': 0,
+             'total_deleted': 0, 'aborted': False, 'reason': ''}
     q = GeneratedJournalEntry.query.filter(
         GeneratedJournalEntry.plaid_investment_transaction_id.isnot(None),
         GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None),
@@ -864,9 +992,77 @@ def reset_investment_drafts(client: ERPNextClient,
         if je is not None:
             client.delete_doc(JOURNAL_ENTRY_DT, gje.erpnext_journal_entry_name)
         db.session.delete(gje)
-        stats['drafts_deleted'] += 1
+        stats['tracker_deleted'] += 1
     db.session.commit()
+    # Only now, and only if nothing aborted: the drafts the tracker cannot see.
+    stats['orphan_deleted'] = _sweep_orphan_drafts(client, account_id)
+    stats['total_deleted'] = stats['tracker_deleted'] + stats['orphan_deleted']
+    stats['drafts_deleted'] = stats['total_deleted']
     return stats
+
+
+# The `user_remark` shapes `_remark` produces for the four types that post.
+# Matching on the REMARK, not on `owner`: the API user on a self-hosted install
+# is usually the operator's own login (it is `tim.polehn@gmail.com` on OML), so
+# an owner filter would sweep up hand-written drafts. A remark this module
+# generated is the only reliable signature of a JE this module wrote.
+_ORPHAN_REMARK_PREFIXES = ('Bought ', 'Sold ', 'Fee: ', 'Cash: ')
+
+
+def _sweep_orphan_drafts(client: ERPNextClient,
+                         account_id: str | None = None) -> int:
+    """Delete DRAFT investment JEs in ERPNext that no GeneratedJournalEntry row
+    claims, and return the count (v0.8.4).
+
+    Three conditions, all required, deliberately narrow — this deletes documents
+    from a live ERPNext and a false positive is somebody's work:
+
+      * `docstatus=0`. A submitted or cancelled entry is never a candidate, so
+        the abort-on-submitted guarantee of the tracker pass holds here by
+        construction rather than by a second check.
+      * `user_remark` starts with a shape `_remark` produces. See
+        `_ORPHAN_REMARK_PREFIXES` for why not `owner`.
+      * NOT named by any GeneratedJournalEntry row. A draft the tracker knows
+        about is the tracker pass's business, including the ones it deliberately
+        left alone (approved, error, cancelled states).
+
+    Fail-soft: an ERPNext that cannot answer the query returns 0 rather than
+    failing a reset that already deleted its tracker rows successfully."""
+    company = ''
+    if account_id:
+        company = owning_company_for_account_id(account_id) or ''
+    filters = [['docstatus', '=', 0]]
+    if company:
+        filters.append(['company', '=', company])
+    try:
+        rows = client.list_docs(JOURNAL_ENTRY_DT, filters=filters,
+                                fields=['name', 'user_remark'],
+                                limit_page_length=0)
+    except (ERPNextAPIError, ERPNextError):
+        log.warning('orphan draft sweep could not list Journal Entries',
+                    exc_info=True)
+        return 0
+    known = {name for (name,) in db.session.query(
+        GeneratedJournalEntry.erpnext_journal_entry_name)
+        .filter(GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None))}
+    deleted = 0
+    for row in rows:
+        name = row.get('name')
+        remark = (row.get('user_remark') or '').strip()
+        if not name or name in known:
+            continue
+        if not remark.startswith(_ORPHAN_REMARK_PREFIXES):
+            continue
+        try:
+            client.delete_doc(JOURNAL_ENTRY_DT, name)
+        except (ERPNextAPIError, ERPNextError):
+            log.warning('could not delete orphan draft %s', name, exc_info=True)
+            continue
+        deleted += 1
+    if deleted:
+        log.info('orphan draft sweep deleted %d untracked investment JE(s)',
+                 deleted)
+    return deleted
 
 
 def reset_cancelled_gjes(account_id: str | None = None) -> int:
@@ -974,3 +1170,140 @@ def clearing_imbalance(account_id: str) -> float:
     the only arrangement where they cannot drift."""
     from . import trade_pairing
     return trade_pairing.projected_clearing_imbalance(account_id)
+
+
+# ── the LEDGER's clearing balance, and the repair for it (v0.8.4) ────────────
+#
+# `clearing_imbalance` above projects what the clearing account SHOULD hold from
+# Bank Bridge's own tables. Everything below reads what ERPNext ACTUALLY holds.
+# Until v0.8.4 nothing did, and the gap between the two is exactly where the
+# -$1,011,119.41 hid: the projection said zero because the model believed the
+# settlement leg posted, and no one asked the ledger.
+
+def ledger_clearing_balance(client: ERPNextClient, company: str) -> float:
+    """Cash Clearing's balance in ERPNext, debit-positive, from non-cancelled
+    GL Entry rows. Raises the usual ERPNext errors — a caller that cannot read
+    the ledger must not be allowed to conclude it is balanced."""
+    clearing = cash_clearing_account(client, company)
+    if not clearing:
+        return 0.0
+    rows = client.list_docs(
+        'GL Entry',
+        filters=[['account', '=', clearing], ['company', '=', company],
+                 ['is_cancelled', '=', 0]],
+        fields=['debit', 'credit'], limit_page_length=0)
+    return round(sum(float(r.get('debit') or 0.0) - float(r.get('credit') or 0.0)
+                     for r in rows), 2)
+
+
+def clearing_status(client: ERPNextClient, account_id: str) -> dict:
+    """What the clearing account holds, what Bank Bridge expects it to hold, and
+    how many settlement legs are still missing. Read-only, and the thing to run
+    BEFORE `clearing_cleanup_je`.
+
+    `unposted_settlements` is the count that matters: those are v0.8.4's
+    backfill, and every one of them relieves clearing when it posts. A cleanup
+    JE written while that count is non-zero would correct an imbalance the
+    backfill is about to correct again."""
+    account = PlaidAccount.query.filter_by(account_id=account_id).first()
+    if account is None:
+        return {'error': f'no account {account_id}'}
+    company = owning_company_for_account_id(account_id) or ''
+    posted = {g.plaid_investment_transaction_id for g in
+              GeneratedJournalEntry.query.filter(
+                  GeneratedJournalEntry.plaid_investment_transaction_id
+                  .isnot(None),
+                  GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None))}
+    missing = 0
+    for txn in SecurityTransaction.query.filter_by(
+            account_id=account_id, type='cash').all():
+        sub = (txn.subtype or '').strip().lower()
+        if sub not in (CASH_SETTLEMENT_OUTFLOW_SUBTYPES
+                       + CASH_SETTLEMENT_INFLOW_SUBTYPES):
+            continue
+        if txn.plaid_investment_transaction_id not in posted:
+            missing += 1
+    return {
+        'account_id': account_id,
+        'company': company,
+        'clearing_account': cash_clearing_account(client, company),
+        'own_gl_account': (account.erpnext_gl_account_name or '') or None,
+        'ledger_balance': ledger_clearing_balance(client, company),
+        'projected_imbalance': clearing_imbalance(account_id),
+        'unposted_settlements': missing,
+        # The only safe order of operations, stated where the caller reads it.
+        'ready_for_cleanup': missing == 0,
+    }
+
+
+def clearing_cleanup_je(client: ERPNextClient, account_id: str, *,
+                        dry_run: bool = True,
+                        posting_date=None) -> dict:
+    """Move whatever is LEFT in Cash Clearing onto the brokerage's own GL leaf,
+    as one DRAFT Journal Entry (v0.8.4).
+
+    THIS IS THE SECOND STEP, NOT THE FIRST. The 643 clearing entries OML already
+    carries are SUBMITTED — real ledger history that `reset_investment_drafts`
+    refuses to touch and should refuse to touch. But their missing halves were
+    never posted at all, so they carry no GeneratedJournalEntry row and nothing
+    marks them handled: re-running `post_investments_for_account` under v0.8.4
+    books every one of them fresh, and clearing walks back toward zero on its
+    own. Run that FIRST. This exists for the residual that remains after it —
+    a genuine transfer out of the sweep, a leg Plaid never returned — and
+    `clearing_status().ready_for_cleanup` is the check that the backfill is done.
+
+    DRY RUN BY DEFAULT. Posting a six-figure correction to a live general ledger
+    is not something a tool should do because it was called; `dry_run=False` is
+    the operator saying so. What it writes is a DRAFT either way — nothing here
+    submits, and an operator who disagrees deletes it.
+
+    Returns {'company', 'clearing_account', 'counter_account', 'balance',
+    'amount', 'journal_entry', 'dry_run', 'skipped'}."""
+    account = PlaidAccount.query.filter_by(account_id=account_id).first()
+    if account is None:
+        raise ERPNextError(f'no account {account_id}')
+    company = owning_company_for_account_id(account_id) or ''
+    clearing = cash_clearing_account(client, company)
+    counter = (account.erpnext_gl_account_name or '').strip() or None
+    balance = ledger_clearing_balance(client, company)
+    out = {'company': company, 'clearing_account': clearing,
+           'counter_account': counter, 'balance': balance,
+           'amount': abs(balance), 'journal_entry': None,
+           'dry_run': bool(dry_run), 'skipped': ''}
+    if not clearing or not counter:
+        out['skipped'] = ('no clearing account or no GL leaf on the brokerage '
+                          '— nothing to move it between')
+        return out
+    if abs(balance) < 0.005:
+        out['skipped'] = 'Cash Clearing is already flat'
+        return out
+    amount = abs(balance)
+    # A net CREDIT balance (negative, debit-positive) is relieved by debiting
+    # clearing and crediting the brokerage leaf — the cash that left the sweep
+    # to fund the trades, finally landing where it left from.
+    if balance < 0:
+        lines = [_dr(clearing, amount), _cr(counter, amount)]
+    else:
+        lines = [_cr(clearing, amount), _dr(counter, amount)]
+    tags = resolve_je_tags(client, account, company)
+    if tags:
+        for line in lines:
+            line.update(tags)
+    doc = {'doctype': JOURNAL_ENTRY_DT, 'voucher_type': 'Journal Entry',
+           'company': company, 'accounts': lines,
+           'user_remark': (f'Cash Clearing cleanup: ${amount:,.2f} to '
+                           f'{counter} (Bank Bridge v0.8.4)')}
+    if posting_date is not None:
+        doc['posting_date'] = (posting_date.isoformat()
+                               if hasattr(posting_date, 'isoformat')
+                               else str(posting_date))
+    out['doc'] = doc
+    if dry_run:
+        out['skipped'] = 'dry run — pass dry_run=False to write the draft'
+        return out
+    created = client.create_doc(JOURNAL_ENTRY_DT, doc)
+    out['journal_entry'] = created.get('name') if isinstance(created, dict) else None
+    audit.record('clearing_cleanup_je', subject_type='PlaidAccount',
+                 subject_id=account_id, after=out,
+                 notes=f'v0.8.4 Cash Clearing cleanup draft ${amount:,.2f}')
+    return out

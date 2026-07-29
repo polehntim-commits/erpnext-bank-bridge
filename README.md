@@ -1815,6 +1815,94 @@ narrower than `/admin/rebuild_investment_accounts`, which now shares the same
 draft pass. Both abort on the first **submitted** entry, deleting nothing
 further.
 
+**v0.8.4** — admin MCP surface + persistent JE gate + rule-form cost-center
+picker + the **invest_je companion routing fix**.
+
+**The settlement leg that never posted.** The Cash Clearing bridge above assumes
+the *cross-account* shape — trade cash arriving on the companion as a
+`BankTransaction` the rules engine books. Wells Fargo Advisors does not work that
+way, and v0.8.1 already established why: **both** halves arrive on the brokerage
+itself, a `type=buy` row for the security and a `type=cash` row for the
+settlement, and *"the cash-services companion carries none of it."* But
+`cash_side_account` kept routing every paired trade through Cash Clearing waiting
+on a companion leg that never comes, while the `type=cash` settlement row that
+**is** the other half was dropped by v0.5.12's "only genuine income posts" guard,
+which cannot tell a sweep from a settlement. Every buy credited clearing with
+nothing ever debiting it. On OML's live ledger that reached
+**−$1,011,119.41 over 643 entries**, against a `1362 Wells Fargo Brokerage - 9401`
+leaf holding exactly **zero**.
+
+It survived three releases because the diagnostics could not see it:
+`trade_pairing` *pairs* a buy with its settlement row and nets their delta to
+zero, so `clearing_imbalance` reported a healthy ~0 while the ledger ran a
+million dollars out. `CLEARING_TYPES` has always included `'cash'` — the model
+believed the leg posted; only the writer disagreed. The lockstep test that was
+supposed to catch exactly this compared `trade_pairing.CLEARING_TYPES` against a
+**literal tuple copied into the test file**, so it restated the claim instead of
+testing it. It now compares against `invest_je.CLEARING_POSTED_TYPES`.
+
+The fix is the missing half, not a new route:
+
+```
+withdrawal:  DR Cash Clearing            CR <brokerage's own GL leaf>
+deposit:     DR <brokerage's own GL leaf>  CR Cash Clearing
+```
+
+which nets clearing to zero per trade and leaves the buy as
+`DR Marketable Securities / CR brokerage cash` — the entry a CPA would write.
+A `type=cash` row with **no** security leg (a genuine transfer out of the sweep)
+still lands in clearing and still surfaces in `list_unpaired_trades`; that is the
+bridge working, not a leak. Nothing books to the companion: ••9401's companion is
+••3194, an ordinary checking account that never saw the money.
+
+**Recovery, and why it is not a reset.** The 643 clearing entries are all
+**submitted** — real ledger history `reset_investment_drafts` refuses to touch,
+so "reset the drafts and re-post" cannot repair them. It does not need to: their
+missing halves were never posted *at all*, so they carry no
+`GeneratedJournalEntry` row and nothing marks them handled. **Re-running the
+investment post under v0.8.4 books every one of them fresh** and clearing walks
+back toward zero on its own. `get_clearing_status` reports what the ledger holds,
+what Bank Bridge projects, and how many settlement legs are still unposted;
+`post_clearing_cleanup_je` is for the residual *after* that, writes a **draft**
+only, is **dry-run by default**, and **refuses** while `unposted_settlements` is
+non-zero — a cleanup written mid-backfill corrects an imbalance the backfill is
+about to correct again.
+
+**Orphan drafts.** `reset_investment_drafts` iterated the tracker only, so a
+draft whose `GeneratedJournalEntry` row had been lost to an earlier partial
+delete was invisible to it — Tim's 2026-07-28 run deleted 642 and left 189
+standing. A second pass now asks ERPNext directly for draft JEs whose
+`user_remark` carries a shape this module writes (`Bought `/`Sold `/`Fee: `/
+`Cash: `) that no tracker row claims, and deletes those too. Matching on the
+**remark, not the `owner`**: the API user on a self-hosted install is usually the
+operator's own login, so an owner filter would sweep up hand-written drafts.
+Reports `{tracker_deleted, orphan_deleted, total_deleted, aborted}`;
+`drafts_deleted` is retained as an alias of the total.
+
+**Persistent JE gate.** `ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES` was env-only,
+which on Umbrel meant a compose edit and an app recreate to pause posting — so in
+practice nobody paused it. It is now a persisted setting with a toggle on
+`/admin/erpnext_settings`; the env var still seeds the boot default, so an
+install that never touches the toggle behaves exactly as before. `rerun_rules`
+gained the gate check it never had (it would post while the settings page said
+generation was off) and moved into `categorization.rerun_rules` so the button and
+the MCP tool run the same code.
+
+**Rule-form cost-center picker.** v0.8.3 built `list_cost_centers` for the
+per-Item picker and the rule form never got it, so the field deciding a rule's
+segment stayed a bare text box. It now uses the same shared dropdown as the
+offset-account field, fed by `/api/rules/known_cost_centers`, re-scoped when
+Applies-to-Company changes, leaf/bookable only, free-text still accepted. The
+**offset-account** field already had a company-scoped refreshing picker
+(v0.3.4/v0.4.0.2) and is unchanged — a plain `<select>` would have lost its
+logical-name mode.
+
+**Seven new MCP tools** (`get_clearing_status` read-only; `rerun_rules`,
+`reset_investment_drafts`, `post_clearing_cleanup_je`, `enable_je_gate`,
+`disable_je_gate`, `set_erpnext_config` mutating), each with its own kill switch
+defaulting **off**, an audit row, and a description on `/admin/mcp`. No schema
+change — the settings live in `DATA_DIR` JSON like every other operator setting.
+
 ## Reconciliation status in ERPNext (v0.5.0)
 
 A bookkeeper opens the ERPNext **Bank Statement** record and sees *this period

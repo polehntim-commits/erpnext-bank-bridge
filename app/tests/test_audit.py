@@ -22,7 +22,8 @@ from unittest import mock
 os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 
 from app import create_app, db, crypto  # noqa: E402
-from app import audit, categorization, erpnext_bank, sync_engine  # noqa: E402
+from app import audit, categorization, erpnext_bank  # noqa: E402
+from app import erpnext_settings, sync_engine  # noqa: E402
 from app.models import (AuditEvent, BankTransaction, CategorizationRule,  # noqa: E402
                         GeneratedJournalEntry, PlaidAccount, PlaidItem, Supplier)
 
@@ -258,6 +259,9 @@ class TestRuleHistory(Base):
 class TestRerun(Base):
     def test_rerun_generates_and_logs(self):
         self._account()
+        # v0.8.4 · the rerun refuses with the JE gate off (it posts in bulk).
+        # This test is about the audit row, so it opts in.
+        erpnext_settings.set_je_generation(True)
         db.session.add(CategorizationRule(
             name='Fuel', priority=10, active=True, archived=False,
             match_type='merchant_contains', match_value='Chevron',

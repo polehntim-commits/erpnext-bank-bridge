@@ -1258,6 +1258,60 @@ def generate_journal_entry(client, row, *, supplier_name=None,
     return gje
 
 
+class JournalEntryGateOff(Exception):
+    """Raised by `rerun_rules` when JE generation is switched off. A rerun that
+    silently generated nothing would look identical to a rerun that found
+    nothing to do, and an operator would go hunting through the rules."""
+
+
+def rerun_rules(erp_client) -> dict:
+    """Re-run the CURRENT rules over posted, non-removed transactions that have
+    no generated Journal Entry yet. Returns {'considered', 'matched',
+    'generated'}.
+
+    Rule edits never re-run retroactively on their own — this is the deliberate
+    opt-in path, and it is idempotent: a transaction that already produced a JE
+    is skipped by name, so running it twice generates nothing the second time.
+
+    v0.8.4 · lifted out of the admin route so the MCP tool and the button run
+    the SAME code rather than two copies that drift. The gate check came with
+    it: the route never had one, so a rerun would post JEs while
+    /admin/erpnext_settings said generation was off."""
+    if erp_client is None:
+        raise JournalEntryGateOff(
+            'ERPNext is not configured — cannot generate Journal Entries.')
+    if not erpnext_settings.je_generation_enabled():
+        raise JournalEntryGateOff(
+            'Journal Entry generation is OFF — turn it on under ERPNext '
+            'settings before rerunning rules, or nothing will be posted.')
+    done = {row.plaid_transaction_id for row in
+            db.session.query(GeneratedJournalEntry.plaid_transaction_id)
+            .filter(GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None))}
+    eligible = (BankTransaction.query
+                .filter(BankTransaction.posted_at.isnot(None),
+                        BankTransaction.removed.is_(False)).all())
+    stats = {'considered': 0, 'matched': 0, 'generated': 0}
+    for row in eligible:
+        if row.plaid_transaction_id in done:
+            continue
+        stats['considered'] += 1
+        gje = generate_journal_entry(erp_client, row)
+        if gje is not None:
+            stats['matched'] += 1
+            if gje.erpnext_journal_entry_name:
+                stats['generated'] += 1
+    # v0.4.6 · a Rerun is the one moment match counts change in bulk, and the
+    # operator's next stop is the Rules tab to see what stuck. Rolling up inline
+    # (a local read + a write per changed rule) beats showing them a column that
+    # is a day out of date at exactly the moment they're relying on it.
+    from . import rule_stats
+    rule_stats.rollup_match_counts()
+    audit.record('rules_rerun', subject_type=None, after=stats,
+                 notes=(f"reran current rules on {stats['considered']} eligible "
+                        f"transaction(s) → {stats['generated']} JE(s)"))
+    return stats
+
+
 def categorize_after_push(erp_client, row) -> None:
     """The sync-path hook, called right after a Bank Transaction is posted +
     committed. Best-effort and self-contained: auto-creates the Supplier (when
@@ -1276,7 +1330,10 @@ def categorize_after_push(erp_client, row) -> None:
             db.session.rollback()
             log.warning('auto-supplier failed for %s', row.plaid_transaction_id,
                         exc_info=True)
-    if not cfg.get('ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES', False):
+    # v0.8.4 · the persisted toggle, which the env var only seeds. Reading the
+    # raw config key here would let /admin/erpnext_settings show the gate OFF
+    # while the sync went on posting.
+    if not erpnext_settings.je_generation_enabled():
         return
     try:
         generate_journal_entry(erp_client, row, supplier_name=supplier_name)

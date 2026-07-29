@@ -428,6 +428,11 @@ class TestMatchCounts(AuthoringBase):
 
     def test_rerun_rules_refreshes_the_count(self):
         self._account()
+        # v0.8.4 · a rerun now requires the JE gate to be ON. It writes Journal
+        # Entries in bulk, and doing that while /admin/erpnext_settings says
+        # generation is off was the inconsistency the gate check ends. This
+        # test is about the match-count rollup, so it opts in.
+        erpnext_settings.set_je_generation(True)
         rule = self._rule(match_value='Chevron')
         row = self._txn('t-a', merchant='Chevron')
         erp = FakeERPClient()

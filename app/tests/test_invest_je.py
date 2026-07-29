@@ -1142,7 +1142,8 @@ class ResetInvestmentDraftsTests(InvestJEBase):
         invest_je.reset_investment_drafts(client)
         self.assertEqual(
             invest_je.reset_investment_drafts(client),
-            {'drafts_deleted': 0, 'aborted': False, 'reason': ''})
+            {'drafts_deleted': 0, 'tracker_deleted': 0, 'orphan_deleted': 0,
+             'total_deleted': 0, 'aborted': False, 'reason': ''})
 
     def test_it_can_be_scoped_to_one_account(self):
         db.session.add(PlaidAccount(

@@ -63,6 +63,32 @@ _DEFAULTS = {
     # withdraws it, which breaks OAuth re-links until it is turned back on.
     'enable_public_url': False,
     'disable_public_url': False,
+    # v0.8.4 — the admin actions that were button-only. Each is a separate
+    # switch on the same reasoning as create_rule/update_rule: they differ in
+    # what they can cost.
+    #
+    #   rerun_rules writes Journal Entries in BULK across the whole mirror. It
+    #     is idempotent and it only ever posts what the operator's own rules
+    #     already say — but "only what the rules say" is a lot of documents.
+    #   reset_investment_drafts DELETES documents from ERPNext. It refuses to
+    #     touch a submitted entry and it is the designed repair path, and it is
+    #     still the only tool here that destroys anything.
+    #   post_clearing_cleanup_je writes a six-figure correction to the general
+    #     ledger. Draft-only and dry-run by default, and the most consequential
+    #     accounting act on this list.
+    #   enable_je_gate / disable_je_gate decide whether ANY of the above can
+    #     post. Split in two because enabling and pausing are not the same
+    #     trust: an operator may well want an AI able to stop the posting
+    #     engine without being able to start it.
+    #   set_erpnext_config re-points the install at a different ERPNext. It
+    #     changes where every future document goes, which makes it closer to
+    #     enable_public_url than to a settings edit.
+    'rerun_rules': False,
+    'reset_investment_drafts': False,
+    'post_clearing_cleanup_je': False,
+    'enable_je_gate': False,
+    'disable_je_gate': False,
+    'set_erpnext_config': False,
 }
 
 _FIELDS = tuple(_DEFAULTS.keys())

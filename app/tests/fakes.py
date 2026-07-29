@@ -499,6 +499,21 @@ class FakeERPClient:
             if fields:
                 rows = [{k: g.get(k) for k in fields} for g in rows]
             return rows
+        if doctype == 'Journal Entry':
+            # v0.8.4 · the orphan-draft sweep enumerates JEs by docstatus and
+            # reads user_remark. `docstatus` defaults to 0 (draft) the way
+            # ERPNext does, and a submitted/cancelled entry carries the state
+            # the fake's submit/cancel helpers put on it.
+            rows = []
+            for name, d in self.created['Journal Entry'].items():
+                doc = {'docstatus': (2 if name in self.cancelled else
+                                     1 if name in self.submitted else 0),
+                       **d, 'name': name}
+                if not self._matches(doc, filters):
+                    continue
+                rows.append({k: doc.get(k) for k in fields} if fields
+                            else {'name': name})
+            return rows
         if doctype in ('Bank', 'Custom Field'):
             return [{'name': n} for n, d in self.created[doctype].items()
                     if self._matches(d, filters)]
