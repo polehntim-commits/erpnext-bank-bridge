@@ -779,6 +779,57 @@ ACCOUNTS_BODY = """
       {{ 'Turn off' if grp.item.invest_je_posting_enabled else 'Turn on' }}</button>
     <span style="font-size:11px;color:#999">real P&amp;L entries — opt-in</span>
   </form>
+  {# v0.8.3 · the accounting DIMENSIONS those JEs carry. Without these every
+     line lands on the Company default cost center ('Main - OML') and no
+     Member, which is how 455 v0.8.2 drafts posted. Both optional: blank means
+     "write no key", so ERPNext applies its own defaults exactly as before. #}
+  <br><span style="font-size:12px">Investment JE dimensions:
+    <b>{{ grp.item.invest_je_cost_center or '(company default)' }}</b>
+    {% if grp.item.invest_je_member %}· member <b>{{ grp.item.invest_je_member }}</b>{% endif %}
+    <a href="#" style="font-size:12px;margin-left:6px"
+       onclick="document.getElementById('ijec-{{ loop.index }}').style.display='flex';this.style.display='none';return false">[Change]</a>
+  </span>
+  <form id="ijec-{{ loop.index }}" method="post"
+        action="/admin/items/{{ grp.item.item_id }}/invest_je_config"
+        style="display:none;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap">
+    <label style="font-size:11px;color:#666">Cost center
+      {% if cost_centers %}
+      <select name="invest_je_cost_center" style="padding:4px;font-size:12px">
+        <option value="">— none (use ERPNext's own default) —</option>
+        {% for cc in cost_centers %}
+        <option value="{{ cc.name }}" {{ 'selected' if cc.name == grp.item.invest_je_cost_center else '' }}>{{ cc.name }}</option>
+        {% endfor %}
+        {% if grp.item.invest_je_cost_center and grp.item.invest_je_cost_center not in cost_center_names %}
+        <option value="{{ grp.item.invest_je_cost_center }}" selected>{{ grp.item.invest_je_cost_center }} (current — not found)</option>
+        {% endif %}
+      </select>
+      {% else %}
+      {# ERPNext unreachable or it has no bookable cost centers — a text box so
+         the operator is never locked out of setting one by an outage. #}
+      <input name="invest_je_cost_center" style="padding:4px;font-size:12px"
+             value="{{ grp.item.invest_je_cost_center or '' }}"
+             placeholder="200 - Investment Activities - OML">
+      {% endif %}
+    </label>
+    <label style="font-size:11px;color:#666">Member
+      {% if members %}
+      <select name="invest_je_member" style="padding:4px;font-size:12px">
+        <option value="">— none —</option>
+        {% for m in members %}
+        <option value="{{ m }}" {{ 'selected' if m == grp.item.invest_je_member else '' }}>{{ m }}</option>
+        {% endfor %}
+        {% if grp.item.invest_je_member and grp.item.invest_je_member not in members %}
+        <option value="{{ grp.item.invest_je_member }}" selected>{{ grp.item.invest_je_member }} (current — not found)</option>
+        {% endif %}
+      </select>
+      {% else %}
+      <input name="invest_je_member" style="padding:4px;font-size:12px"
+             value="{{ grp.item.invest_je_member or '' }}" placeholder="(optional)">
+      {% endif %}
+    </label>
+    <button type="submit" class="secondary" style="padding:4px 10px;font-size:12px">Save dimensions</button>
+    <span style="font-size:11px;color:#999">applies to NEW Journal Entries — every line</span>
+  </form>
   {% endif %}
 </div>
 <table>
@@ -931,6 +982,21 @@ ACCOUNTS_BODY = """
 </table>
 {% endfor %}
 {% if not groups %}<p style="color:#888">No accounts yet — <a href="/admin/link_bank">link a bank</a>.</p>{% endif %}
+
+{# v0.8.3 · re-post the investment drafts after changing the dimensions above.
+   A Journal Entry's cost center cannot be edited in bulk, so the repair is to
+   delete the drafts and let the next sync rebuild them. Only DRAFTS — the first
+   submitted entry aborts the whole pass. #}
+{% if any_investment %}
+<form method="post" action="/admin/reset_investment_drafts"
+      style="margin:10px 0 0"
+      onsubmit="return confirm('Delete every DRAFT investment Journal Entry so the next sync re-posts them with the cost center and member set above? Submitted entries are never touched — the first one found aborts this and deletes nothing further.')">
+  <button type="submit" class="secondary" style="padding:4px 10px;font-size:12px">
+    Reset investment JE drafts</button>
+  <span style="font-size:11px;color:#999">deletes drafts only · the next sync
+    re-posts them with the dimensions above</span>
+</form>
+{% endif %}
 
 <!-- v0.4.7 · disconnect confirmation. One modal for the whole page; the button
      on each bank's header fills in the institution name before showing it.
@@ -1148,8 +1214,14 @@ def accounts_page():
         })
     any_needs_reauth = any(g['item'].needs_reauth and not g['item'].disconnected
                            for g in groups)
+    any_investment = any(g['has_investment'] for g in groups)
     bank_accounts, erp_error = [], ''
     companies = []
+    # v0.8.3 · options for the per-Item investment-JE dimension pickers. Fetched
+    # only when a connection actually holds an investment account, so an install
+    # with none pays nothing for them; both fall back to [] (the template then
+    # renders a free-text field) rather than failing the page.
+    cost_centers, members = [], []
     if erps.is_configured():
         try:
             bank_accounts = erpnext_bank.list_bank_accounts()
@@ -1159,6 +1231,16 @@ def accounts_page():
             companies = erpnext_bank.list_companies()
         except (ERPNextConfigError, ERPNextError):
             companies = []
+        if any_investment:
+            try:
+                cost_centers = erpnext_bank.list_cost_centers()
+            except (ERPNextConfigError, ERPNextError):
+                cost_centers = []
+            try:
+                members = erpnext_bank.list_link_options(
+                    erpnext_bank.get_client(), 'Member')
+            except (ERPNextConfigError, ERPNextError):
+                members = []
     bank_account_names = {ba['name'] for ba in bank_accounts}
     # v0.4.44 · pairing. `pair_options` is the set an account may be paired
     # WITH: other visible accounts under the same Company. `sandbox_ids` lets
@@ -1210,6 +1292,9 @@ def accounts_page():
                  opening_cell=_opening_balance_cell,
                  erpnext_ok=erps.is_configured(), companies=companies,
                  any_needs_reauth=any_needs_reauth,
+                 any_investment=any_investment, cost_centers=cost_centers,
+                 cost_center_names={c['name'] for c in cost_centers},
+                 members=members,
                  loan_summaries=loans.all_summaries(),
                  bootstrap_unavailable=sorted(
                      erpnext_accounts.unavailable_doctypes()),
@@ -1584,6 +1669,80 @@ def set_invest_je_posting(item_id):
     label = it.institution_name or it.item_id
     msg = (f'{label}: investment JE posting is now '
            f'{"ON — trades will post as Journal Entries" if enabled else "OFF"}.')
+    return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
+@bp.post('/admin/items/<item_id>/invest_je_config')
+def set_invest_je_config(item_id):
+    """Set (or clear) the Cost Center and Member every investment Journal Entry
+    line for this Item's accounts carries (v0.8.3).
+
+    Both fields are optional and clearing is a first-class outcome: an empty
+    value stores NULL, which writes NO key onto the line and lets ERPNext apply
+    the Account's or Company's own default — the pre-v0.8.3 behaviour, and the
+    right answer for an operator who has no value-chain segmentation.
+
+    Deliberately NOT validated here. The picker only ever offers bookable leaf
+    Cost Centers, and `invest_je.resolve_je_tags` re-checks at post time and
+    drops a dimension ERPNext positively denies — so a stale docname costs a
+    warning and a default-tagged JE, never a 500 on this form or a failed
+    backfill. Nothing is re-posted by saving; the 455 JEs already written keep
+    their dimensions until /admin/reset_investment_drafts clears them."""
+    it = PlaidItem.query.filter_by(item_id=item_id).first()
+    if it is None:
+        return redirect('/admin/accounts?flash=' + quote_plus('Item not found'))
+    cost_center = (request.form.get('invest_je_cost_center') or '').strip() or None
+    member = (request.form.get('invest_je_member') or '').strip() or None
+    before = {'invest_je_cost_center': it.invest_je_cost_center,
+              'invest_je_member': it.invest_je_member}
+    it.invest_je_cost_center = cost_center
+    it.invest_je_member = member
+    db.session.commit()
+    audit.record('invest_je_config_changed', subject_type='PlaidItem',
+                 subject_id=it.item_id, before=before,
+                 after={'invest_je_cost_center': cost_center,
+                        'invest_je_member': member},
+                 notes='investment JE accounting dimensions')
+    label = it.institution_name or it.item_id
+    parts = [f'cost center {cost_center}' if cost_center else 'no cost center',
+             f'member {member}' if member else 'no member']
+    msg = (f'{label}: investment JEs will now carry {" and ".join(parts)}. '
+           'Existing Journal Entries are unchanged — reset the drafts and '
+           're-sync to rebuild them.')
+    return redirect('/admin/accounts?flash=' + quote_plus(msg))
+
+
+@bp.post('/admin/reset_investment_drafts')
+def reset_investment_drafts():
+    """Delete every DRAFT investment Journal Entry so the next sync re-posts
+    them (v0.8.3) — the repair for the 455 JEs v0.8.2 wrote before the per-Item
+    Cost Center and Member existed.
+
+    Narrower than /admin/rebuild_investment_accounts on purpose: this touches
+    the drafts and nothing else, leaving the GL account structure alone (there
+    is no per-ticker sprawl left to clean up, and re-deriving the 181X leaves is
+    unrelated work to run against a live chart). Aborts on the first SUBMITTED
+    entry, deleting nothing further."""
+    from .. import invest_je
+    if not erps.is_configured():
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            'ERPNext is not configured.'))
+    account_id = (request.form.get('account_id') or '').strip() or None
+    try:
+        client = erpnext_bank.get_client()
+        result = invest_je.reset_investment_drafts(client, account_id)
+    except (ERPNextConfigError, ERPNextError) as e:
+        return redirect('/admin/accounts?flash=' + quote_plus(
+            f'Reset failed: {e}'))
+    if result['aborted']:
+        msg = f'Reset ABORTED: {result["reason"]} (nothing deleted).'
+    else:
+        msg = (f'{result["drafts_deleted"]} draft investment JE(s) deleted. '
+               'The next sync re-posts them with the Item\'s cost center and '
+               'member.')
+    audit.record('invest_je_drafts_reset', subject_type='GeneratedJournalEntry',
+                 subject_id=account_id or 'all', after=result,
+                 notes='v0.8.3 draft reset before re-post')
     return redirect('/admin/accounts?flash=' + quote_plus(msg))
 
 

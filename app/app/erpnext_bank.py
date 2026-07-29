@@ -118,6 +118,53 @@ def list_companies(client: ERPNextClient | None = None) -> list[str]:
     return [r['name'] for r in rows if r.get('name')]
 
 
+def list_cost_centers(client: ERPNextClient | None = None,
+                      company: str = '') -> list[dict]:
+    """Bookable (leaf, enabled) Cost Centers as [{'name', 'company'}], for the
+    per-Item investment-JE dimension picker (v0.8.3).
+
+    `is_group=0` because ERPNext refuses to book against a group node — the
+    same rule `cost_center_exists` enforces on the validation side, so a picker
+    can only ever offer a value that validation would accept. `company=''`
+    returns every Company's, which is what /admin/accounts wants: it renders one
+    picker per Item and each Item names its own owning Company.
+
+    Raises the usual ERPNext errors when unconfigured/unreachable; the dropdown
+    callers swallow those and fall back to a free-text field."""
+    client = client or get_client()
+    filters = [['is_group', '=', 0], ['disabled', '=', 0]]
+    if (company or '').strip():
+        filters.append(['company', '=', company.strip()])
+    rows = client.list_docs('Cost Center', filters=filters,
+                            fields=['name', 'company'],
+                            order_by='name asc', limit_page_length=0)
+    return [{'name': r['name'], 'company': (r.get('company') or '')}
+            for r in rows if r.get('name')]
+
+
+def list_link_options(client: ERPNextClient | None, doctype: str) -> list[str]:
+    """Every docname of `doctype`, for a picker that fills a Link custom field
+    (v0.8.3 — the `member` field on Journal Entry Account).
+
+    Returns [] rather than raising when the doctype is ABSENT: a custom Link
+    field points at whatever doctype the operator's install happens to have, and
+    an install without it should render an empty picker, not a 500. A genuine
+    outage still raises, so the caller can tell "nothing to offer" from "could
+    not ask" — /admin/accounts swallows both into a free-text field."""
+    if client is None:
+        return []
+    try:
+        rows = client.list_docs(doctype, fields=['name'], order_by='name asc',
+                                limit_page_length=0)
+    except ERPNextAPIError as e:
+        if e.status_code in (403, 404, 417):
+            log.info('doctype %r unavailable for link options (%s)',
+                     doctype, e.status_code)
+            return []
+        raise
+    return [r['name'] for r in rows if r.get('name')]
+
+
 # Sentinel for list_accounts(company=…): distinguishes "caller didn't specify a
 # company" (→ back-compat default-Company scoping) from "caller explicitly wants
 # ALL Companies" (company=None/'' → no company filter).

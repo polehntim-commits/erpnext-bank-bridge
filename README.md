@@ -1790,6 +1790,31 @@ that has already mirrored transactions correctly. Nothing is posted for an Item
 whose switch is off, and the first sync after flipping it on **backfills** every
 transaction already held. No schema change, no new kill switches.
 
+**v0.8.3** — **fix**: investment JEs now carry a **Cost Center** and a
+**Member**, set per Item on `/admin/accounts`. v0.8.2's first backfill posted 455
+drafts whose every line read `cost_center = Main - OML` (the Company default)
+with no Member — the categorization rules that name a cost center govern the
+*bank-transaction* path only, and `invest_je` had no dimension wiring at all.
+Two nullable columns on `plaid_items` (`invest_je_cost_center`,
+`invest_je_member`) are resolved once per batch and stamped on **every** line of
+every investment JE: unlike a rule, which tags only its offset because the bank
+side is cash movement belonging to no segment, both sides of a trade *are* the
+same investment activity. Blank keeps the pre-v0.8.3 shape exactly — no key is
+written, so ERPNext applies the Account's or Company's own default. Fail-soft on
+a **positive denial only**: a cost center or member ERPNext answers it does not
+have is dropped with a warning rather than failing a 455-transaction backfill,
+while one it merely could not check is written anyway. `member` rides the line
+dict as a plain key — Frappe applies a child-table dict to the child doc by
+fieldname, and a Link **custom field** (`Journal Entry Account-member`) is an
+ordinary field by then, so an install without it ignores the key instead of
+failing. **Migration:** two `ADD COLUMN`s, both NULL, no backfill. **Repair for
+existing drafts:** `POST /admin/reset_investment_drafts` (button on
+`/admin/accounts`) deletes the draft investment JEs and their
+`generated_journal_entries` rows so the next sync rebuilds them tagged —
+narrower than `/admin/rebuild_investment_accounts`, which now shares the same
+draft pass. Both abort on the first **submitted** entry, deleting nothing
+further.
+
 ## Reconciliation status in ERPNext (v0.5.0)
 
 A bookkeeper opens the ERPNext **Bank Statement** record and sees *this period

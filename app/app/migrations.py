@@ -300,6 +300,21 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     ('statement_anchors', 'security_flow_sum',
      'DOUBLE PRECISION DEFAULT 0.0 NOT NULL'),
     ('statement_anchors', 'mark_to_market_delta', 'DOUBLE PRECISION'),
+
+    # v0.8.3 — per-Item accounting dimensions for investment Journal Entries.
+    # Both add NULL and there is NO backfill, for the same reason v0.7.3's
+    # `categorization_rules.cost_center` has none: NULL means "write no key",
+    # which leaves ERPNext applying the Account's or the Company's own default
+    # exactly as it did before the column existed. Stamping a value — even the
+    # Company default — would turn a server-side default into a per-Item
+    # override and freeze it against any later change to that default.
+    #
+    # So an upgrading install posts investment JEs identically until an operator
+    # sets one on /admin/accounts. (The 455 drafts v0.8.2 already wrote carry
+    # the Company default and are NOT rewritten by this migration — they are
+    # cleared by /admin/reset_investment_drafts and re-posted.)
+    ('plaid_items', 'invest_je_cost_center', 'VARCHAR(140)'),
+    ('plaid_items', 'invest_je_member', 'VARCHAR(140)'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,

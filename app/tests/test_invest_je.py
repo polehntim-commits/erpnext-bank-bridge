@@ -31,6 +31,7 @@ os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 
 from app import create_app, db, crypto  # noqa: E402
 from app import erpnext_settings, invest_je  # noqa: E402
+from app.erpnext_client import ERPNextAPIError, ERPNextError  # noqa: E402
 from app.models import (BankTransaction, GeneratedJournalEntry,  # noqa: E402
                         PlaidAccount, PlaidItem, RetainedLot, Security,
                         SecurityTransaction, TradedCycle)
@@ -816,3 +817,426 @@ class SyncFlowWiringTests(InvestJEBase):
             res = self._sync(flaky)
         self.assertEqual(sorted(seen), ['brk', 'brk3'])
         self.assertEqual(res['invest_je']['posted'], 2)
+
+
+CC = '200 - Investment Activities - EC'
+MEMBER = 'MEM-0001'
+
+
+class DimensionTaggingTests(InvestJEBase):
+    """v0.8.3 · the per-Item Cost Center and Member every investment JE line
+    carries.
+
+    THE BUG. v0.8.2 wired the writer into the sync and 455 JEs landed with
+    `cost_center = 'Main - OML'` — the Company default — on every line, and no
+    Member. The 44 categorization rules that DO name a cost center only govern
+    the bank-transaction path; this module had no dimension wiring at all. The
+    account routing was always right (EEIIX → 1323 Mutual Funds, the advisory
+    fee → 5700), so the drafts looked correct until you opened one.
+
+    Pinned here: both dimensions land on EVERY line, blank stays blank (so
+    ERPNext's own defaults still run), and a dimension ERPNext positively denies
+    is dropped with a warning rather than failing a 455-transaction backfill."""
+
+    def _tagged_client(self, cost_center=True, member=True):
+        links = []
+        if cost_center:
+            links.append(('Cost Center', CC))
+        if member:
+            links.append(('Member', MEMBER))
+        return self._client(link_docs=links)
+
+    def _post_one(self, client):
+        """Post a single buy and return its JE's account lines."""
+        self._security()
+        self._txn('t-buy', 'buy', 1000.0, qty=10, price=100.0)
+        stats = invest_je.post_investments_for_account(client, 'brk')
+        self.assertEqual(stats['posted'], 1, stats)
+        gje = GeneratedJournalEntry.query.filter_by(
+            plaid_investment_transaction_id='t-buy').first()
+        return self._je_for(client, gje)['accounts']
+
+    # ── the fix ──────────────────────────────────────────────────────────────
+    def test_the_items_cost_center_lands_on_every_line(self):
+        self.item.invest_je_cost_center = CC
+        db.session.commit()
+        lines = self._post_one(self._tagged_client())
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertEqual(line['cost_center'], CC, line)
+
+    def test_the_items_member_lands_on_every_line(self):
+        self.item.invest_je_member = MEMBER
+        db.session.commit()
+        lines = self._post_one(self._tagged_client())
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertEqual(line['member'], MEMBER, line)
+
+    def test_both_at_once(self):
+        self.item.invest_je_cost_center = CC
+        self.item.invest_je_member = MEMBER
+        db.session.commit()
+        for line in self._post_one(self._tagged_client()):
+            self.assertEqual((line['cost_center'], line['member']),
+                             (CC, MEMBER), line)
+
+    def test_a_sell_tags_the_gain_line_too(self):
+        """Three lines, not two — the realized-gain line is as much investment
+        activity as the two it balances."""
+        self.item.invest_je_cost_center = CC
+        db.session.commit()
+        self._security()
+        db.session.add(RetainedLot(
+            security_id='sec-aapl', account_id='brk',
+            purchase_date=date(2026, 1, 5), shares_original=10.0,
+            shares_remaining=10.0, cost_basis_per_share=50.0))
+        db.session.commit()
+        self._txn('t-sell', 'sell', 1000.0, qty=10, price=100.0)
+        client = self._tagged_client()
+        stats = invest_je.post_investments_for_account(client, 'brk')
+        self.assertEqual(stats['posted'], 1, stats)
+        gje = GeneratedJournalEntry.query.filter_by(
+            plaid_investment_transaction_id='t-sell').first()
+        lines = self._je_for(client, gje)['accounts']
+        self.assertEqual(len(lines), 3)
+        for line in lines:
+            self.assertEqual(line['cost_center'], CC, line)
+
+    # ── unset stays unset ────────────────────────────────────────────────────
+    def test_neither_set_writes_no_key_at_all(self):
+        """The pre-v0.8.3 shape, preserved exactly. An ABSENT key is what lets
+        ERPNext apply the Account's or Company's own default server-side —
+        writing a guessed value would override the very defaults it falls back
+        to."""
+        lines = self._post_one(self._tagged_client())
+        for line in lines:
+            self.assertNotIn('cost_center', line)
+            self.assertNotIn('member', line)
+
+    def test_a_blank_string_is_treated_as_unset(self):
+        self.item.invest_je_cost_center = '   '
+        self.item.invest_je_member = ''
+        db.session.commit()
+        for line in self._post_one(self._tagged_client()):
+            self.assertNotIn('cost_center', line)
+            self.assertNotIn('member', line)
+
+    def test_the_column_defaults_to_null_on_a_fresh_item(self):
+        """An upgrade must change nothing until an operator sets one."""
+        it = PlaidItem(item_id='item-fresh',
+                       access_token_encrypted=crypto.encrypt('x'))
+        db.session.add(it)
+        db.session.commit()
+        self.assertIsNone(it.invest_je_cost_center)
+        self.assertIsNone(it.invest_je_member)
+
+    # ── fail-soft ────────────────────────────────────────────────────────────
+    def test_a_cost_center_erpnext_denies_is_dropped_not_fatal(self):
+        """One stale docname must not cost the operator all 455 JEs."""
+        self.item.invest_je_cost_center = 'Typo - EC'
+        db.session.commit()
+        client = self._tagged_client()
+        with self.assertLogs('bankbridge.invest_je', level='WARNING') as logs:
+            lines = self._post_one(client)
+        self.assertTrue(any('Typo - EC' in m for m in logs.output), logs.output)
+        for line in lines:
+            self.assertNotIn('cost_center', line)
+
+    def test_a_member_erpnext_denies_is_dropped_not_fatal(self):
+        self.item.invest_je_member = 'MEM-GONE'
+        db.session.commit()
+        client = self._tagged_client()
+        with self.assertLogs('bankbridge.invest_je', level='WARNING'):
+            lines = self._post_one(client)
+        for line in lines:
+            self.assertNotIn('member', line)
+
+    def test_a_denied_cost_center_does_not_stop_the_member(self):
+        self.item.invest_je_cost_center = 'Typo - EC'
+        self.item.invest_je_member = MEMBER
+        db.session.commit()
+        client = self._tagged_client()
+        with self.assertLogs('bankbridge.invest_je', level='WARNING'):
+            lines = self._post_one(client)
+        for line in lines:
+            self.assertNotIn('cost_center', line)
+            self.assertEqual(line['member'], MEMBER)
+
+    def test_an_unreachable_erpnext_writes_the_value_anyway(self):
+        """NO VERDICT is not a denial. Refusing valid input during a transient
+        outage is the worse failure — and ERPNext rejects a genuinely bad link
+        at create time regardless."""
+        self.item.invest_je_cost_center = CC
+        db.session.commit()
+        client = self._tagged_client()
+
+        def boom(doctype, name):
+            if doctype in ('Cost Center', 'Member'):
+                raise ERPNextAPIError('ERPNext is down', status_code=500)
+            return None
+        with mock.patch.object(client, 'get_doc', boom):
+            tags = invest_je.resolve_je_tags(client, self.brk, COMPANY)
+        self.assertEqual(tags, {'cost_center': CC})
+
+    # ── the lookup is resolved once per batch, not once per trade ────────────
+    def test_a_batch_validates_the_dimensions_once(self):
+        self.item.invest_je_cost_center = CC
+        db.session.commit()
+        self._security()
+        for i in range(5):
+            self._txn(f't-{i}', 'buy', 100.0 * (i + 1), qty=1, price=100.0)
+        client = self._tagged_client()
+        stats = invest_je.post_investments_for_account(client, 'brk')
+        self.assertEqual(stats['posted'], 5)
+        probes = [c for c in client.calls
+                  if c[0] == 'get_doc' and c[1] == 'Cost Center']
+        self.assertEqual(len(probes), 1, probes)
+
+    # ── end to end through the sync ──────────────────────────────────────────
+    def test_a_whole_sync_posts_with_the_dimensions_set(self):
+        """posting_enabled + a cost center → sync_item lands tagged JEs. The
+        wiring (v0.8.2) and the tagging (v0.8.3) working together is the thing
+        an operator actually observes."""
+        from app import sync_engine
+        self.item.invest_je_cost_center = CC
+        self.item.invest_je_member = MEMBER
+        db.session.commit()
+        self._security()
+        self._txn('t-buy', 'buy', 1000.0, qty=10, price=100.0)
+        client = self._tagged_client()
+        plaid = FakePlaidClient(accounts=[
+            {'account_id': 'brk', 'name': 'BUSINESS BROKERAGE',
+             'official_name': '', 'mask': '9401', 'type': 'investment',
+             'subtype': 'brokerage', 'balance_available': None,
+             'balance_current': 1000.0, 'iso_currency_code': 'USD'}])
+        res = sync_engine.sync_item(self.item, plaid, client)
+        self.assertEqual(res['invest_je']['posted'], 1, res['invest_je'])
+        gje = GeneratedJournalEntry.query.filter_by(
+            plaid_investment_transaction_id='t-buy').first()
+        for line in self._je_for(client, gje)['accounts']:
+            self.assertEqual((line['cost_center'], line['member']),
+                             (CC, MEMBER), line)
+
+
+class InvestJEConfigUITests(InvestJEBase):
+    """The /admin/accounts form that sets the two dimensions (v0.8.3)."""
+
+    def test_the_endpoint_stores_both(self):
+        resp = self.app.test_client().post(
+            '/admin/items/item-om/invest_je_config',
+            data={'invest_je_cost_center': CC, 'invest_je_member': MEMBER})
+        self.assertEqual(resp.status_code, 302)
+        db.session.expire_all()
+        self.assertEqual(self.item.invest_je_cost_center, CC)
+        self.assertEqual(self.item.invest_je_member, MEMBER)
+
+    def test_blank_clears_back_to_null(self):
+        """Clearing is a first-class outcome, not an ignored empty form."""
+        self.item.invest_je_cost_center = CC
+        self.item.invest_je_member = MEMBER
+        db.session.commit()
+        self.app.test_client().post(
+            '/admin/items/item-om/invest_je_config',
+            data={'invest_je_cost_center': '', 'invest_je_member': ''})
+        db.session.expire_all()
+        self.assertIsNone(self.item.invest_je_cost_center)
+        self.assertIsNone(self.item.invest_je_member)
+
+    def test_an_unknown_item_does_not_500(self):
+        resp = self.app.test_client().post(
+            '/admin/items/nope/invest_je_config',
+            data={'invest_je_cost_center': CC})
+        self.assertEqual(resp.status_code, 302)
+
+    def test_the_accounts_page_renders_the_picker(self):
+        """A new context key that collides with a _page() kwarg 500s every
+        admin page — so the route is GET-tested, not just the form."""
+        self.item.invest_je_cost_center = CC
+        db.session.commit()
+        resp = self.app.test_client().get('/admin/accounts')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_data(as_text=True)
+        self.assertIn('invest_je_config', body)
+        self.assertIn(CC, body)
+
+    def test_the_page_still_renders_when_erpnext_cannot_list_options(self):
+        with mock.patch('app.erpnext_bank.list_cost_centers',
+                        side_effect=ERPNextError('down')), \
+             mock.patch('app.erpnext_bank.list_link_options',
+                        side_effect=ERPNextError('down')):
+            resp = self.app.test_client().get('/admin/accounts')
+        self.assertEqual(resp.status_code, 200)
+        # Falls back to a free-text field rather than locking the operator out.
+        self.assertIn('name="invest_je_cost_center"',
+                      resp.get_data(as_text=True))
+
+
+class ResetInvestmentDraftsTests(InvestJEBase):
+    """v0.8.3 · deleting the drafts so a re-sync rebuilds them with dimensions.
+
+    A Journal Entry's cost center cannot be edited in bulk and the GJE row makes
+    the trade idempotently "already handled", so clearing both is the only route
+    from 455 wrongly-tagged drafts to 455 right ones."""
+
+    def _post_two(self, client):
+        self._security()
+        self._txn('t-buy', 'buy', 1000.0, qty=10, price=100.0)
+        self._txn('t-fee', 'fee', 25.0)
+        invest_je.post_investments_for_account(client, 'brk')
+        self.assertEqual(GeneratedJournalEntry.query.count(), 2)
+
+    def test_drafts_are_deleted_here_and_in_erpnext(self):
+        client = self._client()
+        self._post_two(client)
+        names = {g.erpnext_journal_entry_name
+                 for g in GeneratedJournalEntry.query.all()}
+        stats = invest_je.reset_investment_drafts(client)
+        self.assertEqual(stats['drafts_deleted'], 2)
+        self.assertFalse(stats['aborted'])
+        self.assertEqual(GeneratedJournalEntry.query.count(), 0)
+        self.assertTrue(names <= client.deleted, client.deleted)
+
+    def test_a_re_post_rebuilds_them_with_the_dimensions(self):
+        """The whole point: reset, set the cost center, re-sync, tagged JEs."""
+        client = self._client(link_docs=[('Cost Center', CC)])
+        self._post_two(client)
+        invest_je.reset_investment_drafts(client)
+        self.item.invest_je_cost_center = CC
+        db.session.commit()
+        stats = invest_je.post_investments_for_account(client, 'brk')
+        self.assertEqual(stats['posted'], 2)
+        for gje in GeneratedJournalEntry.query.all():
+            for line in self._je_for(client, gje)['accounts']:
+                self.assertEqual(line['cost_center'], CC, line)
+
+    def test_a_submitted_entry_aborts_the_whole_pass(self):
+        """Submitted entries are real ledger history — the first one found
+        stops everything, having deleted nothing further."""
+        client = self._client()
+        self._post_two(client)
+        first = GeneratedJournalEntry.query.order_by(
+            GeneratedJournalEntry.id.asc()).first()
+        client.created['Journal Entry'][
+            first.erpnext_journal_entry_name]['docstatus'] = 1
+        stats = invest_je.reset_investment_drafts(client)
+        self.assertTrue(stats['aborted'])
+        self.assertEqual(stats['drafts_deleted'], 0)
+        self.assertEqual(GeneratedJournalEntry.query.count(), 2)
+        self.assertEqual(client.deleted, set())
+
+    def test_an_approved_row_is_never_touched(self):
+        client = self._client()
+        self._post_two(client)
+        gje = GeneratedJournalEntry.query.first()
+        gje.state = 'approved'
+        db.session.commit()
+        stats = invest_je.reset_investment_drafts(client)
+        self.assertEqual(stats['drafts_deleted'], 1)
+        self.assertEqual(GeneratedJournalEntry.query.count(), 1)
+        self.assertEqual(GeneratedJournalEntry.query.first().state, 'approved')
+
+    def test_it_is_idempotent(self):
+        client = self._client()
+        self._post_two(client)
+        invest_je.reset_investment_drafts(client)
+        self.assertEqual(
+            invest_je.reset_investment_drafts(client),
+            {'drafts_deleted': 0, 'aborted': False, 'reason': ''})
+
+    def test_it_can_be_scoped_to_one_account(self):
+        db.session.add(PlaidAccount(
+            account_id='brk2', item_id='item-om', name='OTHER BROKERAGE',
+            mask='9402', type='investment', subtype='brokerage',
+            owning_company=COMPANY, erpnext_gl_account_name='Other - EC'))
+        db.session.commit()
+        client = self._client()
+        self._post_two(client)
+        self._txn('t-other', 'buy', 500.0, qty=5, price=100.0,
+                  account_id='brk2')
+        invest_je.post_investments_for_account(client, 'brk2')
+        self.assertEqual(GeneratedJournalEntry.query.count(), 3)
+        stats = invest_je.reset_investment_drafts(client, 'brk2')
+        self.assertEqual(stats['drafts_deleted'], 1)
+        self.assertEqual(GeneratedJournalEntry.query.count(), 2)
+
+    def test_the_admin_endpoint_reports_the_count(self):
+        client = self._client()
+        self._post_two(client)
+        with mock.patch('app.erpnext_bank.get_client', lambda: client):
+            resp = self.app.test_client().post('/admin/reset_investment_drafts')
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn('2+draft', resp.headers['Location'])
+        self.assertEqual(GeneratedJournalEntry.query.count(), 0)
+
+    def test_the_rebuild_endpoint_still_deletes_drafts(self):
+        """rebuild_investment_accounts now delegates its draft pass to
+        reset_investment_drafts — it must not have lost the behaviour."""
+        client = self._client()
+        self._post_two(client)
+        stats = invest_je.rebuild_investment_accounts(client, COMPANY)
+        self.assertEqual(stats['drafts_deleted'], 2)
+        self.assertEqual(GeneratedJournalEntry.query.count(), 0)
+
+    def test_the_rebuild_endpoint_still_aborts_on_a_submitted_entry(self):
+        client = self._client()
+        self._post_two(client)
+        first = GeneratedJournalEntry.query.first()
+        client.created['Journal Entry'][
+            first.erpnext_journal_entry_name]['docstatus'] = 1
+        stats = invest_je.rebuild_investment_accounts(client, COMPANY)
+        self.assertTrue(stats['aborted'])
+        self.assertEqual(GeneratedJournalEntry.query.count(), 2)
+
+
+class InvestJEDimensionMigrationTests(unittest.TestCase):
+    """The two ADD COLUMNs, on a database that predates them."""
+
+    def setUp(self):
+        self._dbfd, self._dbpath = tempfile.mkstemp(suffix='.sqlite')
+        self._datadir = tempfile.mkdtemp()
+        self.app = create_app({
+            'TESTING': True,
+            'SQLALCHEMY_DATABASE_URI': f'sqlite:///{self._dbpath}',
+            'DATA_DIR': self._datadir, 'FERNET_KEY': '',
+            'SCHEDULER_ENABLED': False,
+        })
+        self.ctx = self.app.app_context()
+        self.ctx.push()
+
+    def tearDown(self):
+        db.session.remove()
+        db.engine.dispose()
+        self.ctx.pop()
+        crypto.reset_cache()
+        os.close(self._dbfd)
+        os.remove(self._dbpath)
+
+    def _columns(self):
+        from sqlalchemy import inspect as sa_inspect
+        return {c['name'] for c in
+                sa_inspect(db.engine).get_columns('plaid_items')}
+
+    def test_a_fresh_database_has_both(self):
+        self.assertLessEqual({'invest_je_cost_center', 'invest_je_member'},
+                             self._columns())
+
+    def test_the_migration_adds_them_to_a_pre_v0_8_3_database(self):
+        from app import migrations
+        from sqlalchemy import text
+        with db.engine.begin() as conn:
+            for col in ('invest_je_cost_center', 'invest_je_member'):
+                conn.execute(text(
+                    f'ALTER TABLE plaid_items DROP COLUMN {col}'))
+        self.assertFalse({'invest_je_cost_center', 'invest_je_member'}
+                         & self._columns())
+        migrations.run_migrations()
+        self.assertLessEqual({'invest_je_cost_center', 'invest_je_member'},
+                             self._columns())
+
+    def test_re_running_is_a_no_op(self):
+        from app import migrations
+        migrations.run_migrations()
+        migrations.run_migrations()
+        self.assertLessEqual({'invest_je_cost_center', 'invest_je_member'},
+                             self._columns())

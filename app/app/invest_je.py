@@ -78,6 +78,95 @@ def posting_enabled(account_or_item) -> bool:
     return bool(item and item.invest_je_posting_enabled)
 
 
+# ── accounting dimensions (v0.8.3) ───────────────────────────────────────────
+#
+# THE BUG THIS FIXES. v0.8.2 wired the writer into the sync and 455 investment
+# JEs landed — every line of every one carrying `cost_center = Main - OML`, the
+# Company default, and no Member. The 44 categorization rules that DO name a
+# cost center only ever applied to the bank-transaction path
+# (categorization.build_je_doc); investment JEs are built here, and this module
+# had no dimension wiring at all. Account routing was never the problem — EEIIX
+# reached 1323 Mutual Funds, the advisory fee reached 5700 — the postings simply
+# had no segment to be filed under.
+#
+# WHY THE ITEM CARRIES IT. See PlaidItem.invest_je_cost_center: one Item is one
+# custodial relationship, and the two legs of a single trade must not be able to
+# land in different segments.
+#
+# WHY EVERY LINE, where a rule tags only its offset. A rule's bank line is the
+# operator's own checking account and the movement of cash belongs to no
+# value-chain segment, so tagging it would attribute the payment rather than the
+# cost. An investment JE has no such line: both sides are the SAME activity —
+# securities on one side, the Cash Clearing bridge (or the brokerage's own leaf)
+# on the other — and both are investment activity. Tagging one side only would
+# leave half of every trade filed under the Company default, which is precisely
+# the state this release exists to end.
+
+# The extra keys a Journal Entry Account line may carry, as
+# {PlaidItem attribute: JE Account line key}. `cost_center` is a stock ERPNext
+# field; `member` is a Link CUSTOM FIELD (Journal Entry Account-member → Member)
+# on Tim's install. Frappe applies a child-table dict's keys to the child doc by
+# FIELDNAME, and a custom field is an ordinary field of the doctype by the time
+# a document is instantiated — so `{'account': …, 'member': 'MEM-0001'}` sets it
+# with no special handling, and an install WITHOUT that custom field would
+# ignore the key rather than fail. Both are therefore written the same way.
+_JE_TAG_FIELDS = (('invest_je_cost_center', 'cost_center'),
+                  ('invest_je_member', 'member'))
+
+
+def _member_exists(client, name: str) -> bool | None:
+    """Whether `name` is a Member docname ERPNext will accept on a JE line.
+    TRI-STATE like erpnext_bank.cost_center_exists: True / False (ERPNext
+    answered and has no such doc) / None (no verdict — unreachable, or the
+    Member doctype isn't installed, in which case nothing can be concluded)."""
+    if client is None or not name:
+        return None
+    try:
+        doc = client.get_doc('Member', name)
+    except (ERPNextAPIError, ERPNextError):
+        return None
+    return bool(isinstance(doc, dict) and doc.get('name'))
+
+
+def resolve_je_tags(client, account: PlaidAccount,
+                    company: str = '') -> dict:
+    """The dimension keys every JE line for `account` should carry — {} when the
+    owning Item sets none, which restores the pre-v0.8.3 behaviour exactly.
+
+    FAIL-SOFT, and only on a POSITIVE denial. A dimension ERPNext *answers* it
+    does not have is dropped with a warning and the line falls back to the
+    server-side default, because one stale docname must not cost an operator
+    every JE in a 455-transaction backfill. A dimension it could not check —
+    unreachable, an API error, a doctype this install lacks — is written
+    ANYWAY: refusing valid input during a transient outage is the worse failure,
+    and ERPNext rejects a genuinely bad link at create time regardless. Same
+    "positive mismatch only" discipline as the party_type migration and the
+    rule-editor's cost-center validation.
+
+    Resolved ONCE per batch by post_investments_for_account and threaded down,
+    so a 455-trade backfill costs two lookups rather than 910."""
+    item = PlaidItem.query.filter_by(item_id=account.item_id).first()
+    if item is None:
+        return {}
+    tags: dict = {}
+    for attr, field in _JE_TAG_FIELDS:
+        value = (getattr(item, attr, None) or '').strip()
+        if not value:
+            continue                      # unset → write no key at all
+        if field == 'cost_center':
+            from . import erpnext_bank
+            verdict = erpnext_bank.cost_center_exists(client, value, company)
+        else:
+            verdict = _member_exists(client, value)
+        if verdict is False:
+            log.warning('item %s names %s=%r, which ERPNext does not have — '
+                        'posting without it (ERPNext will apply its own '
+                        'default)', item.item_id, attr, value)
+            continue
+        tags[field] = value
+    return tags
+
+
 # ── GL account taxonomy ──────────────────────────────────────────────────────
 #
 # Each category names the leaf account and the root branch it belongs under.
@@ -448,7 +537,8 @@ def _remark(txn: SecurityTransaction, security: Security | None) -> str:
 
 def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
                         account: PlaidAccount, company: str,
-                        security: Security | None) -> tuple:
+                        security: Security | None,
+                        tags: dict | None = None) -> tuple:
     """(doc, lot_plan) for one SecurityTransaction — doc is None when the type
     is not posted (transfer, cancel, unrecognized), and lot_plan is the FIFO
     consumption to apply only after a successful post (empty except on a
@@ -456,7 +546,11 @@ def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
 
     Never mutates ERPNext state or the local lots — only reads, and creates GL
     accounts. The cash leg is resolved by `cash_side_account` (clearing for
-    paired, bank for unpaired)."""
+    paired, bank for unpaired).
+
+    `tags` (v0.8.3) are the accounting dimensions to stamp on every line. None
+    means "resolve them here" — correct but one lookup per call, so a batch
+    caller resolves once with `resolve_je_tags` and passes the result in."""
     kind = (txn.type or '').lower()
     is_option = bool(security and security.is_option)
     amount = abs(float(txn.amount or 0.0))
@@ -529,6 +623,13 @@ def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
 
     if accounts is None or any(a.get('account') is None for a in accounts):
         return None, []
+    # v0.8.3 · the dimensions, on EVERY line (see the module note above). Applied
+    # here rather than inside _dr/_cr so there is ONE place a line can acquire
+    # one, and so a future line type cannot be added without them.
+    line_tags = resolve_je_tags(client, account, company) if tags is None else tags
+    if line_tags:
+        for line in accounts:
+            line.update(line_tags)
     doc = {'doctype': JOURNAL_ENTRY_DT, 'voucher_type': 'Journal Entry',
            'company': company, 'user_remark': _remark(txn, security),
            'accounts': accounts}
@@ -540,7 +641,9 @@ def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
 # ── generation, idempotent + gated ───────────────────────────────────────────
 
 def generate_investment_je(client: ERPNextClient, txn: SecurityTransaction, *,
-                           force: bool = False) -> GeneratedJournalEntry | None:
+                           force: bool = False,
+                           tags: dict | None = None
+                           ) -> GeneratedJournalEntry | None:
     """Post one SecurityTransaction as a Journal Entry, or return the existing
     GeneratedJournalEntry when it is already posted.
 
@@ -558,7 +661,10 @@ def generate_investment_je(client: ERPNextClient, txn: SecurityTransaction, *,
     approved entries.
 
     Cost-basis lot decrements (FIFO) and the GJE row commit together, so an
-    ERPNext failure rolls the lot consumption back with it."""
+    ERPNext failure rolls the lot consumption back with it.
+
+    `tags` (v0.8.3) is the pre-resolved dimension set — see
+    build_investment_je. None resolves it per call."""
     itx = txn.plaid_investment_transaction_id
     existing = (GeneratedJournalEntry.query
                 .filter_by(plaid_investment_transaction_id=itx).first())
@@ -582,7 +688,7 @@ def generate_investment_je(client: ERPNextClient, txn: SecurityTransaction, *,
 
     try:
         doc, lot_plan = build_investment_je(client, txn, account, company,
-                                            security)
+                                            security, tags)
     except (ERPNextAPIError, ERPNextError):
         db.session.rollback()
         log.warning('failed to build investment JE for %s', itx, exc_info=True)
@@ -691,25 +797,12 @@ def rebuild_investment_accounts(client: ERPNextClient,
         return stats
 
     # 1. Draft investment JEs → cancel/delete in ERPNext, drop the GJE row.
-    drafts = (GeneratedJournalEntry.query
-              .filter(GeneratedJournalEntry.plaid_investment_transaction_id
-                      .isnot(None),
-                      GeneratedJournalEntry.erpnext_journal_entry_name
-                      .isnot(None),
-                      GeneratedJournalEntry.state == 'pending_review').all())
-    for gje in drafts:
-        je = client.get_doc(JOURNAL_ENTRY_DT, gje.erpnext_journal_entry_name)
-        if je is not None and int(je.get('docstatus') or 0) == 1:
-            stats['aborted'] = True
-            stats['reason'] = (f'submitted JE {gje.erpnext_journal_entry_name} '
-                               '— aborted, deleted nothing further')
-            db.session.rollback()
-            return stats
-        if je is not None:
-            client.delete_doc(JOURNAL_ENTRY_DT, gje.erpnext_journal_entry_name)
-        db.session.delete(gje)
-        stats['drafts_deleted'] += 1
-    db.session.commit()
+    reset = reset_investment_drafts(client)
+    stats['drafts_deleted'] = reset['drafts_deleted']
+    if reset['aborted']:
+        stats['aborted'] = True
+        stats['reason'] = reset['reason']
+        return stats
 
     # 2. The orphan per-ticker LEAVES (+ 'Other'), balance-checked. The filter
     #    is is_group=0, so the 1320 GROUP that holds the real balance can never
@@ -724,6 +817,55 @@ def rebuild_investment_accounts(client: ERPNextClient,
                 continue
             client.delete_doc(ACCOUNT_DT, a['name'])
             stats['accounts_deleted'] += 1
+    return stats
+
+
+def reset_investment_drafts(client: ERPNextClient,
+                            account_id: str | None = None) -> dict:
+    """Delete every DRAFT investment Journal Entry — in ERPNext and the GJE row
+    that names it — so the next sync re-posts them from scratch (v0.8.3).
+
+    This is the repair path for a batch that posted with the wrong shape rather
+    than the wrong data: v0.8.2's 455 drafts are correct in account, amount and
+    date, and wrong only in carrying the Company's default cost center. A JE's
+    dimensions cannot be edited in bulk, and the GJE row makes the trade
+    idempotently "already handled" — so clearing both is what lets
+    post_investments_for_account rebuild them with the dimensions set.
+
+    SAFETY, identical to rebuild_investment_accounts (which now calls this):
+    only state='pending_review' rows are candidates, and each is re-checked in
+    ERPNext — the first SUBMITTED docstatus aborts the whole pass with nothing
+    further deleted, because a submitted entry is real ledger history. approved,
+    error and cancelled rows are never touched (`reset_cancelled_gjes` owns the
+    last of those). Idempotent: a second run finds nothing and reports zeros.
+
+    `account_id` scopes it to one brokerage; omitted, it covers every account.
+
+    Returns {'drafts_deleted', 'aborted', 'reason'}."""
+    stats = {'drafts_deleted': 0, 'aborted': False, 'reason': ''}
+    q = GeneratedJournalEntry.query.filter(
+        GeneratedJournalEntry.plaid_investment_transaction_id.isnot(None),
+        GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None),
+        GeneratedJournalEntry.state == 'pending_review')
+    if account_id:
+        itxs = tuple(
+            t.plaid_investment_transaction_id for t in
+            SecurityTransaction.query.filter_by(account_id=account_id).all())
+        q = q.filter(GeneratedJournalEntry.plaid_investment_transaction_id
+                     .in_(itxs or ('',)))
+    for gje in q.all():
+        je = client.get_doc(JOURNAL_ENTRY_DT, gje.erpnext_journal_entry_name)
+        if je is not None and int(je.get('docstatus') or 0) == 1:
+            stats['aborted'] = True
+            stats['reason'] = (f'submitted JE {gje.erpnext_journal_entry_name} '
+                               '— aborted, deleted nothing further')
+            db.session.rollback()
+            return stats
+        if je is not None:
+            client.delete_doc(JOURNAL_ENTRY_DT, gje.erpnext_journal_entry_name)
+        db.session.delete(gje)
+        stats['drafts_deleted'] += 1
+    db.session.commit()
     return stats
 
 
@@ -760,18 +902,32 @@ def post_investments_for_account(client: ERPNextClient, account_id: str, *,
     raises; returns {'posted', 'skipped', 'failed'}.
 
     `force=True` (v0.5.13) regenerates over CANCELLED GJEs — see
-    generate_investment_je. pending_review/approved rows stay protected."""
+    generate_investment_je. pending_review/approved rows stay protected.
+
+    v0.8.3 · the Item's accounting dimensions are resolved ONCE here and handed
+    to every JE, so a backfill validates the cost center and the member a single
+    time rather than once per trade."""
     stats = {'posted': 0, 'skipped': 0, 'failed': 0}
     account = PlaidAccount.query.filter_by(account_id=account_id).first()
     if account is None or not posting_enabled(account):
         return stats
+    company = owning_company_for_account_id(account_id) or ''
+    try:
+        tags = resolve_je_tags(client, account, company)
+    except (ERPNextAPIError, ERPNextError):
+        # Resolution is already fail-soft per-dimension; this catches a client
+        # that cannot answer at all. Posting with the server-side defaults beats
+        # posting nothing — the same trade-off resolve_je_tags itself makes.
+        log.warning('could not resolve investment JE dimensions for %s — '
+                    'posting with ERPNext defaults', account_id, exc_info=True)
+        tags = {}
     rows = (SecurityTransaction.query
             .filter_by(account_id=account_id)
             .order_by(SecurityTransaction.date.asc(),
                       SecurityTransaction.id.asc()).all())
     for txn in rows:
         try:
-            gje = generate_investment_je(client, txn, force=force)
+            gje = generate_investment_je(client, txn, force=force, tags=tags)
         except Exception:  # pragma: no cover - generate already swallows
             db.session.rollback()
             stats['failed'] += 1

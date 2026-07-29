@@ -92,6 +92,26 @@ class PlaidItem(db.Model):
     # this Item in on /admin/accounts. See invest_je.posting_enabled.
     invest_je_posting_enabled = db.Column(db.Boolean, default=False,
                                           nullable=False)
+    # v0.8.3 · the accounting DIMENSIONS every investment JE line for this
+    # Item's accounts carries. Both NULL by default, and NULL means "write no
+    # key at all" — exactly the convention CategorizationRule.cost_center uses
+    # (see categorization.build_je_doc): an absent key leaves ERPNext free to
+    # apply the Account's or the Company's own default server-side, where a
+    # guessed value here would OVERRIDE those defaults and freeze against any
+    # later change to them.
+    #
+    # ON THE ITEM, not the account. A Plaid Item is one login at one custodian,
+    # so its accounts are one custodial relationship: the value-chain segment
+    # investment activity belongs to, and the member who owns it, do not differ
+    # between a brokerage and its own cash-sweep companion. Per-account would
+    # let the two halves of a single trade land in different segments, which is
+    # the one arrangement that cannot be right.
+    #
+    # `invest_je_cost_center` is a Cost Center docname ('200 - Investment
+    # Activities - OML'); `invest_je_member` a Member docname, written to the
+    # `member` custom field on Journal Entry Account. See invest_je.resolve_je_tags.
+    invest_je_cost_center = db.Column(db.String(140), nullable=True)
+    invest_je_member = db.Column(db.String(140), nullable=True)
     # v0.5.3 · whether the statement-transaction matcher may stamp
     # `statement_posted_date` onto this Item's BankTransactions. Defaults TRUE:
     # the WF Advisors pattern (a paired brokerage whose statements carry an

@@ -152,8 +152,13 @@ class FakeERPClient:
                  foreign_bank_statement_doctype=False,
                  fail_bank_statement_create=False,
                  bank_statement_create_race=False,
-                 fail_upload=False, fail_list=None):
+                 fail_upload=False, fail_list=None, link_docs=()):
         self.docs = {}          # name -> doc
+        # v0.8.3 · link targets a JE line's dimensions resolve against, as
+        # {(doctype, docname)} — e.g. ('Cost Center', '200 - Investment - EC').
+        # A leaf/non-group doc; anything not listed reads back as ERPNext's 404,
+        # which is the POSITIVE denial invest_je.resolve_je_tags fails soft on.
+        self.link_docs = {tuple(d) for d in (link_docs or ())}
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
         self.cancelled = set()
@@ -373,6 +378,8 @@ class FakeERPClient:
             if doc is None and name in self.existing_bank_accounts:
                 doc = self.existing_bank_accounts[name]
             return {**doc, 'name': name} if doc is not None else None
+        if (doctype, name) in self.link_docs:
+            return {'name': name, 'is_group': 0}
         return self.docs.get(name)
 
     @staticmethod
@@ -782,6 +789,16 @@ class FakeERPClient:
     def attachments_for(self, docname):
         """Every upload targeted at one document — the assertion helper."""
         return [u for u in self.uploads if u['docname'] == docname]
+
+    def delete_doc(self, doctype, name):
+        """The REST DELETE the real client makes — same end state as the
+        `frappe.client.delete` path below, which is the RPC form. Idempotent on
+        an already-gone doc, exactly like a 404 there."""
+        self.calls.append(('delete_doc', doctype, name))
+        self.created.get(doctype, {}).pop(name, None)
+        self.docs.pop(name, None)
+        self.deleted.add(name)
+        return True
 
     def call_method(self, method, params=None, http_method='GET', json_body=None):
         self.calls.append(('call_method', method, json_body))
