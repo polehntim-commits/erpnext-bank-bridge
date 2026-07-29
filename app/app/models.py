@@ -705,8 +705,34 @@ class CategorizationRule(db.Model):
     # A literal 'Supplier' / 'Customer' remains an override that wins over the
     # derivation, so an operator can force the side when their chart doesn't
     # follow the usual root_type convention.
+    #
+    # v0.9.0 · 'Employee' and 'Shareholder' join the vocabulary. Both are real
+    # ERPNext Party Types (tabParty Type maps Supplier/Employee/Shareholder to
+    # account_type Payable, Customer to Receivable) and both answer a question
+    # this install could not answer before: an owner draw booked to '3201 -
+    # Member Distribution' has a SHAREHOLDER counterparty, and ERPNext accepts a
+    # party on an Equity account — a fact v0.4.0.9's matrix did not encode, so
+    # twelve already-submitted JE lines sit on Equity accounts with an empty
+    # party ERPNext would have taken all along. See
+    # categorization.PARTY_ELIGIBLE_ACCOUNT_TYPES.
     party_type = db.Column(db.String(20), nullable=True)
     party_name = db.Column(db.String(255), nullable=True)
+    # v0.9.0 · create the named party in ERPNext when it does not exist yet.
+    #
+    # TRI-STATE, and NULL is the default for a reason: NULL means "inherit the
+    # global ERPNEXT_AUTO_CREATE_SUPPLIERS setting", which is exactly what every
+    # pre-v0.9.0 rule did, so an upgrade changes no behaviour anywhere. True
+    # forces creation on for this rule, False forces it off — the kill switch
+    # exists per rule (Safety Third: present, but not in the way) so an operator
+    # can have one rule that must only ever match parties they curated by hand
+    # without turning creation off for every other rule.
+    #
+    # What "create" can mean is bounded by the DocType, not by this flag:
+    # Supplier, Customer and Shareholder are mintable; an Employee never is,
+    # because ERPNext requires date_of_birth, date_of_joining and gender on one
+    # and a fabricated birth date in an HR record is worse than no party at all.
+    # See categorization.AUTO_CREATABLE_PARTY_TYPES.
+    auto_create_party = db.Column(db.Boolean, nullable=True, default=None)
     # v0.4.0.7 · omit the Party from the generated JE entirely. ERPNext treats
     # Party as optional on a JE row, and a transfer between two accounts you own
     # (a credit-card payment, a deposit, an inter-account move) has no
@@ -815,6 +841,10 @@ class CategorizationRule(db.Model):
             'debit_account': self.debit_account,
             'credit_account': self.credit_account,
             'party_type': self.party_type, 'party_name': self.party_name,
+            # NULL is meaningful (inherit the global gate), so it is emitted as
+            # None rather than coerced to a bool the caller can't tell apart.
+            'auto_create_party': (None if self.auto_create_party is None
+                                  else bool(self.auto_create_party)),
             'skip_party': bool(self.skip_party),
             'ignore_for_paired': bool(self.ignore_for_paired),
             'description_template': self.description_template,
@@ -2522,4 +2552,114 @@ class DraftHealthSample(db.Model):
             'threshold_source': self.threshold_source or 'default',
             'breached': bool(self.breached),
             'by_prefix': dict(self.by_prefix or {}),
+        }
+
+
+class StatementReconSample(db.Model):
+    """One (account, period, category) comparison of what the STATEMENT says
+    against what Bank Bridge actually BOOKED into ERPNext (v0.9.0).
+
+    WHAT THIS CATCHES THAT NOTHING ELSE DOES. Two guards already exist and
+    neither sees this failure. `StatementAnchor.variance` reconciles CASH — it
+    asks whether the money Plaid mirrored explains the balance the bank
+    asserted, and it is blind to what was posted to the ledger afterwards.
+    v0.8.5's Bank-Transaction-reference dedup catches EXACT re-emission — the
+    same entry written twice. Neither notices a whole period whose booked
+    activity has drifted from the statement's: 26 dividend payments on the
+    statement and 24 in the books balances the cash (the two missing dividends
+    never became cash movements Plaid dropped) and re-emits nothing, and is
+    still two dividends of income the ledger does not know about.
+
+    So the comparison is per CATEGORY, not per balance: dividends against
+    dividends, buys against buys. A category is where drift is legible.
+
+    THE THRESHOLD IS MEASURED, NOT CHOSEN. `delta_pct` on every past
+    observation of the same (account, category) is the population; the alert
+    line is its P95 (see statement_recon.learned_threshold). `DEFAULT_*`
+    constants apply only until there are MIN_SAMPLES_FOR_BASELINE observations,
+    and exist as placeholders for a measurement rather than as a judgement about
+    the right number — the same discipline as [[DraftHealthSample]].
+
+    `drifted` samples are EXCLUDED from the baseline, for the reason every
+    adaptive alarm needs: a threshold that learned from its own excursions
+    ratchets upward until it stops firing, which is how one dies unnoticed.
+
+    KAIROS. One row per (account_id, period_start, category), UPDATED in place
+    rather than appended. That is deliberate and it is what makes the firing
+    kairotic: a reconciled period's delta is SETTLED — the statement will not
+    change — so the meaningful moment is when a drifted observation first
+    APPEARS or when a settled one CHANGES verdict. `fired_at` records that we
+    have already said so, so re-reading the report (an admin page load, an MCP
+    call) cannot re-alert. Re-deciding a settled question on every read is
+    chronos.
+
+    `booked_amount` is what the GL holds (submitted entries); `booked_draft_amount`
+    is what is staged but not yet posted. They are separate columns because they
+    are separate findings — a category that matches only once you count drafts
+    is a submit backlog, not a drift, and telling an operator "drifted" there
+    would send them hunting for a missing transaction that is sitting in the
+    approval queue."""
+    __tablename__ = 'statement_recon_samples'
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=_now, index=True)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+    account_id = db.Column(db.String(120),
+                           db.ForeignKey('plaid_accounts.account_id'),
+                           nullable=False, index=True)
+    # Denormalized so a report row renders without joining PlaidAccount, and so
+    # the history survives an account being re-linked under a new Plaid id.
+    account_mask = db.Column(db.String(16), default='')
+    period_start = db.Column(db.Date, nullable=True, index=True)
+    period_end = db.Column(db.Date, nullable=True)
+    # The PlaidStatement.statement_id this period's figures came from — the
+    # bank's own opaque id, so a finding can always be traced to one document.
+    statement_ref = db.Column(db.String(255), default='', index=True)
+    category = db.Column(db.String(40), nullable=False, index=True)
+    statement_amount = db.Column(db.Float, default=0.0)
+    booked_amount = db.Column(db.Float, default=0.0)
+    booked_draft_amount = db.Column(db.Float, default=0.0)
+    delta = db.Column(db.Float, default=0.0)
+    # NULL, not 0.0, when the statement amount is zero: a percentage of nothing
+    # is undefined, and calling it 0% would make a category the books invented
+    # out of thin air look like a perfect match.
+    delta_pct = db.Column(db.Float, nullable=True)
+    # matched | drifted | unexplained
+    status = db.Column(db.String(20), default='matched', index=True)
+    # Why, in one phrase an operator can act on — see
+    # statement_recon.DRIFT_REASONS. Never blank on a non-matched row: FAIL
+    # FORWARD means every delta over the line gets a categorized reason.
+    reason = db.Column(db.String(60), default='')
+    threshold_pct = db.Column(db.Float, default=0.0)
+    threshold_source = db.Column(db.String(20), default='default')
+    baseline_samples = db.Column(db.Integer, default=0)
+    drifted = db.Column(db.Boolean, default=False, index=True)
+    # When the kairotic alert for THIS observation was raised. NULL = never
+    # fired, which is what stops a re-read from re-alerting.
+    fired_at = db.Column(db.DateTime, nullable=True)
+
+    def to_dict(self):
+        return {
+            'account_id': self.account_id,
+            'account_mask': self.account_mask or '',
+            'period': (self.period_start.isoformat()[:7]
+                       if self.period_start else ''),
+            'period_start': (self.period_start.isoformat()
+                             if self.period_start else None),
+            'period_end': (self.period_end.isoformat()
+                           if self.period_end else None),
+            'statement_id': self.statement_ref or '',
+            'category': self.category,
+            'statement_amount': round(float(self.statement_amount or 0.0), 2),
+            'booked_amount': round(float(self.booked_amount or 0.0), 2),
+            'booked_draft_amount': round(
+                float(self.booked_draft_amount or 0.0), 2),
+            'delta': round(float(self.delta or 0.0), 2),
+            'delta_pct': (None if self.delta_pct is None
+                          else round(float(self.delta_pct), 4)),
+            'status': self.status or 'matched',
+            'reason': self.reason or '',
+            'threshold_pct': round(float(self.threshold_pct or 0.0), 4),
+            'threshold_source': self.threshold_source or 'default',
+            'baseline_samples': int(self.baseline_samples or 0),
+            'fired_at': self.fired_at.isoformat() if self.fired_at else None,
         }

@@ -330,6 +330,22 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # scripts/backfill_je_cost_centers.py — deliberately a one-time operator
     # action, not a boot migration.
     ('categorization_rules', 'bank_cost_center', 'VARCHAR(140)'),
+
+    # v0.9.0 — per-rule "create the party if ERPNext hasn't got one".
+    #
+    # Adds NULL and NULL is the third state, not a missing value: it means
+    # "inherit ERPNEXT_AUTO_CREATE_SUPPLIERS", which is precisely what every
+    # pre-v0.9.0 rule did. So this migration changes no behaviour at all on
+    # upgrade — the flag only does something once an operator sets it. Contrast
+    # v0.8.5's bank_cost_center above, where NULL deliberately DOES change
+    # behaviour; the difference is that mirroring a cost center onto the bank leg
+    # is a fix every rule wanted, while minting party records is a decision only
+    # the operator can make per rule.
+    #
+    # There is no accompanying data migration for the widened party_type
+    # vocabulary ('Employee' / 'Shareholder'): the column is already VARCHAR(20)
+    # and both fit, and no existing row needs rewriting to gain the option.
+    ('categorization_rules', 'auto_create_party', 'BOOLEAN'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,
@@ -620,17 +636,29 @@ def _migrate_incompatible_party_types() -> None:
     no way to approve them. Rules saved before v0.4.0.9's save-time validation
     are still carrying those party_types, so they get repaired here.
 
-    A rule is flipped to no-party only on a POSITIVE mismatch — Supplier on a
-    non-Payable account, or Customer on a non-Receivable one. Anything we cannot
+    A rule is flipped to no-party only on a POSITIVE mismatch. Anything we cannot
     read is LEFT ALONE: an unconfigured/unreachable ERPNext, an offset that no
     longer resolves, or a blank account_type all yield no verdict, and silently
     stripping the operator's party choice on a transient outage would be a worse
     bug than the one being fixed.
 
+    v0.9.0 · THIS MIGRATION USED TO OVER-CLEAR, and the fix is one import. It
+    tested `PARTY_ACCOUNT_TYPES.get(acct_type) == declared`, which admits only
+    Receivable→Customer and Payable→Supplier — so it stripped the party_type off
+    every rule pointing at an EQUITY account, which ERPNext accepts, and had no
+    concept of Employee (which ERPNext exempts from the type-match check
+    entirely). It now asks `categorization.party_allowed_on_account_type`, the
+    same predicate the JE path and the Rules editor use, so all three agree on
+    one definition of eligible. Rules this migration wrongly cleared in an
+    earlier release are NOT restored — the original choice is gone from the row
+    and guessing it back would be inventing operator intent. They surface instead
+    as `rule_has_no_party` in scripts/plan_je_party_backfill.py, which is where a
+    human can see the name and decide.
+
     Idempotent by construction: a rule is only touched when its stored
     party_type contradicts its offset's account_type, so the second run — and
     every run after — flips nothing. `party_type='Auto'` and NULL are never
-    touched; Auto re-derives correctly at JE time under the new matrix.
+    touched; Auto re-derives correctly at JE time under the new rule.
 
     ARCHIVED rules are deliberately left alone. A rule version is archived
     rather than deleted precisely so a past auto-JE decision stays
@@ -649,11 +677,12 @@ def _migrate_incompatible_party_types() -> None:
     from . import erpnext_settings
     if not erpnext_settings.is_configured():
         return  # nothing to resolve an account_type against
-    from .categorization import PARTY_ACCOUNT_TYPES
+    from .categorization import (PARTY_TYPE_ACCOUNT_TYPES,
+                                 party_allowed_on_account_type)
     from .models import CategorizationRule
     rules = CategorizationRule.query.filter(
         CategorizationRule.archived.is_(False),
-        CategorizationRule.party_type.in_(tuple(PARTY_ACCOUNT_TYPES.values()))
+        CategorizationRule.party_type.in_(tuple(PARTY_TYPE_ACCOUNT_TYPES))
     ).all()
     if not rules:
         return  # fast path: nothing declares a literal side
@@ -682,9 +711,9 @@ def _migrate_incompatible_party_types() -> None:
         if not acct_type:
             continue                    # undeterminable → no verdict, leave it
         declared = (r.party_type or '').strip()
-        if PARTY_ACCOUNT_TYPES.get(acct_type) == declared:
+        if party_allowed_on_account_type(acct_type, declared):
             continue                    # already compatible
-        want = 'Payable' if declared == 'Supplier' else 'Receivable'
+        want = PARTY_TYPE_ACCOUNT_TYPES.get(declared, 'Receivable or Payable')
         log.warning('migration: rule %s "%s" party_type %s → none '
                     '(offset %s is %s not %s)',
                     r.id, r.name or '', declared, offset, acct_type, want)

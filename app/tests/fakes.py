@@ -152,7 +152,15 @@ class FakeERPClient:
                  foreign_bank_statement_doctype=False,
                  fail_bank_statement_create=False,
                  bank_statement_create_race=False,
-                 fail_upload=False, fail_list=None, link_docs=()):
+                 fail_upload=False, fail_list=None, link_docs=(),
+                 existing_parties=None):
+        # v0.9.0 · parties that already exist in ERPNext for the doctypes whose
+        # DOCNAME is a naming series rather than the party's name, as
+        # {doctype: [{'name': 'HR-EMP-00001', 'employee_name': 'Mitchell Huru'}]}.
+        # Supplier/Customer keep their own `existing_*` kwargs, since those
+        # autoname on the name field and a bare set of names is enough for them.
+        self.existing_parties = {k: [dict(r) for r in v]
+                                 for k, v in (existing_parties or {}).items()}
         self.docs = {}          # name -> doc
         # v0.8.3 · link targets a JE line's dimensions resolve against, as
         # {(doctype, docname)} — e.g. ('Cost Center', '200 - Investment - EC').
@@ -304,7 +312,10 @@ class FakeERPClient:
                         'Account': {}, 'Supplier': {}, 'Journal Entry': {},
                         'Supplier Group': {}, 'Customer': {},
                         'Customer Group': {}, 'Counterparty': {}, 'DocType': {},
-                        'Bank Statement': {}}
+                        'Bank Statement': {},
+                        # v0.9.0 · Shareholder is mintable, Employee is not —
+                        # the bucket exists so a test can ASSERT it stays empty.
+                        'Shareholder': {}, 'Employee': {}}
 
     def get_logged_user(self):
         return 'admin@example.com'
@@ -389,11 +400,21 @@ class FakeERPClient:
 
     @staticmethod
     def _matches(doc, filters):
-        """True when doc satisfies every [field, '=', value] filter."""
+        """True when doc satisfies every filter. Handles '=' and, since v0.9.0,
+        Frappe's 'like' with '%' wildcards — the party autocomplete searches
+        with one, so without it every substring query would match everything and
+        the search would test as a no-op."""
         for f in (filters or []):
             field, op, value = f[0], f[1], f[2]
             if op == '=' and str(doc.get(field, '')) != str(value):
                 return False
+            if op == 'like':
+                import re as _re
+                pattern = '^' + '.*'.join(
+                    _re.escape(p) for p in str(value).split('%')) + '$'
+                if not _re.match(pattern, str(doc.get(field, '') or ''),
+                                 _re.IGNORECASE):
+                    return False
         return True
 
     @classmethod
@@ -521,8 +542,43 @@ class FakeERPClient:
                 if f[0] == name_field and f[1] == '=':
                     return [{'name': f[2]}] if f[2] in names else []
             flds = fields or ['name']
-            return [{k: (n if k in ('name', name_field) else None) for k in flds}
+            # v0.9.0 · honour a `like` filter ON THE NAME FIELD — the party
+            # autocomplete's search. Without it the fake answered a substring
+            # query with the FULL party list, so a search test passed no matter
+            # what the code sent.
+            #
+            # Scoped to that ONE filter shape on purpose. Every other filter
+            # still yields the full listing, which is what the v0.4.5 pairing
+            # pass's `disabled = 0` needs: these fake rows carry only a name, so
+            # matching a `disabled` filter against them returns nothing and the
+            # pairing sees an empty install. (It did, and nine pairing tests
+            # caught it.)
+            name_like = next((f[2] for f in (filters or [])
+                              if len(f) == 3 and f[0] == name_field
+                              and f[1] == 'like'), None)
+            if name_like is not None:
+                needle = str(name_like).strip('%').lower()
+                names = {n for n in names if needle in n.lower()}
+            return [{k: (n if k in ('name', name_field) else None)
+                     for k in flds}
                     for n in sorted(names)]
+        if doctype in ('Shareholder', 'Employee'):
+            # v0.9.0 · both are autonamed `naming_series:`, so the DOCNAME
+            # ('HR-EMP-00001') is not the human name — the lookup is by title
+            # field. Preset rows stand for parties that already exist; created
+            # ones (Shareholder only; an Employee is never minted) join them.
+            title_field = ('title' if doctype == 'Shareholder'
+                           else 'employee_name')
+            pool = [dict(r) for r in self.existing_parties.get(doctype, ())]
+            for name, d in self.created[doctype].items():
+                pool.append({**d, 'name': name})
+            rows = []
+            for d in pool:
+                if not self._matches(d, filters):
+                    continue
+                rows.append({k: d.get(k) for k in (fields or ['name'])})
+            return sorted(rows, key=lambda r: str(r.get(title_field)
+                                                  or r.get('name') or ''))
         if doctype == 'Counterparty':
             rows = []
             for name, d in self.created['Counterparty'].items():
@@ -803,9 +859,15 @@ class FakeERPClient:
             name = f"{doc.get('dt')}-{doc.get('fieldname')}"
             self.created['Custom Field'][name] = dict(doc)
             return {'name': name}
-        # Unknown doctype — mimic a generic create.
+        # Unknown doctype — mimic a generic create. v0.9.0 · the created doc is
+        # now RECORDED when a bucket for its doctype exists, which is what lets a
+        # test assert on a naming-series doctype like Shareholder (whose docname
+        # the caller cannot predict, so `created[dt][returned_name]` is the only
+        # way to reach it). Doctypes with no bucket behave exactly as before.
         self._counter += 1
         name = f'DOC-{self._counter:04d}'
+        if doctype in self.created:
+            self.created[doctype][name] = {**dict(doc), 'name': name}
         return {'name': name}
 
     def update_doc(self, doctype, name, doc):

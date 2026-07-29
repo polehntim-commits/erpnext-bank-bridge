@@ -544,5 +544,96 @@ class AdminRuleEditorCostCenterTest(Base):
         self.assertIsNone(live.cost_center)
 
 
+class McpUpdateRuleParty(CostCenterMcpBase):
+    """v0.9.0 · the party fields reach update_rule.
+
+    Without them an AI operator could set a rule's cost center but not WHO the
+    money went to — which is the half of ACC-JV-2026-02312 that actually
+    mattered, and closing it would have meant a human in the Rules editor for
+    every rule."""
+
+    def test_it_sets_the_party_type_and_name(self):
+        mcp_settings.save({'update_rule': True})
+        rule = self._rule()
+        _, body = self._call_tool('update_rule', {
+            'rule_id': rule.id, 'party_type': 'Supplier',
+            'party_name': 'Sorren'})
+        new = db.session.get(CategorizationRule,
+                             self._payload(body)['updated_rule']['id'])
+        self.assertEqual(new.party_type, 'Supplier')
+        self.assertEqual(new.party_name, 'Sorren')
+
+    def test_it_accepts_the_two_party_types_v0_9_0_added(self):
+        mcp_settings.save({'update_rule': True})
+        for party_type in ('Employee', 'Shareholder'):
+            rule = self._rule()
+            _, body = self._call_tool('update_rule', {
+                'rule_id': rule.id, 'party_type': party_type})
+            new = db.session.get(CategorizationRule,
+                                 self._payload(body)['updated_rule']['id'])
+            self.assertEqual(new.party_type, party_type)
+
+    def test_it_normalizes_the_case(self):
+        mcp_settings.save({'update_rule': True})
+        rule = self._rule()
+        _, body = self._call_tool('update_rule', {
+            'rule_id': rule.id, 'party_type': 'supplier'})
+        new = db.session.get(CategorizationRule,
+                             self._payload(body)['updated_rule']['id'])
+        self.assertEqual(new.party_type, 'Supplier')
+
+    def test_it_refuses_a_party_type_erpnext_does_not_know(self):
+        """This value is handed to ERPNext AS A DOCTYPE. An unchecked 'Vendor'
+        would produce Journal Entries that fail at submit — the v0.4.0.9 failure
+        mode arriving through a new door."""
+        mcp_settings.save({'update_rule': True})
+        rule = self._rule()
+        _, body = self._call_tool('update_rule', {
+            'rule_id': rule.id, 'party_type': 'Vendor'})
+        text = self._error_text(body)
+        self.assertIn('unknown party_type', text)
+        self.assertIn('Shareholder', text)      # the message lists the valid set
+
+    def test_an_empty_party_type_clears_it(self):
+        mcp_settings.save({'update_rule': True})
+        rule = self._rule(party_type='Supplier', party_name='Sorren')
+        _, body = self._call_tool('update_rule', {
+            'rule_id': rule.id, 'party_type': ''})
+        new = db.session.get(CategorizationRule,
+                             self._payload(body)['updated_rule']['id'])
+        self.assertIsNone(new.party_type)
+
+    def test_auto_create_party_stays_tri_state(self):
+        """None means "inherit the global gate", which is what every pre-v0.9.0
+        rule holds. Collapsing it to a bool would turn creation OFF on every
+        rule an AI operator touched."""
+        mcp_settings.save({'update_rule': True})
+        rule = self._rule()
+        self.assertIsNone(rule.auto_create_party)
+
+        _, body = self._call_tool('update_rule', {
+            'rule_id': rule.id, 'auto_create_party': True})
+        rid = self._payload(body)['updated_rule']['id']
+        self.assertIs(db.session.get(CategorizationRule, rid)
+                      .auto_create_party, True)
+
+        _, body = self._call_tool('update_rule', {
+            'rule_id': rid, 'auto_create_party': False})
+        rid = self._payload(body)['updated_rule']['id']
+        self.assertIs(db.session.get(CategorizationRule, rid)
+                      .auto_create_party, False)
+
+    def test_not_passing_auto_create_party_carries_it_across(self):
+        """The clone-everything-not-listed rule (_RULE_CLONE_SKIP) must keep the
+        flag, so an unrelated edit does not reset it."""
+        mcp_settings.save({'update_rule': True})
+        rule = self._rule(auto_create_party=False)
+        _, body = self._call_tool('update_rule', {
+            'rule_id': rule.id, 'priority': 7})
+        new = db.session.get(CategorizationRule,
+                             self._payload(body)['updated_rule']['id'])
+        self.assertIs(new.auto_create_party, False)
+
+
 if __name__ == '__main__':  # pragma: no cover
     unittest.main()

@@ -260,31 +260,70 @@ class ExplicitPartyTypeOverrides(Base):
     ERPNext would reject is caught at SAVE time (the Rules editor) and by the
     boot migration, not silently at JE time. See effective_party_type."""
 
-    def test_customer_forced_even_on_an_expense_offset(self):
+    def test_an_explicit_side_is_refused_on_an_ineligible_offset(self):
+        """v0.9.0 · an explicit party_type no longer overrides ERPNext.
+
+        Through v0.8.5 this test asserted the opposite — that a literal Customer
+        was forced onto 'Fuel Expense - T' regardless. That produced a Journal
+        Entry which INSERTS fine and then throws at submit
+        (validate_account_party_type: 'Expense Account' is not Receivable,
+        Payable or Equity), leaving the operator a draft nobody can approve.
+        A JE with no party posts and can be repaired; an unsubmittable one
+        cannot. So a DEFINITE conflict on a DEFINITE account now declines the
+        party, and says why in the audit log."""
         erp = _erp()
         rule = self._rule(party_type='Customer',
                           offset_account='Fuel Expense - T',
                           party_name='Odd Co')
         row = self._txn(tid='t-force-c', amount=75.0)
 
+        je = self._je_for(
+            erp, categorization.generate_journal_entry(erp, row, rule=rule))
+
+        self.assertIsNone(self._party_line(je),
+                          'an Expense Account offset must carry no party')
+        # The JE still posted — declining a party never costs the entry.
+        self.assertEqual(len(je['accounts']), 2)
+
+    def test_an_explicit_side_still_wins_where_erpnext_allows_it(self):
+        """The override that DOES survive v0.9.0 — an explicit side beating the
+        derivation on an account ERPNext accepts a party on.
+
+        'Grower Payable - T' would derive Supplier anyway, so the interesting
+        half is the mismatch ERPNext permits: Employee is exempted from the
+        Party-Type/account-type match check, so an explicit Employee on a
+        Payable account is legal and must be honoured verbatim."""
+        # The Employee must already exist — Bank Bridge never mints one.
+        erp = _erp(existing_parties={'Employee': [
+            {'name': 'HR-EMP-00001', 'employee_name': 'Mitchell Huru'}]})
+        rule = self._rule(party_type='Employee',
+                          offset_account='Grower Payable - T',
+                          party_name='Mitchell Huru')
+        row = self._txn(tid='t-force-emp', amount=75.0)
+
         line = self._party_line(self._je_for(
             erp, categorization.generate_journal_entry(erp, row, rule=rule)))
 
-        self.assertEqual(line['party_type'], 'Customer')
-        self.assertIn('Odd Co', erp.created['Customer'])
+        self.assertIsNotNone(line, 'a Payable offset must carry the party')
+        self.assertEqual(line['party_type'], 'Employee')
+        # The DOCNAME, not the typed name — Employee is autonamed by series.
+        self.assertEqual(line['party'], 'HR-EMP-00001')
 
-    def test_supplier_forced_even_on_an_income_offset(self):
+    def test_an_employee_that_does_not_exist_is_never_created(self):
+        """An Employee needs date_of_birth, date_of_joining and gender, none of
+        which Bank Bridge has. Fabricating them into an HR record that payroll
+        reads is worse than booking no party, so the party is declined."""
         erp = _erp()
-        rule = self._rule(party_type='Supplier',
-                          offset_account='Fruit Sales - T',
-                          party_name='Rebate Co')
-        row = self._txn(tid='t-force-s', amount=-75.0)
+        rule = self._rule(party_type='Employee',
+                          offset_account='Grower Payable - T',
+                          party_name='Nobody At All')
+        row = self._txn(tid='t-force-emp2', amount=75.0)
 
-        line = self._party_line(self._je_for(
-            erp, categorization.generate_journal_entry(erp, row, rule=rule)))
+        je = self._je_for(
+            erp, categorization.generate_journal_entry(erp, row, rule=rule))
 
-        self.assertEqual(line['party_type'], 'Supplier')
-        self.assertIn('Rebate Co', erp.created['Supplier'])
+        self.assertIsNone(self._party_line(je))
+        self.assertEqual(erp.created.get('Employee', {}), {})
 
     def test_party_type_none_omits_the_party(self):
         """'— none —' (NULL) has meant "no party" since v0.3.0 and still does."""
@@ -433,14 +472,28 @@ class BackfillCustomerRecords(Base):
     """Fix E — the cleanup script for JEs already booked the wrong way."""
 
     def _posted(self, erp, tid, rule, *, submitted=False):
-        """Generate a JE the pre-v0.4.0.8 way (Supplier on an Income offset) and
-        return its GeneratedJournalEntry."""
+        """A JE already on the books in the pre-v0.4.0.8 shape — a Supplier on an
+        Income offset — and its GeneratedJournalEntry.
+
+        v0.9.0 · the party is STAMPED ON after generation rather than produced by
+        it. The JE path now refuses to write a Supplier onto an 'Income Account'
+        offset (ERPNext throws on it at submit), so today's code cannot create the
+        very shape this backfill script exists to repair. That does not make the
+        script obsolete: a pre-v0.9.0 install has these documents on disk, and
+        reproducing that state directly is what keeps the repair under test.
+        `mismatches()` reads the party off the POSTED document, so stamping it
+        here is faithful to what it will actually find."""
         row = self._txn(tid=tid, amount=-500.0)
         gje = categorization.generate_journal_entry(erp, row, rule=rule)
-        if submitted:
-            erp.created['Journal Entry'][
-                gje.erpnext_journal_entry_name]['docstatus'] = 1
-            erp.docs[gje.erpnext_journal_entry_name]['docstatus'] = 1
+        name = gje.erpnext_journal_entry_name
+        offset = (rule.offset_account or '').strip()
+        for doc in (erp.created['Journal Entry'][name], erp.docs[name]):
+            for line in doc['accounts']:
+                if line.get('account') == offset:
+                    line['party_type'] = 'Supplier'
+                    line['party'] = rule.party_name or 'Valley Packing'
+            if submitted:
+                doc['docstatus'] = 1
         return gje
 
     def _legacy_rule(self, **kw):
@@ -529,10 +582,19 @@ class BackwardCompatibility(Base):
 
     def test_existing_supplier_rules_keep_working_unchanged(self):
         """A merchant rule (Uber, Starbucks) with a literal party_type of
-        Supplier behaves exactly as it did in v0.4.0.7."""
+        Supplier behaves exactly as it did in v0.4.0.7 — on an offset ERPNext
+        accepts a party on.
+
+        v0.9.0 moved the offset from 'Fuel Expense - T' to the Payable ledger.
+        That is not a weakening of the test: an 'Expense Account' offset never
+        actually worked end to end, because ERPNext throws on it at SUBMIT (see
+        test_an_explicit_side_is_refused_on_an_ineligible_offset). What this
+        test is for — a literal Supplier plus the merchant auto-create still
+        producing the same JE — is unchanged and now exercised on a shape that
+        posts AND submits."""
         erp = _erp()
         rule = self._rule(name='Uber', party_type='Supplier',
-                          offset_account='Fuel Expense - T', party_name=None)
+                          offset_account='Grower Payable - T', party_name=None)
         row = self._txn(tid='t-uber', merchant='UBER TRIP', amount=32.0)
 
         gje = categorization.generate_journal_entry(
@@ -542,6 +604,50 @@ class BackwardCompatibility(Base):
         self.assertEqual(line['party_type'], 'Supplier')
         self.assertEqual(line['party'], 'Uber')
         self.assertIn('Uber', erp.created['Supplier'])
+
+    def test_a_blank_account_type_offset_now_carries_a_party(self):
+        """v0.9.0 · the clause that unlocks most of this chart.
+
+        ERPNext's check is `if account_type and account_type not in (...)`, so an
+        Account with NO account_type set skips validation and takes any party.
+        29 of the live chart's ~60 leaf accounts are in exactly that state and
+        v0.4.0.9 refused every one of them."""
+        erp = _erp(chart_accounts=CHART + [
+            {'name': 'Untyped Expense - T', 'account_name': 'Untyped Expense',
+             'company': 'Testing', 'root_type': 'Expense'}])
+        rule = self._rule(name='Sorren', party_type='Supplier',
+                          offset_account='Untyped Expense - T',
+                          party_name='Sorren')
+        row = self._txn(tid='t-untyped', merchant='SORREN', amount=2030.0)
+
+        line = self._party_line(self._je_for(
+            erp, categorization.generate_journal_entry(erp, row, rule=rule)))
+
+        self.assertIsNotNone(line, 'a blank account_type must accept a party')
+        self.assertEqual(line['party_type'], 'Supplier')
+        self.assertEqual(line['party'], 'Sorren')
+
+    def test_an_equity_offset_carries_a_shareholder(self):
+        """The other missed clause: ERPNext allows a party on an Equity account,
+        which is what makes an owner draw attributable. On the live install this
+        is 12 already-submitted JE lines with an empty party."""
+        erp = _erp(chart_accounts=CHART + [
+            {'name': 'Member Distribution - T',
+             'account_name': 'Member Distribution', 'company': 'Testing',
+             'root_type': 'Equity', 'account_type': 'Equity'}])
+        rule = self._rule(name='Draw', party_type='Shareholder',
+                          offset_account='Member Distribution - T',
+                          party_name='Tim Polehn')
+        row = self._txn(tid='t-draw', amount=5000.0)
+
+        line = self._party_line(self._je_for(
+            erp, categorization.generate_journal_entry(erp, row, rule=rule)))
+
+        self.assertIsNotNone(line, 'an Equity offset must accept a party')
+        self.assertEqual(line['party_type'], 'Shareholder')
+        # A Shareholder IS mintable, and its docname is a naming-series id.
+        self.assertEqual(erp.created['Shareholder'][line['party']]['title'],
+                         'Tim Polehn')
 
     def test_a_rule_with_no_party_type_defaults_to_no_party(self):
         """Backward compat · the column has defaulted to NULL since v0.3.0 and
@@ -567,9 +673,19 @@ class BackwardCompatibility(Base):
         self.assertEqual(gje.state, 'blocked')
         self.assertIn('cross-Company', gje.error_message)
 
-    def test_party_types_are_the_four_the_editor_offers(self):
+    def test_party_types_are_the_six_the_editor_offers(self):
+        """v0.9.0 added Employee and Shareholder. Both are real ERPNext Party
+        Types on this install; '' and 'Auto' keep their v0.3.0/v0.4.0.8
+        meanings, and their POSITION in the tuple is irrelevant — the editor
+        renders from this list, so the only contract is membership."""
         self.assertEqual(categorization.PARTY_TYPES,
-                         ('', 'Supplier', 'Customer', 'Auto'))
+                         ('', 'Supplier', 'Customer', 'Employee',
+                          'Shareholder', 'Auto'))
+        # Only three of them may ever be created by Bank Bridge — an Employee
+        # needs a birth date we must not invent.
+        self.assertEqual(categorization.AUTO_CREATABLE_PARTY_TYPES,
+                         ('Supplier', 'Customer', 'Shareholder'))
+        self.assertNotIn('Employee', categorization.AUTO_CREATABLE_PARTY_TYPES)
 
 
 if __name__ == '__main__':

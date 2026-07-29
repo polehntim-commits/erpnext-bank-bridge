@@ -46,6 +46,29 @@ log = logging.getLogger('bankbridge.erpnext')
 DOCTYPE = 'Bank Transaction'
 SUPPLIER_DT = 'Supplier'
 CUSTOMER_DT = 'Customer'
+# v0.9.0 · the two party types Sprint 5 added. They behave differently enough
+# from Supplier/Customer to be worth naming here:
+#
+#   * both are autonamed `naming_series:`, so a docname is 'HR-EMP-00001', NOT
+#     the person's name. Every lookup is therefore by TITLE FIELD and every
+#     return value is the series docname — which is what a JE line needs.
+#   * Shareholder's only mandatory fields are `company` and `title`, so one can
+#     be minted. Employee's are date_of_birth, date_of_joining, gender,
+#     first_name and status — so one CANNOT, and this module never tries. See
+#     categorization.AUTO_CREATABLE_PARTY_TYPES.
+SHAREHOLDER_DT = 'Shareholder'
+EMPLOYEE_DT = 'Employee'
+# The party types whose DOCNAME is a naming-series id rather than the party's
+# own name. Only these accept a docname in the "party name" field — see
+# find_party_by_title.
+SERIES_NAMED_PARTY_TYPES = (SHAREHOLDER_DT, EMPLOYEE_DT)
+# doctype → the field holding the human name, for a by-name lookup.
+PARTY_TITLE_FIELDS = {
+    SUPPLIER_DT: 'supplier_name',
+    CUSTOMER_DT: 'customer_name',
+    SHAREHOLDER_DT: 'title',
+    EMPLOYEE_DT: 'employee_name',
+}
 
 
 def _now() -> datetime:
@@ -918,7 +941,8 @@ def is_dual_role_party(party_name: str, *, source: str = '') -> bool:
 
 
 def ensure_party(client: ERPNextClient | None, party_name: str,
-                 party_type: str, *, source: str = '') -> str | None:
+                 party_type: str, *, source: str = '',
+                 company: str = '') -> str | None:
     """Find-or-create the ERPNext party of `party_type` for `party_name` and
     return its docname — the single entry point the JE path uses (v0.4.0.8).
 
@@ -928,10 +952,23 @@ def ensure_party(client: ERPNextClient | None, party_name: str,
     records already in place is what keeps that second JE from failing. The
     counterpart create can never fail this call — its exceptions are swallowed
     and logged, because the party we were actually asked for is what the JE
-    needs to post."""
+    needs to post.
+
+    v0.9.0 · Shareholder and Employee are handled too, and asymmetrically —
+    see find_party_by_title / ensure_shareholder. An Employee is only ever
+    LOOKED UP; returning None for one that doesn't exist is the correct answer,
+    not a failure, and the caller records it for review."""
     name = (party_name or '').strip()
     ptype = (party_type or '').strip()
-    if not name or ptype not in (SUPPLIER_DT, CUSTOMER_DT):
+    if not name:
+        return None
+    if ptype == EMPLOYEE_DT:
+        # Lookup only, never a create. An Employee needs a birth date and a
+        # joining date we do not have and must not invent.
+        return find_party_by_title(client, EMPLOYEE_DT, name)
+    if ptype == SHAREHOLDER_DT:
+        return ensure_shareholder(client, name, source=source, company=company)
+    if ptype not in (SUPPLIER_DT, CUSTOMER_DT):
         return None
     primary = (ensure_customer(client, name, source=source)
                if ptype == CUSTOMER_DT
@@ -946,6 +983,138 @@ def ensure_party(client: ERPNextClient | None, party_name: str,
             log.warning('dual-role counterpart for %r (%s) failed', name, ptype,
                         exc_info=True)
     return primary
+
+
+# ── v0.9.0 · Shareholder / Employee, whose docname is not their name ────────
+
+def find_party_by_title(client: ERPNextClient | None, doctype: str,
+                        party_name: str) -> str | None:
+    """The docname of an existing party of `doctype` whose human name is
+    `party_name`, or None (v0.9.0).
+
+    Necessary because Shareholder and Employee are autonamed `naming_series:` —
+    their docname is 'HR-EMP-00001', not 'Tim Polehn' — so a JE line needs the
+    series id while an operator only ever types the name.
+
+    The lookup is by TITLE FIELD (PARTY_TITLE_FIELDS). The docname is tried as a
+    fallback ONLY for the series-named doctypes, where an operator may reasonably
+    paste 'HR-EMP-00001' itself. It is deliberately NOT tried for Supplier or
+    Customer: those name themselves after the party, so the title lookup is
+    already exhaustive, and a second query adds nothing but the risk of matching
+    something else.
+
+    Never raises: an unreachable ERPNext yields None, which the caller treats as
+    "no such party" and records rather than acting on."""
+    name = (party_name or '').strip()
+    if not name or client is None:
+        return None
+    title_field = PARTY_TITLE_FIELDS.get(doctype)
+    attempts = []
+    if title_field:
+        attempts.append([[title_field, '=', name]])
+    if doctype in SERIES_NAMED_PARTY_TYPES:
+        attempts.append([['name', '=', name]])
+    for filters in attempts:
+        try:
+            rows = client.list_docs(doctype, filters=filters, fields=['name'],
+                                    limit_page_length=1)
+        except (ERPNextAPIError, ERPNextError):
+            return None
+        if rows:
+            return (rows[0].get('name') or '').strip() or None
+    return None
+
+
+def ensure_shareholder(client: ERPNextClient | None, party_name: str, *,
+                       source: str = '', company: str = '') -> str | None:
+    """Find-or-create the ERPNext Shareholder for a party name, returning its
+    docname (v0.9.0).
+
+    Mintable — unlike Employee — because the DocType's only mandatory fields are
+    `company` and `title`, both of which we have. It exists so an owner draw
+    booked to an Equity account can name WHO drew: ERPNext accepts a party on an
+    Equity account (see categorization.PARTY_ELIGIBLE_ACCOUNT_TYPES) and
+    Shareholder is the party type that belongs there.
+
+    `company` is the Company the record is filed under. It comes from the CALLER
+    — the Company the Journal Entry books to — rather than being read off the
+    global default, because on a multi-entity install those differ and a
+    shareholder of one entity is not a shareholder of another. It falls back to
+    the configured default only when the caller has none.
+
+    The returned docname is a naming-series id, not the title — see
+    find_party_by_title. Returns None on any ERPNext trouble rather than raising,
+    so a JE falls back to no party instead of failing."""
+    name = (party_name or '').strip()
+    if not name or client is None:
+        return None
+    existing = find_party_by_title(client, SHAREHOLDER_DT, name)
+    if existing:
+        _supplier_log('erpnext_shareholder_auto_create', 'success',
+                      f'matched existing Shareholder {existing} for {name!r}')
+        return existing
+    company = (company or '').strip()
+    if not company:
+        from . import erpnext_settings
+        company = (erpnext_settings.load().get('default_company') or '').strip()
+    if not company:
+        # `company` is mandatory on the DocType; without one there is nothing to
+        # create, and guessing a Company would file the shareholder under the
+        # wrong entity.
+        log.info('cannot create Shareholder %r — no default Company set', name)
+        return None
+    try:
+        created = client.create_doc(SHAREHOLDER_DT,
+                                   {'title': name, 'company': company})
+    except (ERPNextAPIError, ERPNextError):
+        log.warning('could not create Shareholder %r', name, exc_info=True)
+        return None
+    docname = ((created or {}).get('name') or '').strip() or None
+    if docname:
+        _supplier_log('erpnext_shareholder_auto_create', 'success',
+                      f'created Shareholder {docname} for {name!r} '
+                      f'(source: {source or "unknown"})')
+    return docname
+
+
+def search_parties(client: ERPNextClient | None, party_type: str,
+                   query: str = '', limit: int = 20) -> list:
+    """Parties of `party_type` whose name matches `query` — [{'name', 'label'}],
+    best-first (v0.9.0).
+
+    QUERIED LIVE, NEVER CACHED, and that is the requirement rather than an
+    implementation detail: the rule form's Party field is data driven from
+    ERPNext's own state, so a Supplier created a minute ago in ERPNext must be
+    selectable a minute later here. A cached party list is a list that is wrong
+    the moment someone else edits the chart.
+
+    `name` is the DOCNAME (what a JE line stores) and `label` is the human name
+    (what the operator reads) — the two differ for Shareholder and Employee.
+    Returns [] on any ERPNext trouble: an autocomplete that cannot reach ERPNext
+    offers nothing, and the operator can still type a name by hand."""
+    ptype = (party_type or '').strip()
+    title_field = PARTY_TITLE_FIELDS.get(ptype)
+    if not title_field or client is None:
+        return []
+    needle = (query or '').strip()
+    filters = [[title_field, 'like', f'%{needle}%']] if needle else []
+    try:
+        rows = client.list_docs(ptype, filters=filters,
+                                fields=['name', title_field],
+                                limit_page_length=max(1, min(int(limit or 20), 50)),
+                                order_by=f'{title_field} asc')
+    except (ERPNextAPIError, ERPNextError):
+        return []
+    out = []
+    for row in (rows or []):
+        if not isinstance(row, dict):
+            continue
+        docname = (row.get('name') or '').strip()
+        if not docname:
+            continue
+        out.append({'name': docname,
+                    'label': (row.get(title_field) or '').strip() or docname})
+    return out
 
 
 def account_types_for_account(client: ERPNextClient | None, account: str,

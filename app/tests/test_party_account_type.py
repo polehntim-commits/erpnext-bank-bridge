@@ -132,20 +132,59 @@ class AutoModeConsultsAccountType(Base):
                 _erp(), 'Grower Payable - T', 'Testing'), 'Supplier')
 
     def test_matrix_is_exhaustive_about_what_it_refuses(self):
-        """Every pair outside the two party-legal ones books no party — an
-        undeterminable type included, since guessing is what caused the bug."""
+        """What books a party and what does not, per ERPNext's ACTUAL rule.
+
+        v0.9.0 rewrote this expectation, because v0.4.0.9's two-entry matrix was
+        narrower than ERPNext. The refusal lives in
+        `erpnext/accounts/party.py::validate_account_party_type`:
+
+            if account_type and (account_type not in
+                                 ["Receivable", "Payable", "Equity"]): throw
+
+        so EQUITY is legal and a BLANK account_type skips the check entirely.
+        Both were being refused here for no reason ERPNext ever gave."""
         f = categorization.party_type_for_account_types
+        # Eligible account_types, each deriving its own side.
         self.assertEqual(f('Income', 'Receivable'), 'Customer')
         self.assertEqual(f('Expense', 'Payable'), 'Supplier')
+        self.assertEqual(f('Equity', 'Equity'), 'Shareholder')
+        # A BLANK account_type is eligible (ERPNext validates nothing), so the
+        # side falls back to root_type — the only signal there is.
+        self.assertEqual(f('Income', ''), 'Customer')
+        self.assertEqual(f('Expense', ''), 'Supplier')
+        self.assertEqual(f('Equity', ''), 'Shareholder')
+        # Explicitly-typed, non-eligible accounts still book NO party: these are
+        # the ones ERPNext throws on at submit.
         for root, acct in (('Income', 'Income Account'),
-                           ('Income', 'Payable'),
                            ('Expense', 'Expense Account'),
-                           ('Expense', 'Receivable'),
-                           ('Asset', 'Bank'), ('Asset', 'Receivable'),
-                           ('Liability', 'Payable'), ('Equity', ''),
-                           ('', ''), ('Income', '')):
+                           ('Asset', 'Bank'), ('Asset', 'Cash'),
+                           ('Expense', 'Tax')):
             self.assertEqual(f(root, acct), '',
                              f'({root!r}, {acct!r}) must book no party')
+        # Nothing knowable at all → no party. Guessing is what caused the bug.
+        for root, acct in (('', ''), ('Asset', ''), ('Liability', '')):
+            self.assertEqual(f(root, acct), '',
+                             f'({root!r}, {acct!r}) must book no party')
+
+    def test_equity_and_blank_account_types_are_party_eligible(self):
+        """The two clauses v0.4.0.9 missed, as a direct predicate test. On the
+        live chart these are 12 Equity JE lines and 29 blank-account_type
+        accounts that were being denied a party ERPNext would have accepted."""
+        allowed = categorization.party_allowed_on_account_type
+        self.assertTrue(allowed('Equity', 'Shareholder'))
+        self.assertTrue(allowed('', 'Supplier'))
+        self.assertTrue(allowed('Receivable', 'Customer'))
+        self.assertTrue(allowed('Payable', 'Supplier'))
+        # Employee is exempted from the type-match check by ERPNext itself
+        # ("since they can be both payable and receivable").
+        self.assertTrue(allowed('Receivable', 'Employee'))
+        self.assertTrue(allowed('Payable', 'Employee'))
+        # A mismatched side on a Receivable/Payable account is still refused.
+        self.assertFalse(allowed('Receivable', 'Supplier'))
+        self.assertFalse(allowed('Payable', 'Customer'))
+        # And an explicitly non-eligible account_type refuses everything.
+        for acct in ('Expense Account', 'Income Account', 'Bank', 'Cash'):
+            self.assertFalse(allowed(acct, 'Supplier'), acct)
 
     def test_account_type_comes_from_the_same_fetch_as_root_type(self):
         """The refinement must not cost an extra ERPNext round-trip — both

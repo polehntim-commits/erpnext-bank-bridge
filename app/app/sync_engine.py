@@ -1332,9 +1332,25 @@ def run_sync(*, account_id: str = '', include_investments: bool = True,
     if erp_client is not None:
         from . import draft_health as draft_health_mod
         draft_health = draft_health_mod.observe_quietly(erp_client)
+    # v0.9.0 · the SECOND kairotic observation, and the same split applies. This
+    # one asks whether the activity the STATEMENTS report matches what actually
+    # reached the ledger, per category — the drift the draft-count reading and
+    # the Bank-Transaction dedup both miss (see app/statement_recon.py).
+    #
+    # It runs here, after draft health, because a sync is what makes its three
+    # state conditions true at once: a new statement may have arrived, its
+    # anchor may have just been rebuilt, and the period's Journal Entries have
+    # just been written. `observe_quietly` gates on that state itself and fires
+    # only on a finding that is NEW or has CHANGED verdict, so a sync every ten
+    # minutes does not produce an alert every ten minutes. Never raises.
+    statement_recon = None
+    if erp_client is not None:
+        from . import statement_recon as statement_recon_mod
+        statement_recon = statement_recon_mod.observe_quietly(erp_client)
     return _finish(started, account_id, include_investments, summaries,
                    item_results, errors, len(items), pairs=pairs,
-                   draft_health=draft_health, notices=notices)
+                   draft_health=draft_health, notices=notices,
+                   statement_recon=statement_recon)
 
 
 def _attribute(summaries: dict, res: dict, item: PlaidItem,
@@ -1421,13 +1437,19 @@ def _dedupe(entries: list) -> list:
 def _finish(started: float, account_id: str, include_investments: bool,
             summaries, item_results: list, errors: list, item_count: int,
             pairs: dict = None, draft_health: dict = None,
-            notices: list = None) -> dict:
+            notices: list = None, statement_recon: dict = None) -> dict:
     """Assemble the result: per-account rows, totals, status, elapsed.
 
     `draft_health` (v0.8.5) is the post-sync draft-JE reading, or None when the
     run had no ERPNext client (an early return) or the ledger could not be read.
     It rides the result rather than only the log because the operator's next
-    question after "what did this sync do?" is "and what is the queue now?"."""
+    question after "what did this sync do?" is "and what is the queue now?".
+
+    `statement_recon` (v0.9.0) is the companion reading for the other question —
+    "and does what we booked still match the statements?" — summarized to its
+    counts here rather than carried whole, because the full row set is a report
+    an operator reads on /admin/statement_recon, not something a sync summary
+    should inline."""
     rows = [r if isinstance(r, dict) and 'transactions_fetched' in r
             else _account_summary(r) for r in summaries.values()]
     totals = {
@@ -1472,6 +1494,15 @@ def _finish(started: float, account_id: str, include_investments: bool,
               'items': item_count, 'accounts': rows, 'totals': totals,
               'errors': errors, 'notices': _dedupe(notices or []),
               'draft_health': draft_health,
+              # Counts only — see the docstring. None when the comparison could
+              # not be made, which is distinct from "made, and everything
+              # matched" (findings: 0).
+              'statement_recon': (None if statement_recon is None else {
+                  'rows': len(statement_recon.get('rows') or []),
+                  'findings': len(statement_recon.get('findings') or []),
+                  'fired': len(statement_recon.get('fired') or []),
+                  'status': statement_recon.get('status', 'ok'),
+                  'headline': statement_recon.get('headline', '')}),
               'elapsed_seconds': round(time.monotonic() - started, 3)}
     audit.record('sync_run_completed', subject_type=None,
                  after={**totals, 'status': status, 'items': item_count},

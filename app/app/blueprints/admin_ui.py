@@ -44,6 +44,7 @@ from .. import counterparty
 from .. import crypto
 from .. import db
 from .. import draft_health
+from .. import statement_recon
 from .. import erpnext_accounts
 from .. import erpnext_bank
 from .. import erpnext_settings as erps
@@ -175,6 +176,7 @@ NAV_HTML = """
   <a href="/admin/counterparties" class="{{ 'active' if page == 'counterparties' else '' }}">Counterparties</a>
   <a href="/admin/generated_entries" class="{{ 'active' if page == 'generated_entries' else '' }}">Generated JEs</a>
   <a href="/admin/draft_health.html" class="{{ 'active' if page == 'draft_health' else '' }}">Draft Health</a>
+  <a href="/admin/statement_recon.html" class="{{ 'active' if page == 'statement_recon' else '' }}">Statement Recon</a>
   <a href="/admin/intercompany" class="{{ 'active' if page == 'intercompany' else '' }}">Intercompany</a>
   <a href="/admin/statements" class="{{ 'active' if page == 'statements' else '' }}">Statements</a>
   <a href="/admin/reconciliation" class="{{ 'active' if page == 'reconciliation' else '' }}">Reconciliation</a>
@@ -2654,6 +2656,56 @@ def refresh_accounts_api():
                     'company': '', 'mode': 'logical'})
 
 
+def _tristate(raw):
+    """A form value that must round-trip as True / False / None (v0.9.0).
+
+    '' and a missing key mean None — "inherit", not "off". Anything that reads as
+    a positive ('1', 'true', 'yes', 'on') is True; anything else present is
+    False. Used for `auto_create_party`, where collapsing None into False would
+    silently disable party creation on every rule an operator saves."""
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if not text:
+        return None
+    return text in ('1', 'true', 'yes', 'on')
+
+
+@bp.get('/api/rules/party_search')
+def party_search_api():
+    """Live party autocomplete for the Rules editor (v0.9.0).
+
+    QUERIED FROM ERPNEXT ON EVERY KEYSTROKE-BATCH, NEVER CACHED. That is the
+    requirement, not an implementation detail: the party list is ERPNext's state,
+    and a cached copy is wrong the moment anyone edits it there. The cost is one
+    small filtered list_docs per lookup, which is what the ERPNext UI itself does
+    for a Link field.
+
+    Emits `name` (the DOCNAME a Journal Entry line stores) alongside `label` (the
+    human name), because for Employee and Shareholder those differ — both are
+    autonamed by series, so 'HR-EMP-00001' is what the JE needs and 'Mitchell
+    Huru' is what the operator recognises.
+
+    Returns an empty list rather than an error when ERPNext is unreachable: the
+    field stays a free-text input, so an operator can always type a name."""
+    party_type = (request.args.get('party_type') or '').strip()
+    query = (request.args.get('q') or '').strip()
+    if party_type.lower() == 'auto' or not party_type:
+        # 'Auto' resolves per transaction, so there is no single doctype to
+        # search. Not an error — just nothing to suggest.
+        return jsonify({'party_type': party_type, 'parties': []})
+    try:
+        client = erpnext_bank.get_client()
+    except Exception:  # noqa: BLE001 — an unconfigured ERPNext suggests nothing
+        return jsonify({'party_type': party_type, 'parties': []})
+    return jsonify({
+        'party_type': party_type,
+        'parties': erpnext_bank.search_parties(client, party_type, query),
+        # Surfaced so the editor can say "will be created" vs "must exist".
+        'creatable': party_type in categorization.AUTO_CREATABLE_PARTY_TYPES,
+    })
+
+
 @bp.get('/api/rules/skip_party_suggestion')
 def skip_party_suggestion_api():
     """Transfer-detection for the Rules editor (v0.4.0.7): does `?offset_account=`
@@ -2885,17 +2937,32 @@ RULES_BODY = """
   <div style="display:flex;gap:12px;flex-wrap:wrap">
     <label style="flex:1;min-width:150px">Party type
       <select name="party_type" id="party-type"
-              title="Which side of the ledger the counterparty sits on. Auto decides per transaction from the offset account: a Receivable account books a Customer, a Payable one books a Supplier, anything else books no party.">
+              title="Which side of the ledger the counterparty sits on. Auto decides per transaction from the offset account: Receivable books a Customer, Payable a Supplier, Equity a Shareholder, and an account with no type set follows its root type.">
         {# A NEW rule (no party_type key at all) defaults to Auto; an EXISTING
            rule always shows what it stored, so a saved "— none —" stays none. #}
         <option value="Auto" {{ 'selected' if (form.party_type or '')|lower == 'auto' or 'party_type' not in form else '' }}>Auto (from offset account)</option>
         <option value="" {{ 'selected' if 'party_type' in form and not form.party_type else '' }}>— none —</option>
         <option value="Supplier" {{ 'selected' if form.party_type == 'Supplier' else '' }}>Supplier</option>
         <option value="Customer" {{ 'selected' if form.party_type == 'Customer' else '' }}>Customer</option>
+        <option value="Employee" {{ 'selected' if form.party_type == 'Employee' else '' }}>Employee</option>
+        <option value="Shareholder" {{ 'selected' if form.party_type == 'Shareholder' else '' }}>Shareholder</option>
       </select>
     </label>
-    <label style="flex:2;min-width:200px">Party name <span style="font-weight:400;color:#888">(blank → auto-created for the merchant, payroll processor, or bank)</span>
-      <input name="party_name" value="{{ form.party_name or '' }}" placeholder="(optional)">
+    <label style="flex:2;min-width:200px;position:relative">Party name <span style="font-weight:400;color:#888">(blank → auto-created for the merchant, payroll processor, or bank)</span>
+      {# v0.9.0 · autocompleted LIVE from ERPNext (/api/rules/party_search), never
+         from a cached list — a Supplier created in ERPNext a minute ago has to be
+         selectable here now.
+
+         On the shared BankBridgeDropdown, NOT a native <datalist>: v0.3.4 moved
+         the offset-account field off one because Safari collapsed the list
+         mid-type (non-matching chars, deletes, arrow keys), and re-introducing
+         one here would re-introduce that bug on a field an operator types
+         partial names into constantly. It stays a plain text input either way,
+         so a party ERPNext does not have yet can be typed and — for the
+         creatable party types — minted on first fire. #}
+      <input name="party_name" id="party-name" autocomplete="off"
+             value="{{ form.party_name or '' }}" placeholder="(optional)">
+      <div id="pn-dd" style="display:none;position:absolute;left:0;right:0;z-index:20;background:#fff;border:1px solid #ccc;border-top:none;border-radius:0 0 4px 4px;max-height:240px;overflow:auto;box-shadow:0 4px 12px rgba(0,0,0,.12)"></div>
     </label>
   </div>
   <!-- v0.4.0.8 · sell-side support. The live hint is swapped by JS as the
@@ -2903,13 +2970,33 @@ RULES_BODY = """
   <p id="party-type-hint" style="font-size:12px;color:#888;margin:-4px 0 6px">
     <b>Auto</b> reads the offset account each time the rule fires — a
     <b>Receivable</b> account books a <b>Customer</b>, a <b>Payable</b> account
-    books a <b>Supplier</b>, and everything else books <b>no party</b>. That
-    includes ordinary Income and Expense accounts: ERPNext only allows a Party
-    on a Receivable or Payable account, and refuses to submit a Journal Entry
-    that breaks the rule. Pick <b>Supplier</b> or <b>Customer</b> to force one
-    side where the account allows it. Banks and brokerages get BOTH records
+    books a <b>Supplier</b>, an <b>Equity</b> account books a
+    <b>Shareholder</b>, and an account with <b>no account type set</b> follows
+    its root type. ERPNext only permits a Party on those, so an account
+    explicitly typed <b>Expense Account</b> or <b>Income Account</b> books
+    <b>no party</b> — it would refuse to submit the entry. Pick a side to force
+    one where the account allows it. Banks and brokerages get BOTH records
     created, since they bill you and pay you.
   </p>
+  <!-- v0.9.0 · per-rule party creation. TRI-STATE: the default "Inherit" is
+       NULL, which is what every pre-v0.9.0 rule holds, so nothing changes for
+       existing rules. -->
+  <div style="margin:2px 0 8px">
+    <label style="font-weight:400">Create the party if ERPNext hasn't got one
+      <select name="auto_create_party" style="width:auto;margin-left:6px"
+              title="Employee is never created — ERPNext requires a birth date and joining date Bank Bridge does not have. Supplier, Customer and Shareholder are.">
+        <option value="" {{ 'selected' if form.get('auto_create_party') in (None, '') else '' }}>Inherit the global setting</option>
+        <option value="1" {{ 'selected' if form.get('auto_create_party') in (True, '1', 1) else '' }}>Yes — create it</option>
+        <option value="0" {{ 'selected' if form.get('auto_create_party') in (False, '0', 0) else '' }}>No — only match existing</option>
+      </select>
+    </label>
+    <span style="display:block;font-size:11px;color:#888;margin:2px 0 0 0">
+      Supplier, Customer and Shareholder records can be created. An
+      <b>Employee</b> never is — ERPNext requires a date of birth and joining
+      date, and inventing those into an HR record is worse than booking no
+      party. Name an Employee that already exists.
+    </span>
+  </div>
   <!-- v0.4.0.7 · pre-checked by JS when the offset resolves to another Bank
        Account of the same Company (/api/rules/skip_party_suggestion). -->
   <div style="margin:2px 0 8px">
@@ -3195,6 +3282,68 @@ RULES_BODY = """
           : '<span style="color:#999">Preview: (empty description)</span>';
       }).catch(function () { dtPreview.textContent = ''; });
   }
+
+  // v0.9.0 · live party autocomplete, on the SHARED dropdown rather than a
+  // native datalist — same reason the offset-account field moved off one in
+  // v0.3.4 (Safari collapsed the list mid-type).
+  //
+  // Queried from ERPNext on each debounced change of the Party type or the
+  // typed name; never a cached list, so a Supplier created in ERPNext moments
+  // ago is selectable here. The input stays free text, which is what lets an
+  // operator name a party that does not exist yet and have it minted on first
+  // fire.
+  var partyName = document.getElementById('party-name');
+  var partyType = document.getElementById('party-type');
+  var partyDD = document.getElementById('pn-dd');
+  // The current suggestions. The dropdown reads this synchronously via
+  // getOptions, so the fetch fills it and then asks the menu to redraw.
+  var parties = [];
+  var partyDropdown = null;
+  var partyTimer = null;
+  if (partyName && partyDD) {
+    partyDropdown = BankBridgeDropdown.createDropdown({
+      input: partyName,
+      menu: partyDD,
+      getOptions: function () { return parties; },
+      // The LABEL is what an operator means to type; the server resolves it to
+      // a docname when the rule fires. For Shareholder and Employee the two
+      // differ, so the row shows both.
+      getLabel: function (p) { return p == null ? '' : String(p.label || ''); },
+      renderRow: function (p) {
+        return esc(p.label) + (p.name !== p.label
+          ? ' <span style="color:#888;font-size:11px">' + esc(p.name) + '</span>'
+          : '');
+      },
+      onInput: function () { refreshPartyOptions(); },
+      emptyRow: function (q) {
+        var t = (q || '').trim();
+        if (!t) return null;
+        return 'No matches — press <b>Enter</b> to use “' + esc(t) + '” as new';
+      }
+    });
+  }
+  function refreshPartyOptions() {
+    if (!partyName || !partyType) return;
+    if (partyTimer) clearTimeout(partyTimer);
+    partyTimer = setTimeout(doFetchPartyOptions, 250);
+  }
+  function doFetchPartyOptions() {
+    var pt = partyType.value || '';
+    if (!pt || pt.toLowerCase() === 'auto') { parties = []; return; }
+    fetch('/api/rules/party_search?party_type=' + encodeURIComponent(pt) +
+          '&q=' + encodeURIComponent(partyName.value || ''))
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        parties = (res && res.parties) || [];
+        // Redraw only while the field has focus, so a background refresh never
+        // pops a menu open under the operator's cursor elsewhere on the form.
+        if (partyDropdown && document.activeElement === partyName) {
+          partyDropdown.refresh();
+        }
+      }).catch(function () { parties = []; });
+  }
+  if (partyType) { partyType.addEventListener('change', refreshPartyOptions); }
+  refreshPartyOptions();
 
   // v0.4.0.7 · transfer detection. When the chosen offset is another Bank
   // Account of the same Company the rule books a transfer, which has no
@@ -3748,6 +3897,12 @@ def _rule_form_values():
         'credit_account': (request.form.get('credit_account') or '').strip(),
         'party_type': party_type,
         'party_name': (request.form.get('party_name') or '').strip() or None,
+        # v0.9.0 · TRI-STATE, and it must stay tri-state through the form round
+        # trip: '' → None (inherit the global gate, what every pre-v0.9.0 rule
+        # holds), '1' → True, '0' → False. A plain bool() here would collapse
+        # "inherit" and "never" into the same value and quietly turn party
+        # creation off for every rule an operator edits.
+        'auto_create_party': _tristate(request.form.get('auto_create_party')),
         # v0.4.0.7 · the checkbox is authoritative — the transfer heuristic only
         # pre-checks it in the editor, it never overrides a saved choice.
         'skip_party': bool(request.form.get('skip_party')),
@@ -9293,3 +9448,140 @@ def draft_health_page():
                  min_samples=draft_health.MIN_SAMPLES_FOR_BASELINE,
                  debounce_minutes=round(
                      draft_health.MIN_SAMPLE_INTERVAL_SECONDS / 60))
+
+
+# ── v0.9.0 · statement-to-books reconciliation ──────────────────────────────
+
+STATEMENT_RECON_BODY = """
+<h2>Statement → books reconciliation</h2>
+<p style="color:#666;max-width:70em">
+  For every RECONCILED statement period, what the statement reports per
+  category against what Bank Bridge actually booked into ERPNext. This catches
+  what the other two guards cannot: the cash reconciliation asks whether Plaid
+  mirrored everything the bank saw, and the duplicate check catches an entry
+  written twice — neither notices a period that booked 24 of 26 dividends.
+</p>
+{% if error %}
+  <p class="pill pill-bad">{{ error }}</p>
+{% else %}
+<p>
+  <span class="pill {{ 'pill-bad' if rep.status == 'warn' else 'pill-good' }}">
+    {{ rep.headline }}</span>
+  &nbsp;·&nbsp; <a href="/admin/statement_recon">JSON</a>
+</p>
+{% if not rep.baseline_ready %}
+  <p style="font-size:12px;color:#888;max-width:70em">
+    Thresholds are still the {{ '%.1f'|format(default_pct * 100) }}% starting
+    default for at least one category — the alert line becomes the P95 of this
+    install's own history after {{ min_samples }} settled observations per
+    account and category. Until then every non-zero delta is flagged, which is
+    the honest direction: strict first, looser as evidence arrives.
+  </p>
+{% endif %}
+<table>
+  <tr><th>Account</th><th>Period</th><th>Category</th>
+      <th style="text-align:right">Statement</th>
+      <th style="text-align:right">Booked</th>
+      <th style="text-align:right">Drafts</th>
+      <th style="text-align:right">Delta</th>
+      <th style="text-align:right">Δ%</th>
+      <th>Status</th><th>Why</th></tr>
+  {% for r in rep.rows %}
+  <tr{% if r.status != 'matched' %} style="background:#fff6f6"{% endif %}>
+    <td style="font-size:12px">••{{ r.account_mask }}</td>
+    <td style="font-size:12px">{{ r.period }}</td>
+    <td>{{ r.category_label }}</td>
+    <td style="text-align:right">
+      {{ '—' if r.statement_amount is none else '{:,.2f}'.format(r.statement_amount) }}</td>
+    <td style="text-align:right">{{ '{:,.2f}'.format(r.booked_amount) }}</td>
+    <td style="text-align:right;color:#888">
+      {{ '{:,.2f}'.format(r.booked_draft_amount) if r.booked_draft_amount else '' }}</td>
+    <td style="text-align:right">{{ '{:,.2f}'.format(r.delta) }}</td>
+    <td style="text-align:right">
+      {{ '—' if r.delta_pct is none else '{:.1%}'.format(r.delta_pct) }}</td>
+    <td><span class="pill {{ 'pill-good' if r.status == 'matched'
+              else 'pill-bad' }}">{{ r.status }}</span></td>
+    <td style="font-size:11px;color:#666">{{ r.reason_detail or r.note }}</td>
+  </tr>
+  {% endfor %}
+  {% if not rep.rows %}
+  <tr><td colspan="10" style="color:#888">
+    No reconciled statement periods to compare yet. Anchor some statements
+    first (Reconciliation → Rebuild statement anchors).</td></tr>
+  {% endif %}
+</table>
+<p style="font-size:12px;color:#888;max-width:70em">
+  <b>Categories are not additive.</b> They come from three different blocks of
+  the statement that overlap on purpose — dividends and interest both sit inside
+  the cash-flow summary's income line, and deposits/withdrawals come from the
+  progress summary. Summing a column will not give you the period's cash
+  movement; that identity is the reconciliation chain's job and it already
+  holds. Each row is an independent probe. Amounts are compared as
+  <b>magnitudes</b>: statement figures carry the bank's own signs while a
+  Journal Entry's direction lives in which line it sits on, and the question
+  here is whether the same amount of activity is in both places.
+</p>
+{% if rep.skipped %}
+<h3>Periods not compared ({{ rep.skipped|length }})</h3>
+<p style="font-size:12px;color:#888">
+  Listed rather than omitted — a month missing without explanation reads as a
+  month that is fine.
+</p>
+<table>
+  <tr><th>Account</th><th>Period</th><th>Reason</th></tr>
+  {% for s in rep.skipped %}
+  <tr><td style="font-size:12px">••{{ s.account_mask }}</td>
+      <td style="font-size:12px">{{ s.period }}</td>
+      <td style="font-size:12px;color:#666">{{ s.detail }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endif %}
+"""
+
+
+def _statement_recon_report(account_id: str = ''):
+    """(report, error). Never raises — a diagnostic page that 500s on an
+    unreachable ERPNext tells the operator less than one that says so.
+
+    Calls `observe`, not `report`: the read IS the kairotic trigger, and it is
+    safe to make it one because `observe` fires only on a finding that is new or
+    has changed verdict. Loading this page twice cannot raise two alerts."""
+    client = sync_engine.get_erp_client_or_none()
+    if client is None:
+        return None, ('ERPNext is not configured — set the connection on the '
+                      'ERPNext settings page first.')
+    try:
+        return statement_recon.observe(client, account_id), None
+    except (ERPNextError, ERPNextConfigError) as e:
+        return None, str(e)
+    except Exception as e:  # noqa: BLE001 - a diagnostic page must not 500
+        db.session.rollback()
+        log.warning('statement recon read failed', exc_info=True)
+        return None, f'{type(e).__name__}: {e}'
+
+
+@bp.get('/admin/statement_recon')
+def statement_recon_json():
+    """The machine-readable report. Same call the MCP tool makes."""
+    rep, error = _statement_recon_report(
+        (request.args.get('account_id') or '').strip())
+    if error:
+        return jsonify({'ok': False, 'error': error}), 503
+    return jsonify({'ok': True, **rep})
+
+
+@bp.get('/admin/statement_recon.html')
+def statement_recon_page():
+    rep, error = _statement_recon_report(
+        (request.args.get('account_id') or '').strip())
+    # NOTE `rep` — not `report`. A context key named `report` would shadow
+    # nothing here, but `source`-style collisions with _page's own kwargs have
+    # 500'd this admin UI before; keeping page context names short and distinct
+    # is the cheap habit that avoids it.
+    return _page(STATEMENT_RECON_BODY, page='statement_recon',
+                 rep=(rep or {'rows': [], 'skipped': [], 'status': 'ok',
+                              'headline': '', 'baseline_ready': True}),
+                 error=error,
+                 default_pct=statement_recon.DEFAULT_THRESHOLD_PCT,
+                 min_samples=statement_recon.MIN_SAMPLES_FOR_BASELINE)

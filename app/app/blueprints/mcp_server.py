@@ -878,6 +878,13 @@ _RULE_UPDATABLE = {
     'priority': 'priority',
     'tag': 'bb_internal_tag',
     'applies_to_company': 'applies_to_company',
+    # v0.9.0 · the party fields. Without these an AI operator could set a rule's
+    # cost center but not who the money went to, which is the half of
+    # ACC-JV-2026-02312 that mattered — and closing it would have meant a human
+    # in the Rules editor for every one of them.
+    'party_type': 'party_type',
+    'party_name': 'party_name',
+    'auto_create_party': 'auto_create_party',
 }
 
 
@@ -930,6 +937,32 @@ def _update_rule(args: dict):
     if 'applies_to_company' in patch:
         patch['applies_to_company'] = (
             (patch['applies_to_company'] or '').strip() or None)
+    if 'party_type' in patch:
+        # Validated against the vocabulary, case-insensitively, because this
+        # value is handed to ERPNext AS A DOCTYPE — an unchecked 'supplier' or
+        # 'Vendor' would produce Journal Entries ERPNext refuses at submit, which
+        # is the v0.4.0.9 failure mode arriving through a new door. '' clears it.
+        declared = (patch['party_type'] or '').strip()
+        if declared:
+            match = {p.lower(): p for p in categorization.PARTY_TYPES
+                     if p}.get(declared.lower())
+            if match is None:
+                raise ToolError(
+                    f'unknown party_type {declared!r} — one of '
+                    + ', '.join(p or '(none)'
+                                for p in categorization.PARTY_TYPES))
+            declared = match
+        patch['party_type'] = declared or None
+    if 'party_name' in patch:
+        patch['party_name'] = (patch['party_name'] or '').strip() or None
+    if 'auto_create_party' in patch:
+        # TRI-STATE, and None must survive: it means "inherit the global gate",
+        # which is what every pre-v0.9.0 rule holds. bool() here would collapse
+        # inherit into never.
+        raw = patch['auto_create_party']
+        patch['auto_create_party'] = (
+            None if raw is None or (isinstance(raw, str) and not raw.strip())
+            else bool(raw))
     if 'cost_center' in patch:
         # Validated against the company the rule will have AFTER the patch, not
         # the one it had before — an update that re-scopes and re-costs a rule
@@ -1261,6 +1294,36 @@ def _get_draft_health(args: dict):
     return snap, snap['headline'] + (
         ' — ALERT: threshold crossed on this reading' if snap.get('crossed')
         else ' — recovered on this reading' if snap.get('recovered') else '')
+
+
+def _get_statement_recon_report(args: dict):
+    """Does what the STATEMENTS report match what Bank Bridge BOOKED, per
+    category and per reconciled period (v0.9.0)? Read-only, and never gated —
+    for the same reason get_draft_health isn't: reading a diagnostic cannot
+    change the books, and an AI operator who cannot see the drift is exactly the
+    operator the v0.8.4 incident had."""
+    from .. import statement_recon
+    client = _erp_client_or_error()
+    account_id = (args.get('account_id') or '').strip()
+    if not account_id and (args.get('account_mask') or '').strip():
+        # Raises a ToolError naming the mask when it doesn't resolve, which is a
+        # better answer than silently reporting on every account instead.
+        account_id = _account_by_mask(args.get('account_mask')).account_id
+    findings_only = bool(args.get('findings_only', False))
+    try:
+        rep = statement_recon.observe(client, account_id)
+    except (ERPNextAPIError, ERPNextError) as e:
+        # An error, not an empty report. A caller handed zero booked amounts by
+        # an unreadable ledger would conclude the books are empty.
+        raise ToolError(f'could not read the ledger for the comparison: {e}')
+    if findings_only:
+        rep = {**rep, 'rows': rep['findings']}
+    line = rep['headline']
+    if rep.get('fired'):
+        line += f" — {len(rep['fired'])} NEW finding(s) on this reading"
+    if rep.get('skipped'):
+        line += f" · {len(rep['skipped'])} period(s) not compared"
+    return rep, line
 
 
 def _post_clearing_cleanup_je(args: dict):
@@ -1718,10 +1781,18 @@ TOOLS = {
         **_tool(
             'Update one categorization rule, changing ONLY the fields you pass '
             '(name, match_type, match_value, offset_account, cost_center, '
-            'bank_cost_center, active, priority, tag, applies_to_company). '
+            'bank_cost_center, party_type, party_name, auto_create_party, '
+            'active, priority, tag, applies_to_company). '
             'Pass cost_center="" to clear it and hand BOTH JE legs back to '
             "ERPNext's own default; pass bank_cost_center=\"\" to restore the "
             'default of mirroring cost_center onto the bank leg. '
+            'party_type is Supplier / Customer / Employee / Shareholder / Auto, '
+            'or "" for no party; it rides the OFFSET leg only, because ERPNext '
+            'accepts a Party solely on an account whose account_type is '
+            'Receivable, Payable or Equity — or is not set at all — and a bank '
+            'line never qualifies. An offset ERPNext positively refuses books NO '
+            'party and logs why rather than producing an entry that cannot be '
+            'submitted. '
             'NON-DESTRUCTIVE: like an edit in the admin UI this writes a NEW '
             'rule version and archives the old one (returns the new id in '
             'updated_rule.id and the archived one in superseded_rule_id), so '
@@ -1744,6 +1815,21 @@ TOOLS = {
                  'description': 'Bank-leg override. "" restores the default '
                                 '(mirror cost_center). "(none)" leaves the '
                                 "bank leg to ERPNext's own default."},
+             'party_type': {
+                 'type': 'string',
+                 'description': 'Supplier | Customer | Employee | Shareholder '
+                                '| Auto, or "" for no party. Auto derives the '
+                                "side from the offset account's type."},
+             'party_name': {
+                 'type': 'string',
+                 'description': 'The party. "" clears it, which falls back to '
+                                "the transaction's merchant."},
+             'auto_create_party': {
+                 'type': 'boolean',
+                 'description': 'Create the party when ERPNext has none. Omit '
+                                'to inherit the global setting. An Employee is '
+                                'NEVER created (ERPNext requires a birth date '
+                                'and joining date) — it must already exist.'},
              'active': _BOOL, 'priority': {'type': 'integer'},
              'tag': _STR, 'applies_to_company': _STR},
             required=('rule_id',), mutating=True),
@@ -1940,6 +2026,37 @@ TOOLS = {
             'what-if.',
             {'company': _STR, 'threshold': {'type': 'integer'}}),
         'handler': _get_draft_health},
+    # ── v0.9.0 · statement-to-books drift ───────────────────────────────────
+    'get_statement_recon_report': {
+        **_tool(
+            'For every RECONCILED statement period, what the STATEMENT reports '
+            'per category (dividends, interest, buys, sells, fees, deposits, '
+            'withdrawals, mark-to-market) against what Bank Bridge actually '
+            'BOOKED into ERPNext, with the delta and a status of matched / '
+            'drifted / unexplained. USE THIS to answer "did we book everything '
+            'the statement says happened?" — a question neither of the other '
+            'two guards answers. get_reconciliation_status reconciles CASH '
+            '(whether Plaid mirrored what the bank saw) and is blind to what '
+            'reached the ledger afterwards; the duplicate check catches an '
+            'entry written TWICE. Neither notices a period that booked 24 of '
+            '26 dividends — the cash balances and nothing is re-emitted, and '
+            'two dividends of income are missing from the books. That is the '
+            'v0.8.4 failure shape. The drift threshold is LEARNED (the P95 of '
+            'this account and category\'s own prior deltas) once there are 20 '
+            'observations, and is a 5% starting default before that, with '
+            'every non-zero delta flagged while the baseline is still forming. '
+            '`booked_amount` is what the GL holds and `booked_draft_amount` is '
+            'what is staged but unsubmitted — a category that only matches '
+            'once you count drafts is a submit backlog, not a drift, and says '
+            'so in its reason. Periods that could NOT be compared are listed '
+            'under `skipped` with a reason rather than omitted. CATEGORIES ARE '
+            'NOT ADDITIVE: they come from overlapping statement blocks, so do '
+            'not sum a column and expect the period\'s cash movement. '
+            'Read-only. Optional `account_mask` or `account_id` narrows it to '
+            'one account; `findings_only` drops the matched rows.',
+            {'account_mask': _STR, 'account_id': _STR,
+             'findings_only': _BOOL}),
+        'handler': _get_statement_recon_report},
     'get_clearing_status': {
         **_tool(
             "What a paired brokerage's Cash Clearing account ACTUALLY holds in "

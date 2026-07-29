@@ -2193,6 +2193,228 @@ wrong. The marker is stamped on trades anyway — it is an audit-trail fact, and
 marker only some entries carry is one nothing can rely on later.
 
 
+## Party on bank-transaction JEs + statement drift detection (v0.9.0)
+
+Two features, one release. Both start from the same complaint: the ledger could
+not answer a question it should have been able to answer.
+
+### Party wiring — "who did we pay?"
+
+**What was wrong.** Drilling into `ACC-JV-2026-02312` (Sorren, $2,030) showed
+Party Type and Party **empty on both lines**. No supplier-wise spend report, no
+1099 pre-fill, no vendor reconciliation, no supplier-ledger drilldown.
+
+**The cause turned out to be two causes**, and only one of them was ours.
+
+Bank Bridge had a party-eligibility rule since v0.4.0.9, written from the error
+message ERPNext prints. The error message is not the rule. The rule is
+`erpnext/accounts/party.py::validate_account_party_type`, reached from
+`GL Entry.validate_party` — so it fires at **submit**, not insert:
+
+```python
+if self.party_type and self.party:
+    account_type = frappe.get_cached_value("Account", self.account, "account_type")
+    if account_type and (account_type not in ["Receivable", "Payable", "Equity"]):
+        frappe.throw("Party Type and Party can only be set for Receivable / Payable account")
+```
+
+Two clauses in there that v0.4.0.9's matrix did not encode:
+
+1. **Equity is allowed.** Not just Receivable/Payable. On this install that is
+   **12 already-submitted JE lines** on Equity accounts (`3201 - Member
+   Distribution`, `3200 - Member Contributions`) carrying an empty party ERPNext
+   would have accepted all along.
+2. **A blank `account_type` is allowed** — the `account_type and` guard skips the
+   check entirely. **29 of ~60 leaf accounts** on this chart are in that state,
+   including most of the 52xx expense accounts. Every one was refused.
+
+So v0.9.0 replaces the matrix with ERPNext's actual predicate
+(`categorization.party_allowed_on_account_type`) and uses the *same* predicate in
+all three places that had drifted apart: the JE path, the Rules editor's
+save-time check, and the boot migration that had been *clearing* valid party
+types off rules.
+
+**And the honest part: Sorren still cannot carry a party as booked.** Its offset
+is `6400 - Professional Services - OML` with `account_type='Expense Account'`,
+set explicitly — genuinely ineligible. No configuration fixes that. There are
+three real ways out, and Bank Bridge now names them instead of failing silently:
+point the rule at an account with no `account_type` set, clear the
+`account_type` on 6400 in ERPNext, or route the spend through
+`2110 - Creditors - OML` as AP.
+
+**Rule form additions.**
+
+| Field | Behaviour |
+|---|---|
+| `party_type` | now **Supplier, Customer, Employee, Shareholder**, plus `Auto` and `— none —`. All four are real ERPNext Party Types (`tabParty Type`: Supplier/Employee/Shareholder → Payable, Customer → Receivable) |
+| `party_name` | autocompleted **live from ERPNext** (`/api/rules/party_search`), never from a cached list. Stays a free-text input, so a party that does not exist yet can be typed and minted on first fire |
+| `auto_create_party` | **tri-state.** `NULL` = inherit `ERPNEXT_AUTO_CREATE_SUPPLIERS` (what every pre-v0.9.0 rule holds, so an upgrade changes nothing), `True` = create, `False` = match existing only |
+
+`Auto` now derives from `account_type` first (Receivable → Customer, Payable →
+Supplier, Equity → Shareholder) and falls back to `root_type` when
+`account_type` is blank — which is safe precisely *because* blank means ERPNext
+validates nothing.
+
+**An Employee is never created.** ERPNext requires `date_of_birth`,
+`date_of_joining`, `gender`, `first_name` and `status` on one; fabricating a
+birth date into an HR record that payroll and leave accrual read is worse than
+booking no party. Supplier, Customer and Shareholder *are* mintable
+(`categorization.AUTO_CREATABLE_PARTY_TYPES`). Note that Shareholder and Employee
+are autonamed `naming_series:`, so their **docname is a series id**
+(`HR-EMP-00001`) and the autocomplete emits it alongside the human label.
+
+**Where the party is stamped.** `apply_rule_dimensions` — the single chokepoint
+v0.8.5 introduced for cost centers, extended rather than branched, exactly as its
+docstring anticipated. Cost Center reaches **both** legs; Party reaches the
+**offset leg only**, and that asymmetry is ERPNext's: a bank line is
+`account_type='Bank'`, never in the eligible set. Resolution stays outside the
+chokepoint (it needs a client and it commits); only the stamping moved in.
+
+**Fail Forward.** Every declined party emits a `journal_entry_party_declined`
+AuditEvent naming the reason — `offset_account_ineligible`, `no_party_name`,
+`party_not_found`. Pre-v0.9.0 an ineligible offset produced a partyless JE with
+nothing anywhere recording that a party had been intended, which is exactly how
+`ACC-JV-2026-02312` sat unnoticed. A transient ERPNext read failure is **not** a
+decline: only a *definite* conflict on a *definite* account declines, so a
+network blip cannot silently cost a party.
+
+### Backfill — `scripts/plan_je_party_backfill.py` + `scripts/backfill_je_parties.py`
+
+Two phases, because the two facts needed to repair one line live in two
+databases: the rule is in Bank Bridge's Postgres, the Journal Entry in ERPNext's
+MariaDB.
+
+```bash
+# phase 1 — inside the Bank Bridge container. WRITES NOTHING.
+python3 -m scripts.plan_je_party_backfill --out /tmp/je_party_plan.json
+
+# phase 2 — inside the ERPNext container. DRY RUN by default.
+../env/bin/python /tmp/backfill_je_parties.py <site> /tmp/je_party_plan.json
+../env/bin/python /tmp/backfill_je_parties.py <site> /tmp/je_party_plan.json \
+    --commit --log /tmp/je_party_backfill.jsonl
+```
+
+**Drafts only, and that is a finding rather than a limitation.** `party` and
+`party_type` on a `Journal Entry Account` are **not `allow_on_submit`** —
+verified on the live site — while `cost_center` **is**, which is exactly why
+v0.8.5's cost-center repair could touch submitted entries and this one must not:
+
+```python
+frappe.get_meta("Journal Entry Account").get_field("party").allow_on_submit  # → 0
+frappe.get_meta("Journal Entry Account").get_field("cost_center").allow_on_submit  # → 1
+```
+
+Worse, for a *submitted* entry the value that matters is not on the Journal Entry
+at all: every supplier-wise report reads `tabGL Entry`. Writing the JE child row
+alone would make the form look repaired while every report kept the empty answer
+— strictly worse than the bug, because it hides itself. So submitted entries are
+**reported with the party the rules now imply** (`--list-submitted`) for an
+operator to apply by cancel + amend if they judge it worth it. A draft has no GL
+Entries yet, so repairing one is a single field and ERPNext validates the party
+on submit — which is what makes drafts the safe population.
+
+The planner **creates nothing**, not even a Supplier (it deliberately does not
+call `resolve_party`, which ensures parties exist — a planner that mutates
+ERPNext is not a planner). The applier re-checks `docstatus`, the live
+`account_type` and the party's existence next to every write, because a plan is a
+file and files get edited.
+
+### Statement → books reconciliation — `/admin/statement_recon`, `get_statement_recon_report`
+
+**The class of bug.** v0.8.4 shipped a settlement leg that never posted and Cash
+Clearing ran to −$1,011,119.41 before a human noticed. Both v0.8.5 guards are
+blind to it:
+
+- `StatementAnchor.variance` reconciles **cash** — whether Plaid *mirrored* what
+  the bank saw. A leg Bank Bridge failed to *post* is not a mirroring gap, so the
+  cash identity balances perfectly while the books are missing half the entry.
+- The Bank-Transaction-reference dedup catches **exact re-emission** — the same
+  entry written twice. A period that booked 24 of 26 dividends re-emits nothing.
+
+So this compares **per category**. A balance can be right while its composition
+is wrong, and a category is the smallest unit where that is legible.
+
+| Field | What it answers |
+|---|---|
+| `account_mask`, `period`, `statement_id` | which document this row is measured against |
+| `category` | dividends, interest, buys, sells, fees, deposits, withdrawals, mark_to_market |
+| `statement_amount` | what the statement reports for it |
+| `booked_amount` | what the **GL** holds (submitted entries) |
+| `booked_draft_amount` | what is staged but unsubmitted |
+| `delta`, `delta_pct` | the divergence; `delta_pct` is `null` when the statement amount is zero |
+| `status` | `matched` / `drifted` / `unexplained` |
+| `reason` | a categorized cause — never blank on a non-matched row |
+
+**`booked_amount` is read from ERPNext, not summed from our own mirror.** The
+local `GeneratedJournalEntry.amount` is what Bank Bridge *intended* to post; a
+report whose job is detecting that the books diverged from reality cannot take
+our own intention as evidence of what the books hold. The read is **batched** —
+one filtered list per period, chunked at 100 docnames — because a per-entry fetch
+is ~900 round-trips on this install every time the page loads, and the sync calls
+it too.
+
+**Drafts are counted separately on purpose.** A category that only matches once
+you count drafts is a *submit backlog* (`drafts_would_match`), not a drift.
+Calling it a drift sends an operator hunting for a transaction sitting in the
+approval queue.
+
+**One side or the other, never both.** A period that produced Plaid *investment*
+transactions is described by them, and its cash movements are already counted as
+`transfer/deposit` / `transfer/withdrawal`; the Bank-Transaction side is used only
+when there were none. That is not a style choice — a paired brokerage pulls in its
+cash-services companion (the same set `anchor_transaction_sum` uses), whose Bank
+Transactions **are** those same settlement flows under another Plaid id. Counting
+both would put a permanent false drift on deposits and withdrawals for every WFA
+period: a detector crying wolf on the account it was built to watch.
+
+**Mark-to-market is shown, never chased.** It is the one category with no booked
+counterpart *by design* — unrealized price movement is deliberately absent from
+the books, because folding market movement into the cash reconciliation would
+manufacture variance on a period that reconciles perfectly (see
+`StatementAnchor`). So a brokerage period whose portfolio moved $28k reports the
+number for visibility and contributes **no finding** (`not_booked_by_design`).
+Treating it as `unexplained` would put an identical, permanent, unactionable row
+on every brokerage period, and a report that always shows the same finding is one
+an operator stops reading — which costs them the findings that do matter. If a
+revaluation *has* posted something, the normal comparison resumes.
+
+**The threshold is measured, not chosen.** The drift line is the **P95 of this
+account and category's own prior deltas**, times a slack factor, once there are
+20 settled observations; `5%` applies before that and every non-zero delta is
+flagged while the baseline is still forming — strict first, looser as evidence
+arrives. Drifted samples are **excluded** from the baseline, because a threshold
+that learned from its own excursions would ratchet upward until it never fired
+again. A learned threshold cannot fall below 0.5%, so an account with a flat-zero
+history does not start reporting rounding as a finding.
+
+**Kairos, not chronos.** Nothing here is scheduled, and the reason is stronger
+than style: a reconciled period's delta is **settled** — the statement is a
+document that will not change, so the answer computed today is the answer
+forever. There is nothing for a nightly job to discover. `report()` is a pure
+read. The action fires on exactly three transitions: a finding **appearing**, a
+finding **changing shape**, and a finding **resolving** (a
+`statement_recon_resolved` event, so the audit trail answers "and was it
+fixed?"). `StatementReconSample.fired_at` is what makes a fourth read silent —
+the admin page and the MCP tool can be read as often as anyone likes.
+
+The gate is state, never time. A period is compared only when the statement has
+**arrived**, is **anchored**, and **reconciles**. A period failing any of those
+is listed under `skipped` **with its reason** rather than omitted, because a
+month missing without explanation reads as a month that is fine.
+
+**Two properties worth stating plainly.** Amounts are compared as
+**magnitudes**: statement figures carry the bank's own signs while a Journal
+Entry's direction lives in which line it sits on, and the question is whether the
+same amount of activity is in both places. And **categories are not additive** —
+they come from three overlapping statement blocks (dividends and interest are
+both inside the cash-flow summary's income line), so summing a column will not
+give you the period's cash movement. That identity is the reconciliation chain's
+job and it already holds. Each row is an independent probe.
+
+The report **never writes to the ledger** — asserted by a test that checks not
+one create, submit, cancel or delete happens.
+
+
 ## Reconciliation status in ERPNext (v0.5.0)
 
 A bookkeeper opens the ERPNext **Bank Statement** record and sees *this period
@@ -4245,7 +4467,12 @@ probe, so getting a public HTTPS callback no longer needs an SSH session~~
 (v0.7.0). ~~A Tailscale sidecar in Bank Bridge's own compose, so Funnel can
 actually reach port 5202 on an Umbrel whose Tailscale is a separate app — public
 URL setup becomes one auth key and one button, with four matching MCP tools~~
-(v0.7.1).
+(v0.7.1). ~~Party Type / Party on generated bank-transaction Journal Entries,
+against ERPNext's real eligibility rule (Receivable, Payable, **Equity**, or an
+account with no `account_type` set) with Employee and Shareholder, a live party
+autocomplete, per-rule auto-create, and a two-phase backfill for historical
+drafts~~ + ~~per-category statement→books drift detection with a P95 threshold
+learned from the install's own history~~ (v0.9.0).
 
 ## Compliance and disclosure
 
