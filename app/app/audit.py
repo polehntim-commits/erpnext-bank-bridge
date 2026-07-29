@@ -45,6 +45,18 @@ EVENT_TYPES = (
     # v0.4.0.2 — push-time cross-Company guard refused a JE whose account(s)
     # belong to a different Company than the target Bank Account.
     'journal_entry_blocked_cross_company',
+    # v0.8.5 — a pipeline declined to write a JE because ERPNext already holds
+    # one for the same identity (Bank Transaction reference, or the [BB:…]
+    # marker on an investment settlement leg). The payload names the pipeline,
+    # the key and the existing entry: this is the Fail-Forward record that lets
+    # us ask later whether the pipeline should have re-emitted at all.
+    'journal_entry_dedup_skipped',
+    # v0.8.5 — the draft-JE queue crossed (or came back inside) its alert
+    # threshold. Written on the TRANSITION only, never on a schedule: the state
+    # changing is the event, and an alert repeated on every poll is one an
+    # operator learns to ignore.
+    'draft_health_threshold_crossed',
+    'draft_health_recovered',
     'bank_transaction_synced',
     'bank_transaction_reconciled',
     'sync_run_started',

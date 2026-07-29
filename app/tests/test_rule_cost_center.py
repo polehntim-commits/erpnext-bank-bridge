@@ -1,16 +1,23 @@
 # SPDX-License-Identifier: MIT
-"""Per-rule ERPNext Cost Center (v0.7.3).
+"""Per-rule ERPNext Cost Center (v0.7.3; both legs since v0.8.5).
 
-A categorization rule may name a Cost Center, which is written onto the OFFSET
-line of every Journal Entry the rule generates — the value-chain segment the
-cost belongs to (Harvest, Irrigation, Crop Protection …). The bank line never
-gets one, and an unset cost_center writes NO key at all so ERPNext applies the
-Account's or Company's own default server-side.
+A categorization rule may name a Cost Center, which is written onto every line
+of every Journal Entry the rule generates — the value-chain segment the cost
+belongs to (Harvest, Irrigation, Crop Protection …). An unset cost_center writes
+NO key at all so ERPNext applies the Account's or Company's own default
+server-side.
+
+v0.8.5 moved the BANK leg from "never gets one" to "mirrors the offset leg";
+the bank-leg override that makes the old behaviour reachable per-rule lives in
+tests/test_je_cost_center_both_legs.py, which owns the new contract. The three
+JE-build cases below assert the v0.7.3 half of it that survives unchanged: the
+offset line always carries the rule's own value, and an unset rule stamps
+nothing anywhere.
 
 Covered here:
   * schema — the column is added on an upgrading database, idempotently, and
     every existing rule migrates to NULL (= write none)
-  * JE build — offset line only, both offset directions, the deprecated
+  * JE build — the offset line under both directions, the deprecated
     debit/credit pair, and no key at all when unset
   * MCP create_rule — accepts cost_center, backwards-compatible without it
   * MCP update_rule — kill switch (its OWN, separate from create_rule),
@@ -141,15 +148,14 @@ class CostCenterMigrationTest(unittest.TestCase):
 
 # ── JE construction ─────────────────────────────────────────────────────────
 class CostCenterJournalEntryTest(Base):
-    def test_offset_line_carries_it_and_the_bank_line_does_not(self):
+    def test_the_offset_line_carries_it(self):
         rule = self._rule(offset_account='Repairs - OML',
                           cost_center='Perennial Care - OML')
         doc = categorization.build_journal_entry(rule, self._row(amount=42.5),
                                                  'OML')
-        offset, bank = doc['accounts']
+        offset, _bank = doc['accounts']
         self.assertEqual(offset['account'], 'Repairs - OML')
         self.assertEqual(offset['cost_center'], 'Perennial Care - OML')
-        self.assertNotIn('cost_center', bank)
 
     def test_it_follows_the_offset_line_when_the_direction_reverses(self):
         """An inflow puts the offset line SECOND in the accounts list — the
@@ -158,11 +164,10 @@ class CostCenterJournalEntryTest(Base):
                           cost_center='Sales & Marketing - OML')
         doc = categorization.build_journal_entry(rule, self._row(amount=-42.5),
                                                  'OML')
-        bank, offset = doc['accounts']
+        _bank, offset = doc['accounts']
         self.assertEqual(offset['account'], 'Fruit Sales - OML')
         self.assertEqual(offset['credit_in_account_currency'], 42.5)
         self.assertEqual(offset['cost_center'], 'Sales & Marketing - OML')
-        self.assertNotIn('cost_center', bank)
 
     def test_unset_writes_no_key_at_all(self):
         """Not '', not the Company default — NO key, so ERPNext's own
@@ -186,10 +191,9 @@ class CostCenterJournalEntryTest(Base):
         rule = self._rule(offset_account='', cost_center='Harvest - OML')
         doc = categorization.build_journal_entry(rule, self._row(amount=42.5),
                                                  'OML')
-        categorized, bank = doc['accounts']
+        categorized, _bank = doc['accounts']
         self.assertEqual(categorized['account'], 'Fuel Expense - EC')
         self.assertEqual(categorized['cost_center'], 'Harvest - OML')
-        self.assertNotIn('cost_center', bank)
 
     def test_it_coexists_with_a_party_on_the_same_line(self):
         rule = self._rule(offset_account='Repairs - OML',

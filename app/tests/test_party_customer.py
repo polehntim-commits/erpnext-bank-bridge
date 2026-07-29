@@ -118,7 +118,12 @@ class Base(unittest.TestCase):
         row = BankTransaction(
             plaid_transaction_id=tid, account_id=account_id, amount=amount,
             name=name, merchant_name=merchant, date=date(2026, 7, 10),
-            erpnext_bank_transaction_id='ACC-BTN-0001',
+            # v0.8.5 · one Bank Transaction PER Plaid transaction, which is what
+            # erpnext_bank.create_bank_transaction guarantees in production
+            # (it find-or-creates on reference_number = plaid_transaction_id).
+            # Sharing one docname across ten synthetic rows was fiction, and the
+            # duplicate-JE guard is right to refuse the second one.
+            erpnext_bank_transaction_id=f'ACC-BTN-{tid}',
             posted_at=categorization._now())
         db.session.add(row)
         db.session.commit()

@@ -1903,6 +1903,296 @@ logical-name mode.
 defaulting **off**, an audit row, and a description on `/admin/mcp`. No schema
 change — the settings live in `DATA_DIR` JSON like every other operator setting.
 
+**v0.8.5** — the bank-transaction JE's **credit leg gets a cost center**, a
+two-phase repair for the entries already posted without one, and **`sync_now`**:
+the Sync Now button as an MCP tool.
+
+**The bug.** v0.7.3 put a rule's Cost Center on the **offset** line and left the
+bank line deliberately blank, reasoning that a balance-sheet account belongs to
+no value-chain segment. Blank does not mean *unset* in ERPNext: the server's own
+fallback fills it, and it fills it with the **Company default**. So
+`ACC-JV-2026-02312` (Sorren, $2,030) booked line 1 — `6400 Professional Services`
+— to `310 - G and A Administration - OML` and line 2 — `1261 Wells Fargo
+Checking` — to `Main - OML`, and the whole historical bank-tx population is
+shaped the same way. The cost sat in one segment, the cash that paid it in
+another, and `Main` silently absorbed the cash side of every segment in the
+chart, so no Cost-Center-wise report balanced.
+
+A cost center is an accounting **dimension**, and a dimension only reads
+correctly when both halves of a double entry carry it. v0.8.5 mirrors the rule's
+value onto **both legs**, which makes each generated entry self-balancing on the
+dimension — what a Cost-Center Trial Balance needs and what an auditor asks for.
+This is the bank-transaction counterpart of the v0.8.3 per-Item fix for
+investment JEs.
+
+**Nothing is hard-coded.** There is no "account 1261 → Main" rule anywhere: the
+value comes from the rule that matched the transaction, always. A rule that
+genuinely wants a *different* cost center on its cash side says so on the rule,
+via the new tri-state `bank_cost_center`:
+
+| `bank_cost_center` | bank leg gets |
+|---|---|
+| NULL / `''` (default) | the rule's own `cost_center` — mirrored |
+| `(none)` | no key at all — ERPNext's Account/Company default, the pre-v0.8.5 shape, now only as a deliberate choice |
+| any docname | that Cost Center |
+
+A rule with no `cost_center` at all still stamps **neither** leg, exactly as
+before — ERPNext's own defaults keep running when the rule claims to know
+nothing. Exposed on the rule form, on `create_rule` / `update_rule` /
+`list_rules`, and validated like `cost_center` (a positive denial refuses; an
+unreachable ERPNext accepts). The `(none)` sentinel is never sent to ERPNext for
+lookup — it is not a docname, and asking would draw a denial.
+
+**Migration:** one `ADD COLUMN`, NULL, **no backfill** — and here the absence of
+a backfill is what *changes* behaviour, the opposite of v0.7.3's. NULL means
+*mirror*, so every rule that already names a cost center starts stamping both
+legs on its next JE. Stamping the sentinel instead would have frozen every
+existing rule into the half-stamped shape the release exists to end.
+
+**Both legs get rule metadata, one function decides.** The stamping moved into
+`categorization.apply_rule_dimensions(rule, offset_line, bank_line)` — the single
+choke point where rule-level metadata reaches a JE line. Each dimension declares
+its own leg eligibility there: cost center reaches **both**, Party reaches the
+**offset only** and that is ERPNext's rule rather than ours
+(`JournalEntry.validate_party` refuses a Party on any account that is not
+Receivable/Payable, and a bank line never is). Sprint 5's per-rule Party wiring
+extends this one function instead of re-deriving the answer per caller.
+
+### Repairing what is already posted
+
+`cost_center` on a Journal Entry Account row is not `allow_on_submit`, so ERPNext
+refuses to change it through the REST API; the supported route is cancel + amend
++ resubmit, which for hundreds of historical entries means hundreds of new
+docnames, a broken audit chain, and every Bank Transaction reconciliation link
+severed. Two scripts do it as a targeted field update instead — reversible from
+the plan file, docnames and links left where the accountant left them.
+
+Two scripts because the two facts needed to repair one line live in two
+different databases: the **rule** is in Bank Bridge's Postgres, the **posted
+entry** is in ERPNext's MariaDB.
+
+```bash
+# phase 1 — in the Bank Bridge container. READS ONLY; writes nothing anywhere.
+python3 -m scripts.plan_je_cost_center_backfill --out /tmp/je_cc_plan.json
+
+# phase 2 — in the ERPNext container. DRY RUN unless --commit.
+docker cp scripts/backfill_je_cost_centers.py <erpnext_container>:/tmp/
+docker exec <erpnext_container> bash -lc 'cd /home/frappe/frappe-bench/sites \
+    && ../env/bin/python /tmp/backfill_je_cost_centers.py <site> /tmp/je_cc_plan.json'
+#   … then re-run with --commit --log /tmp/je_cc_backfill.jsonl
+```
+
+The plan file is the **audit artifact**: per line it records the JE docname, the
+child row, the account, the cost center now, the cost center proposed, and the
+rule ids that justify it — reviewable before a single write, keepable afterwards
+as the record of why the books changed.
+
+- **Fail safe.** Phase 1 mutates nothing. Phase 2 is dry-run by default and
+  `--commit` is required to write; every line is re-read and skipped unless it
+  still holds exactly the value the plan recorded, so a plan built yesterday
+  cannot clobber an edit made this morning. Re-running is a no-op.
+- **Fail forward.** Nothing is skipped in silence. A JE with no recorded rule, a
+  deleted rule, a rule that **still** names no cost center, a missing or
+  cancelled entry, and a bank leg that cannot be identified each land in
+  `review` with a documented reason. `stale`, `row_not_found` and `gl_not_found`
+  are counted and listed on the apply side.
+- **Both tables, always.** `tabJournal Entry Account` is what the JE form shows;
+  `tabGL Entry` is what every report reads, linked by `voucher_detail_no`.
+  Updating only the first would make the form look fixed while the
+  Cost-Center-wise P&L kept the old answer — a worse state than the bug, because
+  it hides itself. A line whose ledger rows cannot be found is refused **whole**.
+- **It proposes the LIVE rule's cost center.** An edit clones a rule and archives
+  the original, so the version that generated a 2026 entry is usually not the
+  version an operator has since costed; the planner walks `superseded_by`
+  forward. Both ids are recorded on every change.
+- **It never CLEARS.** A rule whose bank leg is `(none)` wants ERPNext's default
+  — which is the value already on the line. Writing `''` would strip a cost
+  center off an audited entry to replace it with the same thing.
+- **Kairos.** A one-time operator action run when the rules are right, not a
+  scheduled job and not a runtime MCP tool. Nothing calls it.
+
+Investment JEs are excluded: they post from per-Item dimensions (v0.8.3), not
+from a rule, and a rule lookup for one would be meaningless.
+
+### `sync_now` — the Sync Now button, as a tool
+
+**The gap.** On 2026-07-29, mid-way through the Cash Clearing cleanup, 77
+settlement legs for the ••9401 brokerage still needed posting. `trigger_reparse`
+re-read the statement PDFs and drafted nothing — it is the wrong pipeline.
+`reset_investment_drafts` aborted on the first submitted entry, correctly.
+Nothing on the MCP server could run the thing that actually posts them
+(`sync_engine.post_investment_jes`), so a $1M ledger correction stopped dead
+until a human clicked **Sync Now** in a browser. That is precisely the relay tax
+the MCP server exists to remove.
+
+**The fix is a shared function, not a second implementation.** The button's logic
+moved into `sync_engine.run_sync(...)`; `POST /admin/sync_now` and the `sync_now`
+tool both call it, so "I clicked it and it worked" and "the AI ran it and it
+worked" are the same claim. `sync_all` remains as a thin wrapper for the
+scheduler and the `/api` surface.
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `account_id` | *(all)* | scope to ONE Plaid account — its bank is polled, only that account posts, and the install-wide cross-Item transfer pairing is skipped |
+| `include_investments` | `true` | also run the investment JE post + mark-to-market; `false` leaves the bank-transaction sync untouched |
+| `dry_run` | `false` | report what WOULD post from the local mirror; contacts Plaid **not at all** |
+
+Returns a **per-account** summary — transactions fetched (added/modified/
+removed), Bank Transactions posted/cancelled/failed, investment JEs drafted,
+`skipped_duplicate`, structured errors — plus totals, `status`
+(`ok` | `partial` | `failed`), notices, and elapsed seconds. Kill switch
+`sync_now`, **off** by default: it is the only tool on the list that spends
+billable Plaid calls, and an operator who trusts an AI to re-run rules over data
+already held has not thereby authorized it to go buy more.
+
+- **Fail fast, per scope.** One bank's outage never stops the others. The run
+  returns `partial` with the healthy banks' work reported and a `plaid_error`
+  naming the Item that broke, so the retry is `sync_now(account_id=…)` rather
+  than the whole sweep.
+- **Fail forward.** Every failure carries a **code and a remedy**
+  (`SYNC_ERROR_REMEDIES`), not a bare string — `item_needs_reauth`,
+  `account_unmapped`, `bank_transaction_push_failed`, `invest_je_failed`,
+  `daily_call_brake`, `company_drift`, … A code is something the next release
+  can act on; a string is something a human re-reads.
+- **Notices are not errors.** An Item with investment posting deliberately off
+  is *said* (`invest_je_posting_disabled`) but does not degrade `status` — a
+  status that reads `partial` on every healthy install is not read on the day it
+  matters.
+- **Kairos.** A manual kairotic trigger: the operator decides that *now* is the
+  moment, and the tool does exactly that, once. It schedules nothing, widens
+  nothing, and leaves the background cadence where it is
+  (`services/scheduler.py`). Clock for input; state for action.
+- **`dry_run` costs nothing and says what it cannot know.** It reads the local
+  mirror only, so it reports the queue that would post and the trades that would
+  become JEs — and states plainly that how many *new* transactions the bank is
+  holding cannot be known without spending the call. A preview that quietly
+  bills the operator is not a preview.
+
+**Truthful counts (fix).** `post_investments_for_account` counted an
+already-posted trade as `posted`, because `generate_investment_je` hands back the
+existing row for one. A re-run over 455 settled trades therefore reported
+*"posted 455"* having written nothing, indistinguishable from a real backfill.
+`posted` now means **written**, and already-posted trades count as
+`skipped_duplicate`. One extra query per account buys a number an operator can
+act on.
+
+## Draft health + duplicate-JE guard (v0.8.5)
+
+**The incident.** The v0.8.4 sync at 22:19 UTC on 2026-07-29 re-emitted 112
+pre-2024-12-01 settlement-leg drafts that were duplicates-by-effect of the
+aggregate reconciliation JEs — the `bulk_submit` date filter
+(`from_date=2024-12-01`) never reached them. They sat in draft state for hours
+and were caught by a human noticing the queue grow, then cleaned up by 112
+sequential `delete_draft_journal_entry` calls.
+
+Two things were missing, and v0.8.5 adds both. Nothing knew what a normal draft
+count looked like, so nothing could tell that this one wasn't. And nothing asked
+ERPNext whether the entry it was about to write already existed.
+
+### Draft health — `GET /admin/draft_health`, `/admin/draft_health.html`, `get_draft_health`
+
+One reading in three shapes: JSON for scripts, a dashboard for the operator, an
+always-on read-only MCP tool for an AI operator. Every one of them returns:
+
+| Field | What it answers |
+|---|---|
+| `draft_count` | how many DRAFT Journal Entries ERPNext holds right now |
+| `total_amount` | how much money is sitting in them |
+| `oldest_posting_date` / `oldest_created_at` / `oldest_draft_age_days` | how far back the queue reaches — the v0.8.4 duplicates were all pre-2024-12-01, which is exactly this shape |
+| `by_prefix` | the count and dollar volume grouped by `user_remark` prefix: `Cash` / `Cash withdrawal` are investment settlement legs, `Bought` / `Sold` are trades, the rest is the bank-side rules engine |
+| `threshold`, `threshold_source`, `baseline_samples` | the alert line, where it came from, and how much history it rests on |
+| `breached`, `crossed`, `recovered`, `headline` | the verdict, and whether THIS reading is the one that changed it |
+
+**Data driven, not hand-coded.** The threshold is not 50. It is the **P95 of
+this install's own prior healthy readings**, times 1.25 headroom, floored at 10 —
+learned from `draft_health_samples`, which every snapshot appends to. Fifty is
+only the answer for the first 20 observations, before there is any history to
+learn from, and `baseline_ready` says plainly which of the two you are looking
+at. An install whose queue habitually runs at 100 should not page at 51; one
+that runs at 4 should not need 50 to notice.
+
+Two guards keep the learning honest, and both are the difference between a
+baseline that works and one that quietly stops:
+
+- **Breached samples are excluded from the baseline.** A threshold that learned
+  from its own explosions would ratchet upward until nothing was an explosion —
+  the standard way an adaptive alarm dies without anyone noticing.
+- **A learned threshold never falls below 10.** A flat-zero history computes a
+  P95 of 0 and makes the first legitimate draft an emergency, which trains the
+  operator to ignore the alarm entirely.
+- **Refreshing the page cannot manufacture a baseline.** A same-state reading
+  within five minutes of the last one is not recorded, so twenty refreshes do
+  not become twenty samples. A reading that *changes* the state always is
+  recorded — suppressing a crossing would let the same alert fire twice.
+
+**Kairos over chronos.** The endpoint is a **state query**, answered whenever
+asked — the admin page, the MCP tool, the end of every `run_sync`. It schedules
+nothing. The ACTION fires on the **transition**: `draft_health_threshold_crossed`
+is written the moment a healthy count goes over the line, and
+`draft_health_recovered` when it comes back. Polling a breached queue does not
+re-alert, because the second identical alert is the one that teaches an operator
+to stop reading them. The clock gathers the observation; the state decides
+whether anything happens.
+
+Reading it costs nothing and answers something: run it after any bulk post or
+backfill.
+
+### Bank Transaction reference dedup
+
+Every JE pipeline was already idempotent against its **own local table** —
+`GeneratedJournalEntry` is unique on the Plaid transaction id. That guard is
+exactly as durable as the local row, and the local row is the thing operators
+delete: `reset_investment_drafts` removes it by design, a restore from an older
+volume loses it, a migration marker arrives late. When it goes, ERPNext is still
+holding the JE and Bank Bridge no longer knows.
+
+`app/je_dedup.py` is the belt to that suspenders — the **ledger itself** is
+asked, immediately before the write:
+
+- **Bank side (categorization).** The ERPNext **Bank Transaction** docname, which
+  has ridden every generated JE line as `reference_type` / `reference_name`
+  since v0.3.1. Nothing new is stamped; this only reads it back, via a
+  child-table filter so it stays one round-trip.
+- **Investment side (settlement legs).** There is no Bank Transaction to
+  reference — a settlement leg is built from a `SecurityTransaction` — so every
+  investment JE now carries a compact identity marker in its `user_remark`,
+  `[BB:inv:<plaid_investment_transaction_id>]`, and the lookup matches on that.
+  **Appended, never prepended**: `_sweep_orphan_drafts` recognizes an investment
+  draft by what its remark *starts* with.
+
+A match on `docstatus IN (0, 1)` — **draft or submitted** — skips the creation.
+`docstatus = 2` (cancelled) deliberately does **not**: cancelling is how an
+operator says *"that posting was wrong, replace it"*, and treating a cancelled
+entry as an occupant would leave them no way to.
+
+- **Fail safe.** Every lookup returns "no duplicate" on **any** difficulty — an
+  unreachable ERPNext, a rejected filter, a malformed row — which means the
+  caller creates the JE. A duplicate draft is visible in `/admin/draft_health`
+  and deletable in one call; a Journal Entry that was never written because the
+  network blipped is invisible until a statement fails to reconcile.
+- **Fail forward.** A skip is not a shrug. It writes a
+  `journal_entry_dedup_skipped` AuditEvent naming the **pipeline**, the
+  **identity key**, the **existing JE** and its **docstatus**, sets the local row
+  to `dedup_skipped` (a muted pill on Generated JEs, not a red one — the guard
+  working is not a problem to fix), and reports `dedup_skipped` in the sync
+  summary, split bank-side from investment-side. That is enough to answer *"should
+  that pipeline have re-emitted at all?"* — the question the v0.8.4 incident
+  could not answer from its own logs.
+- **A skip is reversible.** `dedup_skipped` gets a **Retry** button on Generated
+  JEs, alongside `skipped_missing_account`. Cancel the entry ERPNext was already
+  holding and retry, and the JE is written. Without it the row would be a dead
+  end — `rerun_rules` treats a settled skip as done and would never look again.
+  A guard the operator cannot overrule is a wall.
+
+**Trade JEs are deliberately NOT deduped.** They were re-emitted by the same
+v0.8.4 sync and we do not yet know whether any of that was legitimate (a
+corrected cost basis, a re-pull with better security metadata). Blocking a trade
+on that guess is the fail-*unsafe* direction. Settlement legs are deduped because
+their content is fixed by the cash movement: the same leg posted twice is always
+wrong. The marker is stamped on trades anyway — it is an audit-trail fact, and a
+marker only some entries carry is one nothing can rely on later.
+
+
 ## Reconciliation status in ERPNext (v0.5.0)
 
 A bookkeeper opens the ERPNext **Bank Statement** record and sees *this period

@@ -83,6 +83,12 @@ _DEFAULTS = {
     #   set_erpnext_config re-points the install at a different ERPNext. It
     #     changes where every future document goes, which makes it closer to
     #     enable_public_url than to a settings edit.
+    # v0.8.5 — `sync_now` is the Sync Now button as a tool. It gets its own
+    # switch because it is the only tool here that SPENDS MONEY: every call is
+    # billable Plaid traffic, on top of whatever it then writes to ERPNext. An
+    # operator who trusts an AI to re-run rules over data already held has not
+    # thereby authorized it to go buy more data. OFF by default like the rest.
+    'sync_now': False,
     'rerun_rules': False,
     'reset_investment_drafts': False,
     'post_clearing_cleanup_je': False,

@@ -43,6 +43,7 @@ from .. import claude_desktop
 from .. import counterparty
 from .. import crypto
 from .. import db
+from .. import draft_health
 from .. import erpnext_accounts
 from .. import erpnext_bank
 from .. import erpnext_settings as erps
@@ -59,6 +60,7 @@ from .. import sync_engine
 from ..erpnext_client import ERPNextConfigError, ERPNextError
 from ..plaid_client import PlaidConfigError, PlaidError
 from ..models import (AuditEvent, BankTransaction, CategorizationRule,
+                      DraftHealthSample,
                       GeneratedJournalEntry, IntercompanyTransferPair,
                       PlaidAccount, PlaidItem, PlaidStatement, PlaidSyncLog,
                       Supplier)
@@ -172,6 +174,7 @@ NAV_HTML = """
   <a href="/admin/suppliers" class="{{ 'active' if page == 'suppliers' else '' }}">Suppliers</a>
   <a href="/admin/counterparties" class="{{ 'active' if page == 'counterparties' else '' }}">Counterparties</a>
   <a href="/admin/generated_entries" class="{{ 'active' if page == 'generated_entries' else '' }}">Generated JEs</a>
+  <a href="/admin/draft_health.html" class="{{ 'active' if page == 'draft_health' else '' }}">Draft Health</a>
   <a href="/admin/intercompany" class="{{ 'active' if page == 'intercompany' else '' }}">Intercompany</a>
   <a href="/admin/statements" class="{{ 'active' if page == 'statements' else '' }}">Statements</a>
   <a href="/admin/reconciliation" class="{{ 'active' if page == 'reconciliation' else '' }}">Reconciliation</a>
@@ -441,14 +444,32 @@ def dashboard():
 
 @bp.post('/admin/sync_now')
 def sync_now_ui():
-    if not ps.is_configured():
-        return redirect('/admin?flash=' + quote_plus('Plaid not configured'))
+    """The Sync Now button. v0.8.5 · calls `sync_engine.run_sync`, the same core
+    the `sync_now` MCP tool calls — the button IS the tool, from the other side.
+    Sharing the function is what keeps "I clicked it and it worked" and "the AI
+    ran it and it worked" the same claim."""
     try:
-        result = sync_engine.sync_all()
+        result = sync_engine.run_sync(actor='admin')
     except Exception as e:  # surface any Plaid/ERPNext error to the operator
         return redirect('/admin?flash=' + quote_plus(f'Sync failed: {e}'))
-    n = result.get('items', 0)
-    return redirect('/admin?flash=' + quote_plus(f'Sync complete across {n} bank(s).'))
+    return redirect('/admin?flash=' + quote_plus(_sync_flash(result)))
+
+
+def _sync_flash(result: dict) -> str:
+    """One line of what the run did — counts first, then the first error, so a
+    partial run reads as a partial run rather than a success."""
+    t = result.get('totals', {})
+    parts = [f"{result.get('items', 0)} bank(s)",
+             f"{t.get('transactions_fetched', 0)} transaction(s) fetched",
+             f"{t.get('bank_transactions_posted', 0)} posted"]
+    if t.get('investment_jes_drafted'):
+        parts.append(f"{t['investment_jes_drafted']} investment JE(s) drafted")
+    errors = result.get('errors', [])
+    head = 'Sync complete: ' if not errors else 'Sync finished with issues: '
+    line = head + ', '.join(parts) + '.'
+    if errors:
+        line += f" First issue [{errors[0].get('code')}]: {errors[0].get('message')}"
+    return line[:400]
 
 
 # ── Link a bank ──────────────────────────────────────────────────
@@ -2820,7 +2841,7 @@ RULES_BODY = """
     </label>
     <label style="flex:1;min-width:170px;position:relative">Cost center <span style="font-weight:400;color:#888">— optional</span>
       <input name="cost_center" id="cost-center" autocomplete="off" value="{{ form.cost_center or '' }}"
-             title="ERPNext Cost Center written onto the OFFSET line only (the bank line never gets one). Leave blank to let ERPNext apply the account's or company's own default."
+             title="ERPNext Cost Center written onto BOTH legs of the Journal Entry (v0.8.5). Leave blank to let ERPNext apply the account's or company's own default on both."
              placeholder="Harvest - OML">
       <!-- v0.8.4 · same shared dropdown as the offset-account field, fed by
            /api/rules/known_cost_centers and re-scoped when Applies-to-Company
@@ -2829,7 +2850,20 @@ RULES_BODY = """
            depend on. -->
       <div id="cc-dd" style="display:none;position:absolute;left:0;right:0;z-index:20;background:#fff;border:1px solid #ccc;border-top:none;border-radius:0 0 4px 4px;max-height:240px;overflow:auto;box-shadow:0 4px 12px rgba(0,0,0,.12)"></div>
       <span id="cc-hint" style="display:block;font-weight:400;font-size:11px;color:#888;margin-top:3px">
-        Offset line only. Blank = ERPNext's own default.
+        Both legs (v0.8.5). Blank = ERPNext's own default.
+      </span>
+    </label>
+    <!-- v0.8.5 · the bank-leg override. Deliberately a plain text input beside
+         the cost center rather than a third autocomplete: the overwhelmingly
+         common answer is "leave it empty", and the two non-empty answers are
+         the sentinel and a docname the operator already knows. -->
+    <label style="flex:1;min-width:170px">Bank-leg cost center <span style="font-weight:400;color:#888">— rarely needed</span>
+      <input name="bank_cost_center" id="bank-cost-center" autocomplete="off"
+             value="{{ form.bank_cost_center or '' }}"
+             title="Overrides the cost center on the BANK leg only. Blank mirrors the cost center above (the v0.8.5 default). Type (none) to leave the bank leg to ERPNext's own default — the pre-v0.8.5 behaviour, which lands it on the Company default."
+             placeholder="blank = same as above">
+      <span style="display:block;font-weight:400;font-size:11px;color:#888;margin-top:3px">
+        Blank = mirrors the cost center. <code>(none)</code> = ERPNext's default.
       </span>
     </label>
   </div>
@@ -3694,13 +3728,20 @@ def _rule_form_values():
         # v0.3.1 · bank-agnostic offset side.
         'offset_account': (request.form.get('offset_account') or '').strip(),
         'offset_direction': direction,
-        # v0.7.3 · the Cost Center for the offset line. This field must be READ
-        # BACK from the form even though nothing but the editor writes it: an
-        # edit CLONES the rule from these values (see save_rule), so a field
-        # missing here is a field silently cleared on every admin save of a
-        # rule an operator (or the MCP create_rule/update_rule tools) had
-        # costed. Blank → None = write no cost center.
+        # v0.7.3 · the Cost Center, now (v0.8.5) for BOTH JE legs. This field
+        # must be READ BACK from the form even though nothing but the editor
+        # writes it: an edit CLONES the rule from these values (see save_rule),
+        # so a field missing here is a field silently cleared on every admin
+        # save of a rule an operator (or the MCP create_rule/update_rule tools)
+        # had costed. Blank → None = write no cost center.
         'cost_center': (request.form.get('cost_center') or '').strip() or None,
+        # v0.8.5 · the bank-leg override, same clone-safety reasoning. Blank →
+        # None = mirror `cost_center` onto the bank leg. Stored verbatim,
+        # including the '(none)' sentinel, and validated by ERPNext at JE time
+        # exactly like `cost_center` — the editor has never been the authority
+        # on whether a docname exists.
+        'bank_cost_center': (
+            (request.form.get('bank_cost_center') or '').strip() or None),
         # Deprecated pre-v0.3.1 pair — still accepted for backwards compat so a
         # legacy form/caller keeps working during the transition.
         'debit_account': (request.form.get('debit_account') or '').strip(),
@@ -4087,6 +4128,12 @@ def edit_supplier():
 
 # ── Generated Journal Entries (audit) ────────────────────────────
 
+# The states a Retry button appears on, and the only ones `_retry_entry`
+# accepts. Both mean "nothing was written and something outside this row has to
+# change first" — a missing account, or a duplicate ERPNext already held.
+_RETRYABLE_STATES = ('skipped_missing_account', 'dedup_skipped')
+
+
 def _state_pill(state):
     """The coloured state pill — the single source of truth the client-side JS
     `statePill()` mirrors when it refreshes a row in place."""
@@ -4099,6 +4146,14 @@ def _state_pill(state):
         'skipped_missing_account': (
             'pill-err', 'skipped · missing account',
             "No account with this logical name under the transaction's Company"),
+        # v0.8.5 · not an error and not a failure: ERPNext already carried a
+        # Journal Entry for this transaction, so nothing was written. Muted
+        # rather than red, because the guard working correctly is not a problem
+        # the operator has to fix.
+        'dedup_skipped': (
+            'pill-muted', 'skipped · duplicate',
+            'ERPNext already has a Journal Entry for this transaction — see '
+            'the row detail for which one'),
     }
     cls, label, title = pills.get(state, ('pill-muted', state or '', ''))
     t = f' title="{title}"' if title else ''
@@ -4125,7 +4180,7 @@ def _row_action_buttons(g):
         out += btn('approve', 'Approve') + btn('reject', 'Reject')
     elif st == 'approved':
         out += btn('reverse', 'Reverse') + btn('reject', 'Reject (cancel)')
-    elif st == 'skipped_missing_account':
+    elif st in _RETRYABLE_STATES:
         out += btn('retry', 'Retry') + btn('reject', 'Reject')
     elif st in ('blocked', 'error'):
         out += btn('reject', 'Reject')
@@ -4208,7 +4263,8 @@ linked. Approving it corrects the account's balance sheet position."
       reversed: ['pill-muted', 'reversed'],
       error: ['pill-err', 'error'],
       blocked: ['pill-err', 'blocked'],
-      skipped_missing_account: ['pill-err', 'skipped · missing account']
+      skipped_missing_account: ['pill-err', 'skipped · missing account'],
+      dedup_skipped: ['pill-muted', 'skipped · duplicate']
     };
     var m = map[state] || ['pill-muted', state];
     return '<span class="pill ' + m[0] + '">' + m[1] + '</span>';
@@ -4226,7 +4282,7 @@ linked. Approving it corrects the account's balance sheet position."
       return actionBtn(id, 'approve', 'Approve') + actionBtn(id, 'reject', 'Reject');
     if (state === 'approved')
       return actionBtn(id, 'reverse', 'Reverse') + actionBtn(id, 'reject', 'Reject (cancel)');
-    if (state === 'skipped_missing_account')
+    if (state === 'skipped_missing_account' || state === 'dedup_skipped')
       return actionBtn(id, 'retry', 'Retry') + actionBtn(id, 'reject', 'Reject');
     if (state === 'blocked' || state === 'error')
       return actionBtn(id, 'reject', 'Reject');
@@ -4289,7 +4345,8 @@ def generated_entries_page():
                  state_pill=_state_pill, row_actions=_row_action_buttons,
                  is_opening=obal.is_opening_balance_entry,
                  states=('pending_review', 'approved', 'rejected', 'reversed',
-                         'error', 'blocked', 'skipped_missing_account'),
+                         'error', 'blocked', 'skipped_missing_account',
+                         'dedup_skipped'),
                  flash_msg=request.args.get('flash', ''))
 
 
@@ -4301,6 +4358,8 @@ def generated_entries_page():
 #   approved                → rejected         (cancels the submitted JE in ERPNext)
 #   approved                → reversed         (books a reversing JE — the "undo")
 #   skipped_missing_account → pending_review   (retry once the account exists)
+#   dedup_skipped           → pending_review   (v0.8.5 — retry once the JE
+#                                               ERPNext already held is cancelled)
 #   blocked / error         → rejected         (accept the block)
 # `rejected` and `reversed` are terminal. Re-approving an already-approved row
 # (or re-rejecting a rejected one) is an idempotent no-op — success, no ERPNext
@@ -4414,12 +4473,20 @@ def _reverse_entry(g) -> _ActionResult:
 
 
 def _retry_entry(g) -> _ActionResult:
-    """Re-run the rules engine for a `skipped_missing_account` row now that the
-    operator has (presumably) created the missing account. On success the row
-    moves to `pending_review` with a fresh Draft JE."""
-    if g.state != 'skipped_missing_account':
+    """Re-run the rules engine for a skipped row now that the operator has
+    (presumably) removed whatever blocked it. On success the row moves to
+    `pending_review` with a fresh Draft JE.
+
+    Two states qualify. `skipped_missing_account` retries once the account
+    exists. `dedup_skipped` (v0.8.5) retries once the duplicate ERPNext was
+    already holding has been cancelled — without this the row would be a dead
+    end, because `rerun_rules` treats a settled skip as done and would never
+    look at it again. A skip has to be reversible by the operator who disagrees
+    with it; that is the difference between a guard and a wall."""
+    if g.state not in _RETRYABLE_STATES:
         return _ActionResult(
-            False, 'Only a skipped (missing account) entry can be retried', 409)
+            False, 'Only a skipped entry (missing account, or duplicate) can '
+            'be retried', 409)
     erp = sync_engine.get_erp_client_or_none()
     if erp is None:
         return _ActionResult(
@@ -4438,6 +4505,10 @@ def _retry_entry(g) -> _ActionResult:
         return _ActionResult(
             False, 'Still skipped — the account for this rule does not exist '
             'under the transaction’s Company yet', 409)
+    if g.state == 'dedup_skipped':
+        return _ActionResult(
+            False, 'Still skipped — ERPNext still holds a Journal Entry for '
+            'this Bank Transaction. Cancel that entry first, then retry.', 409)
     return _ActionResult(True, f'Retried — now “{g.state}”')
 
 
@@ -8964,6 +9035,9 @@ _MCP_SWITCH_DESC = {
                        '(pauses all posting; syncing continues)',
     'set_erpnext_config': 'Change the ERPNext connection — URL, API key/secret, '
                           'default Company',
+    'sync_now': 'Run a full Plaid sync + investment JE post on demand — the '
+                'Sync Now button, as a tool. Spends billable Plaid calls and '
+                'writes to ERPNext',
 }
 
 
@@ -9067,3 +9141,155 @@ def mcp_test():
         'ok': True,
         'detail': f'{len(tools)} tools advertised: '
                   + ', '.join(t['name'] for t in tools)})
+
+
+# ── Draft health (v0.8.5) ────────────────────────────────────────
+#
+# The v0.8.4 sync re-emitted 112 duplicate settlement-leg drafts and they sat
+# there for hours, because nothing in Bank Bridge knew what a normal draft count
+# looked like. These two routes are the same reading in two shapes: JSON for the
+# MCP tool and any script, HTML for the operator.
+#
+# KAIROS, stated where it is implemented: GET is a pure READ. It records an
+# observation (that is how the baseline is learned) and it fires an alert ONLY
+# on the transition into or out of a breach. Refreshing the page while the queue
+# is over the line does not re-alert; it just answers the question again.
+
+DRAFT_HEALTH_BODY = """
+<h2>Draft Journal Entry health</h2>
+{% if error %}
+<div class="banner-warn">
+  <h3>Could not read ERPNext</h3>
+  {{ error }}
+</div>
+{% else %}
+<div class="kpis">
+  <div class="kpi"><b>{{ snap.draft_count }}</b><br>draft Journal Entries</div>
+  <div class="kpi"><b>${{ '{:,.2f}'.format(snap.total_amount) }}</b><br>total in drafts</div>
+  <div class="kpi"><b>{{ snap.threshold }}</b><br>alert threshold</div>
+  <div class="kpi">
+    <b>{% if snap.breached %}<span class="pill pill-err">over</span>
+       {% else %}<span class="pill pill-ok">ok</span>{% endif %}</b><br>status</div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <b>Oldest draft</b>
+  <div style="font-size:14px;color:#555;margin-top:6px">
+    Posting date <b>{{ snap.oldest_posting_date or '—' }}</b> ·
+    created <b>{{ snap.oldest_created_at or '—' }}</b>
+    {% if snap.oldest_draft_age_days is not none %}
+    ({{ snap.oldest_draft_age_days }} days ago){% endif %}
+  </div>
+  <div style="font-size:13px;color:#777;margin-top:8px">
+    A draft that has been sitting for days is either waiting on a decision
+    nobody made, or a duplicate nobody noticed. Both are worth a look.
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <b>Where the threshold comes from</b>
+  <div style="font-size:14px;color:#555;margin-top:6px">
+    {% if snap.baseline_ready %}
+    Learned: the 95th percentile of this install's own draft counts across
+    <b>{{ snap.baseline_samples }}</b> healthy observations, plus headroom.
+    {% else %}
+    Still the starting default of <b>{{ snap.threshold }}</b> —
+    <b>{{ snap.baseline_samples }}</b> healthy observations recorded, and the
+    baseline starts being learned at <b>{{ min_samples }}</b>. Until then this
+    number is an assumption, not a measurement.
+    {% endif %}
+  </div>
+</div>
+
+<h3 style="margin-top:22px">Drafts by remark prefix</h3>
+<p style="font-size:13px;color:#777">
+  Which pipeline wrote them. <b>Cash</b> / <b>Cash withdrawal</b> are investment
+  settlement legs, <b>Bought</b> / <b>Sold</b> are trades, the rest is the
+  bank-side rules engine. A breach whose mass sits in one row names the pipeline
+  that ran away.
+</p>
+<table>
+  <tr><th>Prefix</th><th class="num">Drafts</th><th class="num">Amount</th></tr>
+  {% for prefix, stats in snap.by_prefix.items() %}
+  <tr><td>{{ prefix }}</td>
+      <td class="num">{{ stats.count }}</td>
+      <td class="num">${{ '{:,.2f}'.format(stats.amount) }}</td></tr>
+  {% else %}
+  <tr><td colspan="3" style="color:#888">No draft Journal Entries.</td></tr>
+  {% endfor %}
+</table>
+
+<h3 style="margin-top:22px">Recent observations</h3>
+<table>
+  <tr><th>Observed</th><th class="num">Drafts</th><th class="num">Threshold</th>
+      <th>Source</th><th>State</th></tr>
+  {% for h in history %}
+  <tr><td style="font-size:12px">{{ h.observed_at }}</td>
+      <td class="num">{{ h.draft_count }}</td>
+      <td class="num">{{ h.threshold }}</td>
+      <td style="font-size:12px">{{ h.threshold_source }}</td>
+      <td>{% if h.breached %}<span class="pill pill-err">over</span>
+          {% else %}<span class="pill pill-ok">ok</span>{% endif %}</td></tr>
+  {% else %}
+  <tr><td colspan="5" style="color:#888">No history yet.</td></tr>
+  {% endfor %}
+</table>
+<p style="font-size:12px;color:#888">
+  This page, every sync, and every <code>get_draft_health</code> MCP call take an
+  observation. A same-state reading within {{ debounce_minutes }} minutes of the
+  last one is <b>not</b> recorded — otherwise refreshing this page would
+  manufacture a baseline out of one moment's reading — but a reading that
+  <b>changes</b> the state always is. Healthy observations are what the threshold
+  is learned from; breached ones are deliberately excluded, so an explosion
+  cannot teach the alarm to ignore explosions.
+</p>
+{% endif %}
+"""
+
+
+def _draft_health_snapshot():
+    """(snapshot, error) for the current Company scope. Never raises — a page
+    that 500s on an unreachable ERPNext tells the operator less than one that
+    says so."""
+    client = sync_engine.get_erp_client_or_none()
+    if client is None:
+        return None, ('ERPNext is not configured — set the connection on the '
+                      'ERPNext settings page first.')
+    try:
+        return draft_health.observe(client, _current_company()), None
+    except (ERPNextError, ERPNextConfigError) as e:
+        return None, str(e)
+    except Exception as e:  # noqa: BLE001 - a health page must not 500
+        db.session.rollback()
+        log.warning('draft health read failed', exc_info=True)
+        return None, f'{type(e).__name__}: {e}'
+
+
+@bp.get('/admin/draft_health')
+def draft_health_json():
+    """The machine-readable reading. Same call the MCP tool makes."""
+    snap, error = _draft_health_snapshot()
+    if error:
+        return jsonify({'ok': False, 'error': error}), 503
+    return jsonify({'ok': True, **snap})
+
+
+@bp.get('/admin/draft_health.html')
+def draft_health_page():
+    snap, error = _draft_health_snapshot()
+    history = []
+    if not error:
+        try:
+            history = [r.to_dict() for r in
+                       DraftHealthSample.query
+                       .filter(DraftHealthSample.company == _current_company())
+                       .order_by(DraftHealthSample.created_at.desc(),
+                                 DraftHealthSample.id.desc()).limit(25).all()]
+        except Exception:  # noqa: BLE001 - the history is a nicety, not the page
+            db.session.rollback()
+            log.warning('draft health history read failed', exc_info=True)
+    return _page(DRAFT_HEALTH_BODY, page='draft_health', snap=snap,
+                 error=error, history=history,
+                 min_samples=draft_health.MIN_SAMPLES_FOR_BASELINE,
+                 debounce_minutes=round(
+                     draft_health.MIN_SAMPLE_INTERVAL_SECONDS / 60))

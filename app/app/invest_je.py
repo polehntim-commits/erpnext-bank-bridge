@@ -84,6 +84,7 @@ from flask import current_app
 
 from . import audit
 from . import db
+from . import je_dedup
 from .erpnext_accounts import (ACCOUNT_DT, _asset_root, _create_group_account,
                                _find_accounts, owning_company_for_account_id)
 from .erpnext_client import ERPNextAPIError, ERPNextError, ERPNextClient
@@ -589,6 +590,31 @@ def _remark(txn: SecurityTransaction, security: Security | None) -> str:
     return f'{verb}: {label} ${total:,.2f} — {txn.name or txn.subtype or ""}'.strip()
 
 
+def is_settlement_leg(txn: SecurityTransaction,
+                      account: PlaidAccount | None) -> bool:
+    """True when this row is the CASH half of a same-account trade (v0.8.5).
+
+    Lifted out of `settlement_leg_accounts` so the dedup guard and the JE
+    builder answer "is this a settlement leg?" from ONE definition. They had to
+    agree exactly: a guard that thought a dividend was a settlement leg would
+    dedup income entries, and one that missed a real leg would leave the very
+    pipeline v0.8.5 exists to protect unprotected.
+
+    Income (`interest` / `dividend`) is explicitly not a settlement leg — the
+    caller books those against an income account long before this is asked."""
+    if txn is None or account is None:
+        return False
+    if (txn.type or '').strip().lower() != 'cash':
+        return False
+    if not (account.paired_account_id or '').strip():
+        return False
+    sub = (txn.subtype or '').strip().lower()
+    if 'interest' in sub or 'dividend' in sub:
+        return False
+    return sub in (CASH_SETTLEMENT_OUTFLOW_SUBTYPES
+                   + CASH_SETTLEMENT_INFLOW_SUBTYPES)
+
+
 def settlement_leg_accounts(client, txn: SecurityTransaction,
                             account: PlaidAccount, company: str,
                             amount: float) -> list | None:
@@ -612,7 +638,7 @@ def settlement_leg_accounts(client, txn: SecurityTransaction,
     to settle against — an account linked but never mapped. The trade's security
     leg still posts; the operator sees the shortfall in Cash Clearing, which is
     precisely what that account is for."""
-    if not (account.paired_account_id or '').strip():
+    if not is_settlement_leg(txn, account):
         return None
     sub = (txn.subtype or '').strip().lower()
     if sub in CASH_SETTLEMENT_OUTFLOW_SUBTYPES:
@@ -747,8 +773,20 @@ def build_investment_je(client: ERPNextClient, txn: SecurityTransaction,
     if line_tags:
         for line in accounts:
             line.update(line_tags)
+    # v0.8.5 · every investment JE carries its source row's identity in the
+    # remark ('… [BB:inv:<plaid_investment_transaction_id>]'). Two things need
+    # it: the settlement-leg dedup guard, which asks ERPNext whether this exact
+    # row already posted (see app/je_dedup.py), and any human reading the
+    # voucher who wants to know which Plaid record produced it. It is APPENDED,
+    # because `_sweep_orphan_drafts` recognizes an investment draft by what its
+    # remark starts with. Stamped on trades too even though nothing dedups them
+    # yet — the marker is an audit-trail fact, not a dedup mechanism, and a
+    # marker that only some entries carry is one nobody can rely on later.
     doc = {'doctype': JOURNAL_ENTRY_DT, 'voucher_type': 'Journal Entry',
-           'company': company, 'user_remark': _remark(txn, security),
+           'company': company,
+           'user_remark': je_dedup.stamp(
+               _remark(txn, security), 'inv',
+               txn.plaid_investment_transaction_id),
            'accounts': accounts}
     if txn.date:
         doc['posting_date'] = txn.date.isoformat()
@@ -823,6 +861,32 @@ def generate_investment_je(client: ERPNextClient, txn: SecurityTransaction, *,
     gje.description = doc['user_remark'][:2000]
     gje.rule_name = 'investment'
     gje.updated_at = _now()
+
+    # v0.8.5 · SETTLEMENT LEGS ONLY — ask ERPNext whether this exact row already
+    # posted, before writing a second one. The local GJE row above is the
+    # primary guard; `reset_investment_drafts` deletes it on purpose, and the
+    # v0.8.4 re-emission of 112 pre-2024-12-01 legs is what that gap looks like
+    # from the operator's side.
+    #
+    # NOT applied to trade JEs. Those were re-emitted by the same v0.8.4 sync and
+    # we do not yet know whether any of that re-emission was legitimate (a
+    # corrected cost basis, a re-pull with better security metadata). Blocking a
+    # trade on that guess is the fail-UNSAFE direction; a duplicate trade draft
+    # is visible in /admin/draft_health and deletable, a missing one is not.
+    if is_settlement_leg(txn, account):
+        duplicate = je_dedup.find_by_marker(client, 'inv', itx, company=company)
+        if duplicate is not None:
+            reason = je_dedup.record_skip(
+                'invest_je settlement leg', je_dedup.marker('inv', itx),
+                duplicate, subject_id=gje.id,
+                extra={'plaid_investment_transaction_id': itx,
+                       'account_id': txn.account_id, 'company': company,
+                       'subtype': (txn.subtype or ''),
+                       'amount': gje.amount})
+            gje.state = 'dedup_skipped'
+            gje.error_message = reason[:2000]
+            db.session.commit()
+            return gje
     try:
         created = client.create_doc(JOURNAL_ENTRY_DT, doc)
         name = created.get('name')
@@ -1095,15 +1159,36 @@ def reset_cancelled_gjes(account_id: str | None = None) -> int:
 def post_investments_for_account(client: ERPNextClient, account_id: str, *,
                                  force: bool = False) -> dict:
     """Post every not-yet-posted SecurityTransaction for one account. Never
-    raises; returns {'posted', 'skipped', 'failed'}.
+    raises; returns {'posted', 'skipped', 'skipped_duplicate', 'dedup_skipped',
+    'failed'}.
 
     `force=True` (v0.5.13) regenerates over CANCELLED GJEs — see
     generate_investment_je. pending_review/approved rows stay protected.
 
     v0.8.3 · the Item's accounting dimensions are resolved ONCE here and handed
     to every JE, so a backfill validates the cost center and the member a single
-    time rather than once per trade."""
-    stats = {'posted': 0, 'skipped': 0, 'failed': 0}
+    time rather than once per trade.
+
+    v0.8.5 · `posted` now counts JEs this call actually WROTE, and the trades
+    that were already posted are counted separately as `skipped_duplicate`.
+    Before, `generate_investment_je` returning the pre-existing row for an
+    already-posted trade fell into the `posted` bucket — so a re-run over 455
+    settled trades reported "posted 455" having written nothing at all. That is
+    a report the operator cannot act on and, worse, cannot distinguish from a
+    real backfill. The set of already-posted ids is read once per account, so
+    the honesty costs one query.
+
+    `skipped` keeps its old meaning: a row this engine does not post — a
+    transfer, a cancel, a type it does not recognize, an account with no owning
+    Company.
+
+    v0.8.5 · `dedup_skipped` is a THIRD kind of not-posting, and it is the one
+    to read first: a settlement leg the LOCAL tracker believed was unposted but
+    ERPNext already held (see generate_investment_je). `skipped_duplicate` means
+    the two agreed; `dedup_skipped` means they had drifted apart and the ledger
+    won. A non-zero count is not an error, but it is always worth a look."""
+    stats = {'posted': 0, 'skipped': 0, 'skipped_duplicate': 0,
+             'dedup_skipped': 0, 'failed': 0}
     account = PlaidAccount.query.filter_by(account_id=account_id).first()
     if account is None or not posting_enabled(account):
         return stats
@@ -1121,7 +1206,19 @@ def post_investments_for_account(client: ERPNextClient, account_id: str, *,
             .filter_by(account_id=account_id)
             .order_by(SecurityTransaction.date.asc(),
                       SecurityTransaction.id.asc()).all())
+    # Which of these trades ALREADY carry a Journal Entry, and WHICH ONE, read
+    # once before the loop. Comparing the name afterwards is what separates "the
+    # existing row was handed back" from "a fresh document was written" — and it
+    # stays correct under force=True, where a rebuild over a cancelled entry
+    # yields a DIFFERENT name and is a real post.
+    already = {itx: name for itx, name in db.session.query(
+        GeneratedJournalEntry.plaid_investment_transaction_id,
+        GeneratedJournalEntry.erpnext_journal_entry_name)
+        .filter(GeneratedJournalEntry.plaid_investment_transaction_id.isnot(None),
+                GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None))
+        .all() if itx}
     for txn in rows:
+        prior = already.get(txn.plaid_investment_transaction_id)
         try:
             gje = generate_investment_je(client, txn, force=force, tags=tags)
         except Exception:  # pragma: no cover - generate already swallows
@@ -1132,6 +1229,11 @@ def post_investments_for_account(client: ERPNextClient, account_id: str, *,
             stats['skipped'] += 1
         elif gje.state == 'error':
             stats['failed'] += 1
+        elif gje.state == 'dedup_skipped':
+            stats['dedup_skipped'] += 1
+        elif prior and prior == gje.erpnext_journal_entry_name:
+            # The pre-existing entry, handed back untouched. Nothing was written.
+            stats['skipped_duplicate'] += 1
         else:
             stats['posted'] += 1
     return stats

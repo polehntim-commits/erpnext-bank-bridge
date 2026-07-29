@@ -164,8 +164,10 @@ class RerunRulesTests(McpBase):
         _, body = self._call_tool('rerun_rules')
         self.assertFalse(body['result']['isError'])
         payload = json.loads(body['result']['content'][0]['text'])
-        self.assertEqual({'considered', 'matched', 'generated'},
-                         set(payload))
+        # v0.8.5 added `dedup_skipped` — how many transactions the rerun
+        # declined to write a JE for because ERPNext already held one.
+        self.assertEqual({'considered', 'matched', 'generated',
+                          'dedup_skipped'}, set(payload))
 
     def test_the_admin_route_and_the_tool_share_one_implementation(self):
         """Two copies of this drifted once already — the route had no gate

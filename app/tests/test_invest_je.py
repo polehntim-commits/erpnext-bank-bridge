@@ -775,8 +775,15 @@ class SyncFlowWiringTests(InvestJEBase):
         seen = []
         res = self._sync(self._recorder(seen))
         self.assertEqual(seen, [])
-        self.assertEqual(res['invest_je'], {'posted': 0, 'skipped': 0,
-                                            'failed': 0})
+        for key in ('posted', 'skipped', 'failed'):
+            self.assertEqual(res['invest_je'][key], 0, res['invest_je'])
+        # v0.8.5 · and it SAYS why, with a code the caller can act on — a pass
+        # that posted nothing because the switch is off must not look like a
+        # pass that posted nothing because there was nothing to post. A NOTICE,
+        # not an error: the switch being off is the designed default.
+        self.assertEqual([e['code'] for e in res['invest_je']['notices']],
+                         ['invest_je_posting_disabled'])
+        self.assertEqual(res['invest_je']['errors'], [])
 
     def test_sync_posts_nothing_when_erpnext_is_not_configured(self):
         from app import sync_engine

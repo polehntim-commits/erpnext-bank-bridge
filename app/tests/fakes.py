@@ -162,6 +162,11 @@ class FakeERPClient:
         self.by_ref = {}        # reference_number -> name
         self.submitted = set()
         self.cancelled = set()
+        # v0.8.5 · {docname: 'YYYY-MM-DD HH:MM:SS'} — Frappe's own `creation`
+        # timestamp, which draft_health reads to find the OLDEST draft. Set by a
+        # test that cares; absent means the JE list reports '' and the age is
+        # simply unknown, which is what the real read does with a null.
+        self.creations = {}
         self.deleted = set()        # v0.4.1 · frappe.client.delete targets
         self.calls = []
         self._counter = 0
@@ -391,6 +396,45 @@ class FakeERPClient:
                 return False
         return True
 
+    @classmethod
+    def _journal_entry_matches(cls, doc, filters):
+        """v0.8.5 · the Journal Entry list filters the real code uses.
+
+        Three forms beyond plain equality, all of them Frappe's and all of them
+        load-bearing for the dedup guard and the draft-health read:
+
+          * `['docstatus', 'in', [0, 1]]` — live entries only.
+          * `['user_remark', 'like', '%[BB:inv:x]%']` — the identity marker.
+          * `['Journal Entry Account', 'reference_name', '=', 'ACC-BTN-0001']`
+            — the FOUR-element child-table form, matched against the JE's own
+            `accounts` rows. Without this the fake would answer "no duplicate"
+            to every dedup lookup and the guard would test as a no-op.
+        """
+        for f in (filters or []):
+            if len(f) >= 4:
+                child, field, op, value = f[0], f[1], f[2], f[3]
+                if child != 'Journal Entry Account':
+                    continue
+                lines = doc.get('accounts') or []
+                if op == '=' and not any(
+                        str(ln.get(field, '') or '') == str(value)
+                        for ln in lines):
+                    return False
+                continue
+            field, op, value = f[0], f[1], f[2]
+            actual = doc.get(field, '')
+            if op == '=':
+                if str(actual if actual is not None else '') != str(value):
+                    return False
+            elif op == 'in':
+                if str(actual) not in [str(v) for v in (value or [])]:
+                    return False
+            elif op == 'like':
+                if str(value).strip('%').lower() not in \
+                        str(actual or '').lower():
+                    return False
+        return True
+
     @staticmethod
     def _counterparty_matches(doc, filters):
         """Like _matches, but also honours the `like` operator the
@@ -508,8 +552,12 @@ class FakeERPClient:
             for name, d in self.created['Journal Entry'].items():
                 doc = {'docstatus': (2 if name in self.cancelled else
                                      1 if name in self.submitted else 0),
+                       'creation': self.creations.get(name, ''),
+                       'total_debit': sum(
+                           float(a.get('debit_in_account_currency') or 0.0)
+                           for a in (d.get('accounts') or [])),
                        **d, 'name': name}
-                if not self._matches(doc, filters):
+                if not self._journal_entry_matches(doc, filters):
                     continue
                 rows.append({k: doc.get(k) for k in fields} if fields
                             else {'name': name})

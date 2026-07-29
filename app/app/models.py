@@ -635,21 +635,31 @@ class CategorizationRule(db.Model):
     offset_account = db.Column(db.String(255), default='')
     # auto | always_debit | always_credit
     offset_direction = db.Column(db.String(20), default='auto')
-    # v0.7.3 · the ERPNext Cost Center docname written onto the OFFSET line of
-    # this rule's generated Journal Entry ('Harvest - OML'). NULL/'' = don't
-    # write one, which is the pre-v0.7.3 behaviour and stays the default for
-    # every existing rule.
+    # v0.7.3 · the ERPNext Cost Center docname written onto this rule's
+    # generated Journal Entry ('Harvest - OML'). NULL/'' = don't write one,
+    # which is the pre-v0.7.3 behaviour and stays the default for every
+    # existing rule.
     #
-    # OFFSET LINE ONLY. The bank side is a balance-sheet account whose activity
-    # belongs to no value-chain segment, and ERPNext's own default would land
-    # every bank line on the Company default anyway; segmenting the categorized
-    # side is the entire point (a Coastal Farm & Ranch purchase is a Crop
-    # Protection cost, the checking account it left is not).
+    # v0.8.5 · BOTH LEGS, not just the offset. Through v0.8.4 this rode the
+    # OFFSET line alone and the bank line was deliberately left blank — at
+    # which point ERPNext's own server-side fallback filled it with the
+    # COMPANY DEFAULT. So a Sorren bill categorized to "310 - G and A
+    # Administration - OML" posted its cash half to "Main - OML", and every
+    # Cost-Center-wise report had the cost in one segment and the cash that
+    # paid it in another. The dimension did not balance inside the entry.
+    #
+    # A cost center is an accounting DIMENSION, and a dimension only reads
+    # correctly when both halves of a double entry carry it. Mirroring the
+    # rule's value onto the bank leg makes each generated JE self-balancing on
+    # the dimension, which is what a Cost-Center Trial Balance needs and what
+    # an auditor asks for. See `bank_cost_center` for the escape hatch, and
+    # categorization.apply_rule_dimensions for the single stamping choke point.
     #
     # LEFT BLANK, NOT DEFAULTED, when unset: ERPNext applies the Account's or
     # the Company's own default cost center server-side, and that server-side
     # default is a better answer than anything this app could guess — writing
-    # a value here would OVERRIDE it. See categorization.build_journal_entry.
+    # a value here would OVERRIDE it. An unset cost_center therefore still
+    # stamps NEITHER leg.
     #
     # Stored verbatim, not resolved per-Company like a Mode B offset account
     # (see `applies_to_company`): a cost center is chosen against one Company's
@@ -657,6 +667,26 @@ class CategorizationRule(db.Model):
     # center is the operator's explicit choice and ERPNext is the authority
     # that rejects it if wrong.
     cost_center = db.Column(db.String(140), nullable=True)
+    # v0.8.5 · the BANK leg's Cost Center, when it must differ from the offset
+    # leg's. TRI-STATE, and the tri-state is the whole point — this is the
+    # rule-level configuration that replaces a hard-coded "bank lines get the
+    # Company default" assumption:
+    #
+    #   * NULL / ''  → MIRROR `cost_center` onto the bank leg. The default, and
+    #     what every existing rule upgrades to (no backfill needed — NULL
+    #     already means mirror).
+    #   * '(none)'   → write NO key on the bank leg, handing it back to
+    #     ERPNext's Account/Company default. This is the pre-v0.8.5 behaviour,
+    #     now reachable only as a DELIBERATE per-rule choice rather than as the
+    #     silent default it used to be. The sentinel spelling lives in
+    #     categorization.BANK_LEG_NO_COST_CENTER; '(none)' can never collide
+    #     with a real docname, which always carries a ' - <abbr>' suffix.
+    #   * any other value → that Cost Center docname, verbatim.
+    #
+    # A rule with NO `cost_center` at all stamps neither leg regardless of what
+    # sits here: there is nothing to mirror and nothing the rule has claimed to
+    # know, so ERPNext's defaults run on both sides exactly as before.
+    bank_cost_center = db.Column(db.String(140), nullable=True)
     # DEPRECATED (pre-v0.3.1) — kept one release for backwards compat.
     debit_account = db.Column(db.String(255), default='')
     credit_account = db.Column(db.String(255), default='')
@@ -781,6 +811,7 @@ class CategorizationRule(db.Model):
             'offset_account': self.offset_account or '',
             'offset_direction': self.offset_direction or 'auto',
             'cost_center': self.cost_center or '',
+            'bank_cost_center': self.bank_cost_center or '',
             'debit_account': self.debit_account,
             'credit_account': self.credit_account,
             'party_type': self.party_type, 'party_name': self.party_name,
@@ -2427,4 +2458,68 @@ class AiActionLog(db.Model):
             'result_summary': self.result_summary or '',
             'caller_ip': self.caller_ip or '',
             'ok': bool(self.ok),
+        }
+
+
+class DraftHealthSample(db.Model):
+    """One observation of how many DRAFT Journal Entries ERPNext is holding
+    (v0.8.5) — the history the alert threshold is LEARNED from.
+
+    THE INCIDENT: the v0.8.4 sync re-emitted 112 pre-2024-12-01 settlement-leg
+    drafts that were duplicates-by-effect of the aggregate reconciliation JEs.
+    They sat in draft state for hours and were noticed by a human watching the
+    queue grow. Nothing in Bank Bridge knew what a normal draft count looked
+    like, so nothing could tell that one wasn't.
+
+    Why a table rather than a constant: a hand-coded "warn above 50" is a guess
+    about an install we have never measured. Every snapshot lands here, and once
+    there are enough of them the threshold becomes the P95 of what this install
+    actually does (see draft_health.learned_threshold). Fifty stays only as the
+    answer for the first few weeks, when there is no history to learn from.
+
+    `breached` is recorded so the baseline can EXCLUDE the abnormal samples it
+    is meant to detect — a learned threshold that ate its own explosions would
+    quietly ratchet upward until the alarm never fired again.
+
+    Append-only, like AuditEvent and AiActionLog: the row IS the history."""
+    __tablename__ = 'draft_health_samples'
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=_now, index=True)
+    # '' means "every Company" — the unscoped snapshot. Samples are compared
+    # only against samples of the SAME scope; a single-Company total and a
+    # per-Company total are different measurements.
+    company = db.Column(db.String(140), default='', index=True)
+    draft_count = db.Column(db.Integer, default=0, index=True)
+    total_amount = db.Column(db.Float, default=0.0)
+    oldest_posting_date = db.Column(db.Date, nullable=True)
+    oldest_created_at = db.Column(db.DateTime, nullable=True)
+    # The threshold in force AT THE MOMENT OF THE OBSERVATION, and where it came
+    # from ('default' | 'baseline_p95'). Stored rather than recomputed so an
+    # after-the-fact read of the history sees the decision that was actually
+    # made, not the one today's baseline would make.
+    threshold = db.Column(db.Integer, default=0)
+    threshold_source = db.Column(db.String(20), default='default')
+    breached = db.Column(db.Boolean, default=False, index=True)
+    # {prefix: {'count': n, 'amount': x}} — the user_remark grouping, kept so a
+    # past explosion can be attributed to a pipeline without re-querying ERPNext
+    # (by then the drafts are gone, which is the point of cleaning them up).
+    by_prefix = db.Column(
+        MutableDict.as_mutable(db.JSON().with_variant(JSONB, 'postgresql')),
+        default=dict)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'observed_at': self.created_at.isoformat() if self.created_at else None,
+            'company': self.company or '',
+            'draft_count': int(self.draft_count or 0),
+            'total_amount': round(float(self.total_amount or 0.0), 2),
+            'oldest_posting_date': (self.oldest_posting_date.isoformat()
+                                    if self.oldest_posting_date else None),
+            'oldest_created_at': (self.oldest_created_at.isoformat()
+                                  if self.oldest_created_at else None),
+            'threshold': int(self.threshold or 0),
+            'threshold_source': self.threshold_source or 'default',
+            'breached': bool(self.breached),
+            'by_prefix': dict(self.by_prefix or {}),
         }

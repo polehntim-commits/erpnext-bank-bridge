@@ -34,6 +34,7 @@ from flask import Blueprint, current_app, jsonify, request
 from .. import db
 from .. import mcp_settings
 from .. import statements as stmts
+from ..erpnext_client import ERPNextAPIError, ERPNextError
 from ..models import (AiActionLog, BankTransaction, CategorizationRule,
                       PlaidAccount, PlaidItem, PlaidStatement,
                       StatementAnchor, StatementTransaction)
@@ -285,6 +286,10 @@ def _list_rules(args: dict):
         # uncosted. An AI auditing value-chain coverage needs that distinction
         # to be visible, which is why the field is listed even when empty.
         'cost_center': r.cost_center or '',
+        # v0.8.5 · '' means the bank leg MIRRORS `cost_center` (the default);
+        # '(none)' means the bank leg is deliberately left to ERPNext's own
+        # default; anything else is an explicit bank-leg cost center.
+        'bank_cost_center': r.bank_cost_center or '',
         'bb_internal_tag': r.bb_internal_tag or '',
         'applies_to_company': r.applies_to_company or None,
     } for r in rules]
@@ -811,6 +816,17 @@ def _checked_cost_center(raw, company: str = '') -> str:
     return cc
 
 
+def _checked_bank_cost_center(raw, company: str = '') -> str:
+    """`_checked_cost_center` plus the v0.8.5 sentinel. '(none)' means "write no
+    cost center on the bank leg" and is NOT a docname, so it must never be
+    looked up — ERPNext would positively deny it and refuse the whole call."""
+    from .. import categorization
+    cc = (raw or '').strip()
+    if cc == categorization.BANK_LEG_NO_COST_CENTER:
+        return cc
+    return _checked_cost_center(cc, company)
+
+
 def _create_rule(args: dict):
     rule = CategorizationRule(
         match_type=(args.get('match_type') or 'merchant_contains'),
@@ -821,6 +837,12 @@ def _create_rule(args: dict):
         # is always Company-agnostic here — create_rule takes no scope — so the
         # lookup is unscoped, which only widens the bare-name fallback.
         cost_center=(_checked_cost_center(args.get('cost_center')) or None),
+        # v0.8.5 · optional bank-leg override. Omitted (None) = MIRROR
+        # cost_center onto the bank leg, which is what the fix wants by
+        # default; pass '(none)' to leave the bank leg to ERPNext's own
+        # default, or a docname to send it somewhere else entirely.
+        bank_cost_center=(_checked_bank_cost_center(
+            args.get('bank_cost_center')) or None),
         bb_internal_tag=(args.get('tag') or ''),
         name=(args.get('name') or args.get('match_value') or 'AI rule'))
     db.session.add(rule)
@@ -851,6 +873,7 @@ _RULE_UPDATABLE = {
     'match_value': 'match_value',
     'offset_account': 'offset_account',
     'cost_center': 'cost_center',
+    'bank_cost_center': 'bank_cost_center',
     'active': 'active',
     'priority': 'priority',
     'tag': 'bb_internal_tag',
@@ -918,6 +941,15 @@ def _update_rule(args: dict):
         # center, handing the line back to ERPNext's own defaults.
         patch['cost_center'] = (
             _checked_cost_center(patch['cost_center'], company) or None)
+    if 'bank_cost_center' in patch:
+        # Same scoping rule as `cost_center` above; '' → None restores the
+        # v0.8.5 default (mirror the offset leg's cost center).
+        company = (patch.get('applies_to_company')
+                   if 'applies_to_company' in patch
+                   else vals.get('applies_to_company')) or ''
+        patch['bank_cost_center'] = (
+            _checked_bank_cost_center(patch['bank_cost_center'], company)
+            or None)
 
     vals.update(patch)
     new_rule = CategorizationRule(**vals)
@@ -1205,6 +1237,32 @@ def _get_clearing_status(args: dict):
                     f"still unposted")
 
 
+
+def _get_draft_health(args: dict):
+    """How many DRAFT Journal Entries ERPNext is holding, and whether that is
+    normal for this install (v0.8.5). Read-only, and never gated: knowing the
+    state of the queue cannot change the books, and an AI operator that cannot
+    see the queue is exactly the operator the v0.8.4 incident had."""
+    from .. import draft_health
+    client = _erp_client_or_error()
+    company = (args.get('company') or '').strip()
+    threshold = args.get('threshold')
+    try:
+        threshold = int(threshold) if threshold not in (None, '') else None
+    except (TypeError, ValueError):
+        raise ToolError(f'threshold must be a whole number, got {threshold!r}')
+    try:
+        snap = draft_health.observe(client, company, threshold=threshold)
+    except (ERPNextAPIError, ERPNextError) as e:
+        # Deliberately an error, not a zero. A caller handed draft_count=0 by an
+        # unreadable ledger would conclude the queue is clean, which is the one
+        # wrong answer this tool could give.
+        raise ToolError(f'could not read draft Journal Entries: {e}')
+    return snap, snap['headline'] + (
+        ' — ALERT: threshold crossed on this reading' if snap.get('crossed')
+        else ' — recovered on this reading' if snap.get('recovered') else '')
+
+
 def _post_clearing_cleanup_je(args: dict):
     from .. import invest_je
     client = _erp_client_or_error()
@@ -1283,6 +1341,78 @@ def _set_erpnext_config(args: dict):
                  after={'changed_fields': changed, 'url': saved['url']},
                  notes='MCP set_erpnext_config', actor='mcp')
     return result, ('changed: ' + (', '.join(changed) if changed else 'nothing'))
+
+
+# ── v0.8.5 · sync on demand ─────────────────────────────────────────────────
+#
+# THE GAP THIS CLOSES. On 2026-07-29, mid-way through the Cash Clearing cleanup,
+# 77 settlement legs for the ••9401 brokerage still needed posting.
+# `trigger_reparse` re-read the statement PDFs and produced no drafts (it is the
+# wrong pipeline). `reset_investment_drafts` refused, correctly, on the first
+# submitted entry. Nothing on this server could run the thing that actually
+# posts them — `sync_engine.post_investment_jes` — and a $1M ledger correction
+# stopped dead until a human clicked Sync Now in a browser. The button and this
+# tool now call ONE function (`sync_engine.run_sync`), so that cannot recur.
+#
+# It is a KAIROTIC trigger and nothing more: the caller decides that now is the
+# moment, and the tool does exactly what was asked, once. It schedules nothing,
+# widens nothing, and leaves the background cadence exactly where it is.
+
+def _flag(args: dict, name: str, default: bool) -> bool:
+    """A boolean argument, tolerant of the string spellings an LLM client sends.
+    `bool("false")` is True, and a tool whose dry_run silently inverted on a
+    quoted argument would be the worst failure on this list."""
+    raw = args.get(name, default)
+    if raw is None:
+        return default
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in ('true', '1', 'yes', 'on'):
+            return True
+        if low in ('false', '0', 'no', 'off', ''):
+            return False
+        raise ToolError(f'{name} must be true or false, got {raw!r}')
+    return bool(raw)
+
+
+def _sync_now(args: dict):
+    from .. import sync_engine
+    account_id = (args.get('account_id') or '').strip()
+    include_investments = _flag(args, 'include_investments', True)
+    dry_run = _flag(args, 'dry_run', False)
+    try:
+        result = sync_engine.run_sync(
+            account_id=account_id,
+            include_investments=include_investments,
+            dry_run=dry_run, actor='mcp')
+    except sync_engine.SyncScopeError as e:
+        raise ToolError(str(e))
+    return result, _sync_summary(result)
+
+
+def _sync_summary(result: dict) -> str:
+    """The one-line result summary written to AiActionLog. Says what LANDED and
+    what did not — a summary that reads 'success' over a partial run is how an
+    operator learns about a broken account a week late."""
+    scope = result['scope']
+    if result.get('dry_run'):
+        would = sum(a.get('would_post', 0) for a in result['accounts'])
+        jes = sum(a.get('would_draft_investment_jes', 0)
+                  for a in result['accounts'])
+        return (f'DRY RUN ({scope}): would post {would} bank transaction(s) '
+                f'and draft {jes} investment JE(s) from what is already '
+                'mirrored; Plaid was not contacted')
+    t = result['totals']
+    line = (f"{result['status']} ({scope}): {t['transactions_fetched']} "
+            f"fetched, {t['bank_transactions_posted']} posted, "
+            f"{t['investment_jes_drafted']} investment JE(s) drafted, "
+            f"{t['investment_jes_skipped_duplicate']} already posted, "
+            f"{len(result['errors'])} error(s) in "
+            f"{result['elapsed_seconds']}s")
+    if result['errors']:
+        line += f" — first: [{result['errors'][0]['code']}] " \
+                f"{result['errors'][0]['message'][:200]}"
+    return line
 
 
 def _set_je_posting(args: dict, on: bool):
@@ -1558,20 +1688,29 @@ TOOLS = {
     'create_rule': {
         **_tool(
             'Create a categorization rule. Optionally set cost_center — the '
-            'ERPNext Cost Center docname written onto the OFFSET line of every '
-            'Journal Entry this rule generates (the bank line is never given '
-            'one). REFUSES a cost_center ERPNext positively denies (unknown, or '
-            'a group node); an unreachable ERPNext yields no verdict and the '
-            'value is accepted. Omit cost_center to write none, which leaves '
-            "ERPNext to apply the Account's or Company's own default. "
-            'REVERSIBLE: a rule is archived, never deleted, and only affects '
-            'Journal Entries generated after it. MUTATING — requires the '
-            'create_rule kill switch to be ON.',
+            'ERPNext Cost Center docname written onto BOTH legs of every '
+            'Journal Entry this rule generates (v0.8.5; through v0.8.4 only '
+            'the offset leg got one and ERPNext filled the bank leg with the '
+            'Company default, which split the dimension across two segments). '
+            'Set bank_cost_center only when the bank leg must differ: a '
+            'docname sends it elsewhere, "(none)" leaves it to ERPNext\'s own '
+            'default. REFUSES a cost center ERPNext positively denies (unknown, '
+            'or a group node); an unreachable ERPNext yields no verdict and the '
+            'value is accepted. Omit cost_center to write none on either leg, '
+            "which leaves ERPNext to apply the Account's or Company's own "
+            'default. REVERSIBLE: a rule is archived, never deleted, and only '
+            'affects Journal Entries generated after it. MUTATING — requires '
+            'the create_rule kill switch to be ON.',
             {'match_type': _STR, 'match_value': _STR, 'offset_account': _STR,
              'cost_center': {
                  'type': 'string',
-                 'description': 'ERPNext Cost Center docname for the offset '
-                                'line, e.g. "Harvest - OML". Omit for none.'},
+                 'description': 'ERPNext Cost Center docname for BOTH JE legs, '
+                                'e.g. "Harvest - OML". Omit for none.'},
+             'bank_cost_center': {
+                 'type': 'string',
+                 'description': 'Bank-leg override. Omit to mirror '
+                                'cost_center (the default). "(none)" leaves '
+                                "the bank leg to ERPNext's own default."},
              'tag': _STR, 'name': _STR},
             required=('match_type', 'match_value'), mutating=True),
         'handler': _create_rule},
@@ -1579,8 +1718,10 @@ TOOLS = {
         **_tool(
             'Update one categorization rule, changing ONLY the fields you pass '
             '(name, match_type, match_value, offset_account, cost_center, '
-            'active, priority, tag, applies_to_company). Pass cost_center="" to '
-            'clear it and hand the offset line back to ERPNext\'s own default. '
+            'bank_cost_center, active, priority, tag, applies_to_company). '
+            'Pass cost_center="" to clear it and hand BOTH JE legs back to '
+            "ERPNext's own default; pass bank_cost_center=\"\" to restore the "
+            'default of mirroring cost_center onto the bank leg. '
             'NON-DESTRUCTIVE: like an edit in the admin UI this writes a NEW '
             'rule version and archives the old one (returns the new id in '
             'updated_rule.id and the archived one in superseded_rule_id), so '
@@ -1596,8 +1737,13 @@ TOOLS = {
              'offset_account': _STR,
              'cost_center': {
                  'type': 'string',
-                 'description': 'ERPNext Cost Center docname for the offset '
-                                'line. "" clears it.'},
+                 'description': 'ERPNext Cost Center docname for BOTH JE '
+                                'legs. "" clears it.'},
+             'bank_cost_center': {
+                 'type': 'string',
+                 'description': 'Bank-leg override. "" restores the default '
+                                '(mirror cost_center). "(none)" leaves the '
+                                "bank leg to ERPNext's own default."},
              'active': _BOOL, 'priority': {'type': 'integer'},
              'tag': _STR, 'applies_to_company': _STR},
             required=('rule_id',), mutating=True),
@@ -1774,6 +1920,26 @@ TOOLS = {
             {}, mutating=True),
         'handler': _disable_public_url},
     # ── v0.8.4 · the admin surface, as tools ────────────────────────────────
+    'get_draft_health': {
+        **_tool(
+            'How many DRAFT Journal Entries ERPNext is holding right now, how '
+            'much money is in them, how old the oldest is, and how they group '
+            'by user_remark prefix (Cash / Cash withdrawal = investment '
+            'settlement legs, Bought / Sold = trades, the rest = the bank-side '
+            'rules engine). Flags `breached` when the count is over the alert '
+            'threshold, which is LEARNED from this install\'s own history (the '
+            'P95 of prior healthy readings) once there are enough observations '
+            'and is a starting default of 50 before that. `crossed` is true '
+            'ONLY on the reading where a healthy queue first goes over the '
+            'line — this is a state query, not a scheduled alert, so calling '
+            'it repeatedly while breached does not re-alert. Run it after any '
+            'bulk post or backfill: the v0.8.4 sync left 112 duplicate '
+            'settlement-leg drafts standing for hours because nothing was '
+            'watching this number. Read-only. Optional `company` scopes the '
+            'count; optional `threshold` overrides the learned one for a '
+            'what-if.',
+            {'company': _STR, 'threshold': {'type': 'integer'}}),
+        'handler': _get_draft_health},
     'get_clearing_status': {
         **_tool(
             "What a paired brokerage's Cash Clearing account ACTUALLY holds in "
@@ -1848,6 +2014,46 @@ TOOLS = {
             'disable_je_gate kill switch ON.',
             {}, mutating=True),
         'handler': _disable_je_gate},
+    # ── v0.8.5 · sync on demand ─────────────────────────────────────────────
+    'sync_now': {
+        **_tool(
+            'Run a sync RIGHT NOW: pull fresh transactions from Plaid into the '
+            'local mirror, push them to ERPNext as Bank Transactions, and (by '
+            'default) post the investment Journal Entries the brokerages have '
+            'mirrored. Exactly what the Sync Now button on /admin does — same '
+            'function, same behaviour — and the tool to reach for when drafts '
+            'or settlement legs need to exist before another tool can act on '
+            'them. It is a MANUAL trigger: it runs once, does only what you '
+            'ask, and changes no schedule.\n\n'
+            'account_id scopes the run to ONE Plaid account (its bank is '
+            'polled, and only that account posts) — the retry to use after a '
+            'partial failure, rather than re-running the whole sweep. Omit it '
+            'to sync every connected bank.\n'
+            'include_investments (default true) also runs the investment JE '
+            'post and mark-to-market; false leaves the bank-transaction sync '
+            'alone.\n'
+            'dry_run (default false) reports what WOULD post from what is '
+            'already mirrored and contacts Plaid not at all — so it cannot '
+            'know how many new transactions the bank is holding, and says so.\n\n'
+            'Returns a per-account summary — transactions fetched, Bank '
+            'Transactions posted, investment JEs drafted, how many were '
+            'skipped as already-posted duplicates, and structured errors with '
+            'a code and a remedy — plus totals, status (ok | partial | '
+            'failed) and elapsed seconds. A partial run reports what LANDED '
+            'alongside what broke; one bank failing never stops the others. '
+            'MUTATING, and the only tool here that spends billable Plaid '
+            'calls — requires the sync_now kill switch ON.',
+            {'account_id': {'type': 'string',
+                            'description': 'Plaid account_id to scope to; '
+                                           'omit for every account'},
+             'include_investments': {
+                 'type': 'boolean',
+                 'description': 'default true — also post investment JEs'},
+             'dry_run': {'type': 'boolean',
+                         'description': 'default false — preview only, '
+                                        'contacts nothing'}},
+            mutating=True),
+        'handler': _sync_now},
     'set_erpnext_config': {
         **_tool(
             'Set the ERPNext connection — URL, API key, API secret, default '

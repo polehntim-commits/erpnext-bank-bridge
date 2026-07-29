@@ -41,6 +41,7 @@ from . import audit
 from . import db
 from . import erpnext_bank
 from . import erpnext_settings
+from . import je_dedup
 from .erpnext_client import ERPNextAPIError, ERPNextError
 from .models import (BankTransaction, CategorizationRule,
                      GeneratedJournalEntry, PlaidAccount)
@@ -590,6 +591,72 @@ def _contribution_bank_leg(client, row, company: str) -> str | None:
     return invest_je.cash_clearing_account(client, company)
 
 
+# ── v0.8.5: rule-level accounting dimensions, stamped onto BOTH legs ─────────
+
+# The `bank_cost_center` sentinel meaning "write NO cost center key on the bank
+# leg". A real Cost Center docname is always Company-suffixed ('Harvest - OML'),
+# so this can never collide with one. See CategorizationRule.bank_cost_center.
+BANK_LEG_NO_COST_CENTER = '(none)'
+
+
+def bank_leg_cost_center(rule) -> str:
+    """The Cost Center docname the BANK line should carry, '' for "write no key
+    at all" (v0.8.5).
+
+      * `bank_cost_center` unset      → MIRROR the rule's own `cost_center`
+      * `bank_cost_center` = '(none)' → '' (ERPNext's own default fills it)
+      * anything else                 → that docname, verbatim
+
+    A rule with no `cost_center` at all returns '' under every branch except an
+    explicit override: there is nothing to mirror."""
+    offset_cc = (getattr(rule, 'cost_center', None) or '').strip()
+    override = (getattr(rule, 'bank_cost_center', None) or '').strip()
+    if not override:
+        return offset_cc
+    if override == BANK_LEG_NO_COST_CENTER:
+        return ''
+    return override
+
+
+def apply_rule_dimensions(rule, offset_line: dict, bank_line: dict) -> None:
+    """Stamp this rule's accounting dimensions onto the JE lines, in place.
+
+    THE ONE PLACE rule-level metadata reaches a Journal Entry line, and the
+    reason it is a function rather than four lines inline: Sprint 5's per-rule
+    Party wiring lands here too, so "which legs does a rule's metadata reach"
+    is answered once per dimension instead of once per caller.
+
+    Each dimension decides its own leg eligibility, because the legs are not
+    interchangeable and ERPNext does not treat them so:
+
+      * COST CENTER → BOTH legs (v0.8.5). Through v0.8.4 only the offset line
+        got one, and ERPNext's server-side fallback then stamped the bank line
+        with the COMPANY DEFAULT — 'Main - OML' on a Sorren bill whose expense
+        half sat in '310 - G and A Administration - OML'. The cost landed in
+        one segment and the cash that paid it in another, so a Cost-Center-wise
+        report never balanced and 'Main' silently absorbed the cash side of
+        every segment in the chart. A dimension only reads correctly when both
+        halves of a double entry carry it.
+
+      * PARTY → offset leg ONLY, and that is ERPNext's rule, not ours:
+        JournalEntry.validate_party refuses a Party on any account that is not
+        Receivable/Payable, and a bank line never is. Party stays on the offset
+        line here (see build_journal_entry) precisely so a future per-rule
+        Party field inherits the eligibility answer rather than re-deriving it.
+
+    An UNSET cost_center writes NO key on EITHER leg, which is the whole
+    fallback chain: ERPNext then applies the Account's default cost center, or
+    failing that the Company's, server-side. Writing a guessed value would
+    OVERRIDE those defaults — "leave it blank" is not a gap in the chain, it is
+    how the rest of the chain gets to run."""
+    cost_center = (getattr(rule, 'cost_center', None) or '').strip()
+    if cost_center:
+        offset_line['cost_center'] = cost_center
+    bank_cc = bank_leg_cost_center(rule)
+    if bank_cc:
+        bank_line['cost_center'] = bank_cc
+
+
 def build_journal_entry(rule: CategorizationRule, row, company: str, *,
                         supplier_name=None, remark: str = '',
                         bank_account: str | None = None,
@@ -663,21 +730,11 @@ def build_journal_entry(rule: CategorizationRule, row, company: str, *,
             bank_line['debit_in_account_currency'] = amt
         accounts = [party_line, bank_line]
 
-    # v0.7.3 · the rule's Cost Center rides the CATEGORIZED side — `party_line`,
-    # which is the offset line in the v0.3.1 path and the (non-bank)
-    # debit_account line in the deprecated one. The BANK side is deliberately
-    # left alone: it is a balance-sheet account whose activity belongs to no
-    # value-chain segment, and stamping one there would attribute the movement
-    # of cash rather than the cost it paid for.
-    #
-    # An UNSET cost_center writes NO key at all, which is the whole fallback
-    # chain: ERPNext then applies the offset Account's default cost center, or
-    # failing that the Company's, server-side. Writing a guessed value here
-    # would OVERRIDE those defaults — so "leave it blank" is not a gap in the
-    # chain, it is how the rest of the chain gets to run.
-    cost_center = (getattr(rule, 'cost_center', None) or '').strip()
-    if cost_center:
-        party_line['cost_center'] = cost_center
+    # v0.8.5 · the rule's accounting dimensions, onto BOTH legs. `party_line` is
+    # the categorized side (the offset line in the v0.3.1 path, the non-bank
+    # debit_account line in the deprecated one) and `bank_line` is the cash
+    # side. See apply_rule_dimensions for the tri-state and the reasoning.
+    apply_rule_dimensions(rule, party_line, bank_line)
 
     # `party_override` follows the same convention as offset_account_override:
     # None means "the caller didn't resolve a party, use the legacy precedence",
@@ -1206,6 +1263,29 @@ def generate_journal_entry(client, row, *, supplier_name=None,
                                 'mismatches': mismatches},
                          notes=f'rule “{rule.name}” blocked — {detail}')
             return gje
+        # v0.8.5 · LAST GATE BEFORE THE WRITE — does ERPNext already carry a JE
+        # for this Bank Transaction? The local GeneratedJournalEntry row above is
+        # the primary idempotency guard; this is the one that still works after
+        # that row has been deleted, restored from a stale volume, or never
+        # written because a migration marker arrived late. See app/je_dedup.py.
+        #
+        # Fail Safe by construction: the lookup answers None on every difficulty,
+        # and None means "create it". A dedup check can cost us a duplicate
+        # draft; it must never cost us the entry.
+        existing = je_dedup.find_by_bank_transaction(
+            client, row.erpnext_bank_transaction_id, company=company)
+        if existing is not None:
+            reason = je_dedup.record_skip(
+                'categorization', f'Bank Transaction '
+                f'{row.erpnext_bank_transaction_id}', existing,
+                subject_id=gje.id,
+                extra={'plaid_transaction_id': tid, 'rule_id': rule.id,
+                       'rule_name': rule.name, 'company': company})
+            gje.state = 'dedup_skipped'
+            gje.error_message = reason[:2000]
+            gje.updated_at = _now()
+            db.session.commit()
+            return gje
         created = client.create_doc(JOURNAL_ENTRY_DT, doc)
         name = created.get('name')
         if not name:
@@ -1267,7 +1347,7 @@ class JournalEntryGateOff(Exception):
 def rerun_rules(erp_client) -> dict:
     """Re-run the CURRENT rules over posted, non-removed transactions that have
     no generated Journal Entry yet. Returns {'considered', 'matched',
-    'generated'}.
+    'generated', 'dedup_skipped'}.
 
     Rule edits never re-run retroactively on their own — this is the deliberate
     opt-in path, and it is idempotent: a transaction that already produced a JE
@@ -1284,13 +1364,20 @@ def rerun_rules(erp_client) -> dict:
         raise JournalEntryGateOff(
             'Journal Entry generation is OFF — turn it on under ERPNext '
             'settings before rerunning rules, or nothing will be posted.')
+    # v0.8.5 · a `dedup_skipped` row counts as DONE. It carries no JE docname
+    # (Bank Bridge did not create the entry ERPNext already holds), so without
+    # this clause every rerun would re-ask ERPNext about the same transaction
+    # forever and re-audit the same skip. The decision is settled; re-deciding
+    # it is chronos, not kairos.
     done = {row.plaid_transaction_id for row in
             db.session.query(GeneratedJournalEntry.plaid_transaction_id)
-            .filter(GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None))}
+            .filter(db.or_(
+                GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None),
+                GeneratedJournalEntry.state == 'dedup_skipped'))}
     eligible = (BankTransaction.query
                 .filter(BankTransaction.posted_at.isnot(None),
                         BankTransaction.removed.is_(False)).all())
-    stats = {'considered': 0, 'matched': 0, 'generated': 0}
+    stats = {'considered': 0, 'matched': 0, 'generated': 0, 'dedup_skipped': 0}
     for row in eligible:
         if row.plaid_transaction_id in done:
             continue
@@ -1300,6 +1387,8 @@ def rerun_rules(erp_client) -> dict:
             stats['matched'] += 1
             if gje.erpnext_journal_entry_name:
                 stats['generated'] += 1
+            elif (gje.state or '') == 'dedup_skipped':
+                stats['dedup_skipped'] += 1
     # v0.4.6 · a Rerun is the one moment match counts change in bulk, and the
     # operator's next stop is the Rules tab to see what stuck. Rolling up inline
     # (a local read + a write per changed rule) beats showing them a column that
@@ -1312,13 +1401,17 @@ def rerun_rules(erp_client) -> dict:
     return stats
 
 
-def categorize_after_push(erp_client, row) -> None:
+def categorize_after_push(erp_client, row):
     """The sync-path hook, called right after a Bank Transaction is posted +
     committed. Best-effort and self-contained: auto-creates the Supplier (when
     enabled) and, when the JE engine is enabled, generates the Journal Entry.
-    Catches everything — categorization must never fail the transaction sync."""
+    Catches everything — categorization must never fail the transaction sync.
+
+    v0.8.5 · returns the GeneratedJournalEntry row (or None) so the push loop can
+    count a `dedup_skipped` outcome in its summary. Every pre-v0.8.5 caller
+    ignored the return, so handing one back changes nothing for them."""
     if erp_client is None or row is None or row.removed:
-        return
+        return None
     cfg = current_app.config
     supplier_name = None
     if cfg.get('ERPNEXT_AUTO_CREATE_SUPPLIERS', True) and row.merchant_name:
@@ -1334,10 +1427,12 @@ def categorize_after_push(erp_client, row) -> None:
     # raw config key here would let /admin/erpnext_settings show the gate OFF
     # while the sync went on posting.
     if not erpnext_settings.je_generation_enabled():
-        return
+        return None
     try:
-        generate_journal_entry(erp_client, row, supplier_name=supplier_name)
+        return generate_journal_entry(erp_client, row,
+                                      supplier_name=supplier_name)
     except Exception:  # noqa: BLE001 - defensive; generate_* already guards
         db.session.rollback()
         log.warning('rules engine failed for %s', row.plaid_transaction_id,
                     exc_info=True)
+    return None

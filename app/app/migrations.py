@@ -315,6 +315,21 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # cleared by /admin/reset_investment_drafts and re-posted.)
     ('plaid_items', 'invest_je_cost_center', 'VARCHAR(140)'),
     ('plaid_items', 'invest_je_member', 'VARCHAR(140)'),
+
+    # v0.8.5 — the BANK leg's Cost Center override on a categorization rule.
+    # Adds NULL and there is NO backfill, but for the OPPOSITE reason to
+    # v0.7.3's `cost_center`: here NULL is not "write nothing", it is "MIRROR
+    # the rule's own cost_center onto the bank leg" (see the model). So the
+    # migration is what CHANGES behaviour on upgrade — every rule that already
+    # names a cost center starts stamping both legs on its next JE, which is
+    # the v0.8.5 fix. Stamping the sentinel here instead would freeze every
+    # existing rule into the half-stamped shape the release exists to end.
+    #
+    # Nothing already posted is touched. Historical JEs are repaired, after
+    # review, by scripts/plan_je_cost_center_backfill.py +
+    # scripts/backfill_je_cost_centers.py — deliberately a one-time operator
+    # action, not a boot migration.
+    ('categorization_rules', 'bank_cost_center', 'VARCHAR(140)'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,
