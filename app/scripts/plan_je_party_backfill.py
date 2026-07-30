@@ -27,24 +27,35 @@ Entries. Phase 1 of 2 — this script WRITES NOTHING ANYWHERE.
          rule at an untyped expense account, clear the account_type on 6400, or
          route the spend through '2110 - Creditors - OML' as AP.
 
-WHY THIS IS DRAFTS-ONLY, AND WHY THAT IS NOT A CLIMBDOWN. `party` and
+DRAFTS AND SUBMITTED ENTRIES ARE PLANNED SEPARATELY (v0.9.1). `party` and
 `party_type` on a Journal Entry Account are NOT `allow_on_submit` — verified on
 the live site:
 
     frappe.get_meta("Journal Entry Account").get_field("party").allow_on_submit
     → 0
 
-`cost_center` IS (which is exactly why v0.8.5's cost-center repair could touch
-submitted entries and this one cannot). For a SUBMITTED entry the value that
-matters is not even on the Journal Entry: every supplier-wise report reads
-`tabGL Entry`, so a "fix" that wrote the JE child row alone would make the form
-look right while every report kept the old answer — strictly worse than the bug,
-because it hides itself. And writing both tables means re-deriving party GL
-entries under a submitted voucher, which is ledger surgery this app should not
-be doing unattended. So: DRAFTS are written, SUBMITTED entries are reported with
-their proposed party for an operator to apply by cancel+amend if they judge it
-worth it. Every one of them is in the plan file with the party name, so that
-decision is informed rather than blind.
+`cost_center` IS, which is why v0.8.5's cost-center repair could go through the
+ordinary write path and this one cannot. So a submitted entry needs the same
+targeted two-table DB write v0.8.5 used, and it is gated behind its own flag:
+this plan puts drafts in `changes` and submitted entries in `submitted_changes`,
+and the applier will not touch the second list without `--include-submitted`.
+
+v0.9.0 REPORTED the submitted entries rather than planning them, reasoning that
+writing both tables meant "re-deriving party GL entries under a submitted
+voucher." That was wrong about the mechanism, and the correction is the whole of
+v0.9.1: `party_type` and `party` are COLUMNS ON GL ENTRY ROWS THAT ALREADY
+EXIST. ERPNext stamps `voucher_detail_no` on every GL row when it posts, so the
+rows this JE line produced are addressable by name and nothing is re-derived —
+it is one column on the child row and the same column on its GL rows, the
+identical shape to the cost-center repair. What v0.9.0 got RIGHT is that both
+tables must move together: every supplier-wise report reads `tabGL Entry`, so
+writing the JE child row alone would make the form look repaired while Accounts
+Payable and the supplier ledger kept the empty answer — strictly worse than the
+bug, because it hides itself. The applier writes both or neither.
+
+Cancel + amend is still the right answer for anything this cannot reach — an
+ineligible offset, a GL row that cannot be identified — and those keep landing
+in `review` with the party the rules imply, so that decision stays informed.
 
 WHY TWO SCRIPTS. The two facts needed to repair one line live in two different
 databases. The RULE that matched a transaction — and the party it now names — is
@@ -110,10 +121,15 @@ REVIEW_REASONS = {
                             'it on the next fire), then re-plan',
     'je_not_found': 'ERPNext has no Journal Entry by that docname',
     'je_cancelled': 'the Journal Entry is cancelled (docstatus 2)',
-    'submitted_not_writable': 'the entry is SUBMITTED and `party` is not '
-                              'allow_on_submit, so it can only be repaired by '
-                              'cancel + amend. The proposed party is recorded '
-                              'here for an operator to apply deliberately',
+    # LEGACY, plan_version 1 only. v0.9.0 routed every submitted entry here;
+    # v0.9.1 routes them to `submitted_changes` instead, because the applier can
+    # now write them. Kept because the applier still reads v1 plan files, and
+    # because a reason an operator may find in an old plan needs an explanation.
+    'submitted_not_writable': 'a plan_version 1 plan recorded this SUBMITTED '
+                              'entry as unrepairable. v0.9.1 can repair it: '
+                              're-plan and run the applier with '
+                              '--include-submitted, or apply it by cancel + '
+                              'amend',
     'offset_line_unidentified': 'no JE line matches the rule\'s offset account, '
                                 'so which line should carry the party cannot be '
                                 'decided from the data',
@@ -218,7 +234,7 @@ def build_plan(client, *, limit: int | None = None) -> dict:
     if limit:
         q = q.limit(limit)
 
-    changes, review = [], []
+    changes, submitted_changes, review = [], [], []
     already_correct = 0
     examined = 0
     for gje in q.all():
@@ -327,22 +343,31 @@ def build_plan(client, *, limit: int | None = None) -> dict:
             'rule_name': rule.name or gje.rule_name or '',
             'plaid_transaction_id': gje.plaid_transaction_id,
             'docstatus': docstatus,
+            # Carried so the applier can honour --company without a second read,
+            # and so a plan file says which books it belongs to.
+            'company': (doc.get('company') or '').strip(),
         }
         if docstatus == 1:
-            # Recorded with its proposal so the operator's cancel+amend decision
-            # is informed, but never handed to the applier.
-            review.append({**ctx, 'reason': 'submitted_not_writable', **entry})
+            # A separate list, not a separate shape. The applier needs
+            # --include-submitted to touch it, because these writes reach the
+            # posted ledger and a draft repair does not.
+            submitted_changes.append(entry)
             continue
         changes.append(entry)
 
     return {
-        'plan_version': 1,
+        # 2 (v0.9.1) added `submitted_changes`. A v1 plan has none, and the
+        # applier falls back to reading v1's `submitted_not_writable` review
+        # rows, so an old plan file still applies.
+        'plan_version': 2,
         'plan_kind': 'je_party',
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'journal_entries_examined': examined,
         'lines_already_correct': already_correct,
         'counts_by_rule': counts_by_rule(changes),
+        'counts_by_rule_submitted': counts_by_rule(submitted_changes),
         'changes': changes,
+        'submitted_changes': submitted_changes,
         'review': review,
     }
 
@@ -368,13 +393,15 @@ def counts_by_rule(changes: list) -> list:
 def summarize(plan: dict) -> str:
     """The human-readable digest printed to stdout (and worth pasting into a
     note to the accountant)."""
+    submitted = plan.get('submitted_changes') or []
     lines = [
         f"Journal Entries examined : {plan['journal_entries_examined']}",
         f"Lines already correct    : {plan['lines_already_correct']}",
         f"Draft lines to change    : {len(plan['changes'])}",
+        f"Submitted lines to change: {len(submitted)}",
         f"Needing review           : {len(plan['review'])}",
         '',
-        'BY RULE (drafts only — submitted entries are under review)',
+        'BY RULE — DRAFTS (one field on the child row; no GL exists yet)',
     ]
     if not plan['counts_by_rule']:
         lines.append('  (nothing to change)')
@@ -383,6 +410,18 @@ def summarize(plan: dict) -> str:
             f"  rule #{agg['live_rule_id']} “{agg['rule_name']}” → "
             f"{agg['new_party_type']}: {agg['new_party']} — "
             f"{agg['lines']} line(s) across {agg['journal_entries']} entry(ies)")
+    if submitted:
+        lines += ['',
+                  'BY RULE — SUBMITTED (writes the posted ledger too: the JE '
+                  'child row AND',
+                  '  its GL Entry rows. The applier needs --include-submitted '
+                  'to touch these.)']
+        for agg in plan.get('counts_by_rule_submitted') or []:
+            lines.append(
+                f"  rule #{agg['live_rule_id']} “{agg['rule_name']}” → "
+                f"{agg['new_party_type']}: {agg['new_party']} — "
+                f"{agg['lines']} line(s) across "
+                f"{agg['journal_entries']} entry(ies)")
     if plan['review']:
         lines += ['', 'NEEDING REVIEW (nothing will be written for these)']
         by_reason: dict = {}

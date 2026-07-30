@@ -2288,36 +2288,107 @@ MariaDB.
 # phase 1 — inside the Bank Bridge container. WRITES NOTHING.
 python3 -m scripts.plan_je_party_backfill --out /tmp/je_party_plan.json
 
-# phase 2 — inside the ERPNext container. DRY RUN by default.
+# phase 2 — inside the ERPNext container. DRY RUN by default, DRAFTS by default.
 ../env/bin/python /tmp/backfill_je_parties.py <site> /tmp/je_party_plan.json
 ../env/bin/python /tmp/backfill_je_parties.py <site> /tmp/je_party_plan.json \
     --commit --log /tmp/je_party_backfill.jsonl
+
+# then, once THAT report reads right, the ~173 submitted entries (v0.9.1)
+../env/bin/python /tmp/backfill_je_parties.py <site> /tmp/je_party_plan.json \
+    --include-submitted --commit --log /tmp/je_party_backfill.jsonl
 ```
 
-**Drafts only, and that is a finding rather than a limitation.** `party` and
-`party_type` on a `Journal Entry Account` are **not `allow_on_submit`** —
-verified on the live site — while `cost_center` **is**, which is exactly why
-v0.8.5's cost-center repair could touch submitted entries and this one must not:
+**Two gates, because these are two different-sized decisions.** `--commit` is the
+dry-run gate. `--include-submitted` is the second: repairing a draft touches one
+field on an unposted document, while repairing a submitted entry rewrites the
+posted ledger. `--company <name>` scopes a run to one set of books, read from the
+live document rather than from the plan.
+
+**Why submitted entries need a direct DB write.** `party` and `party_type` on a
+`Journal Entry Account` are **not `allow_on_submit`** — verified on the live site
+— while `cost_center` **is**:
 
 ```python
 frappe.get_meta("Journal Entry Account").get_field("party").allow_on_submit  # → 0
 frappe.get_meta("Journal Entry Account").get_field("cost_center").allow_on_submit  # → 1
 ```
 
-Worse, for a *submitted* entry the value that matters is not on the Journal Entry
-at all: every supplier-wise report reads `tabGL Entry`. Writing the JE child row
-alone would make the form look repaired while every report kept the empty answer
-— strictly worse than the bug, because it hides itself. So submitted entries are
-**reported with the party the rules now imply** (`--list-submitted`) for an
-operator to apply by cancel + amend if they judge it worth it. A draft has no GL
-Entries yet, so repairing one is a single field and ERPNext validates the party
-on submit — which is what makes drafts the safe population.
+So ERPNext refuses the change over REST and the only supported route is cancel +
+amend + resubmit — for ~173 historical entries that means ~173 new docnames, a
+broken audit chain, and every downstream Bank Transaction reconciliation link
+severed. A targeted update of the two tables that hold the value is smaller,
+reversible from the plan file, and leaves docnames and links where the accountant
+left them. Same trade v0.8.5 made for `cost_center`, for the same reasons.
+
+**What v0.9.0 got wrong, and what it got right.** v0.9.0 shipped this
+drafts-only, reasoning that writing both tables meant *"re-deriving party GL
+entries under a submitted voucher."* The mechanism is not that: `party_type` and
+`party` are **columns on GL Entry rows that already exist**. ERPNext stamps
+`voucher_detail_no` on every GL row when it posts, so the rows a JE line produced
+are addressable by name and nothing is re-derived or re-posted — it is one column
+on the child row and the same column on its GL rows, the identical shape to the
+cost-center repair. That correction is the whole of v0.9.1.
+
+What v0.9.0 got right is the half-repair hazard, and it is why the applier writes
+**both tables or neither**. `tabJournal Entry Account` is what the JE form shows;
+`tabGL Entry` is what every supplier-wise report reads — Accounts Payable,
+supplier ledger, party-wise balances, 1099 aggregation. A submitted line whose GL
+rows cannot be identified is **refused** (`gl_not_found`, `gl_ambiguous`) rather
+than half-written, and cancel + amend stays the answer for those. A write that
+raises aborts the run and rolls back.
+
+It also **finishes a half-repair**: the JE row and its GL rows are checked
+independently, so a line whose form was fixed by hand while the ledger was left
+empty is detected and the ledger brought up. It does not report `already_correct`
+off the child row alone and walk past a wrong ledger — the one behaviour here that
+deliberately differs from the cost-center script.
+
+**Cancelled entries are refused whole.** `docstatus 2` is not touched even at the
+DB level. A cancelled voucher's GL rows are history; naming a party on them
+changes what a prior-period report says about a transaction that was undone.
 
 The planner **creates nothing**, not even a Supplier (it deliberately does not
 call `resolve_party`, which ensures parties exist — a planner that mutates
 ERPNext is not a planner). The applier re-checks `docstatus`, the live
-`account_type` and the party's existence next to every write, because a plan is a
-file and files get edited.
+`account_type`, the company, the party's existence and every GL row's current
+value next to every write, because a plan is a file and files get edited. A plan
+built before someone edited a line reports `stale` and moves on.
+
+`plan_version` is **2** as of v0.9.1 (submitted lines live in
+`submitted_changes`). A version 1 plan file still applies — the applier reads
+v0.9.0's `submitted_not_writable` review rows as work — so an operator with
+yesterday's plan gets the repair rather than a silent no-op.
+
+#### If a rule's offset is a Fixed Asset account, the rule is wrong
+
+An `ineligible_account` refusal naming a **Fixed Asset** account is not a bad
+`account_type`. It means the **rule is mis-categorized** — it is booking an
+expense to the balance sheet, and the missing party is the symptom, not the
+disease. Two live rules are in this state:
+
+| Rule | Offsets to (wrong) | Should offset to |
+|---|---|---|
+| Ernies Locks & Keys | Office Equipment (Fixed Asset) | Repairs & Maintenance |
+| Trailer Station rent | Implements & Attachments (Fixed Asset) | Occupancy & Utilities |
+
+**Fix the rule, not the account.** Edit the rule's `offset_account` in
+`/admin/rules` to the expense account the spend belongs to, then re-run phase 1.
+The rule edit clones the rule and archives the original, and the planner walks
+`superseded_by` forward, so historical entries are re-planned against the
+corrected version automatically.
+
+**Do not clear `account_type` on a Fixed Asset account** to make the backfill
+pass. `Fixed Asset` is functional in ERPNext's depreciation workflow — the asset
+schedule, the depreciation cycle and the disposal path all read it. Clearing it
+would let the party through and quietly break depreciation, trading a reporting
+gap for a GAAP one. (This is the opposite of the 27 leaf **expense** accounts
+whose `account_type` was cleared on 2026-07-29: `Expense Account` and `Indirect
+Expense` carry no ERPNext behaviour that a blank type loses, so clearing them was
+free. `Depreciation` (6700) kept its type for the same reason Fixed Asset does.)
+
+This is deliberately **not** auto-fixed. Which expense account a locksmith bill
+or a rent payment belongs to is an operator's judgement about the chart of
+accounts, not something a backfill script should decide.
 
 ### Statement → books reconciliation — `/admin/statement_recon`, `get_statement_recon_report`
 
