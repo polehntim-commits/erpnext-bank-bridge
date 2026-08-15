@@ -184,7 +184,12 @@ def anchor_payload(anchor, account=None) -> dict:
         'source_statement_id': anchor.statement_id,
         'source_anchor_id': anchor.id,
         'reconciled': bool(anchor.reconciles(tolerance)),
-        'tolerance': tolerance,
+        # `variance_tolerance` is ERPNext's fieldname, and the name has to be
+        # exact: Frappe drops kwargs a whitelisted method doesn't declare, so a
+        # payload saying `tolerance` arrives as no tolerance at all and the
+        # doctype recomputes `reconciled` against its own 0.01 default. The
+        # push looks clean and the answer is a different one than BB's.
+        'variance_tolerance': tolerance,
     }
 
 

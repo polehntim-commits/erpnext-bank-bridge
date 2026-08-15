@@ -111,6 +111,19 @@ class AnchorPayloadTest(PushBase):
         self.assertEqual(p['period_start'], '2026-06-01')
         self.assertEqual(p['period_end'], '2026-06-30')
 
+    def test_the_tolerance_uses_erpnexts_fieldname(self):
+        """`variance_tolerance`, never `tolerance`. Frappe drops kwargs a
+        whitelisted method doesn't declare, so the wrong name is not an error —
+        it is a 200 with the tolerance silently missing, after which the doctype
+        recomputes `reconciled` against its own 0.01 default and disagrees with
+        the `reconciled` in this same payload."""
+        acct = self._account()
+        p = erpnext_push.anchor_payload(self._anchor(acct), acct)
+        self.assertIn('variance_tolerance', p)
+        self.assertNotIn('tolerance', p)
+        from app import statements as stmts
+        self.assertEqual(p['variance_tolerance'], stmts.reconcile_tolerance())
+
     def test_the_fingerprint_is_stable_across_key_order(self):
         """If it weren't, every rebuild would look like a change and the whole
         point of the fingerprint would be lost."""
