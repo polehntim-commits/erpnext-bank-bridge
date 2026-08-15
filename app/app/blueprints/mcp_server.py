@@ -1544,10 +1544,17 @@ def _get_erpnext_push_status(args: dict):
     never_pushed = (StatementAnchor.query
                     .filter(StatementAnchor.erpnext_pushed_at.is_(None))
                     .count())
+    # v1.0.2 · a RETIRED account is not an unmapped one. `reconnect.adopt`
+    # strips the donor's Bank Account by design — two rows naming one Bank
+    # Account would double-post — so counting those rows as "unmapped" reported
+    # nine accounts an operator was invited to go and map, when the correct
+    # action for every one of them was nothing. They are reported below as what
+    # they are: dead Plaid ids whose history hangs off a live account.
     unmapped = (PlaidAccount.query
                 .filter(db.or_(
                     PlaidAccount.erpnext_bank_account_name.is_(None),
-                    PlaidAccount.erpnext_bank_account_name == ''))
+                    PlaidAccount.erpnext_bank_account_name == ''),
+                    PlaidAccount.superseded_by_account_id.is_(None))
                 .count())
     result = {
         'configured': erpnext_settings.is_configured(),
@@ -1567,10 +1574,53 @@ def _get_erpnext_push_status(args: dict):
         # always an unmapped Bank Account, which `unmapped_accounts` counts.
         'anchors_never_pushed': never_pushed,
         'unmapped_accounts': unmapped,
+        # v1.0.2 · the Plaid id chains. Each entry is one real account and every
+        # id Plaid has ever called it, oldest first, with the ERPNext Bank
+        # Account that holds its books. This is the answer to "ERPNext has
+        # ZE4Z… and Bank Bridge has jN7x…, are those the same account" — a
+        # question that had no answerable form before the chain was recorded.
+        'relinked_accounts': _relinked_account_chains(),
     }
     return result, (f"{result['queue_depth']} write(s) queued, "
                     f'{never_pushed} anchor(s) never pushed, '
-                    f'{unmapped} unmapped account(s)')
+                    f'{unmapped} unmapped account(s), '
+                    f"{len(result['relinked_accounts'])} re-linked account(s)")
+
+
+def _relinked_account_chains() -> list:
+    """One entry per real account that has been re-linked, with its full id
+    chain. Read-only and fail-soft: a diagnostic that raised would take the
+    whole status tool down with it, and the queue depth is the part an operator
+    is actually blocked on."""
+    from .. import reconnect
+    from ..models import PlaidAccount, PlaidAccountLink
+    try:
+        heads = {row.account_id for row in PlaidAccountLink.query.all()}
+        heads |= {(a.superseded_by_account_id or '').strip()
+                  for a in PlaidAccount.query.filter(
+                      PlaidAccount.superseded_by_account_id.isnot(None)).all()
+                  if (a.superseded_by_account_id or '').strip()}
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        return []
+    out, seen = [], set()
+    for head in sorted(heads):
+        if head in seen:
+            continue
+        chain = reconnect.chain_for(head)
+        seen.update(chain)
+        current = chain[-1] if chain else head
+        account = PlaidAccount.query.filter_by(account_id=current).first()
+        mapped = reconnect.mapped_account_for(current)
+        out.append({
+            'mask': (account.mask if account is not None else None),
+            'current_plaid_account_id': current,
+            'previous_plaid_account_ids': chain[:-1],
+            'erpnext_bank_account': (
+                mapped.erpnext_bank_account_name if mapped is not None
+                else None),
+        })
+    return out
 
 
 def _flush_erpnext_push_queue(args: dict):
@@ -2430,7 +2480,15 @@ TOOLS = {
             'have no ERPNext Bank Account mapped (the usual reason an anchor is '
             'SKIPPED rather than queued — an unmapped account has nothing to '
             'attach a reconciliation to), and which source each read is '
-            'configured to use. `rule_source_in_force` is the one to read '
+            'configured to use. `relinked_accounts` gives every real account '
+            'that Plaid has re-issued ids for, with its full id chain oldest '
+            'first and the ERPNext Bank Account that holds its books — read it '
+            'whenever ERPNext and Bank Bridge appear to name different Plaid '
+            'accounts for the same mask, because they are usually two ids for '
+            'one account rather than two accounts. A RETIRED id is NOT counted '
+            'in `unmapped_accounts`: its mapping was handed to the account that '
+            'replaced it, on purpose, and there is nothing to go and map. '
+            '`rule_source_in_force` is the one to read '
             'closely: it says which rule set the engine ACTUALLY matched '
             'against, which differs from `rules_source` whenever ERPNext holds '
             'no rules or could not be reached. START HERE when ERPNext and Bank '

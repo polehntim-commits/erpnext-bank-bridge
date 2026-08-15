@@ -463,6 +463,188 @@ class PairingPushTest(PushBase):
         self.assertEqual(len(self._pushes(erpnext_push.PAIRING_METHOD)), 0)
 
 
+class AcknowledgementTest(PushBase):
+    """v1.0.2 — a 200 is not a confirmation.
+
+    THE PRODUCTION BUG. `sync_now` reported `erpnext_push.metadata.unchanged: 4`
+    while all four ERPNext Bank Accounts held null for plaid_account_mask,
+    plaid_account_type, plaid_account_subtype and sync_enabled=false.
+
+    Several things produce a 200 that writes nothing — Frappe drops kwargs a
+    whitelisted method does not DECLARE, a custom field may be absent from the
+    doctype, a validation may rewrite the value — and v1.0.1 could tell none of
+    them from a success. It stamped the fingerprint on the 200, after which the
+    fact was never pushed again. These tests stage the first of those, because
+    it is the cheapest to reproduce; the fix is indifferent to which it was."""
+
+    def test_a_200_that_wrote_nothing_is_queued_not_stamped(self):
+        acct = self._account()
+        self.erp.drops_metadata_fields = True     # the old erpnext_mcp build
+        stats = erpnext_push.push_metadata_for([acct], client=self.erp)
+        self.assertEqual(stats['pushed'], 0)
+        self.assertEqual(stats['queued'], 1)
+        self.assertIsNone(acct.erpnext_metadata_fingerprint)
+        self.assertIsNone(acct.erpnext_metadata_pushed_at)
+
+    def test_the_queued_reason_names_the_fields_that_did_not_land(self):
+        acct = self._account()
+        self.erp.drops_metadata_fields = True
+        erpnext_push.push_metadata_for([acct], client=self.erp)
+        row = ErpnextPushQueue.query.one()
+        self.assertIn('plaid_account_mask', row.last_error)
+        self.assertIn('older', row.last_error)
+
+    def test_the_next_sync_pushes_it_again_rather_than_reporting_unchanged(self):
+        """The whole point: an unconfirmed fact stays pending. Reporting
+        `unchanged` is what made this invisible for a release."""
+        acct = self._account()
+        self.erp.drops_metadata_fields = True
+        erpnext_push.push_metadata_for([acct], client=self.erp)
+        again = erpnext_push.push_metadata_for([acct], client=self.erp)
+        self.assertEqual(again['unchanged'], 0)
+        self.assertEqual(again['queued'], 1)
+        # …and it converges the moment the ERPNext side gains the fields.
+        self.erp.drops_metadata_fields = False
+        fixed = erpnext_push.push_metadata_for([acct], client=self.erp)
+        self.assertEqual(fixed['pushed'], 1)
+        self.assertIsNotNone(acct.erpnext_metadata_fingerprint)
+        self.assertEqual(
+            self.erp.pushed_bank_accounts['WF Brokerage - EC']
+            ['plaid_account_mask'], '4242')
+
+    def test_a_confirmed_push_stamps_and_the_echo_is_what_confirms_it(self):
+        acct = self._account()
+        stats = erpnext_push.push_metadata_for([acct], client=self.erp)
+        self.assertEqual(stats['pushed'], 1)
+        held = self.erp.pushed_bank_accounts['WF Brokerage - EC']
+        self.assertEqual(held['plaid_account_type'], 'investment')
+        self.assertEqual(held['plaid_account_subtype'], 'brokerage')
+        self.assertEqual(held['plaid_account_id'], 'acc-4242')
+
+    def test_sync_enabled_false_is_a_value_and_must_be_confirmed(self):
+        """False is not an absence. 'this account is no longer synced' is
+        exactly the fact a write-only-what-is-truthy endpoint loses."""
+        acct = self._account()
+        acct.sync_enabled = False
+        db.session.commit()
+        self.assertEqual(
+            erpnext_push._ack_metadata(
+                {'updated': [{'bank_account': 'WF Brokerage - EC',
+                              'account': {'plaid_account_mask': '4242',
+                                          'sync_enabled': True}}]},
+                {'bank_account': 'WF Brokerage - EC',
+                 'plaid_account_mask': '4242', 'sync_enabled': False})[0],
+            erpnext_push.ACK_CONTRADICTED)
+
+    def test_a_field_we_did_not_send_is_not_demanded_back(self):
+        """ERPNext writes only the keys a push carried, so a blank subtype is
+        left alone — demanding an echo for it would report every ordinary
+        account as contradicted."""
+        verdict, _ = erpnext_push._ack_metadata(
+            {'updated': [{'bank_account': 'B',
+                          'account': {'plaid_account_mask': '4242',
+                                      'plaid_account_subtype': 'typed by hand',
+                                      'sync_enabled': True}}]},
+            {'bank_account': 'B', 'plaid_account_mask': '4242',
+             'plaid_account_subtype': '', 'sync_enabled': True})
+        self.assertEqual(verdict, erpnext_push.ACK_CONFIRMED)
+
+    def test_an_unrecognized_reply_is_neither_stamped_nor_queued(self):
+        """A shape this build cannot read is not a failure to retry — a
+        re-push would meet the same silence and the queue would never drain.
+        It is simply not claimed, so the next sync sends it again."""
+        acct = self._account()
+        self.erp.method_returns[erpnext_push.PAIRING_METHOD] = {'ok': True}
+        stats = erpnext_push.push_metadata_for([acct], client=self.erp)
+        self.assertEqual(stats['unconfirmed'], 1)
+        self.assertEqual(stats['queued'], 0)
+        self.assertEqual(ErpnextPushQueue.query.count(), 0)
+        self.assertIsNone(acct.erpnext_metadata_fingerprint)
+
+    def test_an_anchor_that_created_and_updated_nothing_is_queued(self):
+        acct = self._account()
+        anchor = self._anchor(acct)
+        self.erp.method_returns[erpnext_push.ANCHOR_METHOD] = {
+            'created_count': 0, 'updated_count': 0, 'failed_count': 1,
+            'failed': [{'error': 'no Bank Account named ... on this site.'}]}
+        verdict = erpnext_push.push_anchor(anchor, acct,
+                                           session=erpnext_push.PushSession(
+                                               self.erp))
+        self.assertEqual(verdict['status'], 'queued')
+        self.assertIn('no Bank Account named', verdict['error'])
+        self.assertIsNone(anchor.erpnext_pushed_at)
+
+    def test_a_v1_0_1_fingerprint_does_not_suppress_the_first_verified_push(self):
+        """The contract version is what invalidates every stamp written when a
+        stamp meant 'Frappe returned 200'. Without it the four accounts on the
+        live install would go on reporting `unchanged` forever."""
+        acct = self._account()
+        payload = erpnext_push.metadata_payload(acct)
+        acct.erpnext_metadata_fingerprint = erpnext_push.fingerprint(payload)
+        acct.erpnext_metadata_pushed_at = datetime(2026, 8, 1)
+        db.session.commit()
+        stats = erpnext_push.push_metadata_for([acct], client=self.erp)
+        self.assertEqual(stats['unchanged'], 0)
+        self.assertEqual(stats['pushed'], 1)
+
+
+class RelinkChainPushTest(PushBase):
+    """v1.0.2 — Plaid reassigns account ids; the books must not notice."""
+
+    def _relinked_pair(self):
+        """A retired account holding history, and the live row that adopted its
+        mapping — the state `reconnect.adopt` leaves behind."""
+        old = self._account(mask='6030', account_id='ZE4Zold',
+                            bank_account='WF Brokerage - EC')
+        new = self._account(mask='6030', account_id='jN7xnew',
+                            bank_account='WF Brokerage - EC')
+        old.erpnext_bank_account_name = None      # adopt() strips the donor
+        old.sync_enabled = False
+        old.import_status = 'superseded'
+        old.superseded_by_account_id = new.account_id
+        db.session.commit()
+        return old, new
+
+    def test_an_anchor_on_a_dead_plaid_id_still_reaches_erpnext(self):
+        """THE BUG. Anchors built before a re-link keep the old account_id, and
+        adopt() nulls that row's Bank Account on purpose. Resolving the mapping
+        from that one row finds nothing, so the whole pre-relink half of the
+        history read as an unmapped account and never left the building."""
+        old, new = self._relinked_pair()
+        anchor = self._anchor(old)
+        verdict = erpnext_push.push_anchor(
+            anchor, session=erpnext_push.PushSession(self.erp))
+        self.assertEqual(verdict['status'], 'pushed')
+        self.assertEqual(self._pushes()[0]['bank_account'],
+                         'WF Brokerage - EC')
+        # The anchor keeps its OWN Plaid id — ERPNext is idempotent on the
+        # period, so the two halves land in one chain under one Bank Account.
+        self.assertEqual(self._pushes()[0]['plaid_account_id'], 'ZE4Zold')
+
+    def test_a_genuinely_unmapped_account_is_still_skipped(self):
+        """The chain walk must not turn 'nobody mapped this' into a push at a
+        neighbouring account's books."""
+        acct = self._account(mask='9999', account_id='orphan',
+                             bank_account='')
+        anchor = self._anchor(acct)
+        verdict = erpnext_push.push_anchor(
+            anchor, session=erpnext_push.PushSession(self.erp))
+        self.assertEqual(verdict['status'], 'skipped')
+        self.assertIn('re-linked', verdict['error'])
+
+    def test_the_metadata_push_repoints_erpnext_at_the_current_plaid_id(self):
+        """ERPNext holds the dead id; the Bank Account DOCNAME is what both
+        systems agree on, so the push keyed by docname is the repoint."""
+        old, new = self._relinked_pair()
+        self.erp.pushed_bank_accounts['WF Brokerage - EC'] = {
+            'name': 'WF Brokerage - EC', 'plaid_account_id': 'ZE4Zold'}
+        stats = erpnext_push.push_metadata_for([new], client=self.erp)
+        self.assertEqual(stats['pushed'], 1)
+        self.assertEqual(
+            self.erp.pushed_bank_accounts['WF Brokerage - EC']
+            ['plaid_account_id'], 'jN7xnew')
+
+
 class AnchorReadTest(PushBase):
     def test_a_read_tolerates_three_envelope_shapes(self):
         """The ERPNext side is a sibling codebase under active development. A

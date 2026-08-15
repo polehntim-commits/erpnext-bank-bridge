@@ -8042,19 +8042,30 @@ def data_hygiene_mark_superseded():
     as superseded_by the active row's account_id AND flip their
     sync_enabled to False. Idempotent — a row already correctly
     superseded is skipped."""
+    from .. import reconnect
     from ..models import PlaidAccount
     updated = 0
+    hops = []
     for group in _duplicate_account_groups():
         active_id = group['active_id']
+        heir = PlaidAccount.query.filter_by(account_id=active_id).first()
         for acct, item in group['rows']:
             if acct.account_id == active_id:
                 continue
+            # v1.0.2 · record the hop even when the flags are already right.
+            # The column and the durable chain are written by different
+            # releases, so a row this page superseded before v1.0.2 would
+            # otherwise never gain its PlaidAccountLink — and `continue` below
+            # is exactly the branch such a row takes.
+            hops.append((acct, heir))
             if acct.superseded_by_account_id == active_id and not acct.sync_enabled:
                 continue
             acct.superseded_by_account_id = active_id
             acct.sync_enabled = False
             updated += 1
     db.session.commit()
+    for donor, heir in hops:
+        reconnect.record_link(donor, heir, reason='hygiene')
     return redirect('/admin/data_hygiene?flash=' + quote_plus(
         f'Marked {updated} duplicate PlaidAccount(s) as superseded.'))
 

@@ -730,5 +730,157 @@ class RegressionTests(ReconnectBase):
         self.assertFalse(self._item().needs_reauth)
 
 
+class IdChainTests(ReconnectBase):
+    """v1.0.2 — keeping the data chain across repeated Plaid reconnections.
+
+    Plaid mints a new account_id on every re-link, so the identifier this whole
+    app keys on is the one thing about a bank account that is NOT stable. The
+    mask is what a human calls the account and the ERPNext Bank Account docname
+    is what the books call it; both survive, and the chain is what ties a dead
+    Plaid id to them."""
+
+    def _relink(self, donor_id, heir_id, *, donor_item='item-old',
+                heir_item='item-new', mask='6030'):
+        self._item(donor_item, disconnected=True)
+        self._item(heir_item)
+        donor = self._account(donor_id, item_id=donor_item, mask=mask,
+                              bank_account='BA-1', company='Testing',
+                              import_status='imported')
+        heir = self._account(heir_id, item_id=heir_item, mask=mask)
+        reconnect.adopt(heir, donor)
+        return donor, heir
+
+    def test_an_adoption_records_a_durable_hop(self):
+        from app.models import PlaidAccountLink
+        self._relink('ZE4Zold', 'jN7xnew')
+        link = PlaidAccountLink.query.one()
+        self.assertEqual(link.previous_account_id, 'ZE4Zold')
+        self.assertEqual(link.account_id, 'jN7xnew')
+        # Snapshotted AT the hop — the only moment both are readable, since
+        # adopt() is about to null the donor's mapping.
+        self.assertEqual(link.mask, '6030')
+        self.assertEqual(link.erpnext_bank_account_name, 'BA-1')
+
+    def test_the_hop_outlives_the_retired_plaid_account_row(self):
+        """THE REASON THIS IS A TABLE. `superseded_by_account_id` is a column on
+        the retired row, so it has no existence independent of it — and the day
+        anything prunes that row, the only record that the old id ever became
+        the new one goes with it, silently."""
+        from app.models import PlaidAccountLink
+        donor, heir = self._relink('ZE4Zold', 'jN7xnew')
+        db.session.delete(donor)
+        db.session.commit()
+        self.assertEqual(PlaidAccountLink.query.count(), 1)
+        self.assertEqual(reconnect.chain_for('jN7xnew'),
+                         ['ZE4Zold', 'jN7xnew'])
+
+    def test_a_chain_survives_three_reconnections(self):
+        self._relink('id-1', 'id-2')
+        self._item('item-third')
+        third = self._account('id-3', item_id='item-third', mask='6030')
+        reconnect.adopt(third, PlaidAccount.query.filter_by(
+            account_id='id-2').first())
+        for anywhere in ('id-1', 'id-2', 'id-3'):
+            self.assertEqual(reconnect.chain_for(anywhere),
+                             ['id-1', 'id-2', 'id-3'],
+                             f'walked from {anywhere}')
+            self.assertEqual(reconnect.current_account_id(anywhere), 'id-3')
+
+    def test_a_never_relinked_account_is_its_own_chain(self):
+        """Every account on most installs. Callers need no special case."""
+        self._account('solo')
+        self.assertEqual(reconnect.chain_for('solo'), ['solo'])
+        self.assertEqual(reconnect.current_account_id('solo'), 'solo')
+
+    def test_a_dead_id_resolves_to_the_row_holding_the_mapping(self):
+        """What anchors and statements recorded before the re-link need: the
+        donor's own Bank Account is gone by design, and the heir's is the same
+        real account's books."""
+        self._relink('ZE4Zold', 'jN7xnew')
+        mapped = reconnect.mapped_account_for('ZE4Zold')
+        self.assertEqual(mapped.account_id, 'jN7xnew')
+        self.assertEqual(mapped.erpnext_bank_account_name, 'BA-1')
+
+    def test_the_newest_mapped_row_wins_over_an_older_one(self):
+        """A twice-relinked account's mapping is on the live row; resolving to
+        the oldest mapped row would resurrect a stale docname."""
+        self._relink('id-1', 'id-2')
+        middle = PlaidAccount.query.filter_by(account_id='id-2').first()
+        self._item('item-third')
+        third = self._account('id-3', item_id='item-third', mask='6030')
+        reconnect.adopt(third, middle)
+        # Something re-mapped the middle row by hand afterwards.
+        middle.erpnext_bank_account_name = 'BA-STALE'
+        db.session.commit()
+        self.assertEqual(
+            reconnect.mapped_account_for('id-1').erpnext_bank_account_name,
+            'BA-1')
+
+    def test_an_unmapped_account_resolves_to_nothing_rather_than_a_neighbour(self):
+        self._account('orphan', mask='9999')
+        mapped = reconnect.mapped_account_for('orphan')
+        self.assertIsNone(mapped.erpnext_bank_account_name)
+
+    def test_the_backfill_reconstructs_hops_an_upgrade_inherited(self):
+        """An install upgrading into v1.0.2 has hops only the column knows
+        about — nine of them on Tim's box — and each is one cleanup away from
+        being unrecoverable."""
+        from app.migrations import _backfill_account_id_links
+        from app.models import PlaidAccountLink
+        donor = self._account('pre-old', bank_account='BA-9',
+                              import_status='superseded', mask='3194')
+        heir = self._account('pre-new', bank_account='BA-9', mask='3194')
+        donor.superseded_by_account_id = 'pre-new'
+        donor.erpnext_bank_account_name = None
+        db.session.commit()
+        _backfill_account_id_links()
+        link = PlaidAccountLink.query.one()
+        self.assertEqual(link.reason, 'backfill')
+        self.assertEqual(link.previous_account_id, 'pre-old')
+        self.assertEqual(link.erpnext_bank_account_name, 'BA-9')
+        # Idempotent: every boot after the first writes nothing.
+        _backfill_account_id_links()
+        self.assertEqual(PlaidAccountLink.query.count(), 1)
+        del heir
+
+    def test_recording_the_same_hop_twice_keeps_the_first_account(self):
+        """A later pass knows less about the moment of the hop than the pass
+        that was there for it, so a re-record fills blanks and overwrites
+        nothing — otherwise a hygiene sweep relabels history it did not see."""
+        from app.models import PlaidAccountLink
+        donor, heir = self._relink('ZE4Zold', 'jN7xnew')
+        reconnect.record_link(donor, heir, reason='hygiene')
+        link = PlaidAccountLink.query.one()
+        self.assertEqual(link.reason, 'plaid_relink')
+        self.assertEqual(link.erpnext_bank_account_name, 'BA-1')
+
+    def test_a_re_record_fills_in_what_the_backfill_could_not_know(self):
+        """The backfill reconstructs a hop from the column alone and cannot
+        recover a docname `adopt` nulled releases ago. A later pass that does
+        know it should be able to say so."""
+        from app.models import PlaidAccountLink
+        donor = self._account('pre-old', mask='3194')
+        heir = self._account('pre-new', bank_account='BA-9', mask='3194')
+        db.session.add(PlaidAccountLink(previous_account_id='pre-old',
+                                        account_id='pre-new',
+                                        reason='backfill'))
+        db.session.commit()
+        reconnect.record_link(donor, heir, reason='hygiene')
+        link = PlaidAccountLink.query.one()
+        self.assertEqual(link.reason, 'backfill')          # not overwritten
+        self.assertEqual(link.erpnext_bank_account_name, 'BA-9')   # filled in
+        self.assertEqual(link.mask, '3194')
+
+    def test_a_cycle_in_the_data_terminates(self):
+        """It should be impossible and will therefore eventually happen."""
+        from app.models import PlaidAccountLink
+        db.session.add(PlaidAccountLink(previous_account_id='a',
+                                        account_id='b'))
+        db.session.add(PlaidAccountLink(previous_account_id='b',
+                                        account_id='a'))
+        db.session.commit()
+        self.assertEqual(sorted(reconnect.chain_for('a')), ['a', 'b'])
+
+
 if __name__ == '__main__':
     unittest.main()

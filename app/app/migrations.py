@@ -363,6 +363,19 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     ('statement_anchors', 'erpnext_pushed_at', 'TIMESTAMP'),
     ('plaid_accounts', 'erpnext_metadata_fingerprint', 'VARCHAR(64)'),
     ('plaid_accounts', 'erpnext_metadata_pushed_at', 'TIMESTAMP'),
+
+    # ── v1.0.2 — the Plaid account-id chain ─────────────────────────────────
+    #
+    # No column lines here either: `plaid_account_links` is a NEW TABLE and
+    # create_all() builds it. What v1.0.2 needs is the DATA backfill below
+    # (_backfill_account_id_links), which reconstructs the chain from the
+    # `superseded_by_account_id` pointers an upgrading install already holds.
+    #
+    # Nor is there a line to clear the stale `erpnext_metadata_fingerprint`
+    # values v1.0.1 stamped on unverified pushes. That invalidation is carried
+    # by erpnext_push.PUSH_FINGERPRINT_CONTRACT, in the hash input — exact,
+    # clockless, and self-resolving on the first verified push of each row,
+    # which a timestamp cutoff here could be none of.
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,
@@ -527,8 +540,82 @@ def run_migrations() -> None:
         _migrate_incompatible_party_types()
         # v0.5.9: seed activated_at = created_at for pre-v0.5.9 rules.
         _backfill_rule_activated_at()
+        # v1.0.2: reconstruct the durable Plaid id chain from the pointers an
+        # upgrading install already holds.
+        _backfill_account_id_links()
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)
+
+
+def _backfill_account_id_links() -> None:
+    """Give every re-link this install already recorded a durable
+    `PlaidAccountLink` row — v1.0.2.
+
+    WHY IT CANNOT WAIT FOR THE NEXT RE-LINK. `superseded_by_account_id` lives
+    on the RETIRED account row, so every hop recorded only there is exactly as
+    durable as a row nothing in this app is obliged to keep. On the live
+    install that is nine accounts' worth of history — the orphaned old ids
+    `get_erpnext_push_status` was counting as unmapped accounts. Running this
+    once at upgrade converts a pointer with no independent existence into a
+    record that outlives both ends.
+
+    Idempotent by the table's own unique hop constraint plus the existence
+    check below, so every boot after the first is a single query and no
+    writes."""
+    insp = inspect(db.engine)
+    names = set(insp.get_table_names())
+    if 'plaid_account_links' not in names or 'plaid_accounts' not in names:
+        return
+    try:
+        _do_backfill_account_id_links()
+    except Exception:  # noqa: BLE001 - its own rollback, so a failure here
+        db.session.rollback()   # cannot leave a dirty session for the app
+        log.warning('could not backfill the Plaid account id chain',
+                    exc_info=True)
+
+
+def _do_backfill_account_id_links() -> None:
+    from .models import PlaidAccount, PlaidAccountLink
+    donors = (PlaidAccount.query
+              .filter(PlaidAccount.superseded_by_account_id.isnot(None))
+              .all())
+    if not donors:
+        return
+    known = {(row.previous_account_id, row.account_id)
+             for row in PlaidAccountLink.query.all()}
+    heirs = {a.account_id: a for a in PlaidAccount.query.filter(
+        PlaidAccount.account_id.in_(
+            [d.superseded_by_account_id for d in donors
+             if d.superseded_by_account_id])).all()}
+    added = 0
+    for donor in donors:
+        heir_id = (donor.superseded_by_account_id or '').strip()
+        if not heir_id or heir_id == donor.account_id:
+            continue
+        if (donor.account_id, heir_id) in known:
+            continue
+        heir = heirs.get(heir_id)
+        db.session.add(PlaidAccountLink(
+            previous_account_id=donor.account_id,
+            account_id=heir_id,
+            previous_item_id=donor.item_id,
+            item_id=heir.item_id if heir is not None else None,
+            # The donor's own mask is the reliable one here: `adopt` never
+            # clears it, while the heir row may not exist any more.
+            mask=(donor.mask or (heir.mask if heir is not None else '') or '')
+                 or None,
+            # `adopt` nulls the donor's Bank Account, so the heir is the only
+            # place the docname can still be read at backfill time.
+            erpnext_bank_account_name=(
+                (heir.erpnext_bank_account_name if heir is not None else None)
+                or donor.erpnext_bank_account_name or None),
+            reason='backfill'))
+        known.add((donor.account_id, heir_id))
+        added += 1
+    if added:
+        db.session.commit()
+        log.info('migration: recorded %d Plaid account re-link(s) as durable '
+                 'id-chain history', added)
 
 
 def _backfill_rule_activated_at() -> None:

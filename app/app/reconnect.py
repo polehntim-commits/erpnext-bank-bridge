@@ -53,9 +53,17 @@ from datetime import datetime, timezone
 from flask import current_app
 
 from . import db
-from .models import GeneratedJournalEntry, PlaidAccount, PlaidItem
+from .models import (GeneratedJournalEntry, PlaidAccount, PlaidAccountLink,
+                     PlaidItem)
 
 log = logging.getLogger('bankbridge.reconnect')
+
+# A real chain is one or two hops (a re-link, occasionally two). Ten is far
+# past any legitimate history and exists so a cycle introduced by bad data
+# cannot hang a walk — which should be impossible and will therefore eventually
+# happen. Moved here from statements.py in v1.0.2, along with the walk itself:
+# one walk, one limit.
+MAX_CHAIN_DEPTH = 10
 
 
 def _now() -> datetime:
@@ -302,6 +310,12 @@ def adopt(heir: PlaidAccount, donor: PlaidAccount) -> dict:
         moved[field] = value
     rekeyed = _rekey_opening_balance(donor, heir)
 
+    # v1.0.2 · record the hop BEFORE the donor is stripped. `record_link`
+    # snapshots the mask and the Bank Account docname, and the next four lines
+    # are what make the donor's copy of both unreadable — so this is the last
+    # moment the hop can be recorded in full.
+    record_link(donor, heir, reason='plaid_relink')
+
     # Retire the donor in the SAME operation. Two rows naming one ERPNext Bank
     # Account would both push into it and duplicate every transaction.
     donor.superseded_by_account_id = heir.account_id
@@ -319,7 +333,8 @@ def adopt(heir: PlaidAccount, donor: PlaidAccount) -> dict:
              donor.account_id, heir.account_id, ', '.join(moved) or 'nothing',
              rekeyed)
     return {'donor': donor.account_id, 'heir': heir.account_id,
-            'moved': moved, 'opening_balance_rekeyed': rekeyed}
+            'moved': moved, 'opening_balance_rekeyed': rekeyed,
+            'chain': chain_for(heir.account_id)}
 
 
 def adopt_if_unambiguous(account: PlaidAccount, item: PlaidItem) -> dict | None:
@@ -364,6 +379,216 @@ def adopt_if_unambiguous(account: PlaidAccount, item: PlaidItem) -> dict | None:
     except Exception:  # pragma: no cover - auditing must not break the link
         log.debug('adoption audit failed', exc_info=True)
     return report
+
+
+# ── the id chain ────────────────────────────────────────────────────────────
+#
+# v1.0.2. Everything above moves a re-linked account's CONFIGURATION. This
+# section keeps its IDENTITY: the record that ...6030 was three different Plaid
+# ids over eighteen months and is one bank account.
+#
+# Two sources, read together and never separately:
+#
+#   * `PlaidAccount.superseded_by_account_id` — the live pointer, written by
+#     `adopt`. Authoritative while both rows exist, and only as durable as the
+#     retired row it sits on.
+#   * `PlaidAccountLink` — the durable event log, written here. Outlives both
+#     rows because it holds no foreign key to either.
+#
+# Reading both is not belt-and-braces, it is correctness in each direction: an
+# install that upgraded into v1.0.2 has hops only the column knows about (until
+# the backfill runs), and an install that has since pruned has hops only the
+# table knows about. Neither source is complete on its own, and their union is.
+
+
+def record_link(donor: PlaidAccount, heir: PlaidAccount, *,
+                reason: str = 'plaid_relink') -> PlaidAccountLink | None:
+    """Record one hop of the id chain, durably and idempotently.
+
+    Snapshots the mask and the ERPNext Bank Account docname AT THE HOP, which
+    is the only moment both are knowable: `adopt` is about to null the donor's
+    mapping (it must — two rows naming one Bank Account would double-post), so
+    a minute later there is nothing left to read.
+
+    RECORDED ONCE, THEN ONLY FILLED IN. A second call for the same hop — the
+    hygiene sweep re-asserting what an adoption already wrote — updates only
+    the fields that are still empty, and never `reason` or `detected_at`. This
+    row says what was true AT the hop; a later pass knows less about that
+    moment than the pass that was there for it, and overwriting a snapshot with
+    a re-observation is how a history stops being one.
+
+    Best-effort and never raises. The caller is mid-adoption and a failure to
+    write history must not fail the adoption itself — an un-recorded hop is
+    recoverable (the backfill reconstructs it from the column), a half-applied
+    adoption is not."""
+    if donor is None or heir is None:
+        return None
+    previous = (donor.account_id or '').strip()
+    current = (heir.account_id or '').strip()
+    if not previous or not current or previous == current:
+        return None
+    try:
+        row = PlaidAccountLink.query.filter_by(
+            previous_account_id=previous, account_id=current).first()
+        if row is not None:
+            _fill_blanks(row, donor, heir)
+            db.session.commit()
+            return row
+        db.session.add(PlaidAccountLink(
+            previous_account_id=previous, account_id=current,
+            previous_item_id=donor.item_id, item_id=heir.item_id,
+            # The heir's mask, falling back to the donor's: adoption only ever
+            # matches on an identical mask, so these agree — but a
+            # hygiene-marked hop is operator-driven and need not, and the
+            # donor's is the one naming the account nobody can look up now.
+            mask=(heir.mask or donor.mask or '') or None,
+            erpnext_bank_account_name=(
+                (heir.erpnext_bank_account_name
+                 or donor.erpnext_bank_account_name or '') or None),
+            reason=reason, detected_at=_now()))
+        db.session.commit()
+        return PlaidAccountLink.query.filter_by(
+            previous_account_id=previous, account_id=current).first()
+    except Exception:  # noqa: BLE001 - history must never break an adoption
+        db.session.rollback()
+        log.warning('could not record the account link %s → %s', previous,
+                    current, exc_info=True)
+        return None
+
+
+def _fill_blanks(row: PlaidAccountLink, donor: PlaidAccount,
+                 heir: PlaidAccount) -> None:
+    """Complete a hop already on file, without overwriting it. The case this
+    is for: the v1.0.2 backfill reconstructs a hop from the column alone and
+    cannot know the donor's Bank Account (adopt nulled it releases ago), so a
+    later pass that DOES know it should be able to say so — and nothing else."""
+    if not row.previous_item_id:
+        row.previous_item_id = donor.item_id
+    if not row.item_id:
+        row.item_id = heir.item_id
+    if not row.mask:
+        row.mask = (heir.mask or donor.mask or '') or None
+    if not row.erpnext_bank_account_name:
+        row.erpnext_bank_account_name = (
+            (heir.erpnext_bank_account_name
+             or donor.erpnext_bank_account_name or '') or None)
+
+
+def _hops() -> list[tuple[str, str]]:
+    """Every (previous, current) edge this install knows about, from both
+    sources. One query each rather than one per node — a chain walk is on the
+    push path and runs per account."""
+    edges = [(row.previous_account_id, row.account_id)
+             for row in PlaidAccountLink.query.all()
+             if row.previous_account_id and row.account_id]
+    edges += [(row.account_id, (row.superseded_by_account_id or '').strip())
+              for row in PlaidAccount.query.filter(
+                  PlaidAccount.superseded_by_account_id.isnot(None)).all()
+              if row.account_id and (row.superseded_by_account_id or '').strip()]
+    return [(a, b) for a, b in edges if a != b]
+
+
+def chain_for(account_id: str) -> list:
+    """Every Plaid id that is the SAME REAL ACCOUNT as `account_id`, oldest
+    first.
+
+    Walks BOTH directions — an id can be handed a chain in the middle of, and
+    which end the caller happens to hold is arbitrary. Ordered by following the
+    hops forward from whichever ids nothing points at; ids the ordering cannot
+    place (a fork, a cycle, an orphan half of a pruned pair) are appended
+    sorted rather than dropped, because a chain that silently omits an id is
+    exactly the data loss this exists to prevent.
+
+    Returns `[account_id]` for an account that has never been re-linked, which
+    is every account on most installs — so callers need no special case."""
+    account_id = (account_id or '').strip()
+    if not account_id:
+        return []
+    try:
+        edges = _hops()
+    except Exception:  # noqa: BLE001 - a chain walk never breaks its caller
+        db.session.rollback()
+        log.warning('could not read the account id chain', exc_info=True)
+        return [account_id]
+    if not edges:
+        return [account_id]
+    forward: dict[str, set] = {}
+    backward: dict[str, set] = {}
+    for previous, current in edges:
+        forward.setdefault(previous, set()).add(current)
+        backward.setdefault(current, set()).add(previous)
+    seen = {account_id}
+    frontier = [account_id]
+    for _ in range(MAX_CHAIN_DEPTH):
+        if not frontier:
+            break
+        nxt = set()
+        for node in frontier:
+            nxt |= forward.get(node, set())
+            nxt |= backward.get(node, set())
+        frontier = sorted(nxt - seen)
+        seen.update(frontier)
+    if len(seen) == 1:
+        return [account_id]
+    # Order it: start from the ids in the chain nothing in the chain points at,
+    # then follow the hops forward. `placed` is the cycle guard.
+    heads = sorted(i for i in seen if not (backward.get(i, set()) & seen))
+    ordered: list[str] = []
+    placed = set()
+    queue = heads or sorted(seen)
+    while queue:
+        node = queue.pop(0)
+        if node in placed:
+            continue
+        placed.add(node)
+        ordered.append(node)
+        queue.extend(sorted(forward.get(node, set()) & seen))
+    ordered.extend(sorted(seen - placed))
+    return ordered
+
+
+def current_account_id(account_id: str) -> str:
+    """The id this real account goes by NOW — the last hop of its chain."""
+    chain = chain_for(account_id)
+    return chain[-1] if chain else (account_id or '')
+
+
+def mapped_account_for(account_id: str) -> PlaidAccount | None:
+    """The PlaidAccount row that currently CARRIES the ERPNext mapping for this
+    Plaid id: itself, or the row that inherited the mapping on a re-link.
+
+    THE BUG THIS EXISTS FOR. `adopt` nulls the donor's
+    `erpnext_bank_account_name` — it has to, or two rows would push into one
+    Bank Account and double every transaction in the overlap. But anchors,
+    statements and transactions recorded BEFORE the re-link keep the dead
+    account_id, so anything that resolves "which Bank Account does this row
+    belong to" by loading that one row gets None, and the pre-relink half of
+    the history silently never reaches ERPNext. It reads as an unmapped
+    account, which is a mapping decision nobody made.
+
+    Prefers the row asked for when it is itself mapped, so the ordinary case
+    costs one query and the chain is only walked when there is a reason to."""
+    account_id = (account_id or '').strip()
+    if not account_id:
+        return None
+    account = PlaidAccount.query.filter_by(account_id=account_id).first()
+    if account is not None and (account.erpnext_bank_account_name or '').strip():
+        return account
+    chain = chain_for(account_id)
+    if len(chain) <= 1:
+        return account
+    # Newest first: a twice-relinked account's mapping is on the live row, and
+    # asking for the OLDEST mapped row would resurrect a stale docname.
+    for other_id in reversed(chain):
+        if other_id == account_id:
+            continue
+        other = PlaidAccount.query.filter_by(account_id=other_id).first()
+        if other is not None \
+                and (other.erpnext_bank_account_name or '').strip():
+            log.debug('plaid account %s resolves its ERPNext mapping through '
+                      're-linked %s', account_id, other_id)
+            return other
+    return account
 
 
 # ── repointing ERPNext ──────────────────────────────────────────────────────

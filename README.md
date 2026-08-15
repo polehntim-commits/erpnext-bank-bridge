@@ -2697,6 +2697,147 @@ Verification, per the plan's checklist: `get_erpnext_push_status` should reach
 reading locally.
 
 
+## Verified pushes and the Plaid id chain (v1.0.2)
+
+Two bugs with one shape: the pipe believed something it had not been told.
+
+### A 200 is not a confirmation
+
+`sync_now` reported `erpnext_push.metadata.unchanged: 4` while all four ERPNext
+Bank Accounts held null for `plaid_account_mask`, `plaid_account_type`,
+`plaid_account_subtype` and `sync_enabled: false`. The accounts were mapped
+correctly; the metadata simply never landed.
+
+Bank Bridge treated the 200 as proof and stamped
+`erpnext_metadata_fingerprint` — which is precisely the flag that stops a fact
+being pushed again. So the sync reported `unchanged` forever, correctly by its
+own lights, about data ERPNext had never received.
+
+**Several things produce a 200 that writes nothing**, and the old code could
+not tell any of them from a success:
+
+- **Frappe hands a whitelisted method only the kwargs its signature declares**
+  and drops the rest silently. A push carrying six fields to a method that
+  declares three returns exactly the same 200 as one that carried all six —
+  and the three it dropped are the ones an operator then finds empty. (The
+  v1.0.1 fix, where anchor pushes sent `tolerance` to a method wanting
+  `variance_tolerance`, is this same mechanism caught by hand.)
+- the custom field may be **absent from the Bank Account doctype**
+- a validation may **rewrite the value** after the write
+
+Which of these the live install hit is not recoverable after the fact — and
+that opacity is itself the defect being fixed.
+
+Every push now reads ERPNext's reply. `push_account_pairing` echoes the Bank
+Account **as it now reads**, so the check compares against ERPNext's state, not
+its claim of success:
+
+| verdict | what it means | what happens |
+|---|---|---|
+| **confirmed** | the echo shows the fields we sent | stamped; not pushed again |
+| **contradicted** | a reply we understand, saying they are not there | queued and retried on the backoff, with the missing fields and the likely cause in `last_error` |
+| **unconfirmed** | a reply shape this build cannot read | neither stamped nor queued — re-sent next sync against an idempotent upsert |
+
+The asymmetry in the last two rows is load-bearing. Treating an unknown
+envelope as failure would let one rename on the ERPNext side stall every push
+behind a queue that can never drain; treating it as success is the bug above.
+Re-sending an idempotent upsert is the only cost bounded in both directions.
+
+Fingerprints already on a live database were written under the old meaning of
+"stamped", so `erpnext_push.PUSH_FINGERPRINT_CONTRACT` is folded into the hash
+input. That invalidates them exactly once — no clock, no migration, no state —
+and each row self-resolves on its first verified push.
+
+Only fields actually sent are demanded back: ERPNext writes a key only when its
+value is non-empty (a pipe that knows the mask and not the subtype must not
+blank a subtype somebody typed), so requiring an echo for a field we sent as
+`''` would report every ordinary account as contradicted. **`sync_enabled` is
+the exception and is always checked** — `false` is a value, not an absence, and
+"this account is no longer synced" is exactly the fact that must not be lost in
+transit.
+
+### Plaid reassigns account ids; the books must not notice
+
+A reconnection mints new `account_id`s for the same real accounts. On the live
+install ••6030 is `jN7xBz8…` in Bank Bridge and was still `ZE4ZoOp…` in ERPNext.
+
+Three identifiers, and only one of them changes:
+
+- the **mask** (••6030) is what a human calls the account — stable
+- the **ERPNext Bank Account docname** is what the books call it — stable
+- the **Plaid account id** is what this app keys on — *not* stable
+
+So the chain is recorded, in `plaid_account_links`, one row per hop.
+`superseded_by_account_id` remains the live pointer; the table is the history,
+and it exists because that column cannot be one:
+
+1. **It is only as durable as the row it sits on.** The column lives on the
+   *retired* account, so anything that removes that row — a hand-pruned
+   duplicate, a restore from a partial backup, a future cleanup pass — takes
+   with it the only record that the old id ever became the new one. Nothing
+   deletes a `PlaidAccount` today, which is what makes the risk easy to miss:
+   the history has no independent existence, and the day something does prune,
+   the loss is silent and total. The link row carries **no foreign key** to
+   either account, deliberately, so it cannot be taken along.
+2. **It cannot say when or why.** "Which id was this account in March" is the
+   question asked when a statement and a ledger disagree.
+3. **It loses the stable names.** The mask and the docname are snapshotted at
+   the hop — the one moment both are readable, since `adopt` is about to strip
+   the donor's.
+
+`reconnect.chain_for` walks the link table and the column **together**, in both
+directions (an id can be handed a chain from the middle), depth-bounded and
+cycle-safe. Neither source is complete alone — an install upgrading into v1.0.2
+has hops only the column knows about, one that has since pruned has hops only
+the table knows about — and their union is the chain.
+
+What that buys:
+
+- **Anchors on a dead id still reach ERPNext.** `adopt` nulls the retired row's
+  Bank Account on purpose (two rows naming one Bank Account would double-post
+  every transaction in the overlap), so anything resolving the mapping from
+  that one row found nothing and reported the whole pre-relink history as an
+  unmapped account. `push_anchor` now resolves through the chain to the row
+  holding the mapping. ERPNext is idempotent on the *period*, so both halves
+  land under one Bank Account in one chain.
+- **The metadata push is the repoint.** `plaid_account_id` rides in the payload
+  and ERPNext writes it keyed by the *docname*, so a sync after a re-link
+  corrects a record still holding the dead id. This only ever worked in theory
+  before: the unverified push stamped a fingerprint, after which the stale id
+  read as up to date forever.
+- **Retired ids stop reading as unmapped accounts.**
+  `get_erpnext_push_status` counted nine of them, inviting an operator to map
+  nine accounts whose correct action was nothing. They now appear under
+  `relinked_accounts`, each with its full chain and its Bank Account.
+
+Nothing on the ERPNext side changes: `erpnext_mcp.bank.push_account_pairing`
+already declares all four metadata kwargs and `upsert_pairing` already writes
+them, so on a current ERPNext this release simply lands the data v1.0.1
+believed it had sent. Against an older one, the queue now names what is missing
+instead of reporting `unchanged`.
+
+Verification after deploying: run a sync, then
+
+```
+get_erpnext_push_status
+```
+
+`metadata` should report `pushed: 4` on the first run and `unchanged: 4` on the
+second — and this time the ERPNext Bank Accounts carry the mask, type, subtype
+and the *current* `plaid_account_id`. A non-zero `queue_by_kind.plaid_metadata`
+with an error naming `plaid_account_mask` means the ERPNext side predates the
+fields; deploy `erpnext_mcp` ≥ v0.73.0 and `flush_erpnext_push_queue`.
+
+**State of the live install when this shipped** (2026-08-15, checked with
+`get_account_pairing` and `get_statement_anchor_chain`): all four Bank Accounts
+already carried correct metadata *including* the current `plaid_account_id`, so
+the metadata symptom described above had cleared on the box by the time the fix
+landed — `erpnext_mcp` v0.73.0 is deployed and declares every field. What is
+still zero there is **anchors**: `anchored_periods: 0` on all four accounts,
+against ~27 periods held locally. That is the half this release's chain
+resolution is aimed at, and it is the thing to re-check first after deploying.
+
+
 ## Reconciliation status in ERPNext (v0.5.0)
 
 A bookkeeper opens the ERPNext **Bank Statement** record and sees *this period

@@ -203,6 +203,17 @@ class FakeERPClient:
         self.method_failures = {}
         # Every (method, payload) a push sent, in order.
         self.method_calls = []
+        # v1.0.2 · what the two push endpoints have actually WRITTEN, so their
+        # replies can echo it. `pushed_bank_accounts` is {docname: fields} and
+        # is what _pairing_reply hands back; `pushed_anchors` is keyed the way
+        # the real endpoint is idempotent, on (bank_account, start, end).
+        self.pushed_bank_accounts = {}
+        self.pushed_anchors = {}
+        # Model an erpnext_mcp build whose push_account_pairing predates the
+        # Plaid metadata kwargs: Frappe drops what the signature does not
+        # declare, so the call succeeds and nothing is written — one of the
+        # several ways a 200 writes nothing, and the cheapest to stage.
+        self.drops_metadata_fields = False
         self.fail_create = fail_create             # fail Bank Transaction create
         self.fail_bank_account = fail_bank_account  # fail Bank Account create
         # Fields ERPNext will reject as "not a valid field" on a Bank Account
@@ -985,7 +996,66 @@ class FakeERPClient:
                 self.created.get(doctype, {}).pop(name, None)
                 self.docs.pop(name, None)
                 self.deleted.add(name)
+        elif method == 'erpnext_mcp.bank.push_account_pairing':
+            return self._pairing_reply(json_body or {})
+        elif method == 'erpnext_mcp.bank.push_statement_anchor':
+            return self._anchor_reply(json_body or {})
         return {}
+
+    # ── the consolidation's push replies (v1.0.2) ──────────────────────────
+    #
+    # These used to return `{}` and the pushes counted as landed, which is
+    # exactly the production bug: Frappe hands a whitelisted method only the
+    # kwargs it DECLARES, so an erpnext_mcp build older than a field returns a
+    # clean 200 having written nothing, and Bank Bridge stamped a fingerprint
+    # on it. A fake that answers `{}` cannot tell those apart either — so it
+    # now models the real endpoints: it keeps the Bank Account state it was
+    # asked to write and ECHOES IT BACK, the way `upsert_pairing` does.
+
+    def _pairing_reply(self, payload):
+        name = (payload.get('bank_account') or '').strip()
+        if not name:
+            from app.erpnext_client import ERPNextAPIError
+            raise ERPNextAPIError('POST push_account_pairing -> 417',
+                                  status_code=417,
+                                  response_body='bank_account is required.')
+        held = self.pushed_bank_accounts.setdefault(name, {'name': name})
+        written = []
+        for key in ('plaid_account_id', 'plaid_account_mask',
+                    'plaid_account_type', 'plaid_account_subtype',
+                    'paired_bank_account', 'pairing_type'):
+            # `drops_metadata_fields` models an erpnext_mcp build whose
+            # push_account_pairing does not declare these — the 200-that-writes-
+            # nothing this release exists to stop believing.
+            if self.drops_metadata_fields and key.startswith('plaid_'):
+                continue
+            value = str(payload.get(key) or '').strip()
+            if not value:
+                continue    # ERPNext writes only the keys actually carried
+            held[key] = value
+            written.append(key)
+        if not self.drops_metadata_fields and payload.get('sync_enabled') is not None:
+            held['sync_enabled'] = bool(payload.get('sync_enabled'))
+            written.append('sync_enabled')
+        echoed = dict(held)
+        echoed.setdefault('sync_enabled', False)
+        return {'updated': [{'bank_account': name,
+                             'updated_fields': sorted(written),
+                             'account': echoed}],
+                'updated_count': 1, 'failed': [], 'failed_count': 0}
+
+    def _anchor_reply(self, payload):
+        key = (payload.get('bank_account'), payload.get('period_start'),
+               payload.get('period_end'))
+        row = {'bank_account': key[0], 'period_start': key[1],
+               'period_end': key[2]}
+        first = key not in self.pushed_anchors
+        self.pushed_anchors[key] = dict(payload)
+        return {'created': [row] if first else [],
+                'created_count': 1 if first else 0,
+                'updated': [] if first else [row],
+                'updated_count': 0 if first else 1,
+                'failed': [], 'failed_count': 0}
 
     # count helpers for assertions
     def creates_of(self, doctype='Bank Transaction'):

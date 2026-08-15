@@ -1366,11 +1366,10 @@ def metadata_figures(metadata: dict) -> list[tuple[str, str, float]]:
 # Nothing here writes to ERPNext. That is a property of the release, not an
 # oversight.
 
-# How far a supersede chain is walked before we assume something is wrong.
-# A real chain is one or two links (a bank re-link, occasionally two); ten is
-# far past any legitimate history and exists so a cycle introduced by bad data
-# cannot hang a page render.
-_MAX_SUPERSEDE_DEPTH = 10
+# The depth limit that used to live here — "a real chain is one or two links;
+# ten is far past any legitimate history, and exists so a cycle in the data
+# cannot hang a page render" — moved to `reconnect.MAX_CHAIN_DEPTH` in v1.0.2
+# along with the walk itself. One walk, one limit.
 
 
 def supersede_chain(account_id: str) -> list:
@@ -1394,31 +1393,26 @@ def supersede_chain(account_id: str) -> list:
 
     Breadth-first with a visited set, so a cycle in the data (which should be
     impossible and therefore will eventually happen) terminates instead of
-    looping. Returns the ids including the one asked for."""
+    looping. Returns the ids including the one asked for, SORTED — every caller
+    uses this as a set of ids to filter on, and a stable order keeps a chain
+    readable in a log line.
+
+    v1.0.2 · the walk itself moved to `reconnect.chain_for`, which reads the
+    same `superseded_by_account_id` pointers PLUS the durable
+    `plaid_account_links` history. That matters here and not merely for
+    tidiness: the pointer lives on the retired row and has no existence apart
+    from it, so the day anything removes that row this function would quietly
+    start reporting half the history as a complete chain — which reads exactly
+    like money going missing, and is the failure mode it was written to end."""
+    from . import reconnect
     account_id = (account_id or '').strip()
     if not account_id:
         return []
-    seen = {account_id}
-    frontier = [account_id]
-    for _ in range(_MAX_SUPERSEDE_DEPTH):
-        if not frontier:
-            break
-        # Successors: rows these point at. Predecessors: rows pointing at them.
-        successors = {
-            (a.superseded_by_account_id or '').strip()
-            for a in PlaidAccount.query
-            .filter(PlaidAccount.account_id.in_(tuple(frontier))).all()
-            if (a.superseded_by_account_id or '').strip()}
-        predecessors = {
-            a.account_id for a in PlaidAccount.query
-            .filter(PlaidAccount.superseded_by_account_id.in_(
-                tuple(frontier))).all()}
-        frontier = sorted((successors | predecessors) - seen)
-        seen.update(frontier)
-    if len(seen) > 1:
+    chain = sorted(reconnect.chain_for(account_id))
+    if len(chain) > 1:
         log.debug('account %s resolves to a supersede chain of %d rows',
-                  account_id, len(seen))
-    return sorted(seen)
+                  account_id, len(chain))
+    return chain
 
 
 def _fingerprint(txn) -> tuple:
@@ -2424,7 +2418,8 @@ def push_anchors_to_erpnext(anchors, *, client=None, force: bool = False) -> dic
     empty dict, because "the push was never attempted" and "the push tried and
     pushed nothing" are the two states an operator most needs to tell apart."""
     if not anchors:
-        return {'pushed': 0, 'queued': 0, 'skipped': 0, 'unchanged': 0}
+        return {'pushed': 0, 'queued': 0, 'skipped': 0, 'unchanged': 0,
+                'unconfirmed': 0}
     try:
         from . import erpnext_push
         return erpnext_push.push_anchors(anchors, client=client, force=force)

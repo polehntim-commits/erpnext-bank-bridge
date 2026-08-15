@@ -327,6 +327,81 @@ class PlaidAccount(db.Model):
         }
 
 
+class PlaidAccountLink(db.Model):
+    """One hop in a real account's chain of Plaid ids — v1.0.2.
+
+    WHAT THIS IS FOR. Plaid mints a new `account_id` every time an Item is
+    re-linked, so the identifier this whole app keys on is the one thing about
+    a bank account that is NOT stable. `PlaidAccount.superseded_by_account_id`
+    already records the hop, and for a while that was enough. It stopped being
+    enough for three reasons, and this table is one row per reason:
+
+      1. IT IS ONLY AS DURABLE AS THE ROW IT SITS ON. `superseded_by_account_id`
+         is a column on the RETIRED account, so anything that removes that row —
+         a hand-pruned duplicate, a restore from a partial backup, a future
+         cleanup pass — takes with it the only record that the old id ever
+         became the new one. Nothing in this app deletes a PlaidAccount today,
+         which is exactly why the risk is easy to miss: the history has no
+         independent existence, and the day something does prune, the loss is
+         silent and total. This row holds no foreign key to either account
+         precisely so it cannot be taken along (an FK would either block the
+         delete or cascade the history away, and both defeat the point).
+
+      2. IT CANNOT SAY WHEN OR WHY. "Which of these ids was the account in
+         March" is the question asked when a statement and a ledger disagree,
+         and a single nullable column cannot answer it. This is an event log:
+         `detected_at` and `reason` are the columns `superseded_by_account_id`
+         has nowhere to put.
+
+      3. IT LOSES THE TWO STABLE NAMES. The mask (what a human calls the
+         account: "the 6030") and the ERPNext Bank Account docname (what the
+         books call it) are the identifiers that DON'T change across a re-link.
+         Snapshotting them here means a chain can still be reassembled by hand
+         when every Plaid id in it is dead and both PlaidAccount rows are gone.
+
+    UNIQUE ON (previous_account_id, account_id) so recording the same hop twice
+    — the backfill and the live adoption both try — is a no-op rather than a
+    duplicate. The chain is walked in `reconnect.chain_for`, which reads BOTH
+    this table and `superseded_by_account_id`: the column stays the live
+    pointer, this is the durable history, and neither is trusted alone."""
+    __tablename__ = 'plaid_account_links'
+    __table_args__ = (
+        db.UniqueConstraint('previous_account_id', 'account_id',
+                            name='ux_plaid_account_link_hop'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    # The dead id and the one that replaced it. NO ForeignKey on either — see
+    # reason 1 above; this row has to outlive both PlaidAccount rows.
+    previous_account_id = db.Column(db.String(120), nullable=False, index=True)
+    account_id = db.Column(db.String(120), nullable=False, index=True)
+    previous_item_id = db.Column(db.String(120), nullable=True)
+    item_id = db.Column(db.String(120), nullable=True)
+    # The two identifiers that survive a re-link, snapshotted at the hop.
+    mask = db.Column(db.String(10), nullable=True, index=True)
+    erpnext_bank_account_name = db.Column(db.Text, nullable=True)
+    # 'plaid_relink'  — fingerprint adoption during an account refresh
+    # 'hygiene'       — the operator's duplicate cleanup on /admin/data_hygiene
+    # 'backfill'      — reconstructed from superseded_by_account_id at upgrade
+    # Left un-constrained, like import_status, so a future reason is not a
+    # migration.
+    reason = db.Column(db.String(40), default='plaid_relink', index=True)
+    detected_at = db.Column(db.DateTime, default=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'previous_account_id': self.previous_account_id,
+            'account_id': self.account_id,
+            'previous_item_id': self.previous_item_id,
+            'item_id': self.item_id,
+            'mask': self.mask,
+            'erpnext_bank_account_name': self.erpnext_bank_account_name,
+            'reason': self.reason or 'plaid_relink',
+            'detected_at': (self.detected_at.isoformat()
+                            if self.detected_at else None),
+        }
+
+
 class BankTransaction(db.Model):
     """Local mirror of one Plaid transaction — NOT the ERPNext Bank
     Transaction (that lives in Frappe; we store its docname in
