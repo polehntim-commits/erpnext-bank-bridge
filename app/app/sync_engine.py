@@ -1347,10 +1347,47 @@ def run_sync(*, account_id: str = '', include_investments: bool = True,
     if erp_client is not None:
         from . import statement_recon as statement_recon_mod
         statement_recon = statement_recon_mod.observe_quietly(erp_client)
+    # v1.0.0 · THE OUTWARD LEG. ERPNext owns the account topology now — the
+    # pairing, the Plaid ids, the masks, the types, whether Bank Bridge syncs a
+    # given account — so its Bank Account records carry that metadata and its
+    # own MCP tools answer topology questions without a round-trip here.
+    #
+    # A sync is the right moment for it because a sync is when any of it can
+    # change: `refresh_accounts` runs inside `pull_item` and is what discovers a
+    # renamed account, a new subtype, or a re-linked replacement. Bounded by the
+    # fingerprint check, so the steady state pushes NOTHING — the write only
+    # happens on the sync where something actually moved.
+    #
+    # Then the queue is drained: whatever an earlier outage could not deliver
+    # gets its chance while a client is already in hand. Both run last, after
+    # every JE and every anchor this run intends to write, and neither can fail
+    # the sync.
+    erpnext_push_result = _push_to_erpnext(erp_client, accounts.values())
     return _finish(started, account_id, include_investments, summaries,
                    item_results, errors, len(items), pairs=pairs,
                    draft_health=draft_health, notices=notices,
-                   statement_recon=statement_recon)
+                   statement_recon=statement_recon,
+                   erpnext_push=erpnext_push_result)
+
+
+def _push_to_erpnext(erp_client, accounts) -> dict | None:
+    """Mirror Plaid account metadata into ERPNext and drain the push queue.
+
+    Returns {'metadata': …, 'queue': …} or None when there was no ERPNext client
+    to work with. Never raises: this is the last thing a sync does, and a sync
+    that transferred every transaction correctly must not report `failed`
+    because a metadata mirror timed out."""
+    if erp_client is None:
+        return None
+    try:
+        from . import erpnext_push
+        metadata = erpnext_push.push_metadata_for(accounts, client=erp_client)
+        queue = erpnext_push.drain(erp_client)
+        return {'metadata': metadata, 'queue': queue}
+    except Exception as e:  # noqa: BLE001
+        db.session.rollback()
+        log.warning('the ERPNext push leg of the sync failed', exc_info=True)
+        return {'error': f'{type(e).__name__}: {e}'}
 
 
 def _attribute(summaries: dict, res: dict, item: PlaidItem,
@@ -1437,7 +1474,8 @@ def _dedupe(entries: list) -> list:
 def _finish(started: float, account_id: str, include_investments: bool,
             summaries, item_results: list, errors: list, item_count: int,
             pairs: dict = None, draft_health: dict = None,
-            notices: list = None, statement_recon: dict = None) -> dict:
+            notices: list = None, statement_recon: dict = None,
+            erpnext_push: dict = None) -> dict:
     """Assemble the result: per-account rows, totals, status, elapsed.
 
     `draft_health` (v0.8.5) is the post-sync draft-JE reading, or None when the
@@ -1503,6 +1541,10 @@ def _finish(started: float, account_id: str, include_investments: bool,
                   'fired': len(statement_recon.get('fired') or []),
                   'status': statement_recon.get('status', 'ok'),
                   'headline': statement_recon.get('headline', '')}),
+              # v1.0.0 · what reached ERPNext, and what is still waiting.
+              # None when the run had no ERPNext client at all — distinct from
+              # "pushed nothing", which is the healthy steady state.
+              'erpnext_push': erpnext_push,
               'elapsed_seconds': round(time.monotonic() - started, 3)}
     audit.record('sync_run_completed', subject_type=None,
                  after={**totals, 'status': status, 'items': item_count},

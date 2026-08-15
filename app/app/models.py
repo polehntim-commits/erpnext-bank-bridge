@@ -289,6 +289,18 @@ class PlaidAccount(db.Model):
     # never needs a migration — which is exactly what let 'superseded' be added
     # in v0.4.11 with no constraint change.
     import_status = db.Column(db.String(20), default='pending', index=True)
+    # v1.0.0 · the Plaid metadata mirror (see app/erpnext_push.py). ERPNext's
+    # Bank Account carries plaid_account_id / mask / type / subtype / pairing /
+    # sync_enabled now, so its own MCP tools can answer topology questions
+    # without a Bank Bridge round-trip.
+    #
+    # The fingerprint is a hash of exactly those fields as last pushed. Every
+    # sync would otherwise re-write the same six values onto every mapped Bank
+    # Account on every poll — a write per account per ten minutes that says
+    # nothing. NULL = never pushed, which is the state every account upgrades
+    # into and the first sync clears.
+    erpnext_metadata_fingerprint = db.Column(db.String(64), nullable=True)
+    erpnext_metadata_pushed_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -308,6 +320,10 @@ class PlaidAccount(db.Model):
             'opening_balance_je_id': self.opening_balance_je_id,
             'import_status': self.import_status or 'pending',
             'superseded_by_account_id': self.superseded_by_account_id,
+            'paired_account_id': self.paired_account_id,
+            'erpnext_metadata_pushed_at': (
+                self.erpnext_metadata_pushed_at.isoformat()
+                if self.erpnext_metadata_pushed_at else None),
         }
 
 
@@ -755,6 +771,28 @@ class CategorizationRule(db.Model):
     # unconditional keeps that escape hatch open without anyone having to opt in
     # to correct behaviour.
     ignore_for_paired = db.Column(db.Boolean, default=True)
+    # v1.0.0 · the ERPNext Bank Categorization Rule docname this row MIRRORS.
+    #
+    # NULL means "authored here" — every pre-v1.0.0 rule, and any rule an
+    # operator writes on /admin/rules while RULES_SOURCE=local. A non-NULL value
+    # means the row is a READ-THROUGH CACHE of a rule ERPNext owns: the fetch
+    # (see app/erpnext_rules.py) upserts on this column, so re-fetching the same
+    # rule set is idempotent and never accumulates duplicates.
+    #
+    # Deliberately NOT unique: a rule superseded locally keeps its docname on
+    # the ARCHIVED version as the record of which ERPNext rule generated a past
+    # Journal Entry, and a unique index would make that history impossible to
+    # keep.
+    #
+    # And deliberately NOT indexed either. This table holds dozens of rows, and
+    # the one hot path over it (categorization.rule_snapshots) reads ALL of them
+    # in one query — an index would never be chosen. The real reason is
+    # consistency: migrations.py adds a column to an existing table but only
+    # creates UNIQUE indexes (see SCHEMA_INDEXES), so `index=True` here would
+    # give a fresh install an index an upgraded one never gets. Two schemas that
+    # differ by deployment history are worth more trouble than a scan of sixty
+    # rows is worth saving.
+    erpnext_rule_name = db.Column(db.String(255), nullable=True)
     description_template = db.Column(db.Text, default='')
     # v0.4.0.1 · multi-entity rule scoping: when set, the rule only fires for a
     # transaction whose linked Plaid account resolves to this ERPNext Company.
@@ -853,6 +891,10 @@ class CategorizationRule(db.Model):
             'archived': bool(self.archived),
             'match_count': int(self.match_count or 0),
             'bb_internal_tag': self.bb_internal_tag or '',
+            # v1.0.0 · '' = authored here; a docname = mirrored from ERPNext,
+            # which since v1.0.0 is what decides whether the rule is even in the
+            # eligible set (see categorization.rule_snapshots).
+            'erpnext_rule_name': self.erpnext_rule_name or '',
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'activated_at': (self.activated_at.isoformat()
@@ -1367,6 +1409,24 @@ class StatementAnchor(db.Model):
     variance_reason = db.Column(db.String(40), nullable=True)
     chain_gap_from_prior = db.Column(db.Boolean, default=False, nullable=False)
     parser_version = db.Column(db.String(40), default='')
+    # ── v1.0.0 · the consolidation's outward leg ─────────────────────────────
+    #
+    # ERPNext owns the reconciliation truth now (see app/erpnext_push.py); this
+    # table became the WRITE-AHEAD CACHE in front of it. These two columns are
+    # what make that honest rather than hopeful:
+    #
+    # `erpnext_push_fingerprint` is a hash of the figures last successfully
+    # pushed. A rebuild that recomputes an unchanged period therefore pushes
+    # NOTHING — which matters because rebuild_statement_anchors is called after
+    # every reparse and every pairing change, and 27 unchanged periods against a
+    # live ERPNext on each of those is 27 writes that say nothing.
+    #
+    # `erpnext_pushed_at` is when that push landed. NULL = this period's truth
+    # has never reached ERPNext, which is a QUERYABLE state: an operator (or an
+    # AI) can ask "what does ERPNext not know yet?" and get an answer from the
+    # anchor table itself rather than from a log.
+    erpnext_push_fingerprint = db.Column(db.String(64), nullable=True)
+    erpnext_pushed_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=_now)
     updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
 
@@ -1413,6 +1473,10 @@ class StatementAnchor(db.Model):
             'portfolio_delta': self.portfolio_delta(),
             'security_flow_sum': self.security_flow_sum or 0.0,
             'mark_to_market_delta': self.mark_to_market_delta,
+            # v1.0.0 · has this period's truth reached ERPNext, and when. NULL
+            # is a finding, not an absence — see the columns' comment.
+            'erpnext_pushed_at': (self.erpnext_pushed_at.isoformat()
+                                  if self.erpnext_pushed_at else None),
         }
 
 
@@ -2662,4 +2726,77 @@ class StatementReconSample(db.Model):
             'threshold_source': self.threshold_source or 'default',
             'baseline_samples': int(self.baseline_samples or 0),
             'fired_at': self.fired_at.isoformat() if self.fired_at else None,
+        }
+
+
+class ErpnextPushQueue(db.Model):
+    """One authoritative write that has NOT yet reached ERPNext (v1.0.0).
+
+    THE PROBLEM THIS SOLVES. After the consolidation, ERPNext owns the
+    reconciliation truth and Bank Bridge pushes it outward. A push happens at
+    the moment the fact becomes true — a statement parses, an anchor rebuilds,
+    an operator pairs two accounts — and that moment has nothing to do with
+    whether ERPNext is reachable. Umbrel restarts, Frappe migrates, the
+    community-app network blips. Without a queue, every one of those windows
+    silently drops a fact ERPNext is now the system of record for, and the two
+    systems disagree with nobody watching.
+
+    So a failed push is not lost and is not retried in a tight loop: it lands
+    here, and the next sync drains it. That makes the outward leg eventually
+    consistent by construction rather than by luck.
+
+    WHY THE ROW IS THE PAYLOAD. `payload` is the exact JSON body the push would
+    have sent, not a pointer back to the source row. A pointer would re-read the
+    source at drain time and push whatever it says THEN — which is usually
+    right and occasionally wrong in the one way that matters: an anchor
+    corrected between the failure and the drain would have its intermediate
+    state skipped, and an operator reading ERPNext's audit trail would see a
+    period jump from stale to current with no record of the correction. Storing
+    the body keeps the queue a log of intended writes.
+
+    `dedupe_key` is UNIQUE and is what keeps that from becoming unbounded:
+    re-queuing the same target (`anchor:1187`) REPLACES its payload rather than
+    appending a second one. The queue holds at most one pending write per
+    target, always the latest.
+
+    `next_attempt_at` carries the exponential backoff BETWEEN drains, so an
+    ERPNext that is down for an hour is not asked 360 times. A row is deleted
+    on success — this is a queue, not history; where the write landed is
+    recorded on the source row (StatementAnchor.erpnext_pushed_at,
+    PlaidAccount.erpnext_metadata_pushed_at), which is the queryable place for
+    it.
+    """
+    __tablename__ = 'erpnext_push_queue'
+    id = db.Column(db.Integer, primary_key=True)
+    # 'statement_anchor' | 'account_pairing' | 'plaid_metadata' — the kind of
+    # fact, not the endpoint. Left un-constrained (like plaid_sync_log.direction)
+    # so a future push never needs a migration.
+    kind = db.Column(db.String(40), nullable=False, index=True)
+    # The whitelisted Frappe method this body is destined for. Stored per row
+    # rather than derived from `kind` so a queued write still targets the method
+    # that was current when it was queued, even across an upgrade that moves it.
+    method = db.Column(db.String(200), nullable=False, default='')
+    # One pending write per target. See the class docstring.
+    dedupe_key = db.Column(db.String(200), unique=True, nullable=False,
+                           index=True)
+    payload = db.Column(db.Text, nullable=False, default='{}')
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    last_error = db.Column(db.Text, default='')
+    last_attempt_at = db.Column(db.DateTime, nullable=True)
+    # When this row becomes eligible again. NULL = immediately (a fresh queue).
+    next_attempt_at = db.Column(db.DateTime, nullable=True, index=True)
+    created_at = db.Column(db.DateTime, default=_now)
+    updated_at = db.Column(db.DateTime, default=_now, onupdate=_now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'kind': self.kind, 'method': self.method,
+            'dedupe_key': self.dedupe_key,
+            'attempts': int(self.attempts or 0),
+            'last_error': (self.last_error or '')[:500],
+            'last_attempt_at': (self.last_attempt_at.isoformat()
+                                if self.last_attempt_at else None),
+            'next_attempt_at': (self.next_attempt_at.isoformat()
+                                if self.next_attempt_at else None),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
         }

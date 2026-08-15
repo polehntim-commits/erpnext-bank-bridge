@@ -3571,6 +3571,13 @@ RULES_BODY = """
       hint.textContent = 'Pick a Plaid category seen locally (full hierarchy shown).';
     } else if (isRegex) {
       hint.textContent = 'A Python regex tested against the transaction description.';
+    } else if (m === 'combined') {
+      // v1.0.0 · without its own branch this fell through to the amount-range
+      // hint, which is the one thing a combined rule's value is definitely not.
+      hint.textContent = 'Clauses as JSON: {"all": [{"match_type": '
+        + '"merchant_contains", "match_value": "wells"}, {"match_type": '
+        + '"amount_range", "match_value": "[10000, 1000000]"}]} — "all" needs '
+        + 'every clause, "any" needs one, both may appear.';
     } else {
       hint.textContent = 'Amount range as JSON: [min, max] — e.g. [10, 500].';
     }
@@ -7054,6 +7061,19 @@ def set_account_pair():
     except Exception:  # pragma: no cover
         db.session.rollback()
         log.warning('anchor rebuild after pairing failed', exc_info=True)
+    # v1.0.0 · the pairing is account topology and ERPNext owns that now, so it
+    # is pushed onto both Bank Account records — the same push the pair_accounts
+    # MCP tool performs, because an operator pairing in a browser and an AI
+    # pairing over MCP must leave ERPNext in the same state. Fail-soft: the
+    # push queues itself on failure and the next sync drains it.
+    try:
+        from .. import erpnext_push
+        partner = (PlaidAccount.query.filter_by(account_id=partner_id).first()
+                   if partner_id else None)
+        erpnext_push.push_pairing(account, partner)
+    except Exception:  # pragma: no cover
+        db.session.rollback()
+        log.warning('pushing the pairing to ERPNext failed', exc_info=True)
     msg = (f'Paired ••{account.mask or "????"} with its cash account.'
            if partner_id else f'Unpaired ••{account.mask or "????"}.')
     return redirect('/admin/accounts?flash=' + quote_plus(msg))
@@ -9193,6 +9213,11 @@ _MCP_SWITCH_DESC = {
     'sync_now': 'Run a full Plaid sync + investment JE post on demand — the '
                 'Sync Now button, as a tool. Spends billable Plaid calls and '
                 'writes to ERPNext',
+    'flush_erpnext_push_queue': 'Retry every queued push to ERPNext now, '
+                                'ignoring the backoff — statement anchors, '
+                                'pairings and Plaid metadata an outage could '
+                                'not deliver. Sends nothing new; each payload '
+                                'is upserted idempotently',
 }
 
 

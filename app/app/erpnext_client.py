@@ -91,11 +91,21 @@ RETRY_BACKOFFS = (1, 3, 9)
 
 class ERPNextClient:
     def __init__(self, config: ERPNextConfig, *, timeout: int = 30,
-                 on_log=None, session=None):
+                 on_log=None, session=None, retry_backoffs=None):
         """`on_log(entry: dict)` — optional callback invoked once per HTTP
         request with {method, url, status, request_body, response_body,
         error}. The sync layer uses it to persist ERPNextSyncLog rows.
-        `session` lets a caller inject a requests.Session (or a stub)."""
+        `session` lets a caller inject a requests.Session (or a stub).
+
+        `retry_backoffs` overrides the module default for THIS client. The
+        ladder is the right trade for a posting — a Bank Transaction that fails
+        is a document that has to be re-pushed by hand — and the wrong one for a
+        call that already has somewhere to fall back to. The v1.0.0
+        consolidation reads and pushes both do: a read falls back to the local
+        chain, a push falls into the retry queue. Spending thirteen seconds
+        proving ERPNext is down, twenty-seven times, when the answer is already
+        durably parked, costs a sync six minutes and buys nothing. Pass a
+        shorter ladder (or ()) there."""
         if not config.is_complete():
             raise ERPNextConfigError(
                 'ERPNext client requires url + api_key + api_secret')
@@ -103,6 +113,8 @@ class ERPNextClient:
         self.timeout = timeout
         self.on_log = on_log
         self._session = session
+        self.retry_backoffs = (tuple(RETRY_BACKOFFS) if retry_backoffs is None
+                               else tuple(retry_backoffs))
 
     # ── low-level ────────────────────────────────────────────────────
 
@@ -134,7 +146,8 @@ class ERPNextClient:
         on any non-retryable outcome (2xx OR 4xx — the caller classifies)."""
         caller = self._session.request if self._session is not None else requests.request
         last_exc = None
-        attempts = len(RETRY_BACKOFFS) + 1
+        backoffs = self.retry_backoffs
+        attempts = len(backoffs) + 1
         for attempt in range(attempts):
             try:
                 resp = caller(
@@ -143,7 +156,7 @@ class ERPNextClient:
             except requests.RequestException as e:
                 last_exc = e
                 if attempt < attempts - 1:
-                    wait = RETRY_BACKOFFS[attempt]
+                    wait = backoffs[attempt]
                     log.warning('erpnext %s %s connection error (attempt %d/%d): '
                                 '%s — retrying in %ss', method, url, attempt + 1,
                                 attempts, e.__class__.__name__, wait)
@@ -154,7 +167,7 @@ class ERPNextClient:
                     status_code=None) from e
             # 5xx → retry; everything else (2xx/3xx/4xx) is terminal here.
             if resp.status_code >= 500 and attempt < attempts - 1:
-                wait = RETRY_BACKOFFS[attempt]
+                wait = backoffs[attempt]
                 log.warning('erpnext %s %s -> %d (attempt %d/%d) — retrying in %ss',
                             method, url, resp.status_code, attempt + 1, attempts, wait)
                 self._sleep(wait)

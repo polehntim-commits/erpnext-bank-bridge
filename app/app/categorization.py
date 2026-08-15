@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 
 from flask import current_app, g
 
+from . import appcache
 from . import audit
 from . import db
 from . import erpnext_bank
@@ -51,8 +52,15 @@ log = logging.getLogger('bankbridge.categorization')
 JOURNAL_ENTRY_DT = 'Journal Entry'
 
 # match_type values the engine understands.
+#
+# v1.0.0 · `combined` joins the list. The other five each test ONE facet, and
+# the rules that actually needed writing kept wanting two: "Wells Fargo, but
+# only the wires over $10,000", "this merchant, but only on the OML accounts".
+# The workaround was a regex that smuggled an amount into a description match,
+# which is unreadable and wrong the first time a description changes. See
+# rule_matches for the shape.
 MATCH_TYPES = ('merchant_exact', 'merchant_contains', 'description_regex',
-               'plaid_category_matches', 'amount_range')
+               'plaid_category_matches', 'amount_range', 'combined')
 
 # offset_direction values (v0.3.1). 'auto' infers debit/credit from the amount
 # sign; the two 'always_*' overrides force the offset side (rare — reversals).
@@ -200,13 +208,33 @@ def _amount_range(match_value: str):
 
 def rule_matches(rule: CategorizationRule, *, merchant_name: str = '',
                  description: str = '', category: str = '',
-                 amount: float = 0.0) -> bool:
+                 amount: float = 0.0, _depth: int = 0) -> bool:
     """True when `rule` matches the given transaction facets. Pure + total —
     a malformed pattern (bad regex, bad amount_range JSON) matches nothing
-    rather than raising, so one broken rule can't wedge the engine."""
+    rather than raising, so one broken rule can't wedge the engine.
+
+    `rule` is duck-typed on `match_type` + `match_value`, so a RuleSnapshot (the
+    matcher's cached form) and a live CategorizationRule are both accepted. That
+    is what lets the fast path and the authoring preview run the SAME predicate
+    rather than two that agree until they don't.
+
+    v1.0.0 · `combined`. `match_value` is a JSON object of clauses:
+
+        {"all": [{"match_type": "merchant_contains", "match_value": "wells"},
+                 {"match_type": "amount_range",      "match_value": "[10000, 1e9]"}]}
+
+    `all` requires every clause; `any` requires one. Both may appear, and both
+    must then hold. An empty or malformed object matches NOTHING — the same
+    total-function rule the other five follow, and the right default: a rule
+    whose predicate cannot be read should leave the transaction for a human, not
+    claim everything."""
     mt = rule.match_type
     mv = (rule.match_value or '')
     merchant = (merchant_name or '')
+    if mt == 'combined':
+        return _combined_matches(mv, merchant_name=merchant,
+                                 description=description, category=category,
+                                 amount=amount, _depth=_depth)
     if mt == 'merchant_exact':
         return bool(merchant) and merchant.strip().lower() == mv.strip().lower()
     if mt == 'merchant_contains':
@@ -237,6 +265,59 @@ def rule_matches(rule: CategorizationRule, *, merchant_name: str = '',
     return False
 
 
+# How many levels of `combined` may nest inside each other. One covers every
+# shape anyone has actually wanted — "any of these merchants AND over this
+# amount" — and three leaves room without the cap ever being the thing an
+# operator hits. The cap exists at all because it is what keeps the predicate
+# TOTAL against a hand-written (or ERPNext-authored) rule that nests itself:
+# every other match type is total by construction, and this one would not be.
+_MAX_COMBINED_DEPTH = 3
+
+
+class _Clause:
+    """A `combined` sub-predicate, shaped like a rule so rule_matches can run it
+    unchanged. Deliberately not a CategorizationRule: a clause has no id, no
+    priority and no offset account, and giving it one would invite code that
+    treats it as a rule in its own right."""
+    __slots__ = ('match_type', 'match_value')
+
+    def __init__(self, match_type, match_value):
+        self.match_type = (match_type or '').strip()
+        self.match_value = match_value if isinstance(match_value, str) \
+            else json.dumps(match_value)
+
+
+def _combined_matches(match_value: str, *, merchant_name: str,
+                      description: str, category: str, amount: float,
+                      _depth: int) -> bool:
+    if _depth >= _MAX_COMBINED_DEPTH:
+        return False
+    try:
+        spec = json.loads(match_value or '')
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(spec, dict):
+        return False
+    groups = [(key, spec[key]) for key in ('all', 'any')
+              if isinstance(spec.get(key), list) and spec[key]]
+    if not groups:
+        return False
+
+    def run(clause) -> bool:
+        if not isinstance(clause, dict):
+            return False
+        return rule_matches(
+            _Clause(clause.get('match_type'), clause.get('match_value')),
+            merchant_name=merchant_name, description=description,
+            category=category, amount=amount, _depth=_depth + 1)
+
+    for key, clauses in groups:
+        results = (run(c) for c in clauses)
+        if not (all(results) if key == 'all' else any(results)):
+            return False
+    return True
+
+
 def _rule_eligible_for_paired(rule, row) -> bool:
     """Whether a rule may fire on this transaction given its intercompany status
     (v0.4.1). A transaction the detector has paired is booked through the Due
@@ -260,12 +341,140 @@ def _rule_applies_to_company(rule, row_company: str) -> bool:
     return not scope or scope == row_company
 
 
+# ── v1.0.0 · the matcher's fast path ────────────────────────────────────────
+#
+# THE PROBLEM. `evaluate_rules` used to issue a full `CategorizationRule.query`
+# per transaction — 64 rows hydrated into ORM objects, once for every row
+# considered. A `rerun_rules` over a few thousand transactions therefore did a
+# few thousand full table scans and built a few hundred thousand model
+# instances, all to answer a question whose input changes a handful of times a
+# month. Tim's brief for the consolidation asked for maximum efficiency in rule
+# matching; this is where it lives.
+#
+# THE SHAPE. Fetch the rule set ONCE, sort by priority, and match in a single
+# pass over the transactions. The cached form is a RuleSnapshot — a frozen tuple
+# of exactly the fields the predicate reads — and NOT an ORM object, for two
+# reasons that both bite in practice: a model instance cached across the
+# commits `rerun_rules` performs goes detached and re-emits a SELECT on first
+# attribute access (undoing the whole optimization), and a cached instance whose
+# row was edited underneath it would match on stale values.
+#
+# THE INVALIDATION. Keyed on a three-column fingerprint of the table —
+# (count, max(id), max(updated_at)) — which is one cheap aggregate rather than a
+# full fetch, and which changes on every insert, edit, activation and archive
+# because `updated_at` carries onupdate=now. That means the cache is CORRECT by
+# construction rather than by remembering to call an invalidator: a rule
+# authored on /admin/rules, one pushed by an MCP tool and one mirrored from
+# ERPNext are all seen immediately, with no coupling between those surfaces and
+# this one. `invalidate_rule_cache` exists anyway, for the case where the
+# fingerprint cannot be read.
+
+class RuleSnapshot:
+    """The immutable, matcher-only view of one rule."""
+    __slots__ = ('id', 'name', 'priority', 'match_type', 'match_value',
+                 'applies_to_company', 'ignore_for_paired',
+                 'erpnext_rule_name')
+
+    def __init__(self, rule):
+        self.id = rule.id
+        self.name = rule.name or ''
+        self.priority = rule.priority if rule.priority is not None else 100
+        self.match_type = rule.match_type
+        self.match_value = rule.match_value
+        self.applies_to_company = rule.applies_to_company
+        self.ignore_for_paired = (True if rule.ignore_for_paired is None
+                                  else bool(rule.ignore_for_paired))
+        self.erpnext_rule_name = rule.erpnext_rule_name
+
+
+# Per APP INSTANCE, not per process — see app/appcache.py. The key is a
+# fingerprint of one database's rule table, and a fingerprint is only unique
+# within the database that produced it.
+_CACHE = 'rule_snapshots'
+
+
+def _rule_cache() -> dict:
+    cache = appcache.bucket(_CACHE)
+    if not cache:
+        cache.update({'key': None, 'snapshots': (), 'source': 'local'})
+    return cache
+
+
+def invalidate_rule_cache() -> None:
+    """Drop the matcher's snapshot. Called after an ERPNext refresh mirrors a
+    new rule set, and available to any surface that wants to be certain."""
+    cache = _rule_cache()
+    cache['key'] = None
+    cache['snapshots'] = ()
+
+
+def _rule_table_fingerprint():
+    """(count, max_id, max_updated_at) — the cache key. Returns None when the
+    aggregate cannot be read, which forces a rebuild rather than trusting a
+    snapshot we cannot prove is current."""
+    try:
+        return db.session.query(
+            db.func.count(CategorizationRule.id),
+            db.func.max(CategorizationRule.id),
+            db.func.max(CategorizationRule.updated_at)).one()
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+        return None
+
+
+def rule_snapshots() -> tuple:
+    """Every eligible rule, priority ascending (id as tiebreak), cached.
+
+    WHICH RULES ARE ELIGIBLE depends on RULES_SOURCE. With 'erpnext' (the
+    default) and at least one active mirrored rule present, the set is the
+    MIRRORED rules alone — ERPNext is the source of truth, and a local rule that
+    could still outrank one of its rules at the same priority would make that
+    claim false. With 'local', or when ERPNext holds no rules, the set is every
+    active local rule, which is both the pre-v1.0.0 behaviour and the rollback.
+    """
+    from . import erpnext_settings
+    source = erpnext_settings.rules_source()
+    cache = _rule_cache()
+    key = (_rule_table_fingerprint(), source)
+    if key[0] is not None and cache['key'] == key:
+        return cache['snapshots']
+    q = CategorizationRule.query.filter(
+        CategorizationRule.active.is_(True),
+        CategorizationRule.archived.is_(False))
+    effective = 'local'
+    if source == erpnext_settings.SOURCE_ERPNEXT:
+        from . import erpnext_rules
+        if erpnext_rules.mirrored_rule_count() > 0:
+            q = q.filter(CategorizationRule.erpnext_rule_name.isnot(None))
+            effective = 'erpnext'
+        else:
+            # Said once per rebuild, not per transaction: with RULES_SOURCE=
+            # erpnext and nothing mirrored, the engine is running on the
+            # rollback cache, and an operator who believes ERPNext is driving
+            # categorization should be able to find out from the log.
+            log.info('RULES_SOURCE=erpnext but no mirrored rules are present '
+                     '— matching against the local rule table')
+    snapshots = tuple(RuleSnapshot(r) for r in
+                      q.order_by(CategorizationRule.priority.asc(),
+                                 CategorizationRule.id.asc()).all())
+    cache.update({'key': key, 'snapshots': snapshots, 'source': effective})
+    return snapshots
+
+
+def rule_source_in_force() -> str:
+    """Which set the last snapshot build actually used — 'erpnext' or 'local'.
+    Distinct from the configured flag, and that distinction is the whole value:
+    RULES_SOURCE can say erpnext while the engine is running on the fallback."""
+    rule_snapshots()
+    return _rule_cache()['source']
+
+
 def evaluate_rules(row):
-    """Walk the ACTIVE, non-archived rules in priority order and return
-    (winner_or_None, trace). `trace` is the ordered list of every rule
-    considered — {rule_id, rule_name, priority, matched} — up to and including
-    the winner, so the audit log captures exactly what was evaluated and why the
-    winner won. Evaluation stops at the first match (first-match-wins).
+    """Walk the eligible rules in priority order and return (winner_or_None,
+    trace). `trace` is the ordered list of every rule considered — {rule_id,
+    rule_name, priority, matched} — up to and including the winner, so the audit
+    log captures exactly what was evaluated and why the winner won. Evaluation
+    stops at the first match (first-match-wins).
 
     v0.4.0.1: a rule scoped to an owning Company (`applies_to_company`) is only
     eligible when the transaction's account resolves to that Company. The row's
@@ -275,27 +484,39 @@ def evaluate_rules(row):
     entirely for a transaction the intercompany detector has paired — that
     transfer is booked through its Due from / Due to entries instead. The trace
     still records the rule as considered-and-unmatched, so the audit log shows
-    exactly why an otherwise-matching rule didn't win."""
+    exactly why an otherwise-matching rule didn't win.
+
+    v1.0.0: matches against the cached snapshots (see rule_snapshots) and
+    hydrates ONLY the winner. A run that matches nothing now touches the rules
+    table for one aggregate rather than for every transaction."""
     from . import erpnext_accounts
     row_company = erpnext_accounts.owning_company_for_account_id(
         getattr(row, 'account_id', None))
-    rules = (CategorizationRule.query
-             .filter(CategorizationRule.active.is_(True),
-                     CategorizationRule.archived.is_(False))
-             .order_by(CategorizationRule.priority.asc(),
-                       CategorizationRule.id.asc()).all())
+    merchant = row.merchant_name
+    description = (row.name or '')
+    category = (row.category or '')
+    amount = row.amount
     trace = []
-    for rule in rules:
-        matched = (_rule_eligible_for_paired(rule, row)
-                   and _rule_applies_to_company(rule, row_company)
+    for snap in rule_snapshots():
+        matched = (_rule_eligible_for_paired(snap, row)
+                   and _rule_applies_to_company(snap, row_company)
                    and rule_matches(
-                       rule, merchant_name=row.merchant_name,
-                       description=(row.name or ''), category=(row.category or ''),
-                       amount=row.amount))
-        trace.append({'rule_id': rule.id, 'rule_name': rule.name,
-                      'priority': rule.priority, 'matched': matched})
+                       snap, merchant_name=merchant, description=description,
+                       category=category, amount=amount))
+        trace.append({'rule_id': snap.id, 'rule_name': snap.name,
+                      'priority': snap.priority, 'matched': matched})
         if matched:
-            return rule, trace
+            # The one hydration. A snapshot carries the predicate; generating
+            # the Journal Entry needs the offset account, the cost centers, the
+            # party fields and the template, which is the whole row.
+            winner = db.session.get(CategorizationRule, snap.id)
+            if winner is not None:
+                return winner, trace
+            # The row vanished between the snapshot and here (an archive
+            # committed mid-run). Drop the stale view and keep walking rather
+            # than reporting a match nothing can generate from.
+            invalidate_rule_cache()
+            trace[-1]['matched'] = False
     return None, trace
 
 
@@ -1705,6 +1926,14 @@ def rerun_rules(erp_client) -> dict:
         raise JournalEntryGateOff(
             'Journal Entry generation is OFF — turn it on under ERPNext '
             'settings before rerunning rules, or nothing will be posted.')
+    # v1.0.0 · FORCED, past the TTL. A rerun is the operator saying "apply the
+    # current rules", and the current rules live in ERPNext now — answering it
+    # from a five-minute-old mirror would apply the rules as of five minutes
+    # ago, which is precisely the rule the operator just finished editing.
+    # Never raises; an unreachable ERPNext leaves the local cache in force and
+    # says so in `rule_source`.
+    from . import erpnext_rules
+    refresh = erpnext_rules.refresh(erp_client, force=True)
     # v0.8.5 · a `dedup_skipped` row counts as DONE. It carries no JE docname
     # (Bank Bridge did not create the entry ERPNext already holds), so without
     # this clause every rerun would re-ask ERPNext about the same transaction
@@ -1718,7 +1947,13 @@ def rerun_rules(erp_client) -> dict:
     eligible = (BankTransaction.query
                 .filter(BankTransaction.posted_at.isnot(None),
                         BankTransaction.removed.is_(False)).all())
-    stats = {'considered': 0, 'matched': 0, 'generated': 0, 'dedup_skipped': 0}
+    stats = {'considered': 0, 'matched': 0, 'generated': 0, 'dedup_skipped': 0,
+             # v1.0.0 · which rule set actually fired, and what the refresh did.
+             # A rerun that generated nothing has two very different causes —
+             # "no transaction matched" and "ERPNext was unreachable so the
+             # mirror is empty" — and these two keys are what tell them apart.
+             'rule_source': rule_source_in_force(),
+             'rules_refreshed': refresh}
     for row in eligible:
         if row.plaid_transaction_id in done:
             continue

@@ -333,3 +333,93 @@ class PortfolioBridgeMigrationTests(MigrationBase):
         row = StatementAnchor.query.filter_by(statement_id=99).one()
         self.assertEqual(0.0, row.security_flow_sum)
         self.assertIsNone(row.mark_to_market_delta)
+
+
+class ConsolidationMigrationTests(MigrationBase):
+    """v1.0.0 · the five additive columns the ERPNext consolidation introduces,
+    plus the `erpnext_push_queue` table.
+
+    The property worth its own test is that the upgrade CHANGES NOTHING until
+    something pushes. All five backfill to NULL, and NULL is the correct
+    starting state for every one of them — "this fact has never been pushed to
+    (or fetched from) ERPNext" is true of every row on a v0.9.1 database. In
+    particular a pre-v1.0.0 categorization rule must still fire, because a NULL
+    `erpnext_rule_name` is what marks it as authored-here rather than mirrored.
+    """
+
+    V100_COLUMNS = (('categorization_rules', 'erpnext_rule_name'),
+                    ('statement_anchors', 'erpnext_push_fingerprint'),
+                    ('statement_anchors', 'erpnext_pushed_at'),
+                    ('plaid_accounts', 'erpnext_metadata_fingerprint'),
+                    ('plaid_accounts', 'erpnext_metadata_pushed_at'))
+
+    def _downgrade(self):
+        with db.engine.begin() as conn:
+            for table, column in self.V100_COLUMNS:
+                conn.execute(
+                    text(f'ALTER TABLE {table} DROP COLUMN {column}'))
+
+    def test_fresh_install_has_the_columns_and_the_queue_table(self):
+        for table, column in self.V100_COLUMNS:
+            self.assertIn(column, self._columns(table))
+        self.assertIn('erpnext_push_queue', inspect(db.engine).get_table_names())
+
+    def test_upgrade_adds_them_and_every_model_query_succeeds(self):
+        """The production symptom this guards: a missing column 500s every page
+        that touches the model, because the SELECT lists them all."""
+        self._downgrade()
+        for table, column in self.V100_COLUMNS:
+            self.assertNotIn(column, self._columns(table))
+        migrations.run_migrations()
+        for table, column in self.V100_COLUMNS:
+            self.assertIn(column, self._columns(table),
+                          f'{table}.{column} should be added on upgrade')
+        from app.models import PlaidAccount, StatementAnchor
+        self.assertEqual(CategorizationRule.query.all(), [])
+        self.assertEqual(StatementAnchor.query.all(), [])
+        self.assertEqual(PlaidAccount.query.all(), [])
+
+    def test_idempotent(self):
+        self._downgrade()
+        migrations.run_migrations()
+        migrations.run_migrations()
+        for table, column in self.V100_COLUMNS:
+            self.assertIn(column, self._columns(table))
+
+    def test_a_pre_v100_rule_still_fires_after_the_upgrade(self):
+        """NULL `erpnext_rule_name` means "authored here", and an authored rule
+        is the whole rule set until ERPNext holds one. An upgrade that stopped
+        64 working rules from matching would be the worst outcome of this
+        release."""
+        self._downgrade()
+        migrations.run_migrations()
+        with db.engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO categorization_rules "
+                "(priority, active, archived, name, match_type, match_value, "
+                " offset_account) VALUES "
+                "(100, 1, 0, 'Fuel', 'merchant_contains', 'chevron', '5100')"))
+        rule = CategorizationRule.query.one()
+        self.assertIsNone(rule.erpnext_rule_name)
+        from app import categorization
+        categorization.invalidate_rule_cache()
+        self.assertEqual([s.id for s in categorization.rule_snapshots()],
+                         [rule.id])
+        self.assertEqual(categorization.rule_source_in_force(), 'local')
+
+    def test_a_pre_v100_anchor_reads_as_never_pushed(self):
+        """NULL is a queryable finding, not an absence: it is how an operator
+        asks "what does ERPNext not know yet?"."""
+        self._downgrade()
+        migrations.run_migrations()
+        with db.engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO statement_anchors "
+                "(account_id, statement_id, transaction_sum, "
+                " security_flow_sum, chain_gap_from_prior) "
+                "VALUES ('a', 77, 0.0, 0.0, 0)"))
+        from app.models import StatementAnchor
+        row = StatementAnchor.query.filter_by(statement_id=77).one()
+        self.assertIsNone(row.erpnext_pushed_at)
+        self.assertIsNone(row.erpnext_push_fingerprint)
+        self.assertIsNone(row.to_dict()['erpnext_pushed_at'])

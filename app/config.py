@@ -573,6 +573,42 @@ class Config:
     except ValueError:
         LOAN_MIN_ACCRUAL = 1.00
 
+    # ── v1.0.0 · the ERPNext consolidation (see app/erpnext_push.py) ─────
+    #
+    # ERPNext becomes the single source of truth for reconciliation truth
+    # (Statement Anchors), account pairings, categorization rules and advisory
+    # agreements. Bank Bridge keeps Plaid, PDF parsing and JE generation, and
+    # PUSHES everything authoritative outward.
+    #
+    # Each of the three flags below names WHERE A READ COMES FROM, and each has
+    # exactly one alternative — 'local' — which is the rollback. Nothing is
+    # deleted when a flag flips to 'erpnext': the internal tables stay as the
+    # write-ahead / read-through cache they became, so flipping back is a
+    # restart, not a restore. These seed the persisted settings (see
+    # app/erpnext_settings.py); once the toggle has been written there, the
+    # persisted value WINS.
+    #
+    #   * where the statement-anchor chain is read from. Writes always go to
+    #     BOTH (local first, then pushed) — this only decides who answers.
+    ANCHOR_SOURCE = (os.environ.get('ANCHOR_SOURCE', 'erpnext').strip().lower()
+                     or 'erpnext')
+    #   * where the categorization rule set is read from. 'erpnext' fetches the
+    #     active rules over the API and mirrors them into the local table as a
+    #     read-through cache; the JE generation engine itself never moves.
+    RULES_SOURCE = (os.environ.get('RULES_SOURCE', 'erpnext').strip().lower()
+                    or 'erpnext')
+    #   * where advisory-agreement TERMS are read from when a fee is computed.
+    ADVISORY_SOURCE = (os.environ.get('ADVISORY_SOURCE', 'erpnext')
+                       .strip().lower() or 'erpnext')
+    #   * how long a fetched-from-ERPNext read is trusted before it is fetched
+    #     again. Rules are re-fetched on startup and on every rerun_rules
+    #     regardless; this bounds the drift for everything in between.
+    try:
+        ERPNEXT_CACHE_TTL_SECONDS = max(0, int(os.environ.get(
+            'ERPNEXT_CACHE_TTL_SECONDS', '300')))
+    except ValueError:
+        ERPNEXT_CACHE_TTL_SECONDS = 300
+
     # Set false to disable the in-process scheduler entirely (e.g. drive syncs by
     # cron hitting /api/sync/plaid_now instead). Distinct from MANUAL-ONLY above:
     # this stops the scheduler process; MANUAL-ONLY runs it with no poll job.

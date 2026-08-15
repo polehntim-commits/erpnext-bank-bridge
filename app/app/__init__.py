@@ -13,7 +13,7 @@ from flask_sqlalchemy import SQLAlchemy
 
 from config import Config
 
-__version__ = '0.9.1'
+__version__ = '1.0.0'
 db = SQLAlchemy()
 
 
@@ -58,6 +58,30 @@ def _install_db_host_pinning(app: Flask) -> None:
     app.config['SQLALCHEMY_ENGINE_OPTIONS'] = options
     # Kept for /api/health and the tests to inspect which address we settled on.
     app.extensions.setdefault('bankbridge', {})['db_host_pin'] = pin
+
+
+def _refresh_rules_in_background(app: Flask) -> None:
+    """Kick off the startup rule fetch from ERPNext on a daemon thread.
+
+    Never raises and never blocks boot — see the call site. A failure here means
+    the engine keeps matching against the local rule cache, which is the
+    documented fallback, so there is nothing to escalate."""
+    import threading
+
+    def _run():
+        with app.app_context():
+            try:
+                from .erpnext_rules import refresh
+                result = refresh(force=True)
+                logging.getLogger('bankbridge').info(
+                    'startup rule refresh: %s', result)
+            except Exception:  # noqa: BLE001 - the fallback is the local cache
+                logging.getLogger('bankbridge').warning(
+                    'startup rule refresh from ERPNext failed; matching against '
+                    'the local rule cache', exc_info=True)
+
+    threading.Thread(target=_run, daemon=True,
+                     name='bb-rules-refresh').start()
 
 
 def create_app(test_config: dict | None = None) -> Flask:
@@ -113,6 +137,17 @@ def create_app(test_config: dict | None = None) -> Flask:
         # one — apply idempotent additive column migrations here.
         from .migrations import run_migrations
         run_migrations()
+
+    # v1.0.0 — ERPNext owns the categorization rules now, so the first thing a
+    # boot does is fetch them (see app/erpnext_rules.py). ON A THREAD, and that
+    # is not premature optimization: the fetch is an HTTP round-trip to a
+    # neighbouring Umbrel container, and when that container is restarting the
+    # client spends its full retry ladder discovering it. Doing that inline
+    # would hold /api/health down for ~13 seconds during exactly the window an
+    # orchestrator is asking whether this app came up. The rule engine falls
+    # back to the local cache until the fetch lands, so nothing waits on it.
+    if not app.config.get('TESTING'):
+        _refresh_rules_in_background(app)
 
     if not app.config.get('TESTING') and app.config.get('SCHEDULER_ENABLED', True):
         try:

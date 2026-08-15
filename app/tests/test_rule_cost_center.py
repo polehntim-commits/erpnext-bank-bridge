@@ -45,6 +45,7 @@ from app import categorization, create_app, crypto, db  # noqa: E402
 from app import erpnext_bank, mcp_settings, migrations  # noqa: E402
 from app.models import CategorizationRule  # noqa: E402
 
+from tests.fakes import unwrap_tool_payload  # noqa: E402
 from tests.test_categorization import Base  # noqa: E402
 from tests.test_mcp_server import McpBase  # noqa: E402
 
@@ -266,7 +267,8 @@ class CostCenterMcpBase(McpBase):
     def _payload(self, body):
         self.assertFalse(body['result']['isError'],
                          body['result']['content'][0]['text'])
-        return json.loads(body['result']['content'][0]['text'])
+        return unwrap_tool_payload(
+            json.loads(body['result']['content'][0]['text']))
 
     def _error_text(self, body):
         self.assertTrue(body['result']['isError'])

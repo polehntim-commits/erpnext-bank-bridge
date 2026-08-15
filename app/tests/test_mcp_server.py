@@ -23,6 +23,7 @@ from app import db, mcp_settings
 from app.models import (AiActionLog, CategorizationRule, PlaidAccount,
                         PlaidItem, PlaidStatement, StatementAnchor)
 
+from tests.fakes import unwrap_tool_payload
 from tests.test_statements import StatementsBase
 
 TOKEN = 'test-mcp-token-abcd'
@@ -97,7 +98,7 @@ class ReadToolTest(McpBase):
         self.assertEqual(resp.status_code, 200)
         result = body['result']
         self.assertFalse(result['isError'])
-        payload = json.loads(result['content'][0]['text'])
+        payload = unwrap_tool_payload(json.loads(result['content'][0]['text']))
         self.assertEqual(payload['count'], 1)
         self.assertEqual(payload['accounts'][0]['mask'], '4242')
 
@@ -116,7 +117,8 @@ class ReadToolTest(McpBase):
         db.session.commit()
         _, body = self._call_tool('get_reconciliation_status',
                                   {'account_mask': '4242'})
-        payload = json.loads(body['result']['content'][0]['text'])
+        payload = unwrap_tool_payload(
+            json.loads(body['result']['content'][0]['text']))
         self.assertEqual(payload['account_mask'], '4242')
         self.assertEqual(len(payload['anchors']), 1)
         self.assertEqual(payload['anchors'][0]['variance'], 0.0)

@@ -95,6 +95,14 @@ _DEFAULTS = {
     'enable_je_gate': False,
     'disable_je_gate': False,
     'set_erpnext_config': False,
+    # v1.0.0 — draining the ERPNext push queue writes authoritative facts onto
+    # somebody's books, which is why it is gated at all. It is the mildest
+    # switch on this list: every payload it sends was computed when the fact
+    # became true, was already attempted once, and is upserted idempotently on
+    # the ERPNext side — so the worst a flush can do is repeat a write that
+    # already succeeded. It still defaults OFF, because "writes to the ledger"
+    # is the line this file draws and a mild write is on the far side of it.
+    'flush_erpnext_push_queue': False,
 }
 
 _FIELDS = tuple(_DEFAULTS.keys())

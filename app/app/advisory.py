@@ -29,13 +29,16 @@ rewrites an opening balance or posts a correction.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, timedelta
 
 from flask import current_app
 
+from . import appcache
 from . import audit
 from . import db
 from . import erpnext_accounts
+from .erpnext_client import ERPNextAPIError, ERPNextError
 from .models import (AdvisoryAgreement, AdvisoryFeeAccrual, DailyAUM,
                      GeneratedJournalEntry, HighWaterMark, HurdleRateSample,
                      PerformanceSnapshot, PlaidAccount, RiskControlCheck,
@@ -537,6 +540,169 @@ def agreement_aum(agreement: AdvisoryAgreement) -> float:
                      for aid in agreement.account_ids()), 2)
 
 
+# ── v1.0.0 · fee terms, when ERPNext is the source ──────────────────────────
+#
+# WHAT MOVED. The advisory AGREEMENT — client, advisor, objective, fee basis,
+# billing frequency, effective and termination dates — belongs in ERPNext, where
+# it sits next to the Governance Document that was signed and inside the
+# compliance engine that can flag an expiring one. What stays here is the fee
+# COMPUTATION: the daily AUM sample, the quarterly settlement, the high-water
+# mark, the performance snapshot. Those read holdings Bank Bridge pulls from
+# Plaid, and moving them would mean moving the holdings.
+#
+# So the split is: ERPNext states the terms, Bank Bridge applies them. This is
+# the seam. Two functions read a rate off an agreement — `sample_daily_aum` and
+# `base_fee_split` — and both now read it through here.
+#
+# WHY AN OVERLAY AND NOT A WRITE-BACK. A fetched term is NOT persisted onto the
+# local row. If it were, an ERPNext outage would silently leave the local row
+# holding whatever it last saw and there would be no way to tell a mirrored
+# value from an authored one. Keeping the read transient means the local row
+# stays exactly what it always was — the rollback — and `source` on the returned
+# dict always says which set of numbers produced a given accrual.
+
+# Keyed by agreement id, and therefore PER APP INSTANCE (see app/appcache.py):
+# id 1 exists in every database, so a process-global dict would hand a second
+# app the first app's terms.
+_TERMS_CACHE = 'advisory_fee_terms'
+
+
+def reset_terms_cache() -> None:
+    """Forget every fetched term set. For tests, and for the moment after an
+    agreement is amended in ERPNext and the next accrual must see it."""
+    appcache.clear(_TERMS_CACHE)
+
+
+def _terms_ttl() -> int:
+    try:
+        return int(current_app.config.get('ERPNEXT_CACHE_TTL_SECONDS', 300))
+    except (RuntimeError, TypeError, ValueError):
+        return 300
+
+
+def _remote_terms(agreement: AdvisoryAgreement) -> dict | None:
+    """One agreement's terms as ERPNext holds them, or None when they cannot be
+    read.
+
+    Cached per agreement for the shared ERPNext TTL, and THE FAILURE IS CACHED
+    TOO. Both directions matter: `settle_quarter` calls `base_fee_split` once
+    per day in the quarter, so without a cache a single settlement is ninety-two
+    identical round-trips — and with only successes cached, ninety-two identical
+    FAILED ones the day ERPNext is down. A negative that expires on the same TTL
+    is the honest shape: the outage is discovered again in five minutes, not
+    ninety-two times in one second. `reset_terms_cache()` clears it sooner."""
+    cache = appcache.bucket(_TERMS_CACHE)
+    key = int(agreement.id or 0)
+    hit = cache.get(key)
+    if hit is not None and (time.monotonic() - hit[0]) < _terms_ttl():
+        return hit[1]
+    doc = _fetch_remote_terms(agreement)
+    cache[key] = (time.monotonic(), doc)
+    return doc
+
+
+def _fetch_remote_terms(agreement: AdvisoryAgreement) -> dict | None:
+    """The uncached read. Never raises — every failure mode resolves to None,
+    which `fee_terms` reads as "use the local agreement"."""
+    from . import erpnext_push
+    client = erpnext_push._client_or_none()
+    if client is None:
+        return None
+    masks, ids = [], []
+    for aid in agreement.account_ids():
+        ids.append(aid)
+        acct = PlaidAccount.query.filter_by(account_id=aid).first()
+        if acct is not None and (acct.mask or '').strip():
+            masks.append(acct.mask)
+    try:
+        out = client.call_method(erpnext_push.ADVISORY_METHOD, params={
+            'agreement_name': agreement.name or '',
+            'plaid_account_ids': ','.join(ids),
+            'plaid_account_masks': ','.join(masks)})
+    except (ERPNextAPIError, ERPNextError) as e:
+        log.info('advisory terms read from ERPNext failed (%s) — using the '
+                 'local agreement', e)
+        return None
+    except Exception:  # noqa: BLE001
+        log.warning('advisory terms read from ERPNext raised', exc_info=True)
+        return None
+    return _agreement_doc(out)
+
+
+def _agreement_doc(out):
+    """The agreement dict out of whatever envelope ERPNext returned — same
+    tolerance, and same reason, as erpnext_push._anchor_rows."""
+    if isinstance(out, list):
+        return out[0] if out and isinstance(out[0], dict) else None
+    if isinstance(out, dict):
+        for key in ('agreement', 'data', 'message'):
+            value = out.get(key)
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                return value[0]
+        # A bare doc — recognized by carrying a term this engine actually uses,
+        # rather than by "it is a dict", so an error envelope isn't mistaken
+        # for an agreement with every rate at zero.
+        if any(k in out for k in ('fee_percent_of_aum', 'fee_type',
+                                  'total_base_fee_rate', 'fee_flat_annual')):
+            return out
+    return None
+
+
+def fee_terms(agreement: AdvisoryAgreement) -> dict:
+    """The terms in force for one agreement: ERPNext's when ADVISORY_SOURCE is
+    'erpnext' and they can be read, the local row's otherwise.
+
+    `total_base_fee_rate` is the FRACTION the daily accrual multiplies by (0.01
+    for 1%), derived from ERPNext's `fee_percent_of_aum` (stated the way a
+    document states it, 1.0 for 1%) exactly as _apply_fee_basis derives it
+    locally. One conversion, in one place, in both directions — a rate converted
+    at each read is a rate that eventually drifts.
+
+    `bank_fee_rate` is never taken from ERPNext: it is the custodian's cut of
+    the headline rate, a Bank-Bridge-side split of a fee the advisor's agreement
+    does not itemize. Taking a missing field as zero would move the bank's whole
+    cut onto the Manager's payable."""
+    from . import erpnext_settings
+    local = {
+        'source': 'local',
+        'fee_type': agreement.fee_type or '',
+        'total_base_fee_rate': float(agreement.total_base_fee_rate or 0.0),
+        'bank_fee_rate': float(agreement.bank_fee_rate or 0.0),
+        'fee_flat_annual': agreement.fee_flat_annual,
+        'billing_frequency': agreement.billing_frequency or '',
+        'status': agreement.status or '',
+    }
+    if erpnext_settings.advisory_source() != erpnext_settings.SOURCE_ERPNEXT:
+        return local
+    doc = _remote_terms(agreement)
+    if not doc:
+        return local
+    terms = dict(local, source='erpnext')
+    pct = doc.get('fee_percent_of_aum')
+    rate = doc.get('total_base_fee_rate')
+    if rate is not None:
+        try:
+            terms['total_base_fee_rate'] = float(rate)
+        except (TypeError, ValueError):
+            pass
+    elif pct is not None:
+        try:
+            terms['total_base_fee_rate'] = round(float(pct) / 100.0, 8)
+        except (TypeError, ValueError):
+            pass
+    for key in ('fee_type', 'billing_frequency', 'status'):
+        if doc.get(key):
+            terms[key] = doc[key]
+    if doc.get('fee_flat_annual') is not None:
+        try:
+            terms['fee_flat_annual'] = float(doc['fee_flat_annual'])
+        except (TypeError, ValueError):
+            pass
+    return terms
+
+
 def sample_daily_aum(agreement: AdvisoryAgreement,
                      on: date | None = None) -> DailyAUM:
     """Record one day's AUM and base-fee accrual for the agreement.
@@ -550,7 +716,11 @@ def sample_daily_aum(agreement: AdvisoryAgreement,
     dashboard shows; only the settlement JE is gated."""
     on = on or date.today()
     aum = agreement_aum(agreement)
-    daily = round(aum * float(agreement.total_base_fee_rate or 0.0) / 365.0, 2)
+    # v1.0.0 · the rate comes from whichever system owns the terms. See
+    # fee_terms — with ADVISORY_SOURCE=local, or an unreachable ERPNext, this is
+    # byte-for-byte the pre-v1.0.0 expression.
+    daily = round(aum * float(fee_terms(agreement)['total_base_fee_rate'])
+                  / 365.0, 2)
     row = (DailyAUM.query
            .filter_by(agreement_id=agreement.id, date=on).first())
     if row is None:
@@ -573,9 +743,14 @@ def sample_daily_aum(agreement: AdvisoryAgreement,
 def base_fee_split(agreement: AdvisoryAgreement, daily_accrual: float) -> dict:
     """Split one day's base accrual into the bank's cut (recorded, never posted
     — WF deducts it directly) and the Manager's cut (accrued to the payable and
-    settled quarterly)."""
-    total_rate = float(agreement.total_base_fee_rate or 0.0) or 1.0
-    bank = round(daily_accrual * float(agreement.bank_fee_rate or 0.0)
+    settled quarterly).
+
+    v1.0.0 · the HEADLINE rate is whatever owns the terms (ERPNext, by default);
+    the bank's cut of it is always local. See fee_terms for why the two are not
+    sourced together."""
+    terms = fee_terms(agreement)
+    total_rate = float(terms['total_base_fee_rate'] or 0.0) or 1.0
+    bank = round(daily_accrual * float(terms['bank_fee_rate'] or 0.0)
                  / total_rate, 4)
     return {'bank': bank, 'manager': round(daily_accrual - bank, 4)}
 

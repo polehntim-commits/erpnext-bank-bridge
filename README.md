@@ -22,6 +22,15 @@ ERPNext  ──►  Bank Reconciliation Tool
 
 ## Features
 
+- **ERPNext is the source of truth** (v1.0.0) — Bank Bridge is the pipe. It
+  keeps Plaid connectivity, statement PDF parsing and Journal Entry generation,
+  and pushes everything authoritative — statement anchors, account pairings,
+  Plaid metadata, variance explanations — into ERPNext. A push that fails is
+  queued and drained on the next sync, so an outage delays the two systems
+  converging rather than silently diverging. Categorization rules and advisory
+  terms are read *from* ERPNext; the local tables stay as a cache and as a
+  one-flag rollback. See
+  [ERPNext consolidation](#erpnext-consolidation--bank-bridge-becomes-the-pipe-v100).
 - **Plaid Link OAuth flow** for secure bank connection — no bank credentials
   ever touch this app; Plaid holds them and returns a token.
 - **One-click public URL** (v0.7.0 wizard, v0.7.1 sidecar) — OAuth needs a
@@ -2486,6 +2495,208 @@ The report **never writes to the ledger** — asserted by a test that checks not
 one create, submit, cancel or delete happens.
 
 
+## ERPNext consolidation — Bank Bridge becomes the pipe (v1.0.0)
+
+Through v0.9.1 there were two systems of record. ERPNext held Bank
+Transactions; Bank Bridge held the **statement anchor chain** — the
+period-by-period reconciliation truth — in its own Postgres, along with the
+categorization rules, the account pairings and the advisory terms. ERPNext had
+no way to answer *"does account ••6030 reconcile in October 2025?"* without
+asking a sidecar Flask app.
+
+**From v1.0.0 ERPNext is the authority and Bank Bridge is the pipe.** Bank
+Bridge keeps Plaid connectivity, statement PDF parsing, trade-leg pairing and
+Journal Entry generation — the things that need Plaid credentials, a PDF
+recognizer and a ledger client. Everything authoritative is pushed outward.
+
+That is a major version because it is an architecture change, not a feature.
+Nothing was deleted to make it: the internal tables stay, as a write-ahead cache
+in front of ERPNext and as the rollback behind it.
+
+### What is pushed, and when
+
+| Fact | Pushed when | ERPNext method |
+|---|---|---|
+| Statement Anchor | after `rebuild_anchors`, after a statement parses, after `set_variance_tag` | `erpnext_mcp.bank.push_statement_anchor` |
+| Account pairing | on `pair_accounts` (both sides), and from `/admin/accounts` | `erpnext_mcp.bank.push_account_pairing` |
+| Plaid metadata (`plaid_account_id`, mask, type, subtype, `sync_enabled`) | every `sync_now` / scheduled sync, when it changed | `erpnext_mcp.bank.push_account_pairing` |
+
+Three properties make that trustworthy, and all three are tested
+(`tests/test_erpnext_push.py`):
+
+1. **A push never fails its caller.** Parsing a statement and rebuilding the
+   chain must keep working when ERPNext is down — they are how Bank Bridge earns
+   its keep. Every push returns a verdict; none raises.
+2. **A failed push is not a lost fact.** It lands in `erpnext_push_queue` with
+   exponential backoff (60s → 120s → … → 1h, capped) and is drained by the next
+   sync. One pending write per target, always the latest.
+3. **An unchanged fact is not pushed.** Each push carries a fingerprint of its
+   own payload, recorded on the source row. `rebuild_anchors` runs after every
+   reparse and every pairing change; without this it would re-write 27 identical
+   periods each time.
+
+"After a statement parses" became true in this release. The monthly pull job now
+rebuilds the anchor chain when it stored anything new; before v1.0.0 it did not,
+and `reparse_stale` only re-reads statements parsed by an *older* recognizer — so
+a freshly-arrived month sat parsed and unanchored until an operator pressed
+**Rebuild** on `/admin/statements`. That was invisible when the anchor only lived
+here; it is a month ERPNext never hears about once the anchor is what gets
+pushed.
+
+An anchor whose Plaid account has **no ERPNext Bank Account mapped** is
+*skipped*, not queued — there is nothing to attach a reconciliation to, and that
+is a mapping decision only an operator can make on `/admin/accounts`.
+`get_erpnext_push_status` counts them.
+
+### Where reads come from — the three flags
+
+Each names where a **read** comes from. Writes are unaffected: anchors and
+pairings are pushed either way, because a rollback that also stopped the outward
+flow would leave ERPNext silently stale rather than merely unused.
+
+| Flag | Default | `local` means |
+|---|---|---|
+| `ANCHOR_SOURCE` | `erpnext` | the anchor chain is read from this app's `statement_anchors` |
+| `RULES_SOURCE` | `erpnext` | the engine matches against the local `categorization_rules` |
+| `ADVISORY_SOURCE` | `erpnext` | fee terms come from the local `advisory_agreements` |
+
+They seed the persisted settings; once written there, the persisted value wins
+(same contract as the JE gate). Flip one back with the `set_source` helper in
+`app/erpnext_settings.py`, or by editing `erpnext_settings.json` in the data
+volume. **This is the whole of the plan's §9 rollback** — no data is deleted in
+either sprint, so reverting is a settings flip and a restart, never a restore.
+
+**Every read that falls back says so.** `get_reconciliation_status` and
+`list_unreconciled_statements` return an `anchor_source` of `erpnext`, `local`
+or `mixed`; `list_rules` and `get_erpnext_push_status` return
+`rule_source_in_force`. That label is not decoration: through the migration
+window the ERPNext side may not be deployed at all, and the two systems agree
+almost all of the time — which is exactly what makes a silent divergence hard to
+catch.
+
+### Rules: ERPNext owns them, Bank Bridge still generates the entries
+
+ERPNext's native Bank Categorization Rule *categorizes* a Bank Transaction and
+stops there. Bank Bridge's rules *generate draft Journal Entries*, with party
+resolution, cost-center mirroring across both legs, dedup and description
+templating. So the rules move and the engine does not.
+
+`erpnext_rules.refresh()` fetches the active set (on boot, on every
+`rerun_rules`, and otherwise at most once per `ERPNEXT_CACHE_TTL_SECONDS`) and
+upserts it into the local table keyed on `erpnext_rule_name`. That table is now
+a read-through cache — kept as real rows so JE provenance, the stats rollup, the
+audit trail and `/admin/rules` all keep working unchanged.
+
+**Once ERPNext holds at least one active rule, only ERPNext-sourced rules
+fire.** That is what "single source of truth" means; a mixed set where a stale
+local rule could outrank an ERPNext one at the same priority would be the worst
+of both. When ERPNext holds none, or cannot be reached, the full local set is
+the fallback — and `rule_source_in_force` says `local` so a rerun that generated
+nothing is distinguishable from a quiet day.
+
+Matching got faster in the same change. `evaluate_rules` used to issue a full
+`CategorizationRule.query` **per transaction**; it now matches against an
+immutable snapshot fetched once, sorted by priority, in a single pass, hydrating
+only the winner. The snapshot is keyed on a three-column table fingerprint
+(`count`, `max(id)`, `max(updated_at)`), so a rule authored on `/admin/rules`,
+one written over MCP and one mirrored from ERPNext are all seen immediately —
+correctness does not depend on every authoring surface remembering to
+invalidate.
+
+The rule vocabulary gains **`combined`**, whose `match_value` is a JSON object
+of clauses:
+
+```json
+{"all": [{"match_type": "merchant_contains", "match_value": "wells"},
+         {"match_type": "amount_range",      "match_value": "[10000, 1000000]"}]}
+```
+
+`all` requires every clause, `any` requires one, both may appear. It replaces
+the workaround of smuggling an amount into a description regex, which was
+unreadable and wrong the first time a description changed. A malformed
+`combined` rule matches nothing — the same total-function rule the other five
+follow.
+
+### Advisory: ERPNext states the terms, Bank Bridge applies them
+
+`advisory.fee_terms()` is the single seam. With `ADVISORY_SOURCE=erpnext` it
+reads the Advisory Agreement from ERPNext and derives the engine rate from
+`fee_percent_of_aum` exactly as `_apply_fee_basis` does locally (a document says
+`1.0` for 1%; the daily accrual multiplies by `0.01`). The fetched terms are
+**never written back** onto the local row — if they were, an outage would leave
+the row holding whatever it last saw with no way to tell a mirrored value from
+an authored one.
+
+`bank_fee_rate` is always local: it is Bank Bridge's split of the custodian's
+cut, which the advisor's agreement does not itemize, and reading a missing field
+as zero would move the bank's whole share onto the Manager's payable.
+
+### The fourteen migrated MCP tools
+
+They all still work. Each now answers inside a handover envelope:
+
+```json
+{"deprecated": true,
+ "use_instead": "erpnext.get_statement_anchor_chain",
+ "data": { … exactly what it always returned … }}
+```
+
+and each carries a `DEPRECATED (v1.0.0) — … Prefer …` **prefix** on its
+`tools/list` description, because the response flag only reaches a caller that
+already committed; the description is what changes the choice.
+
+| Bank Bridge tool | Use instead |
+|---|---|
+| `get_reconciliation_status` | `erpnext.get_statement_anchor_chain` |
+| `list_unreconciled_statements` | `erpnext.list_unreconciled_anchors` |
+| `get_variance_breakdown` | `erpnext.get_anchor_variance_breakdown` |
+| `list_unmatched_statement_transactions` | `erpnext.list_unmatched_statement_lines` |
+| `set_variance_tag` | `erpnext.set_anchor_variance_reason` |
+| `get_account_topology` | `erpnext.get_account_pairing` |
+| `pair_accounts` | `erpnext.pair_bank_accounts` |
+| `list_rules` | `erpnext.list_bank_categorization_rules` |
+| `create_rule` | `erpnext.create_bank_categorization_rule` |
+| `update_rule` | ERPNext's amendment workflow (supersede, never patch) |
+| `create_advisory_agreement` | `erpnext.create_advisory_agreement` |
+| `get_advisory_agreement_summary` | `erpnext.get_advisory_agreement_summary` |
+| `update_advisory_agreement` | `erpnext.update_advisory_agreement` |
+| `get_statement_recon_report` | `erpnext.get_statement_recon_report` |
+
+Removal is a later sprint, after 30 days of parallel operation and an operator's
+sign-off — the same bar the internal tables have to clear before they are
+dropped. Deleting them mid-migration turns *"here is a better tool"* into *"your
+tool vanished"*, at which point the model guesses.
+
+Two tools are **new**, and they are how the arrangement above is observed and
+repaired:
+
+- **`get_erpnext_push_status`** (read-only) — queue depth and its oldest rows
+  with error and next-attempt time, how many anchors have never reached ERPNext,
+  how many accounts are unmapped, and which source each read is configured to
+  use. Start here when ERPNext and Bank Bridge disagree about a number.
+- **`flush_erpnext_push_queue`** (kill switch, default OFF) — retry every queued
+  push now, ignoring the backoff. For after you fixed whatever was wrong. It
+  writes nothing new; every payload is upserted idempotently.
+
+### Migration
+
+No operator action is required to upgrade. The boot migration adds five nullable
+columns and one table; all five backfill to NULL, which correctly means "this
+fact has never been pushed to (or fetched from) ERPNext".
+
+Until the `erpnext_mcp` app is deployed on the ERPNext side, every push 404s and
+queues, and every read falls back locally with `anchor_source: local` — which is
+exactly the pre-v1.0.0 behaviour plus a growing queue. When it lands, run
+`flush_erpnext_push_queue` (or wait for the next sync) and the whole history
+replays.
+
+Verification, per the plan's checklist: `get_erpnext_push_status` should reach
+`queue_depth: 0` with `anchors_never_pushed: 0`, and
+`list_unreconciled_statements` read from ERPNext must return the same 27 periods
+— ••6030 totalling **+$76.37**, ••9401 totalling **−$15,113** — as it did
+reading locally.
+
+
 ## Reconciliation status in ERPNext (v0.5.0)
 
 A bookkeeper opens the ERPNext **Bank Statement** record and sees *this period
@@ -4323,6 +4534,10 @@ service is set by the shipped compose.
 | `ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES` | `false` | v0.3.0 · master switch for the rules engine — **off by default** (a wrong auto-JE is worse than none) |
 | `ERPNEXT_JOURNAL_ENTRY_AUTO_SUBMIT` | `false` | submit generated JEs (docstatus 1) vs leave as Draft for review |
 | `ERPNEXT_JOURNAL_ENTRY_REVIEW_STATE` | `pending_review` | initial audit state for a freshly generated Draft JE |
+| `ANCHOR_SOURCE` | `erpnext` | v1.0.0 · where the statement-anchor chain is **read** from. `local` is the rollback — this app's own `statement_anchors`. Pushes happen either way |
+| `RULES_SOURCE` | `erpnext` | v1.0.0 · where the categorization rule set is read from. `local` restores the pre-v1.0.0 engine exactly |
+| `ADVISORY_SOURCE` | `erpnext` | v1.0.0 · where advisory fee **terms** come from when a fee is computed. `local` uses the `advisory_agreements` row |
+| `ERPNEXT_CACHE_TTL_SECONDS` | `300` | v1.0.0 · how long a fetched-from-ERPNext rule set or advisory term set is trusted before re-fetching. Boot and `rerun_rules` force past it regardless |
 | `INTERCOMPANY_DATE_TOLERANCE_DAYS` | `3` | v0.4.1 · ± window, in days, the two legs of one intercompany transfer may be dated apart |
 | `INTERCOMPANY_DESCRIPTION_THRESHOLD` | `0.6` | v0.4.1 · minimum description similarity (0.0–1.0, stdlib `difflib`) for two transactions to be considered a candidate pair |
 | `INTERCOMPANY_CONFIDENCE_THRESHOLD` | `0.75` | v0.4.1 · minimum overall confidence to pair **automatically**; below this the candidate is logged and left for a human |

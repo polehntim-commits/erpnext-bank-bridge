@@ -47,6 +47,59 @@ PROTOCOL_VERSION = '2024-11-05'
 SERVER_NAME = 'bank-bridge'
 
 
+# ── v1.0.0 · the migrated tools ─────────────────────────────────────────────
+#
+# Fourteen tools whose subject matter moved to ERPNext in the consolidation.
+# They still WORK — every one of them, unchanged — and each now says so in its
+# own answer:
+#
+#   {"deprecated": true, "use_instead": "erpnext.get_statement_anchor_chain",
+#    "data": { …exactly what it always returned… }}
+#
+# WHY A FLAG AND NOT A REMOVAL. These tools are wired into a Claude Desktop
+# config sitting on Tim's machine and into whatever an AI has learned to reach
+# for. Deleting them mid-migration turns "here is a better tool" into "your
+# tool vanished", and the model's next move is to guess. The flag is the
+# handover: an AI reading this response learns the replacement's name at the
+# exact moment it would otherwise have kept using the old one. Removal is a
+# later sprint, after 30 days of parallel operation and an operator's sign-off
+# — the same bar the internal tables have to clear before they are dropped.
+#
+# The value is the tool an AI should call INSTEAD, namespaced `erpnext.` for
+# the ERPNext MCP server. `update_rule` names a workflow rather than a tool
+# because ERPNext's amendment is a workflow: you supersede a Bank Categorization
+# Rule, you do not patch it, which is the same non-destructive shape
+# update_rule itself implements here.
+DEPRECATED_TOOLS = {
+    'get_reconciliation_status': 'erpnext.get_statement_anchor_chain',
+    'list_unreconciled_statements': 'erpnext.list_unreconciled_anchors',
+    'get_variance_breakdown': 'erpnext.get_anchor_variance_breakdown',
+    'list_unmatched_statement_transactions':
+        'erpnext.list_unmatched_statement_lines',
+    'set_variance_tag': 'erpnext.set_anchor_variance_reason',
+    'get_account_topology': 'erpnext.get_account_pairing',
+    'pair_accounts': 'erpnext.pair_bank_accounts',
+    'list_rules': 'erpnext.list_bank_categorization_rules',
+    'create_rule': 'erpnext.create_bank_categorization_rule',
+    'update_rule': "ERPNext's Bank Categorization Rule amendment workflow "
+                   '(supersede via erpnext.create_bank_categorization_rule; '
+                   'a rule is never patched in place)',
+    'create_advisory_agreement': 'erpnext.create_advisory_agreement',
+    'get_advisory_agreement_summary': 'erpnext.get_advisory_agreement_summary',
+    'update_advisory_agreement': 'erpnext.update_advisory_agreement',
+    'get_statement_recon_report': 'erpnext.get_statement_recon_report',
+}
+
+# Prefixed onto a deprecated tool's description in tools/list, so an AI choosing
+# a tool sees the handover BEFORE it calls one — the response flag only reaches
+# a caller that already committed.
+_DEPRECATION_NOTICE = (
+    'DEPRECATED (v1.0.0) — this subject moved to ERPNext, which is now the '
+    'source of truth for it. Prefer {use_instead}. This tool still works and '
+    'still answers correctly during the migration window; its response is '
+    'wrapped as {{"deprecated": true, "use_instead": …, "data": …}}. ')
+
+
 # ── errors a tool raises to signal a clean, client-visible failure ──────────
 class ToolError(Exception):
     """A tool couldn't do what was asked for an expected reason (unknown mask,
@@ -161,25 +214,92 @@ def _cash_chain(account: PlaidAccount) -> list:
 
 
 # ── read-only tools ─────────────────────────────────────────────────────────
+def _anchor_rows_for(account) -> tuple[list, str]:
+    """One account's anchor chain plus WHERE IT CAME FROM (v1.0.0).
+
+    With ANCHOR_SOURCE=erpnext (the default) this reads the chain ERPNext holds,
+    because ERPNext owns the reconciliation truth after the consolidation. It
+    falls back to the local chain whenever ERPNext cannot answer — unconfigured,
+    unreachable, or the Statement Anchor doctype not deployed yet, which is the
+    normal state through the migration window.
+
+    THE FALLBACK IS ALWAYS LABELLED. A reconciliation tool that quietly answered
+    from the wrong system would be worse than one that failed: the numbers agree
+    almost all of the time, which is exactly what makes a silent divergence hard
+    to catch. So the caller always ships `anchor_source` alongside the rows."""
+    from .. import erpnext_push
+    from .. import erpnext_settings
+    if erpnext_settings.anchor_source() == erpnext_settings.SOURCE_ERPNEXT:
+        remote = erpnext_push.fetch_anchor_chain(account)
+        if remote is not None:
+            return list(remote), 'erpnext'
+    return ([a.to_dict() for a in stmts.anchors_for_account(account.account_id)],
+            'local')
+
+
+# The tolerance StatementAnchor.reconciles() applies by default, and what
+# stmts.anchor_summary has always counted 'unexplained' against — NOT the
+# operator-configurable reconcile_tolerance, which is a different (larger)
+# threshold used for the worklist. Restated here so the dict-based summary below
+# is arithmetically identical to the model-based one it replaces; changing which
+# threshold the summary uses is a decision, not a refactor.
+_SUMMARY_TOLERANCE = 0.005
+
+
+def _summarize(rows: list) -> dict:
+    """{'variance', 'unexplained', 'gaps', 'periods', 'year'} over the rows
+    ACTUALLY RETURNED — the same shape stmts.anchor_summary produces, computed
+    from dicts so it works on an ERPNext chain and a local one alike.
+
+    Summing the local chain here (which is what this did before v1.0.0) would
+    have meant a total that described a different set of rows than the ones
+    beside it the moment the two systems diverged — and reconciling that
+    divergence is the whole reason someone calls this tool."""
+    variance = 0.0
+    unexplained = gaps = 0
+    for r in rows:
+        v = r.get('variance')
+        if v is None:
+            unexplained += 1
+        else:
+            variance += float(v)
+            if abs(float(v)) > _SUMMARY_TOLERANCE:
+                unexplained += 1
+        if r.get('chain_gap_from_prior'):
+            gaps += 1
+    return {'variance': round(variance, 2), 'unexplained': unexplained,
+            'gaps': gaps, 'periods': len(rows), 'year': None}
+
+
+def _in_window(row: dict, ps: str, pe: str) -> bool:
+    """Whether one anchor row falls inside an optional ISO date window. Works on
+    a dict rather than the model so it applies identically to a local row and an
+    ERPNext one — a filter implemented twice is a filter that disagrees."""
+    start = row.get('period_start')
+    end = row.get('period_end')
+    if ps and (not start or str(start) < ps):
+        return False
+    if pe and (not end or str(end) > pe):
+        return False
+    return True
+
+
 def _get_reconciliation_status(args: dict):
     account = _account_by_mask(args.get('account_mask'))
-    anchors = stmts.anchors_for_account(account.account_id)
+    all_rows, source = _anchor_rows_for(account)
     ps = args.get('period_start')
     pe = args.get('period_end')
-    rows = []
-    for a in anchors:
-        if ps and (a.period_start is None or a.period_start.isoformat() < ps):
-            continue
-        if pe and (a.period_end is None or a.period_end.isoformat() > pe):
-            continue
-        rows.append(a.to_dict())
+    rows = [r for r in all_rows if _in_window(r, ps, pe)]
     result = {
         'account_mask': account.mask,
         'account_id': account.account_id,
-        'summary': stmts.anchor_summary(account.account_id),
+        # Computed from `rows`, so the totals always describe what is beside
+        # them — see _summarize.
+        'summary': _summarize(rows),
+        'anchor_source': source,
         'anchors': rows,
     }
-    return result, (f'{account.mask}: {len(rows)} anchor(s), '
+    return result, (f'{account.mask}: {len(rows)} anchor(s) from {source}, '
                     f"variance {result['summary']['variance']}")
 
 
@@ -197,6 +317,15 @@ def _get_account_topology(args: dict):
             'sync_enabled': bool(a.sync_enabled),
             'import_status': a.import_status or 'pending',
             'has_anchor_chain': a.account_id in anchored,
+            # v1.0.0 · where this account's topology lives in ERPNext, and
+            # whether it has got there. An empty erpnext_bank_account is the
+            # reason an anchor push would be skipped, so naming it here turns
+            # "why is ERPNext missing this account's reconciliation?" into one
+            # call instead of a hunt.
+            'erpnext_bank_account': a.erpnext_bank_account_name or '',
+            'erpnext_metadata_pushed_at': (
+                a.erpnext_metadata_pushed_at.isoformat()
+                if a.erpnext_metadata_pushed_at else None),
         })
     return {'accounts': out, 'count': len(out)}, f'{len(out)} account(s)'
 
@@ -259,15 +388,24 @@ def _anchor_dict_for(account, statement):
 def _list_unreconciled_statements(args: dict):
     tol = stmts.reconcile_tolerance()
     rows = []
+    sources = set()
     for account in stmts.accounts_with_anchors():
-        for a in stmts.anchors_for_account(account.account_id):
-            if a.variance is not None and abs(a.variance) > tol:
-                d = a.to_dict()
-                d['account_mask'] = account.mask
-                rows.append(d)
-    rows.sort(key=lambda d: abs(d.get('variance') or 0.0), reverse=True)
-    return {'unreconciled': rows, 'count': len(rows),
-            'tolerance': tol}, f'{len(rows)} unreconciled period(s)'
+        chain, source = _anchor_rows_for(account)
+        sources.add(source)
+        for d in chain:
+            variance = d.get('variance')
+            if variance is not None and abs(float(variance)) > tol:
+                rows.append({**d, 'account_mask': account.mask})
+    rows.sort(key=lambda d: abs(float(d.get('variance') or 0.0)), reverse=True)
+    # 'mixed' is a real answer, not a fudge: one account's chain can read from
+    # ERPNext while another falls back locally (an unmapped Bank Account, say),
+    # and a worklist that claimed a single source would be lying about half its
+    # rows. Each row carries the chain it came from in its own right.
+    source = ('mixed' if len(sources) > 1
+              else (sources.pop() if sources else 'local'))
+    return {'unreconciled': rows, 'count': len(rows), 'tolerance': tol,
+            'anchor_source': source}, \
+           f'{len(rows)} unreconciled period(s) from {source}'
 
 
 def _list_rules(args: dict):
@@ -292,8 +430,18 @@ def _list_rules(args: dict):
         'bank_cost_center': r.bank_cost_center or '',
         'bb_internal_tag': r.bb_internal_tag or '',
         'applies_to_company': r.applies_to_company or None,
+        # v1.0.0 · the ERPNext Bank Categorization Rule this row mirrors, or ''
+        # for one authored here. With RULES_SOURCE=erpnext and any mirrored rule
+        # present, ONLY the mirrored ones fire — so a rule listed with an empty
+        # erpnext_rule_name alongside populated ones is a rule that is not
+        # currently being evaluated, which is exactly what an operator hunting a
+        # transaction that "should have matched" needs to see.
+        'erpnext_rule_name': r.erpnext_rule_name or '',
     } for r in rules]
-    return {'rules': slim, 'count': len(slim)}, f'{len(slim)} rule(s)'
+    from .. import categorization
+    return ({'rules': slim, 'count': len(slim),
+             'rule_source': categorization.rule_source_in_force()},
+            f'{len(slim)} rule(s)')
 
 
 def _list_unmatched_statement_transactions(args: dict):
@@ -1071,12 +1219,20 @@ def _update_advisory_agreement(args: dict):
 
 
 def _set_variance_tag(args: dict):
+    from .. import erpnext_push
     anchor = StatementAnchor.query.get(int(args.get('anchor_id')))
     if anchor is None:
         raise ToolError(f"no anchor id {args.get('anchor_id')}")
     anchor.variance_reason = (args.get('reason') or '')
     db.session.commit()
-    return {'anchor': anchor.to_dict()}, f'tagged anchor {anchor.id}'
+    # v1.0.0 · the reason is the most human thing on the anchor — somebody
+    # worked out why a period didn't tie and wrote it down — and it belongs
+    # wherever the anchor is read. FORCED past the fingerprint check: the reason
+    # IS the change, and suppressing this push would be suppressing the only
+    # part of the row a person authored.
+    push = erpnext_push.push_anchor(anchor, force=True)
+    return ({'anchor': anchor.to_dict(), 'erpnext_push': push},
+            f"tagged anchor {anchor.id} (ERPNext: {push['status']})")
 
 
 def _trigger_reparse(args: dict):
@@ -1113,12 +1269,20 @@ def _rebuild_anchors(args: dict):
 
 
 def _pair_accounts(args: dict):
+    from .. import erpnext_push
     brk = _account_by_mask(args.get('brokerage_mask'))
     cash = _account_by_mask(args.get('cash_services_mask'))
     brk.paired_account_id = cash.account_id
     db.session.commit()
-    return ({'brokerage_mask': brk.mask, 'cash_services_mask': cash.mask},
-            f'paired {brk.mask} → {cash.mask}')
+    # v1.0.0 · a pairing is account topology, and topology lives on ERPNext's
+    # Bank Account records now (paired_bank_account + pairing_type + the Plaid
+    # metadata). BOTH sides are pushed — see erpnext_push.push_pairing for why
+    # one is not enough.
+    push = erpnext_push.push_pairing(brk, cash)
+    return ({'brokerage_mask': brk.mask, 'cash_services_mask': cash.mask,
+             'erpnext_push': push},
+            f'paired {brk.mask} → {cash.mask} '
+            f"(ERPNext: {push['brokerage']['status']})")
 
 
 def _enable_je_posting(args: dict):
@@ -1350,6 +1514,77 @@ def _post_clearing_cleanup_je(args: dict):
         return result, result['skipped']
     return result, (f"draft {result['journal_entry']} moves "
                     f"${result['amount']:,.2f} to {result['counter_account']}")
+
+
+# ── v1.0.0 · the consolidation's own instrumentation ────────────────────────
+#
+# The consolidation makes a promise — "ERPNext has everything Bank Bridge knows"
+# — and these two tools are how that promise is checked and repaired. Without
+# them the queue is a table nobody can see, and a guarantee nobody can observe
+# is a guarantee nobody should believe.
+
+def _get_erpnext_push_status(args: dict):
+    """What ERPNext has not received yet, and which system is answering each
+    read. Read-only and never gated, on the same reasoning as get_draft_health:
+    reading the state of a queue cannot change the books."""
+    from .. import categorization
+    from .. import erpnext_push
+    from .. import erpnext_settings
+    from ..models import ErpnextPushQueue, PlaidAccount, StatementAnchor
+    rows = (ErpnextPushQueue.query
+            .order_by(ErpnextPushQueue.next_attempt_at.asc().nullsfirst(),
+                      ErpnextPushQueue.id.asc()).limit(50).all())
+    # Counted with an aggregate, not by walking `rows` — `rows` is capped at 50
+    # so a queue that built up over a week would report a breakdown of its first
+    # fifty entries under a heading that claims to describe the whole thing.
+    by_kind = {kind: int(n) for kind, n in
+               db.session.query(ErpnextPushQueue.kind,
+                                db.func.count(ErpnextPushQueue.id))
+               .group_by(ErpnextPushQueue.kind).all()}
+    never_pushed = (StatementAnchor.query
+                    .filter(StatementAnchor.erpnext_pushed_at.is_(None))
+                    .count())
+    unmapped = (PlaidAccount.query
+                .filter(db.or_(
+                    PlaidAccount.erpnext_bank_account_name.is_(None),
+                    PlaidAccount.erpnext_bank_account_name == ''))
+                .count())
+    result = {
+        'configured': erpnext_settings.is_configured(),
+        'sources': {
+            'anchor_source': erpnext_settings.anchor_source(),
+            'rules_source': erpnext_settings.rules_source(),
+            'advisory_source': erpnext_settings.advisory_source(),
+            # What the rule engine is ACTUALLY running on, which can differ from
+            # rules_source when ERPNext holds no rules or could not be reached.
+            'rule_source_in_force': categorization.rule_source_in_force(),
+        },
+        'queue_depth': erpnext_push.queue_depth(),
+        'queue_by_kind': by_kind,
+        'queued': [r.to_dict() for r in rows],
+        # Anchors whose reconciliation truth has never reached ERPNext. Non-zero
+        # with an empty queue means they were SKIPPED, not failed — almost
+        # always an unmapped Bank Account, which `unmapped_accounts` counts.
+        'anchors_never_pushed': never_pushed,
+        'unmapped_accounts': unmapped,
+    }
+    return result, (f"{result['queue_depth']} write(s) queued, "
+                    f'{never_pushed} anchor(s) never pushed, '
+                    f'{unmapped} unmapped account(s)')
+
+
+def _flush_erpnext_push_queue(args: dict):
+    """Drain the queue NOW, ignoring the backoff.
+
+    MUTATING because it writes to ERPNext — every queued row is an authoritative
+    fact landing on somebody's books. It writes nothing NEW: every payload was
+    already computed and already attempted, so the worst this can do is repeat a
+    write ERPNext upserts idempotently."""
+    from .. import erpnext_push
+    client = _erp_client_or_error()
+    result = erpnext_push.drain(client, force=True)
+    return result, (f"{result['attempted']} attempted, {result['pushed']} "
+                    f"pushed, {result['remaining']} still queued")
 
 
 def _set_je_gate(args: dict, on: bool):
@@ -2181,6 +2416,40 @@ TOOLS = {
             {'url': _STR, 'api_key': _STR, 'api_secret': _STR,
              'default_company': _STR}, mutating=True),
         'handler': _set_erpnext_config},
+    # ── v1.0.0 · the consolidation ──────────────────────────────────────────
+    'get_erpnext_push_status': {
+        **_tool(
+            'What ERPNext does NOT yet know. Since v1.0.0 ERPNext is the source '
+            'of truth for reconciliation (Statement Anchors), account pairings, '
+            'categorization rules and advisory terms, and Bank Bridge pushes '
+            'them outward; a push that fails is QUEUED and drained on the next '
+            'sync, so the two systems converge across an outage rather than '
+            'silently diverging. This reports the queue depth and its oldest '
+            'rows with their error and next-attempt time, how many statement '
+            'anchors have never reached ERPNext at all, how many Plaid accounts '
+            'have no ERPNext Bank Account mapped (the usual reason an anchor is '
+            'SKIPPED rather than queued — an unmapped account has nothing to '
+            'attach a reconciliation to), and which source each read is '
+            'configured to use. `rule_source_in_force` is the one to read '
+            'closely: it says which rule set the engine ACTUALLY matched '
+            'against, which differs from `rules_source` whenever ERPNext holds '
+            'no rules or could not be reached. START HERE when ERPNext and Bank '
+            'Bridge disagree about a number. Read-only.',
+            {}),
+        'handler': _get_erpnext_push_status},
+    'flush_erpnext_push_queue': {
+        **_tool(
+            'Retry every queued push to ERPNext RIGHT NOW, ignoring the '
+            'exponential backoff a failed push earns. The tool to reach for '
+            'after fixing whatever was wrong — ERPNext restarted, a Bank '
+            'Account finally mapped, the erpnext_mcp app deployed — instead of '
+            'waiting for the next sync. It writes nothing NEW: every payload '
+            'was computed when the fact became true and is upserted '
+            'idempotently, so a redundant flush is a no-op rather than a '
+            'double-write. Returns {attempted, pushed, failed, remaining}. '
+            'MUTATING — requires the flush_erpnext_push_queue kill switch ON.',
+            {}, mutating=True),
+        'handler': _flush_erpnext_push_queue},
 }
 
 
@@ -2218,7 +2487,7 @@ def dispatch_tool(tool_name: str, args: dict) -> dict:
     try:
         result, summary = spec['handler'](args)
         _log(tool_name, args, summary, ok=True)
-        return _tool_ok_result(result)
+        return _tool_ok_result(_with_deprecation(tool_name, result))
     except ToolError as e:
         _log(tool_name, args, f'error: {e}', ok=False)
         return _tool_error_result(str(e))
@@ -2227,6 +2496,21 @@ def dispatch_tool(tool_name: str, args: dict) -> dict:
         _log(tool_name, args, f'exception: {type(e).__name__}', ok=False)
         log.warning('MCP tool %s failed', tool_name, exc_info=True)
         return _tool_error_result(f'{type(e).__name__}: {e}')
+
+
+def _with_deprecation(tool_name: str, result):
+    """Wrap a migrated tool's answer in its handover envelope, or pass a
+    still-current tool's answer through untouched.
+
+    The payload moves to `data` rather than having two keys merged in beside it,
+    deliberately: several of these tools return a dict with a `count`, and a
+    caller that had learned to read `result['count']` should break loudly on the
+    shape change rather than silently read a key that now means something else.
+    An MCP client re-reads the envelope; a script does not."""
+    use_instead = DEPRECATED_TOOLS.get(tool_name)
+    if not use_instead:
+        return result
+    return {'deprecated': True, 'use_instead': use_instead, 'data': result}
 
 
 def _tool_ok_result(result) -> dict:
@@ -2241,9 +2525,21 @@ def _tool_error_result(message: str) -> dict:
 
 # ── JSON-RPC surface ────────────────────────────────────────────────────────
 def _tools_list() -> dict:
-    return {'tools': [{'name': name, 'description': spec['description'],
+    return {'tools': [{'name': name,
+                       'description': _described(name, spec['description']),
                        'inputSchema': spec['inputSchema']}
                       for name, spec in TOOLS.items()]}
+
+
+def _described(name: str, description: str) -> str:
+    """A tool's description, with the deprecation handover prefixed when it has
+    one. Prefixed rather than appended because a client that truncates a long
+    description keeps the head, and the head is where the replacement's name has
+    to be for it to change a choice."""
+    use_instead = DEPRECATED_TOOLS.get(name)
+    if not use_instead:
+        return description
+    return _DEPRECATION_NOTICE.format(use_instead=use_instead) + description
 
 
 def _rpc_result(req_id, result):

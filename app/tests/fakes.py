@@ -185,6 +185,24 @@ class FakeERPClient:
         self.existing_bank_accounts = {}
         # ('<method name>', (status, body)) — make one call_method target raise.
         self.method_error = None
+        # v1.0.0 · {method_name: value} for the whitelisted RPCs the ERPNext
+        # consolidation calls (erpnext_mcp.bank.*). The value is what
+        # ERPNextClient.call_method RETURNS — i.e. already unwrapped from
+        # Frappe's {"message": …} envelope, since that unwrapping is the real
+        # client's job and not something a test should have to restate.
+        # A callable is invoked with (json_body_or_params) so a test can script
+        # a per-call response; anything else is returned as-is. A method with no
+        # entry returns {}, which is what a Frappe method that accepts a push
+        # and returns nothing looks like.
+        self.method_returns = {}
+        # Methods that should raise as if ERPNext refused them, as
+        # {method_name: (status_code_or_None, body)}. status_code=None models a
+        # connection failure (the transient case); 404 models "the erpnext_mcp
+        # app is not deployed on this instance yet", which is the state the
+        # whole migration window lives in.
+        self.method_failures = {}
+        # Every (method, payload) a push sent, in order.
+        self.method_calls = []
         self.fail_create = fail_create             # fail Bank Transaction create
         self.fail_bank_account = fail_bank_account  # fail Bank Account create
         # Fields ERPNext will reject as "not a valid field" on a Bank Account
@@ -927,6 +945,8 @@ class FakeERPClient:
 
     def call_method(self, method, params=None, http_method='GET', json_body=None):
         self.calls.append(('call_method', method, json_body))
+        self.method_calls.append((method, json_body if json_body is not None
+                                  else params))
         # v0.4.15 · stage a refusal from one whitelisted method — the cleanup
         # page needs ERPNext to decline a delete (LinkExistsError) so the
         # "still has linked documents" outcome is exercised for real.
@@ -935,6 +955,16 @@ class FakeERPClient:
             status, body = self.method_error[1]
             raise ERPNextAPIError(f'POST {method} -> {status}',
                                   status_code=status, response_body=body)
+        # v1.0.0 · the consolidation's own RPCs.
+        if method in self.method_failures:
+            from app.erpnext_client import ERPNextAPIError
+            status, body = self.method_failures[method]
+            raise ERPNextAPIError(f'POST {method} -> {status}',
+                                  status_code=status, response_body=body)
+        if method in self.method_returns:
+            value = self.method_returns[method]
+            return value(json_body if json_body is not None else params) \
+                if callable(value) else value
         if method == 'frappe.client.submit':
             inner = json.loads((json_body or {}).get('doc', '{}'))
             if inner.get('name'):
@@ -1099,3 +1129,28 @@ class FakeFrappe:
 
     def destroy(self):
         pass
+
+
+# ── v1.0.0 · the MCP deprecation envelope ───────────────────────────────────
+
+def unwrap_tool_payload(payload):
+    """A tool result's DATA, with the v1.0.0 deprecation envelope removed.
+
+    Since the ERPNext consolidation, the fourteen tools whose subject moved to
+    ERPNext answer
+
+        {"deprecated": true, "use_instead": "erpnext.…", "data": {…}}
+
+    where they used to answer the inner dict directly (see
+    mcp_server.DEPRECATED_TOOLS). Every test that asserts on WHAT a tool
+    returned goes through here, so those assertions keep describing the tool's
+    own contract rather than the envelope it now ships in — and so the envelope
+    itself is asserted in exactly one place (tests/test_deprecation.py), which
+    is where a change to it should break something.
+
+    Passing through a non-deprecated tool's payload untouched is deliberate: a
+    caller should not have to know which list a tool is on."""
+    if isinstance(payload, dict) and payload.get('deprecated') is True \
+            and 'data' in payload:
+        return payload['data']
+    return payload

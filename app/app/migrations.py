@@ -346,6 +346,23 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # vocabulary ('Employee' / 'Shareholder'): the column is already VARCHAR(20)
     # and both fit, and no existing row needs rewriting to gain the option.
     ('categorization_rules', 'auto_create_party', 'BOOLEAN'),
+
+    # ── v1.0.0 — the ERPNext consolidation ───────────────────────────────────
+    #
+    # Every one of these backfills to NULL, and NULL is the correct starting
+    # state for all five: "this fact has never been pushed to (or fetched from)
+    # ERPNext", which is true of every row on an upgrading install. Nothing
+    # about a v0.9.1 database changes behaviour until the first sync runs — and
+    # what that sync then does is bounded by the source flags (see
+    # erpnext_settings.SOURCE_FIELDS), not by these columns.
+    #
+    # The `erpnext_push_queue` TABLE itself needs no line here: create_all()
+    # builds a missing table. Only additive columns on EXISTING tables belong.
+    ('categorization_rules', 'erpnext_rule_name', 'VARCHAR(255)'),
+    ('statement_anchors', 'erpnext_push_fingerprint', 'VARCHAR(64)'),
+    ('statement_anchors', 'erpnext_pushed_at', 'TIMESTAMP'),
+    ('plaid_accounts', 'erpnext_metadata_fingerprint', 'VARCHAR(64)'),
+    ('plaid_accounts', 'erpnext_metadata_pushed_at', 'TIMESTAMP'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,

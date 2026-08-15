@@ -26,12 +26,29 @@ _FIELDS = ('url', 'api_key', 'api_secret', 'default_company',
            # the settings page and an MCP call. The env var still seeds the
            # boot default (see _defaults), so an install that has never touched
            # the toggle behaves exactly as it did before.
-           'auto_generate_journal_entries')
+           'auto_generate_journal_entries',
+           # v1.0.0 — the consolidation rollback switches. Each names where a
+           # READ comes from: 'erpnext' (the default, and the point of the
+           # consolidation) or 'local' (this app's own tables, which are never
+           # deleted and stay current as a cache). Writes are unaffected —
+           # anchors and pairings are pushed to ERPNext either way, because a
+           # rollback that also stopped the outward flow would leave ERPNext
+           # silently stale rather than merely unused.
+           'anchor_source', 'rules_source', 'advisory_source')
 
 # Fields whose persisted value is a bool rather than a string. Kept explicit so
 # `load` coerces them through `_as_bool` rather than `bool()` — this file is
 # operator-editable, and `bool("false")` is True.
 _BOOL_FIELDS = ('auto_generate_journal_entries',)
+
+# The three consolidation flags, and the only two values each may take. A
+# hand-edited file holding anything else falls back to ERPNEXT rather than to
+# an empty string, because '' is not a source and a silently source-less read
+# would answer from nothing.
+SOURCE_FIELDS = ('anchor_source', 'rules_source', 'advisory_source')
+SOURCE_ERPNEXT = 'erpnext'
+SOURCE_LOCAL = 'local'
+SOURCES = (SOURCE_ERPNEXT, SOURCE_LOCAL)
 
 # The strings a human writes into a JSON settings file meaning "off". Anything
 # else non-empty is True, which keeps `true`/`1`/`yes` all working.
@@ -60,7 +77,18 @@ def _defaults() -> dict:
         'default_company': (c.get('ERPNEXT_DEFAULT_COMPANY') or '').strip(),
         'auto_generate_journal_entries': bool(
             c.get('ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES', False)),
+        'anchor_source': _as_source(c.get('ANCHOR_SOURCE')),
+        'rules_source': _as_source(c.get('RULES_SOURCE')),
+        'advisory_source': _as_source(c.get('ADVISORY_SOURCE')),
     }
+
+
+def _as_source(value) -> str:
+    """A persisted/env source value, normalised. Anything that isn't one of
+    SOURCES becomes 'erpnext' — see SOURCE_FIELDS for why the unknown case
+    resolves forward rather than to nothing."""
+    v = (value or '').strip().lower() if isinstance(value, str) else ''
+    return v if v in SOURCES else SOURCE_ERPNEXT
 
 
 def load() -> dict:
@@ -77,7 +105,12 @@ def load() -> dict:
         if isinstance(saved, dict):
             for k in _FIELDS:
                 if k in saved and saved[k] is not None:
-                    d[k] = _as_bool(saved[k]) if k in _BOOL_FIELDS else saved[k]
+                    if k in _BOOL_FIELDS:
+                        d[k] = _as_bool(saved[k])
+                    elif k in SOURCE_FIELDS:
+                        d[k] = _as_source(saved[k])
+                    else:
+                        d[k] = saved[k]
     except (FileNotFoundError, ValueError, OSError):
         pass
     return d
@@ -99,6 +132,45 @@ def set_je_generation(enabled: bool) -> bool:
     d['auto_generate_journal_entries'] = bool(enabled)
     _write(d)
     return d['auto_generate_journal_entries']
+
+
+# ── v1.0.0 · the consolidation source flags ─────────────────────────────────
+#
+# THE ONE PLACE each is read. Every call site asks these three functions rather
+# than the raw config key, for the same reason je_generation_enabled exists:
+# the env var only SEEDS the default, and a reader that consulted the env
+# directly would report a source the operator had already switched away from.
+
+def anchor_source() -> str:
+    """Where the statement-anchor chain is read from — 'erpnext' or 'local'."""
+    return _as_source(load().get('anchor_source'))
+
+
+def rules_source() -> str:
+    """Where the categorization rule set is read from."""
+    return _as_source(load().get('rules_source'))
+
+
+def advisory_source() -> str:
+    """Where advisory-agreement fee terms are read from."""
+    return _as_source(load().get('advisory_source'))
+
+
+def set_source(field: str, value: str) -> str:
+    """Persist one source flag and return the value now in force. Raises
+    ValueError on an unknown field or value — this is the rollback switch, and
+    a typo that silently did nothing is the worst possible behaviour for it."""
+    if field not in SOURCE_FIELDS:
+        raise ValueError(f'unknown source flag {field!r} — one of '
+                         + ', '.join(SOURCE_FIELDS))
+    v = (value or '').strip().lower()
+    if v not in SOURCES:
+        raise ValueError(f'{field} must be one of ' + ', '.join(SOURCES)
+                         + f', got {value!r}')
+    d = load()
+    d[field] = v
+    _write(d)
+    return v
 
 
 def _write(d: dict) -> None:

@@ -39,6 +39,7 @@ from app import statements as stmts
 from app.models import (BankTransaction, PlaidAccount, PlaidStatement,
                         Security, SecurityHolding, SecurityTransaction)
 
+from tests.fakes import unwrap_tool_payload
 from tests.test_mcp_server import McpBase
 
 
@@ -69,7 +70,8 @@ class InvestToolBase(McpBase):
         result = body['result']
         self.assertFalse(result['isError'],
                          f'{name} failed: {result["content"][0]["text"]}')
-        return json.loads(result['content'][0]['text'])
+        return unwrap_tool_payload(
+            json.loads(result['content'][0]['text']))
 
     def _err(self, name, args=None):
         """Call a tool expecting a clean tool error; return the message."""

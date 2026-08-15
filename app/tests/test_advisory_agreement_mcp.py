@@ -36,6 +36,7 @@ from app.migrations import run_migrations
 from app.models import (AdvisoryAgreement, AdvisoryFeeAccrual, DailyAUM,
                         PlaidAccount)
 
+from tests.fakes import unwrap_tool_payload
 from tests.test_mcp_server import McpBase
 
 CLIENT_ENTITY = 'Test Orchard, LLC'
@@ -83,7 +84,11 @@ class AdvisoryMcpBase(McpBase):
         result = body['result']
         if result['isError']:
             return result, None
-        return result, json.loads(result['content'][0]['text'])
+        # v1.0.0 · the advisory tools migrated to ERPNext and now answer
+        # inside a deprecation envelope. Unwrapped here so every assertion
+        # below keeps describing the TOOL's contract, not the wrapper's.
+        return result, unwrap_tool_payload(
+            json.loads(result['content'][0]['text']))
 
     def _register(self, **overrides):
         args = dict(BASE_ARGS)

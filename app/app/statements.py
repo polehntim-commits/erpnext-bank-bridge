@@ -2343,10 +2343,22 @@ def rebuild_statement_anchors(account_id: str | None = None) -> dict:
     an absent one, because it makes the chain look continuous where it isn't.
 
     Company-agnostic on purpose — see StatementAnchor. Never raises; returns
-    {'accounts', 'written', 'skipped', 'gaps', 'variances'}."""
+    {'accounts', 'written', 'skipped', 'gaps', 'variances', 'erpnext'}.
+
+    v1.0.0 · pushes what it wrote to ERPNext, which owns the reconciliation
+    truth now (see app/erpnext_push.py). The push happens HERE, at the end of
+    the rebuild, rather than per-anchor inside the loop, for two reasons: the
+    rows are not committed until the loop ends, so an in-loop push could send a
+    figure a later exception rolled back; and one batch shares one circuit
+    breaker, so an unreachable ERPNext costs one timeout for the whole chain
+    instead of one per period. Fail-soft in both directions — an ERPNext that
+    is down cannot fail a rebuild that succeeded, and an anchor that could not
+    be pushed is queued rather than dropped."""
     from .models import StatementAnchor
     stats = {'accounts': 0, 'written': 0, 'skipped': 0, 'gaps': 0,
              'variances': 0}
+    # The anchors this run touched, in chain order, for the push below.
+    touched: list = []
     accounts = ([PlaidAccount.query.filter_by(account_id=account_id).first()]
                 if account_id else PlaidAccount.query.all())
     for account in [a for a in accounts if a is not None]:
@@ -2388,6 +2400,7 @@ def rebuild_statement_anchors(account_id: str | None = None) -> dict:
                           - float(prior_closing)) > 0.005
             anchor.chain_gap_from_prior = gap
             anchor.updated_at = _now()
+            touched.append(anchor)
             stats['written'] += 1
             if gap:
                 stats['gaps'] += 1
@@ -2396,7 +2409,29 @@ def rebuild_statement_anchors(account_id: str | None = None) -> dict:
             if values['anchored_closing'] is not None:
                 prior_closing = values['anchored_closing']
     db.session.commit()
+    stats['erpnext'] = push_anchors_to_erpnext(touched)
     return stats
+
+
+def push_anchors_to_erpnext(anchors, *, client=None, force: bool = False) -> dict:
+    """Send a set of freshly-written anchors onward. Never raises.
+
+    Split out of `rebuild_statement_anchors` so the reparse path, the admin
+    pairing route and an operator's "resend" all reach the same code, and so a
+    test can exercise the rebuild without the push and vice versa.
+
+    Returns the push counters, or a `{'error': …}` verdict — deliberately not an
+    empty dict, because "the push was never attempted" and "the push tried and
+    pushed nothing" are the two states an operator most needs to tell apart."""
+    if not anchors:
+        return {'pushed': 0, 'queued': 0, 'skipped': 0, 'unchanged': 0}
+    try:
+        from . import erpnext_push
+        return erpnext_push.push_anchors(anchors, client=client, force=force)
+    except Exception as e:  # noqa: BLE001 - a push never fails a rebuild
+        db.session.rollback()
+        log.warning('pushing anchors to ERPNext failed', exc_info=True)
+        return {'error': f'{type(e).__name__}: {e}'}
 
 
 def period_tag_summary(account: PlaidAccount, start: date | None,
