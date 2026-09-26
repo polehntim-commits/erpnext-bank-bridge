@@ -1371,22 +1371,43 @@ def run_sync(*, account_id: str = '', include_investments: bool = True,
 
 
 def _push_to_erpnext(erp_client, accounts) -> dict | None:
-    """Mirror Plaid account metadata into ERPNext and drain the push queue.
+    """Mirror Plaid account metadata into ERPNext, attach any brokerage
+    statement PDF its Bank Account is missing, and drain the push queue.
 
-    Returns {'metadata': …, 'queue': …} or None when there was no ERPNext client
-    to work with. Never raises: this is the last thing a sync does, and a sync
-    that transferred every transaction correctly must not report `failed`
-    because a metadata mirror timed out."""
+    Returns {'metadata': …, 'statement_pdfs': …, 'queue': …} or None when there
+    was no ERPNext client to work with. Never raises: this is the last thing a
+    sync does, and a sync that transferred every transaction correctly must not
+    report `failed` because a metadata mirror timed out."""
     if erp_client is None:
         return None
     try:
         from . import erpnext_push
+        accounts = list(accounts)
         metadata = erpnext_push.push_metadata_for(accounts, client=erp_client)
+        # v1.0.3 · new statements reach their Bank Account on the next sync
+        # after they are pulled. Already-attached ones cost nothing but the one
+        # File listing; see erpnext_push.push_statement_pdfs.
+        statement_pdfs = _push_statement_pdfs(erpnext_push, accounts,
+                                              erp_client)
         queue = erpnext_push.drain(erp_client)
-        return {'metadata': metadata, 'queue': queue}
+        return {'metadata': metadata, 'statement_pdfs': statement_pdfs,
+                'queue': queue}
     except Exception as e:  # noqa: BLE001
         db.session.rollback()
         log.warning('the ERPNext push leg of the sync failed', exc_info=True)
+        return {'error': f'{type(e).__name__}: {e}'}
+
+
+def _push_statement_pdfs(erpnext_push, accounts, erp_client) -> dict:
+    """The statement-PDF leg on its own fail-soft footing, so a PDF that will
+    not upload can neither cost the metadata push its result nor stop the queue
+    drain behind it."""
+    try:
+        return erpnext_push.statement_pdfs_summary(
+            erpnext_push.push_statement_pdfs(accounts, client=erp_client))
+    except Exception as e:  # noqa: BLE001
+        db.session.rollback()
+        log.warning('pushing statement PDFs to ERPNext failed', exc_info=True)
         return {'error': f'{type(e).__name__}: {e}'}
 
 

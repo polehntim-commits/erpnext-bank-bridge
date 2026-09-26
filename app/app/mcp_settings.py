@@ -103,6 +103,12 @@ _DEFAULTS = {
     # already succeeded. It still defaults OFF, because "writes to the ledger"
     # is the line this file draws and a mild write is on the far side of it.
     'flush_erpnext_push_queue': False,
+    # v1.0.3 — attaches statement PDFs to ERPNext Bank Accounts. Additive only
+    # (it skips anything already attached and never deletes), but it puts
+    # documents into the books' audit trail, so it sits on the gated side of
+    # the line with the rest. Every sync does the same work ungated; this
+    # switch only decides whether an AI may trigger it.
+    'push_statement_pdfs': False,
 }
 
 _FIELDS = tuple(_DEFAULTS.keys())

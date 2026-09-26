@@ -9229,6 +9229,9 @@ _MCP_SWITCH_DESC = {
                                 'pairings and Plaid metadata an outage could '
                                 'not deliver. Sends nothing new; each payload '
                                 'is upserted idempotently',
+    'push_statement_pdfs': 'Attach brokerage statement PDFs to their ERPNext '
+                           'Bank Account — only ones not already attached; '
+                           'never replaces or deletes a file',
 }
 
 

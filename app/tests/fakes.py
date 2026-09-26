@@ -537,6 +537,23 @@ class FakeERPClient:
                 rows.append({k: doc.get(k) for k in fields} if fields
                             else {'name': name})
             return sorted(rows, key=lambda r: str(r.get('period_start') or ''))
+        if doctype == 'File':
+            # v1.0.3 · every upload, as the File rows Frappe would list.
+            rows = []
+            for i, u in enumerate(self.uploads, 1):
+                doc = {'name': f'FILE-{i:04d}', 'file_name': u['filename'],
+                       'attached_to_doctype': u['doctype'],
+                       'attached_to_name': u['docname']}
+                ok = True
+                for f in (filters or []):
+                    if f[1] == 'in':
+                        ok = ok and doc.get(f[0]) in f[2]
+                    else:
+                        ok = ok and self._matches(doc, [f])
+                if ok:
+                    rows.append({k: doc.get(k) for k in fields} if fields
+                                else {'name': doc['name']})
+            return rows
         if doctype == 'Company':
             rows = [{'name': c} for c in self.companies]
             if order_by:

@@ -1637,6 +1637,50 @@ def _flush_erpnext_push_queue(args: dict):
                     f"pushed, {result['remaining']} still queued")
 
 
+def _push_statement_pdfs(args: dict):
+    """Attach stored brokerage statement PDFs to their ERPNext Bank Account.
+
+    MUTATING because it writes documents into ERPNext. It never overwrites or
+    deletes one: a statement whose file name is already attached is skipped,
+    so a repeated call is a no-op."""
+    from .. import erpnext_push
+    from .. import reconnect
+    period = (args.get('period') or '').strip() or None
+    if period:
+        if len(period) > 7:
+            period = _iso_date(period, 'period').isoformat()
+        else:
+            _period_bounds(period)
+    accounts = None
+    if (args.get('account_mask') or '').strip():
+        account = _account_by_mask(args.get('account_mask'))
+        # The row that carries the Bank Account mapping — a re-link strips it
+        # from the retired id, and the mask may resolve to either.
+        account = reconnect.mapped_account_for(account.account_id) or account
+        if (account.type or '') != 'investment':
+            raise ToolError(
+                f'account {account.mask} is a {account.type or "non-investment"}'
+                ' account. push_statement_pdfs attaches BROKERAGE statements '
+                'to their Bank Account; depository statements already reach '
+                "ERPNext on their Bank Statement records.")
+        if not (account.erpnext_bank_account_name or '').strip():
+            raise ToolError(f'account {account.mask} is not mapped to an '
+                            'ERPNext Bank Account — map it on /admin/accounts '
+                            'first')
+        accounts = [account]
+    dry_run = _flag(args, 'dry_run', False)
+    client = _erp_client_or_error()
+    result = erpnext_push.push_statement_pdfs(accounts, period=period,
+                                              client=client, dry_run=dry_run)
+    if result.get('error'):
+        raise ToolError(result['error'])
+    moved = result['would_push'] if dry_run else result['pushed']
+    return result, ((f'DRY RUN: would push {len(moved)}' if dry_run
+                     else f'pushed {len(moved)}')
+                    + f", skipped {len(result['skipped'])}, "
+                    f"failed {len(result['failed'])}")
+
+
 def _set_je_gate(args: dict, on: bool):
     from .. import audit
     from .. import erpnext_settings
@@ -2508,6 +2552,33 @@ TOOLS = {
             'MUTATING — requires the flush_erpnext_push_queue kill switch ON.',
             {}, mutating=True),
         'handler': _flush_erpnext_push_queue},
+    'push_statement_pdfs': {
+        **_tool(
+            'Attach brokerage statement PDFs from Bank Bridge\'s own store to '
+            'their ERPNext Bank Account, as private files named '
+            '`{institution}-Brokerage-{mask}-{period_end}-Statement.pdf` '
+            '(e.g. WF-Brokerage-9401-2026-06-30-Statement.pdf). Omit both '
+            'arguments to push every missing statement for every mapped '
+            'investment account. Reads the Bank Account\'s existing '
+            'attachments first and skips any statement already there, so it '
+            'is safe to repeat. Returns {pushed, skipped, failed} — per '
+            'statement, with a reason on each skip (already_attached, no_pdf, '
+            'unmapped). dry_run reports the same under `would_push` and '
+            'uploads nothing. Every sync already runs this for new '
+            'statements; call it to backfill or to check one period. '
+            'MUTATING — requires the push_statement_pdfs kill switch ON.',
+            {'account_mask': {'type': 'string',
+                              'description': '4-digit mask of one brokerage '
+                                             'account; omit for all'},
+             'period': {'type': 'string',
+                        'description': "'YYYY-MM' (month the period starts) "
+                                       "or 'YYYY-MM-DD' (exact period_end); "
+                                       'omit for all periods'},
+             'dry_run': {'type': 'boolean',
+                         'description': 'report what would be pushed without '
+                                        'uploading (default false)'}},
+            mutating=True),
+        'handler': _push_statement_pdfs},
 }
 
 

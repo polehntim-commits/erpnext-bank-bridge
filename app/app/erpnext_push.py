@@ -76,6 +76,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -963,6 +964,261 @@ def push_metadata_for(accounts, *, client=None, force: bool = False) -> dict:
     for account in accounts:
         push_account_metadata(account, session=session, force=force)
     return dict(session.stats)
+
+
+# ── v1.0.3 · statement PDFs, attached to the Bank Account itself ────────────
+#
+# WHY THE BANK ACCOUNT. The v0.4.10 `Bank Statement` doctype already carries a
+# PDF per record, but a bookkeeper navigating from ••9401 in ERPNext lands on
+# the Bank Account, and its attachment sidebar was empty. A brokerage statement
+# is the document every anchor on that account is measured against; it belongs
+# where the account is.
+#
+# WHY NO QUEUE AND NO FINGERPRINT. Every other push here is a small JSON fact
+# that can be parked in ErpnextPushQueue. A PDF is not — parking hundreds of KB
+# of base64 in a retry table is the wrong shape. The retry is structural
+# instead: each run asks ERPNext what is ALREADY attached and uploads only the
+# difference, so a failed upload is simply still missing next time, and an
+# attachment someone deleted in ERPNext comes back. ERPNext stays the authority
+# on what it holds; nothing local claims to know.
+#
+# One GET per run (every target Bank Account in a single File query), so the
+# steady state — everything already attached — costs one round trip.
+
+STATEMENT_PDF_DOCTYPE = 'Bank Account'
+
+# Short institution tags for the file name. Anything not listed falls back to
+# the initials of its Plaid institution name ("Charles Schwab" → "CS"), so a new
+# brokerage still gets a stable, readable name without a code change.
+_INSTITUTION_TAGS = {'wells fargo': 'WF'}
+
+
+def _institution_tag(account) -> str:
+    from .models import PlaidItem
+    item = PlaidItem.query.filter_by(item_id=account.item_id).first()
+    name = ((item.institution_name if item is not None else '') or '').strip()
+    low = name.lower()
+    for prefix, tag in _INSTITUTION_TAGS.items():
+        if low.startswith(prefix):
+            return tag
+    words = re.findall(r'[A-Za-z0-9]+', name)
+    return ''.join(w[0].upper() for w in words) or 'Bank'
+
+
+def statement_pdf_filename(account, statement) -> str:
+    """`WF-Brokerage-9401-2026-06-30-Statement.pdf`.
+
+    Keyed on `period_end` because that is the date ERPNext's anchor chain keys
+    on, so the attachment and the anchor it substantiates carry the same date.
+    The name is also the idempotency key — see `push_statement_pdfs`."""
+    return (f'{_institution_tag(account)}-Brokerage-{account.mask}-'
+            f'{statement.period_end.isoformat()}-Statement.pdf')
+
+
+def statement_pdf_accounts(accounts=None) -> list:
+    """The accounts whose statements go onto their Bank Account: LIVE (not a
+    retired re-link id) INVESTMENT accounts. Mapping is checked by the caller,
+    because an unmapped brokerage is something to report, not to hide."""
+    from .models import PlaidAccount
+    if accounts is None:
+        accounts = PlaidAccount.query.filter(
+            PlaidAccount.type == 'investment').all()
+    out = [a for a in accounts
+           if (a.type or '') == 'investment'
+           and not (a.superseded_by_account_id or '').strip()]
+    return sorted(out, key=lambda a: (a.mask or '', a.account_id))
+
+
+def _period_matches(statement, period: str | None) -> bool:
+    """Same two spellings the MCP statement tools accept: 'YYYY-MM' is the
+    month the period STARTS in, 'YYYY-MM-DD' is an exact `period_end`."""
+    if not period:
+        return True
+    if len(period) > 7:
+        return (statement.period_end is not None
+                and statement.period_end.isoformat() == period[:10])
+    ref = statement.period_start or statement.period_end
+    return ref is not None and ref.strftime('%Y-%m') == period
+
+
+def _statements_to_attach(account, period: str | None) -> list:
+    """Every stored statement for this real account — across its whole re-link
+    chain, since a pre-relink statement is still this account's statement —
+    oldest period first."""
+    from . import statements as stmts
+    from .models import PlaidStatement
+    chain = list(stmts.supersede_chain(account.account_id))
+    rows = (PlaidStatement.query
+            .filter(PlaidStatement.plaid_account_id.in_(tuple(chain)))
+            .order_by(PlaidStatement.period_end.asc().nullslast(),
+                      PlaidStatement.id.asc()).all())
+    return [s for s in rows if _period_matches(s, period)]
+
+
+def _attached_file_names(client, docnames) -> dict:
+    """{Bank Account docname: {lower-cased file_name, …}} for every File
+    already hanging off those accounts. Raises on failure — the caller must
+    not upload blind."""
+    rows = client.list_docs(
+        'File',
+        filters=[['attached_to_doctype', '=', STATEMENT_PDF_DOCTYPE],
+                 ['attached_to_name', 'in', list(docnames)]],
+        fields=['name', 'file_name', 'attached_to_name'])
+    out = {d: set() for d in docnames}
+    for r in rows or []:
+        target = r.get('attached_to_name')
+        if target in out:
+            out[target].add((r.get('file_name') or '').strip().lower())
+    return out
+
+
+def push_statement_pdfs(accounts=None, *, period: str | None = None,
+                        client=None, dry_run: bool = False) -> dict:
+    """Attach every stored brokerage statement PDF that its ERPNext Bank
+    Account does not already carry. Never raises.
+
+    `accounts` narrows the run (None = every live investment account);
+    `period` narrows it to one statement ('YYYY-MM' or 'YYYY-MM-DD').
+
+    Returns {'dry_run', 'pushed', 'would_push', 'skipped', 'failed'} — lists of
+    per-statement rows — plus 'error' when the run could not start at all.
+    A dry run fills `would_push` and leaves `pushed` empty, so a dry-run answer
+    can never be misread as a delivery.
+
+    IDEMPOTENCY. The file name is the key: a statement whose name is already
+    attached is skipped. That list is read BEFORE anything is uploaded, and if
+    it cannot be read nothing is uploaded — Frappe does not reliably refuse a
+    duplicate name (it can store a second copy under a hashed URL), so an
+    upload without the list is how an account ends up with every statement
+    twice.
+
+    VERIFIED, NOT ASSUMED (the v1.0.2 rule). An upload counts as pushed only
+    when ERPNext's reply is a File record with a file_url — and, when the reply
+    names what it is attached to, the right Bank Account."""
+    out = {'dry_run': bool(dry_run), 'pushed': [], 'would_push': [],
+           'skipped': [], 'failed': []}
+    targets = statement_pdf_accounts(accounts)
+    mapped = []
+    for account in targets:
+        if (account.erpnext_bank_account_name or '').strip():
+            mapped.append(account)
+        else:
+            out['skipped'].append({
+                'account_mask': account.mask, 'bank_account': None,
+                'period': None, 'reason': 'unmapped',
+                'detail': 'no ERPNext Bank Account is mapped to this account '
+                          '— map it on /admin/accounts first'})
+    if not mapped:
+        return out
+    if client is None:
+        client = _client_or_none()
+    if client is None:
+        out['error'] = 'ERPNext is not configured'
+        return out
+    docnames = sorted({a.erpnext_bank_account_name.strip() for a in mapped})
+    try:
+        attached = _attached_file_names(client, docnames)
+    except Exception as e:  # noqa: BLE001 - never upload blind
+        log.warning('could not list Bank Account attachments', exc_info=True)
+        out['error'] = (f'could not read what is already attached to '
+                        f'{", ".join(docnames)} ({type(e).__name__}: {e}) — '
+                        'nothing was uploaded, since without that list a '
+                        'push could attach every statement twice')
+        return out
+
+    from . import statements as stmts
+    broken = ''
+    for account in mapped:
+        docname = account.erpnext_bank_account_name.strip()
+        have = attached.setdefault(docname, set())
+        for st in _statements_to_attach(account, period):
+            row = {'account_mask': account.mask, 'bank_account': docname,
+                   'period': st.period_label(),
+                   'period_end': (st.period_end.isoformat()
+                                  if st.period_end else None)}
+            if st.period_end is None:
+                out['skipped'].append({**row, 'reason': 'no_period_end',
+                                       'detail': 'the statement has no period '
+                                                 'end, so it cannot be named'})
+                continue
+            file_name = statement_pdf_filename(account, st)
+            row['file_name'] = file_name
+            if file_name.lower() in have:
+                out['skipped'].append({**row, 'reason': 'already_attached'})
+                continue
+            path = stmts.resolve_pdf_path(st)
+            if not path:
+                out['skipped'].append({**row, 'reason': 'no_pdf',
+                                       'detail': 'no PDF on disk for this '
+                                                 'statement — re-run the '
+                                                 'statements pull'})
+                continue
+            try:
+                with open(path, 'rb') as fh:
+                    data = fh.read()
+            except OSError as e:
+                out['failed'].append({**row, 'error': f'stored PDF unreadable '
+                                      f'({type(e).__name__}): {path}'})
+                continue
+            row['size_bytes'] = len(data)
+            if dry_run:
+                out['would_push'].append(row)
+                have.add(file_name.lower())
+                continue
+            if broken:
+                out['failed'].append({**row, 'error': f'not attempted: {broken}'})
+                continue
+            try:
+                created = client.upload_file(
+                    file_name, data, doctype=STATEMENT_PDF_DOCTYPE,
+                    docname=docname, is_private=1)
+            except ERPNextAPIError as e:
+                # Same split as PushSession: "could not reach ERPNext" stops the
+                # batch; "ERPNext refused this one" does not.
+                if e.status_code is None or e.status_code >= 500:
+                    broken = 'ERPNext unreachable earlier in this run'
+                out['failed'].append({**row, 'error': str(e)[:500]})
+                continue
+            except Exception as e:  # noqa: BLE001 - a push never raises upward
+                log.warning('statement PDF upload %s raised', file_name,
+                            exc_info=True)
+                out['failed'].append({**row,
+                                      'error': f'{type(e).__name__}: {e}'})
+                continue
+            created = created if isinstance(created, dict) else {}
+            file_url = (created.get('file_url') or '').strip()
+            on = (created.get('attached_to_name') or '').strip()
+            if not file_url:
+                out['failed'].append({**row, 'error': 'ERPNext accepted the '
+                                      'upload but returned no File record — '
+                                      'not confirmed; it will be retried'})
+                continue
+            if on and on != docname:
+                out['failed'].append({**row, 'error': f'ERPNext attached the '
+                                      f'file to {on!r}, not {docname!r}'})
+                continue
+            have.add(file_name.lower())
+            out['pushed'].append({**row, 'file_url': file_url,
+                                  'file': created.get('name')})
+            log.info('statement PDF %s -> %s', file_name, docname)
+    return out
+
+
+def statement_pdfs_summary(result: dict) -> dict:
+    """Counts, plus the failures by name — what a sync result carries. The
+    full per-statement lists belong to the MCP tool; a sync every few minutes
+    should not grow a row for every statement already in place."""
+    if result is None:
+        return None
+    out = {k: len(result.get(k) or []) for k in
+           ('pushed', 'skipped', 'failed')}
+    if result.get('failed'):
+        out['failures'] = [{'file_name': r.get('file_name'),
+                            'error': r.get('error')}
+                           for r in result['failed'][:10]]
+    if result.get('error'):
+        out['error'] = result['error']
+    return out
 
 
 # ── the inward leg: reads, when ERPNext is the source ───────────────────────

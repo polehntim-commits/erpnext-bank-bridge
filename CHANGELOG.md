@@ -10,6 +10,47 @@ architecture rather than the API surface.
 
 ---
 
+## [1.0.3] — 2026-09-26
+
+**Brokerage statement PDFs land on their ERPNext Bank Account.**
+
+### Added
+
+- **`push_statement_pdfs` MCP tool.** Attaches every stored brokerage statement
+  PDF that its ERPNext Bank Account does not already carry, as a private file
+  named `{institution}-Brokerage-{mask}-{period_end}-Statement.pdf` (e.g.
+  `WF-Brokerage-9401-2026-06-30-Statement.pdf`). Optional `account_mask` and
+  `period` (`YYYY-MM` or an exact `YYYY-MM-DD` period end) narrow the run; omit
+  both to push everything missing. `dry_run` lists what would be pushed under
+  `would_push` and uploads nothing. Returns `{pushed, skipped, failed}` per
+  statement, each skip with a reason (`already_attached`, `no_pdf`,
+  `unmapped`). Gated by its own kill switch, **off by default**.
+- **Every sync now runs the same push** as part of its ERPNext leg (beside the
+  Plaid metadata push and the queue drain), so a newly pulled statement reaches
+  its Bank Account on the next sync. The result appears as
+  `erpnext_push.statement_pdfs` in the sync result, as counts.
+
+### How it stays idempotent
+
+- The file name is the key. ERPNext's existing attachments on the target Bank
+  Accounts are read first — one File query per run — and a statement whose
+  name is already there is skipped. If that list cannot be read, **nothing is
+  uploaded**: Frappe does not reliably refuse a duplicate name, so uploading
+  blind is how an account ends up with every statement twice.
+- No queue and no local "pushed" marker. A failed upload is simply still
+  missing on the next run, and a file someone deletes in ERPNext comes back.
+- Following v1.0.2, an upload counts as pushed only when ERPNext returns a File
+  record with a `file_url` attached to the right Bank Account.
+
+### Scope
+
+- Live (not re-link-retired), mapped **investment** accounts only. Statements
+  recorded under a pre-relink Plaid id are attached to the live account's Bank
+  Account. Depository statements keep reaching ERPNext through their
+  `Bank Statement` records, unchanged.
+
+---
+
 ## [1.0.2] — 2026-08-15
 
 **A 200 is not a confirmation, and a Plaid account id is not an identity.**
