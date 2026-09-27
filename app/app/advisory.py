@@ -70,6 +70,20 @@ def quarter_start(d: date) -> date:
     return date(d.year, ((d.month - 1) // 3) * 3 + 1, 1)
 
 
+def quarter_days(d: date) -> int:
+    """Calendar days in the quarter containing `d` (90, 91 or 92)."""
+    start = quarter_start(d)
+    nxt = (date(start.year + 1, 1, 1) if start.month == 10
+           else date(start.year, start.month + 3, 1))
+    return (nxt - start).days
+
+
+def quarter_billing_factor(d: date) -> float:
+    """What turns a quarter's summed Actual/365 daily accrual into rate / 4 of
+    its average AUM. See settle_quarter."""
+    return (365.0 / 4.0) / quarter_days(d)
+
+
 # ── registration: the agreement as a signed document (v0.7.4) ────────────────
 #
 # Everything above this line assumes an agreement already EXISTS and computes
@@ -767,6 +781,16 @@ def settle_quarter(client, agreement: AdvisoryAgreement,
     is recorded whether or not the switch is on — so a bookkeeper can SEE the
     pending amount — and gains its `erpnext_je_id` only once actually posted.
 
+    THE QUARTER IS A QUARTER OF THE YEAR, NOT n/365 OF IT. The daily accrual is
+    Actual/365 (aum × rate / 365), so summing it bills a 90-day Q1 at 90/365 =
+    24.66% of the annual rate and a 92-day Q3 at 25.21%. A quarterly-billed
+    agreement charges rate / 4 on the quarter's average AUM — which is how WFA
+    bills AA-00001 — so the Actual/365 sum understated Q1 2026 by ~$49 and Q2
+    by ~$9. The sum is re-weighted by (365 / 4) / calendar days in the quarter:
+    a full quarter settles at exactly rate / 4 of the average daily AUM, and a
+    partial one (an agreement starting mid-quarter) still prorates by the days
+    actually sampled.
+
     Returns the AdvisoryFeeAccrual, or None when there is nothing to settle."""
     period = quarter_label(quarter_end)
     qstart = quarter_start(quarter_end)
@@ -778,13 +802,16 @@ def settle_quarter(client, agreement: AdvisoryAgreement,
         return None
     manager_total = round(sum(
         base_fee_split(agreement, r.fee_accrual_daily)['manager']
-        for r in rows), 2)
+        for r in rows) * quarter_billing_factor(quarter_end), 2)
     if manager_total <= 0:
         return None
 
     accrual = (AdvisoryFeeAccrual.query
                .filter_by(agreement_id=agreement.id, fee_type='base',
                           period_label=period).first())
+    if accrual is not None and accrual.posted_to_erpnext:
+        # The posted JE is the record; never rewrite the amount it carries.
+        return accrual
     if accrual is None:
         accrual = AdvisoryFeeAccrual(
             agreement_id=agreement.id, fee_type='base', period_label=period,
@@ -793,10 +820,6 @@ def settle_quarter(client, agreement: AdvisoryAgreement,
     accrual.amount = manager_total
     accrual.accrual_date = quarter_end
     accrual.updated_at = _now()
-
-    if accrual.posted_to_erpnext:
-        db.session.commit()
-        return accrual
     if not agreement.fee_accrual_enabled:
         accrual.notes = 'accrued — fee posting disabled (opt-in required)'
         db.session.commit()

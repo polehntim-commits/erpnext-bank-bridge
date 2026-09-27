@@ -206,6 +206,63 @@ class SettlementTests(AdvisoryBase):
         self.assertLess(accrual.amount, gross)   # bank slice excluded
 
 
+class QuarterlyBillingBasisTests(AdvisoryBase):
+    """A quarterly-billed 1% agreement settles at rate / 4 of the quarter's
+    average AUM, whatever the quarter's day count. Pinned to AA-00001's real
+    2026 WFA charges: the Actual/365 sum settled Q1 at $3,524.50 against WFA's
+    $3,575.03 and Q2 at $3,273.85 against $3,284.56."""
+
+    def _settle_full_quarter(self, aum, qstart, qend):
+        a = self._agreement(total_base_fee_rate=0.01, bank_fee_rate=0.0)
+        self._holding('TESTCO', aum - 5000.0)    # + 5,000 on the paired cash
+        d = qstart
+        while d <= qend:
+            advisory.sample_daily_aum(a, on=d)
+            d = date.fromordinal(d.toordinal() + 1)
+        return advisory.settle_quarter(FakeERPClient(), a, qend)
+
+    def test_q1_2026_matches_wfa_rate_over_four(self):
+        # 90-day quarter: Actual/365 alone would give 90/365 of the annual fee.
+        accrual = self._settle_full_quarter(
+            1_430_012.0, date(2026, 1, 1), date(2026, 3, 31))
+        self.assertAlmostEqual(accrual.amount, 3575.03, delta=0.50)
+
+    def test_q2_2026_matches_wfa_rate_over_four(self):
+        accrual = self._settle_full_quarter(
+            1_313_824.0, date(2026, 4, 1), date(2026, 6, 30))
+        self.assertAlmostEqual(accrual.amount, 3284.56, delta=0.50)
+
+    def test_every_quarter_length_bills_a_quarter_of_the_year(self):
+        for d, days in ((date(2026, 2, 1), 90), (date(2024, 2, 1), 91),
+                        (date(2026, 5, 1), 91), (date(2026, 8, 1), 92),
+                        (date(2026, 11, 1), 92)):
+            self.assertEqual(advisory.quarter_days(d), days)
+            self.assertAlmostEqual(
+                advisory.quarter_billing_factor(d) * days, 365 / 4)
+
+    def test_partial_quarter_prorates_by_days_sampled(self):
+        a = self._agreement(total_base_fee_rate=0.01, bank_fee_rate=0.0)
+        self._holding('TESTCO', 360_000.0)       # 365,000 AUM → 10.00 a day
+        for day in range(1, 31):                 # 30 of Q1's 90 days
+            advisory.sample_daily_aum(a, on=date(2026, 3, day))
+        accrual = advisory.settle_quarter(FakeERPClient(), a, date(2026, 3, 31))
+        # A third of the quarter at rate / 4: 365,000 × 1% / 4 / 3 = 304.17.
+        self.assertAlmostEqual(accrual.amount, 304.17, places=2)
+
+    def test_posted_accrual_amount_is_never_rewritten(self):
+        a = self._agreement(total_base_fee_rate=0.01, bank_fee_rate=0.0,
+                            fee_accrual_enabled=True)
+        self._holding('TESTCO', 360_000.0)
+        advisory.sample_daily_aum(a, on=date(2026, 3, 1))
+        client = FakeERPClient()
+        first = advisory.settle_quarter(client, a, date(2026, 3, 31))
+        posted = first.amount
+        advisory.sample_daily_aum(a, on=date(2026, 3, 2))
+        again = advisory.settle_quarter(client, a, date(2026, 3, 31))
+        self.assertEqual(again.amount, posted)
+        self.assertEqual(len(client.created['Journal Entry']), 1)
+
+
 # ── high-water mark ───────────────────────────────────────────────────────────
 
 class HighWaterMarkTests(AdvisoryBase):
