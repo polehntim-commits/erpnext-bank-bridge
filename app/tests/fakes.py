@@ -954,8 +954,14 @@ class FakeERPClient:
                  'size': len(content_bytes or b''), 'content': content_bytes}
         self.uploads.append(entry)
         file_url = f'/private/files/{filename}'
+        # v1.0.3 · the File record Frappe actually returns carries where it
+        # hangs and an md5 of what was stored; the statement-PDF push checks
+        # both before it counts an upload as delivered.
+        import hashlib
         return {'name': f'FILE-{len(self.uploads):04d}', 'file_url': file_url,
-                'file_name': filename}
+                'file_name': filename, 'attached_to_doctype': doctype,
+                'attached_to_name': docname,
+                'content_hash': hashlib.md5(content_bytes or b'').hexdigest()}
 
     def attachments_for(self, docname):
         """Every upload targeted at one document — the assertion helper."""

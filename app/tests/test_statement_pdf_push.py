@@ -7,7 +7,11 @@ What matters here:
     skipped, and a second run uploads nothing
   * nothing is uploaded when the existing-attachment list cannot be read
   * a dry run reports `would_push` and uploads nothing
-  * an upload counts as pushed only on a File record ERPNext returned
+  * an upload counts as pushed only on a File record ERPNext returned, on the
+    right Bank Account, with the sha256 of the bytes sent
+  * both upload modes — `staged` (default: chunked read, verified before
+    sending) and `direct` (single read) — land the same bytes through the
+    client's upload_file and say which ran
   * only live, mapped INVESTMENT accounts are in scope
   * the MCP tool narrows by mask and period, and is kill-switch gated
   * the sync's ERPNext leg runs it, fail-soft
@@ -115,6 +119,7 @@ class PushTest(StatementPdfBase):
         self.assertEqual(len(out['failed']), 1)
 
     def test_an_upload_with_no_file_record_is_not_counted(self):
+        """The v1.0.2 rule: a 200 that says nothing is not a delivery."""
         acct = self._account('4242', bank_account=BA)
         self._statement(acct)
         with unittest.mock.patch.object(self.erp, 'upload_file',
@@ -122,6 +127,29 @@ class PushTest(StatementPdfBase):
             out = erpnext_push.push_statement_pdfs(client=self.erp)
         self.assertEqual(out['pushed'], [])
         self.assertIn('not confirmed', out['failed'][0]['error'])
+
+    def test_a_reply_on_the_wrong_account_is_not_counted(self):
+        acct = self._account('4242', bank_account=BA)
+        self._statement(acct)
+        with unittest.mock.patch.object(
+                self.erp, 'upload_file',
+                return_value={'file_url': '/private/files/x.pdf',
+                              'attached_to_name': 'Other'}):
+            out = erpnext_push.push_statement_pdfs(client=self.erp)
+        self.assertEqual(out['pushed'], [])
+        self.assertIn("not 'WF Brokerage - EC'", out['failed'][0]['error'])
+
+    def test_a_content_hash_mismatch_is_not_counted(self):
+        acct = self._account('4242', bank_account=BA)
+        self._statement(acct)
+        with unittest.mock.patch.object(
+                self.erp, 'upload_file',
+                return_value={'file_url': '/private/files/x.pdf',
+                              'attached_to_name': BA,
+                              'content_hash': '0' * 32}):
+            out = erpnext_push.push_statement_pdfs(client=self.erp)
+        self.assertEqual(out['pushed'], [])
+        self.assertIn('content_hash mismatch', out['failed'][0]['error'])
 
     def test_an_unreachable_erpnext_stops_the_batch(self):
         from app.erpnext_client import ERPNextAPIError
@@ -186,6 +214,84 @@ class PushTest(StatementPdfBase):
                          ['2026-05-31'])
 
 
+class ModeTest(StatementPdfBase):
+    """Both modes go through the ERPNext client's upload_file — the same
+    authenticated session the anchor push uses. They differ in how the bytes
+    are read and checked on this side before they are sent."""
+
+    def _pdf(self, acct):
+        st = self._statement(acct)
+        with open(st.pdf_path, 'rb') as fh:
+            return st, fh.read()
+
+    def test_staged_is_the_default_and_is_reported(self):
+        acct = self._account('4242', bank_account=BA)
+        _, body = self._pdf(acct)
+        out = erpnext_push.push_statement_pdfs(client=self.erp)
+        self.assertEqual(out['mode'], 'staged')
+        self.assertEqual(out['pushed'][0]['mode'], 'staged')
+        self.assertEqual(self.erp.uploads[0]['content'], body)
+        self.assertEqual(self.erp.uploads[0]['doctype'], 'Bank Account')
+
+    def test_staged_reassembles_across_chunks_byte_for_byte(self):
+        acct = self._account('4242', bank_account=BA)
+        _, body = self._pdf(acct)
+        with unittest.mock.patch.object(erpnext_push, 'STAGED_CHUNK_BYTES', 7):
+            out = erpnext_push.push_statement_pdfs(client=self.erp)
+        self.assertEqual(len(out['pushed']), 1)
+        self.assertEqual(self.erp.uploads[0]['content'], body)
+
+    def test_staged_refuses_a_file_that_changed_between_reads(self):
+        """What staged buys over direct: a PDF still being written, or one
+        truncated on the volume, is caught here instead of attached."""
+        acct = self._account('4242', bank_account=BA)
+        self._pdf(acct)
+        real = erpnext_push._staged_read
+
+        def truncated(path, expected):
+            return real(path, expected + b'x')
+        with unittest.mock.patch.object(erpnext_push, '_staged_read',
+                                        side_effect=truncated):
+            out = erpnext_push.push_statement_pdfs(client=self.erp)
+        self.assertEqual(out['pushed'], [])
+        self.assertIn('changed while it was being read',
+                      out['failed'][0]['error'])
+        self.assertEqual(self.erp.uploads, [])
+
+    def test_direct_uploads_without_the_staged_check(self):
+        acct = self._account('4242', bank_account=BA)
+        _, body = self._pdf(acct)
+        with unittest.mock.patch.object(erpnext_push, '_staged_read') as chk:
+            out = erpnext_push.push_statement_pdfs(client=self.erp,
+                                                   mode='direct')
+        chk.assert_not_called()
+        self.assertEqual(out['mode'], 'direct')
+        self.assertEqual(out['pushed'][0]['mode'], 'direct')
+        self.assertEqual(self.erp.uploads[0]['content'], body)
+
+    def test_both_modes_honour_the_same_idempotency_check(self):
+        acct = self._account('4242', bank_account=BA)
+        self._pdf(acct)
+        erpnext_push.push_statement_pdfs(client=self.erp, mode='staged')
+        out = erpnext_push.push_statement_pdfs(client=self.erp, mode='direct')
+        self.assertEqual([r['reason'] for r in out['skipped']],
+                         ['already_attached'])
+        self.assertEqual(len(self.erp.uploads), 1)
+
+    def test_a_dry_run_reports_its_mode_and_sends_nothing(self):
+        acct = self._account('4242', bank_account=BA)
+        self._pdf(acct)
+        out = erpnext_push.push_statement_pdfs(client=self.erp, mode='direct',
+                                               dry_run=True)
+        self.assertEqual(out['mode'], 'direct')
+        self.assertEqual(len(out['would_push']), 1)
+        self.assertEqual(self.erp.uploads, [])
+
+    def test_an_unknown_mode_is_refused(self):
+        with self.assertRaises(ValueError):
+            erpnext_push.push_statement_pdfs(client=self.erp, mode='ftp')
+
+
 class McpToolTest(StatementPdfBase):
     def setUp(self):
         super().setUp()
@@ -218,6 +324,31 @@ class McpToolTest(StatementPdfBase):
         self.assertEqual(self.erp.uploads, [])
         self.assertIn('DRY RUN', summary)
 
+    def test_mode_direct_is_passed_through_and_reported(self):
+        acct = self._account('4242', bank_account=BA)
+        self._statement(acct)
+        result, summary = mcp_server._push_statement_pdfs({'mode': 'direct'})
+        self.assertEqual(result['mode'], 'direct')
+        self.assertIn('(direct)', summary)
+        self.assertEqual(result['pushed'][0]['mode'], 'direct')
+
+    def test_the_default_mode_is_staged(self):
+        acct = self._account('4242', bank_account=BA)
+        self._statement(acct)
+        result, summary = mcp_server._push_statement_pdfs({})
+        self.assertEqual(result['mode'], 'staged')
+        self.assertIn('(staged)', summary)
+
+    def test_an_unknown_mode_is_a_tool_error(self):
+        self._account('4242', bank_account=BA)
+        with self.assertRaises(mcp_server.ToolError):
+            mcp_server._push_statement_pdfs({'mode': 'ftp'})
+
+    def test_the_schema_offers_both_modes(self):
+        schema = mcp_server.TOOLS['push_statement_pdfs']['inputSchema']
+        self.assertEqual(schema['properties']['mode']['enum'],
+                         ['staged', 'direct'])
+
     def test_a_malformed_period_is_a_tool_error(self):
         self._account('4242', bank_account=BA)
         with self.assertRaises(mcp_server.ToolError):
@@ -239,6 +370,7 @@ class SyncLegTest(StatementPdfBase):
         self._statement(acct)
         out = sync_engine._push_to_erpnext(self.erp, [acct])
         self.assertEqual(out['statement_pdfs']['pushed'], 1)
+        self.assertEqual(out['statement_pdfs']['mode'], 'staged')
         self.assertEqual(len(self.erp.attachments_for(BA)), 1)
         self.assertIn('queue', out)
 

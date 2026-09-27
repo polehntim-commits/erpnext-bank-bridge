@@ -1072,15 +1072,96 @@ def _attached_file_names(client, docnames) -> dict:
     return out
 
 
+# UPLOAD MODES (v1.0.3). Both upload through Bank Bridge's own ERPNext client —
+# the same authenticated API-key session the anchor and metadata pushes use —
+# to Frappe's standard `POST /api/method/upload_file` (multipart, attached to
+# the Bank Account, private). Nothing on the ERPNext side has to be deployed for
+# either one. What differs is how the bytes are read and checked HERE:
+#
+#   staged (DEFAULT) — the PDF is read from storage in fixed-size chunks and
+#     reassembled, and the assembled bytes must match the file's size on disk
+#     and a sha256 taken independently before a byte is sent. A short read, a
+#     file still being written, or a truncated volume is caught locally rather
+#     than delivered to the books.
+#   direct — one read, one upload. The fast path.
+#
+# Statement PDFs are a few hundred KB, so both send one request.
+MODE_STAGED = 'staged'
+MODE_DIRECT = 'direct'
+UPLOAD_MODES = (MODE_STAGED, MODE_DIRECT)
+
+STAGED_CHUNK_BYTES = 64 * 1024
+
+
+class StatementUploadRefused(Exception):
+    """Refused on this side, before anything was sent."""
+
+
+def _staged_read(path: str, expected: bytes) -> bytes:
+    """Re-read `path` chunk by chunk and prove it matches `expected`, the
+    single read the caller already made. Raises StatementUploadRefused when the
+    two disagree — a file that changes between two reads is not one to send."""
+    import os
+    size = os.path.getsize(path)
+    digest = hashlib.sha256()
+    chunks = []
+    with open(path, 'rb') as fh:
+        while True:
+            piece = fh.read(STAGED_CHUNK_BYTES)
+            if not piece:
+                break
+            digest.update(piece)
+            chunks.append(piece)
+    data = b''.join(chunks)
+    if len(data) != size or len(data) != len(expected) \
+            or digest.hexdigest() != hashlib.sha256(expected).hexdigest():
+        raise StatementUploadRefused(
+            f'stored PDF changed while it was being read ({size} bytes on '
+            f'disk, {len(data)} assembled, {len(expected)} first read) — not '
+            'sent; it will be retried on the next run')
+    return data
+
+
+def _upload_statement_pdf(client, mode: str, docname: str, file_name: str,
+                          data: bytes, *, path: str | None = None) -> dict:
+    """Upload one PDF by `mode` and return ERPNext's File record. Raises
+    ERPNextAPIError on an ERPNext refusal or an unreachable ERPNext."""
+    if mode == MODE_STAGED and path:
+        data = _staged_read(path, data)
+    return client.upload_file(file_name, data, doctype=STATEMENT_PDF_DOCTYPE,
+                              docname=docname, is_private=1) or {}
+
+
+def _unconfirmed(reply, docname: str, data: bytes) -> str:
+    """'' when ERPNext's reply proves the file landed, else why it doesn't."""
+    if not isinstance(reply, dict) or not (reply.get('file_url') or '').strip():
+        return ('ERPNext accepted the upload but returned no File record — not '
+                'confirmed; it will be retried')
+    on = (reply.get('attached_to_name') or '').strip()
+    if on != docname:
+        return f'ERPNext attached the file to {on or "nothing"!r}, not {docname!r}'
+    # Frappe records an md5 of what it stored as `content_hash`. When the reply
+    # carries it, it has to be the md5 of what was sent.
+    stored = (reply.get('content_hash') or '').strip().lower()
+    if stored and stored != hashlib.md5(data).hexdigest():  # noqa: S324
+        return ('ERPNext stored different bytes from the ones sent '
+                '(content_hash mismatch) — check the File and remove it if it '
+                'is corrupt')
+    return ''
+
+
 def push_statement_pdfs(accounts=None, *, period: str | None = None,
-                        client=None, dry_run: bool = False) -> dict:
+                        client=None, dry_run: bool = False,
+                        mode: str = MODE_STAGED) -> dict:
     """Attach every stored brokerage statement PDF that its ERPNext Bank
     Account does not already carry. Never raises.
 
     `accounts` narrows the run (None = every live investment account);
-    `period` narrows it to one statement ('YYYY-MM' or 'YYYY-MM-DD').
+    `period` narrows it to one statement ('YYYY-MM' or 'YYYY-MM-DD');
+    `mode` is 'staged' (the default) or 'direct' — see UPLOAD MODES above.
 
-    Returns {'dry_run', 'pushed', 'would_push', 'skipped', 'failed'} — lists of
+    Returns {'mode', 'dry_run', 'pushed', 'would_push', 'skipped', 'failed'} —
+    lists of
     per-statement rows — plus 'error' when the run could not start at all.
     A dry run fills `would_push` and leaves `pushed` empty, so a dry-run answer
     can never be misread as a delivery.
@@ -1093,10 +1174,13 @@ def push_statement_pdfs(accounts=None, *, period: str | None = None,
     twice.
 
     VERIFIED, NOT ASSUMED (the v1.0.2 rule). An upload counts as pushed only
-    when ERPNext's reply is a File record with a file_url — and, when the reply
-    names what it is attached to, the right Bank Account."""
-    out = {'dry_run': bool(dry_run), 'pushed': [], 'would_push': [],
-           'skipped': [], 'failed': []}
+    when ERPNext's reply is a File record with a file_url, attached to the right
+    Bank Account, whose sha256 is the sha256 of the bytes that were sent."""
+    if mode not in UPLOAD_MODES:
+        raise ValueError(f'mode must be one of {", ".join(UPLOAD_MODES)}, '
+                         f'got {mode!r}')
+    out = {'mode': mode, 'dry_run': bool(dry_run), 'pushed': [],
+           'would_push': [], 'skipped': [], 'failed': []}
     targets = statement_pdf_accounts(accounts)
     mapped = []
     for account in targets:
@@ -1169,9 +1253,8 @@ def push_statement_pdfs(accounts=None, *, period: str | None = None,
                 out['failed'].append({**row, 'error': f'not attempted: {broken}'})
                 continue
             try:
-                created = client.upload_file(
-                    file_name, data, doctype=STATEMENT_PDF_DOCTYPE,
-                    docname=docname, is_private=1)
+                reply = _upload_statement_pdf(client, mode, docname,
+                                              file_name, data, path=path)
             except ERPNextAPIError as e:
                 # Same split as PushSession: "could not reach ERPNext" stops the
                 # batch; "ERPNext refused this one" does not.
@@ -1179,28 +1262,24 @@ def push_statement_pdfs(accounts=None, *, period: str | None = None,
                     broken = 'ERPNext unreachable earlier in this run'
                 out['failed'].append({**row, 'error': str(e)[:500]})
                 continue
+            except StatementUploadRefused as e:
+                out['failed'].append({**row, 'error': str(e)})
+                continue
             except Exception as e:  # noqa: BLE001 - a push never raises upward
                 log.warning('statement PDF upload %s raised', file_name,
                             exc_info=True)
                 out['failed'].append({**row,
                                       'error': f'{type(e).__name__}: {e}'})
                 continue
-            created = created if isinstance(created, dict) else {}
-            file_url = (created.get('file_url') or '').strip()
-            on = (created.get('attached_to_name') or '').strip()
-            if not file_url:
-                out['failed'].append({**row, 'error': 'ERPNext accepted the '
-                                      'upload but returned no File record — '
-                                      'not confirmed; it will be retried'})
-                continue
-            if on and on != docname:
-                out['failed'].append({**row, 'error': f'ERPNext attached the '
-                                      f'file to {on!r}, not {docname!r}'})
+            problem = _unconfirmed(reply, docname, data)
+            if problem:
+                out['failed'].append({**row, 'error': problem})
                 continue
             have.add(file_name.lower())
-            out['pushed'].append({**row, 'file_url': file_url,
-                                  'file': created.get('name')})
-            log.info('statement PDF %s -> %s', file_name, docname)
+            out['pushed'].append({**row, 'mode': mode,
+                                  'file_url': reply['file_url'],
+                                  'file': reply.get('name')})
+            log.info('statement PDF %s -> %s (%s)', file_name, docname, mode)
     return out
 
 
@@ -1212,6 +1291,7 @@ def statement_pdfs_summary(result: dict) -> dict:
         return None
     out = {k: len(result.get(k) or []) for k in
            ('pushed', 'skipped', 'failed')}
+    out['mode'] = result.get('mode')
     if result.get('failed'):
         out['failures'] = [{'file_name': r.get('file_name'),
                             'error': r.get('error')}

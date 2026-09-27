@@ -1669,14 +1669,20 @@ def _push_statement_pdfs(args: dict):
                             'first')
         accounts = [account]
     dry_run = _flag(args, 'dry_run', False)
+    mode = (args.get('mode') or erpnext_push.MODE_STAGED)
+    mode = mode.strip().lower() if isinstance(mode, str) else mode
+    if mode not in erpnext_push.UPLOAD_MODES:
+        raise ToolError(f"mode must be 'staged' or 'direct', got "
+                        f"{args.get('mode')!r}")
     client = _erp_client_or_error()
     result = erpnext_push.push_statement_pdfs(accounts, period=period,
-                                              client=client, dry_run=dry_run)
+                                              client=client, dry_run=dry_run,
+                                              mode=mode)
     if result.get('error'):
         raise ToolError(result['error'])
     moved = result['would_push'] if dry_run else result['pushed']
-    return result, ((f'DRY RUN: would push {len(moved)}' if dry_run
-                     else f'pushed {len(moved)}')
+    return result, ((f'DRY RUN ({mode}): would push {len(moved)}' if dry_run
+                     else f'pushed {len(moved)} ({mode})')
                     + f", skipped {len(result['skipped'])}, "
                     f"failed {len(result['failed'])}")
 
@@ -2564,9 +2570,14 @@ TOOLS = {
             'is safe to repeat. Returns {pushed, skipped, failed} — per '
             'statement, with a reason on each skip (already_attached, no_pdf, '
             'unmapped). dry_run reports the same under `would_push` and '
-            'uploads nothing. Every sync already runs this for new '
-            'statements; call it to backfill or to check one period. '
-            'MUTATING — requires the push_statement_pdfs kill switch ON.',
+            'uploads nothing. `mode`: "staged" (default) re-reads the stored '
+            'PDF in chunks and refuses to send it unless the assembled bytes '
+            'match its size and sha256; "direct" reads and sends it in one '
+            'go. Both upload through Frappe upload_file with Bank Bridge\'s '
+            'own ERPNext credentials, and the result says which mode ran. '
+            'Every sync already runs this (staged) for new statements; call '
+            'it to backfill or to check one period. MUTATING — requires the '
+            'push_statement_pdfs kill switch ON.',
             {'account_mask': {'type': 'string',
                               'description': '4-digit mask of one brokerage '
                                              'account; omit for all'},
@@ -2576,7 +2587,11 @@ TOOLS = {
                                        'omit for all periods'},
              'dry_run': {'type': 'boolean',
                          'description': 'report what would be pushed without '
-                                        'uploading (default false)'}},
+                                        'uploading (default false)'},
+             'mode': {'type': 'string', 'enum': ['staged', 'direct'],
+                      'description': "'staged' (default): chunked read, "
+                                     'size + sha256 verified before upload. '
+                                     "'direct': single read and upload"}},
             mutating=True),
         'handler': _push_statement_pdfs},
 }

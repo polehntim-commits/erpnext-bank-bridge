@@ -22,9 +22,21 @@ architecture rather than the API surface.
   `WF-Brokerage-9401-2026-06-30-Statement.pdf`). Optional `account_mask` and
   `period` (`YYYY-MM` or an exact `YYYY-MM-DD` period end) narrow the run; omit
   both to push everything missing. `dry_run` lists what would be pushed under
-  `would_push` and uploads nothing. Returns `{pushed, skipped, failed}` per
-  statement, each skip with a reason (`already_attached`, `no_pdf`,
+  `would_push` and uploads nothing. Returns `{mode, pushed, skipped, failed}`
+  per statement, each skip with a reason (`already_attached`, `no_pdf`,
   `unmapped`). Gated by its own kill switch, **off by default**.
+- **Two upload modes**, chosen with `mode`. Both upload through Bank Bridge's
+  own ERPNext client (the same API-key session as the anchor push) to Frappe's
+  standard `POST /api/method/upload_file`, private and attached to the Bank
+  Account. Nothing needs deploying on the ERPNext side.
+  - **`staged`** (the default, and what every sync uses): the stored PDF is
+    re-read in chunks and reassembled, and it is sent only if the result
+    matches its size on disk and the sha256 of the first read. A file still
+    being written or a truncated volume is caught here, not attached.
+  - **`direct`**: one read, one upload.
+
+  Both modes use the same name and the same already-attached check, and the
+  result says which mode ran.
 - **Every sync now runs the same push** as part of its ERPNext leg (beside the
   Plaid metadata push and the queue drain), so a newly pulled statement reaches
   its Bank Account on the next sync. The result appears as
@@ -40,7 +52,8 @@ architecture rather than the API surface.
 - No queue and no local "pushed" marker. A failed upload is simply still
   missing on the next run, and a file someone deletes in ERPNext comes back.
 - Following v1.0.2, an upload counts as pushed only when ERPNext returns a File
-  record with a `file_url` attached to the right Bank Account.
+  record with a `file_url`, attached to the right Bank Account, and — when
+  Frappe reports one — a `content_hash` matching the bytes sent.
 
 ### Scope
 
