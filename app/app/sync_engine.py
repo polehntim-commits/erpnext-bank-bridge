@@ -487,10 +487,12 @@ def pull_item(item: PlaidItem, plaid_client: PlaidClient) -> dict:
         item.updated_at = _now()
         db.session.commit()
         # v0.4.11 · a sync that completed is proof the link works, whatever a
-        # stale webhook or an earlier failure claimed. Self-healing matters
-        # here: a PENDING_EXPIRATION warning that the bank later resolves on
-        # its own must not park the Item permanently.
-        reconnect.clear_reauth(item)
+        # stale webhook or an earlier failure claimed, so a park is cleared.
+        # v1.0.5 · warnings (PENDING_EXPIRATION & co.) no longer park at all —
+        # they ride along in reauth_reason while the Item keeps syncing, and a
+        # good pull retires one only after reconnect.WARNING_TTL, so the
+        # advance-notice banner outlives the next poll.
+        reconnect.clear_after_sync(item)
     except PlaidError as e:
         db.session.rollback()
         item = db.session.get(PlaidItem, item.id)
@@ -1112,7 +1114,12 @@ def _syncable_items():
     polling it just burns a billable request and writes an error row per cycle.
     The operator sees it on /admin/accounts with a Reconnect button; nothing
     here can clear the state, so nothing here should keep paying to rediscover
-    it."""
+    it.
+
+    v1.0.5 · only HARD codes set needs_reauth (reconnect.REAUTH_CODES). A
+    Plaid warning such as PENDING_EXPIRATION leaves the Item here in the poll
+    set — it still works, and parking it was permanent, since only a pull can
+    clear the flag."""
     items = (PlaidItem.query
              .filter(PlaidItem.status != 'revoked')
              .filter(PlaidItem.disconnected.isnot(True))

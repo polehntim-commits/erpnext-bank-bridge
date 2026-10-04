@@ -554,6 +554,9 @@ def run_migrations() -> None:
         # v1.0.2: reconstruct the durable Plaid id chain from the pointers an
         # upgrading install already holds.
         _backfill_account_id_links()
+        # v1.0.5: un-park Items a Plaid WARNING parked before warnings stopped
+        # parking.
+        _unpark_warning_only_items()
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)
 
@@ -644,6 +647,34 @@ def _backfill_rule_activated_at() -> None:
         conn.execute(text(
             'UPDATE categorization_rules SET activated_at = created_at '
             'WHERE activated_at IS NULL'))
+
+
+def _unpark_warning_only_items() -> None:
+    """Release Items parked by a Plaid WARNING (v1.0.5).
+
+    Before v1.0.5, PENDING_EXPIRATION and NEW_ACCOUNTS_AVAILABLE set
+    needs_reauth, and a parked Item is never polled — so it never had the
+    successful pull that clears the flag, and stayed parked forever. Dropping
+    needs_reauth while KEEPING reauth_reason turns each such row into exactly
+    what a warning produces now: still polled, still bannered. Idempotent — a
+    re-run matches nothing, and a hard code (ITEM_LOGIN_REQUIRED …) is never
+    touched."""
+    from .reconnect import WARNING_CODES
+    insp = inspect(db.engine)
+    if 'plaid_items' not in insp.get_table_names():
+        return
+    cols = {c['name'] for c in insp.get_columns('plaid_items')}
+    if not {'needs_reauth', 'reauth_reason'} <= cols:
+        return
+    codes = sorted(WARNING_CODES)
+    marks = ', '.join(f':c{i}' for i in range(len(codes)))
+    with db.engine.begin() as conn:
+        n = conn.execute(text(
+            'UPDATE plaid_items SET needs_reauth = false '
+            f'WHERE needs_reauth = true AND reauth_reason IN ({marks})'),
+            {f'c{i}': c for i, c in enumerate(codes)}).rowcount
+    if n:
+        log.info('migration: un-parked %d Item(s) held by a Plaid warning', n)
 
 
 def _migrate_rule_offset_accounts() -> None:

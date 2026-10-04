@@ -48,7 +48,7 @@ the safe direction to be wrong in.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import current_app
 
@@ -77,24 +77,44 @@ def _now() -> datetime:
 # code — the SDK's ApiException stringifies to a body containing the code, which
 # is the same shape erpnext_accounts._is_missing_doctype_error keys off.
 
-# The operator must re-authenticate. Nothing retries its way out of these.
+# The operator must re-authenticate. Nothing retries its way out of these, so
+# an Item carrying one is PARKED: `needs_reauth` is set and the poll loop stops
+# paying to rediscover the failure (sync_engine._syncable_items).
 REAUTH_CODES = (
     'ITEM_LOGIN_REQUIRED',
-    'PENDING_EXPIRATION',
     'ITEM_LOCKED',
     'USER_PERMISSION_REVOKED',
 )
 
-# ITEM webhook codes carrying the same meaning. PENDING_EXPIRATION is a WARNING
-# — the Item still works — but it is surfaced the same way on purpose: it is the
-# only advance notice Plaid gives, and an operator who reconnects during the
-# warning window never has a failed sync at all.
+# ITEM webhook codes that park the Item. ITEM_LOCKED arrives as the nested code
+# of an ERROR webhook, which the handler unwraps before looking here.
 REAUTH_WEBHOOK_CODES = {
     'ITEM_LOGIN_REQUIRED',
-    'PENDING_EXPIRATION',
+    'ITEM_LOCKED',
     'USER_PERMISSION_REVOKED',
+}
+
+# v1.0.5 · Plaid WARNINGS. The Item still works, so these must NOT park it:
+# until v1.0.5 they did, and because only a successful pull (or a re-link)
+# clears the flag while a parked Item is never pulled, a warning stranded the
+# bank permanently. Now a warning is recorded in `reauth_reason` with
+# `needs_reauth` left false — the Accounts page shows an advance-notice banner
+# and a Reconnect button, and syncing carries on. Same columns, no new table:
+# the hard/soft split is a property of the CODE, so it is derived, not stored.
+WARNING_CODES = {
+    'PENDING_EXPIRATION',
+    'PENDING_DISCONNECT',
     'NEW_ACCOUNTS_AVAILABLE',
 }
+
+# How long a warning outlives successful pulls. A pull cannot prove a warning
+# resolved — PENDING_EXPIRATION is sent about a week BEFORE the Item stops
+# working, and syncs keep succeeding right up to the deadline — so clearing on
+# the next good pull would show the banner for one poll interval and lose the
+# only advance notice Plaid gives. Past this age the warning has either come
+# true (the pull would have failed and parked the Item) or it was resolved at
+# the bank, so a good pull retires it.
+WARNING_TTL = timedelta(days=14)
 
 # Human-readable cause per code, shown on the Accounts page.
 REAUTH_HELP = {
@@ -107,10 +127,24 @@ REAUTH_HELP = {
         'Resolve it with the bank, then reconnect.',
     'USER_PERMISSION_REVOKED':
         'access was revoked at the bank. Reconnect to grant it again.',
+    'PENDING_DISCONNECT':
+        'this connection will be disconnected soon. Reconnect now to avoid an '
+        'interruption.',
     'NEW_ACCOUNTS_AVAILABLE':
         'this bank has accounts Bank Bridge has not seen. Reconnect to add '
         'them.',
 }
+
+
+def is_warning(code: str | None) -> bool:
+    """True for a Plaid advisory code — the Item still works."""
+    return (code or '') in WARNING_CODES
+
+
+def has_warning(item: PlaidItem) -> bool:
+    """A working Item carrying an advance-notice warning (not parked)."""
+    return (item is not None and not item.needs_reauth
+            and is_warning(item.reauth_reason))
 
 
 def is_reauth_error(exc: Exception | str) -> str:
@@ -133,9 +167,14 @@ def mark_needs_reauth(item: PlaidItem, code: str, *, source: str = '') -> bool:
     than every poll that rediscovers the same dead link.
 
     Never raises: this is called from inside a sync error handler, where a
-    second failure would mask the first."""
+    second failure would mask the first.
+
+    A WARNING code is routed to note_warning rather than parking, so no caller
+    can strand a working Item by passing one."""
     if item is None:
         return False
+    if is_warning(code):
+        return note_warning(item, code, source=source)
     already = bool(item.needs_reauth) and (item.reauth_reason or '') == code
     if already:
         return False
@@ -157,10 +196,53 @@ def mark_needs_reauth(item: PlaidItem, code: str, *, source: str = '') -> bool:
     return True
 
 
+def note_warning(item: PlaidItem, code: str, *, source: str = '') -> bool:
+    """Record a Plaid warning WITHOUT parking the Item. Returns True when this
+    changed the row.
+
+    A parked Item keeps its hard reason: "sign in again" outranks "expires
+    soon", and overwriting it would hide why syncing stopped. Never raises, for
+    the same reason as mark_needs_reauth."""
+    if item is None or item.needs_reauth:
+        return False
+    if (item.reauth_reason or '') == code:
+        return False
+    try:
+        item.reauth_reason = code
+        item.reauth_detected_at = _now()
+        item.updated_at = _now()
+        db.session.commit()
+    except Exception:  # pragma: no cover - never mask the original failure
+        db.session.rollback()
+        log.warning('could not record warning on item %s',
+                    item.item_id, exc_info=True)
+        return False
+    log.info('item %s (%s) warning [%s%s] — still syncing; %s',
+             item.item_id, item.institution_name or '?', code,
+             f' via {source}' if source else '', REAUTH_HELP.get(code, ''))
+    return True
+
+
+def clear_after_sync(item: PlaidItem) -> bool:
+    """A pull just succeeded. That proves the link works, so a park is cleared
+    outright; a warning is retired only once it is older than WARNING_TTL (see
+    there for why a good pull alone proves nothing about a warning). Returns
+    True when anything was cleared."""
+    if item is None:
+        return False
+    if item.needs_reauth:
+        return clear_reauth(item)
+    if has_warning(item):
+        seen = item.reauth_detected_at
+        if seen is None or _now() - seen >= WARNING_TTL:
+            return clear_reauth(item)
+    return False
+
+
 def clear_reauth(item: PlaidItem) -> bool:
-    """Clear the flag after a successful reconnect or sync. Returns True when it
-    was actually set."""
-    if item is None or not item.needs_reauth:
+    """Clear a park or a warning after a successful reconnect. Returns True
+    when either was actually set."""
+    if item is None or not (item.needs_reauth or item.reauth_reason):
         return False
     item.needs_reauth = False
     item.reauth_reason = None

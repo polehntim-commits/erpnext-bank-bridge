@@ -10,6 +10,45 @@ architecture rather than the API surface.
 
 ---
 
+## [1.0.5] — 2026-10-03
+
+**A Plaid warning no longer stops a bank syncing forever.**
+
+### Fixed
+
+- **PENDING_EXPIRATION / NEW_ACCOUNTS_AVAILABLE parked the Item permanently.**
+  Both are Plaid *warnings* — the Item still works — but the ITEM webhook
+  handler set `needs_reauth` for them, and the poll loop skips every
+  `needs_reauth` Item. Only a successful pull (or a re-link) clears the flag,
+  and a skipped Item is never pulled, so the bank silently stopped syncing
+  until someone pressed Reconnect. Now only hard codes park
+  (`ITEM_LOGIN_REQUIRED`, `ITEM_LOCKED`, `USER_PERMISSION_REVOKED`); the
+  sync-error classifier no longer treats `PENDING_EXPIRATION` text as one
+  either.
+
+### Changed
+
+- Warnings (`PENDING_EXPIRATION`, `PENDING_DISCONNECT`,
+  `NEW_ACCOUNTS_AVAILABLE`) are recorded in `reauth_reason` with
+  `needs_reauth` left false. The Accounts page shows a "⏳ Reconnect soon"
+  pill, an advance-notice banner and the Reconnect button; syncing continues.
+  No new column or table — hard vs. warning is derived from the code.
+- A successful pull clears a park immediately but retires a warning only once
+  it is older than 14 days (`reconnect.WARNING_TTL`). PENDING_EXPIRATION is
+  sent about a week before the Item stops working and pulls keep succeeding
+  until then, so clearing on the next good pull would hide the only advance
+  notice Plaid gives. A Reconnect clears a warning at once.
+- A warning never overwrites a hard reason on an already-parked Item.
+
+### Upgrade
+
+- On boot, `_unpark_warning_only_items` releases any Item the old behaviour
+  parked with a warning reason (`needs_reauth` → false, reason kept, so the
+  banner still shows). Idempotent; hard parks are untouched. Those Items
+  resume on the next poll.
+
+---
+
 ## [1.0.4] — 2026-10-03
 
 **A pending card charge is booked once — when it posts.**

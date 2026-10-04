@@ -735,10 +735,15 @@ ACCOUNTS_BODY = """
        inside an HTML attribute breaks the moment it contains a quote. Jinja's
        autoescaping handles attribute VALUES correctly, so this shape can't be
        broken by the bank's name. -->
+  {% if grp.item.needs_reauth or grp.reauth_warning %}
   {% if grp.item.needs_reauth %}
   <span class="pill" style="vertical-align:middle;margin-left:6px;
         background:#fff3cd;border-color:#f0d68a;color:#7a5b00"
         title="{{ grp.item.reauth_reason or 'Re-authentication required' }} — syncing is paused for this bank, so no Plaid calls are being spent on it.">⚠ Needs reconnect</span>
+  {% else %}
+  <span class="pill" style="vertical-align:middle;margin-left:6px"
+        title="{{ grp.item.reauth_reason }} — advance notice from Plaid. Syncing continues.">⏳ Reconnect soon</span>
+  {% endif %}
   <button type="button"
           style="vertical-align:middle;margin-left:8px;padding:3px 10px;font-size:12px"
           data-bb-reconnect="{{ grp.item.item_id }}"
@@ -762,6 +767,14 @@ ACCOUNTS_BODY = """
     Syncing for this bank is <b>paused</b> until you reconnect — no Plaid calls
     are being spent on it in the meantime. Reconnecting repairs this same
     connection, so your account mappings and Company assignment are unaffected.
+  </p>
+</div>
+{% elif grp.reauth_warning %}
+<div class="banner-warn" style="margin:4px 0 10px">
+  <p style="font-size:14px;margin:0">
+    <b>Heads up — {{ grp.item.institution_name or 'this bank' }}:</b>
+    {{ grp.reauth_help }} Syncing is <b>still running</b>; reconnecting repairs
+    this same connection, so your account mappings are unaffected.
   </p>
 </div>
 {% endif %}
@@ -1255,15 +1268,20 @@ def accounts_page():
             'item': it, 'accounts': accts,
             # v0.4.11 · the operator-facing sentence for why this bank stopped.
             # '' for a healthy Item, so the banner renders nothing extra.
+            # v1.0.5 · also for a warning, which shows as advance notice on a
+            # bank that is still syncing.
+            'reauth_warning': reconnect.has_warning(it),
             'reauth_help': (reconnect.REAUTH_HELP.get(it.reauth_reason or '', '')
-                            if it.needs_reauth else ''),
+                            if it.needs_reauth or reconnect.has_warning(it)
+                            else ''),
             # v0.5.1 · only show the investment-JE kill switch on a connection
             # that actually holds an investment account.
             'has_investment': any((a.type or '').lower() in
                                   ('investment', 'brokerage') for a in accts),
         })
-    any_needs_reauth = any(g['item'].needs_reauth and not g['item'].disconnected
-                           for g in groups)
+    # Loads Plaid Link — so a warning's Reconnect button needs it too.
+    any_needs_reauth = any((g['item'].needs_reauth or g['reauth_warning'])
+                           and not g['item'].disconnected for g in groups)
     any_investment = any(g['has_investment'] for g in groups)
     bank_accounts, erp_error = [], ''
     companies = []

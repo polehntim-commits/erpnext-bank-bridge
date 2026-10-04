@@ -36,7 +36,7 @@ import os
 import tempfile
 import unittest
 import unittest.mock
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 
@@ -140,6 +140,31 @@ class ReauthDetectionTests(ReconnectBase):
         reconnect.mark_needs_reauth(item, 'PENDING_EXPIRATION')
         self.assertTrue(reconnect.mark_needs_reauth(item, 'ITEM_LOGIN_REQUIRED'))
         self.assertEqual(item.reauth_reason, 'ITEM_LOGIN_REQUIRED')
+        self.assertTrue(item.needs_reauth)
+
+    def test_a_warning_never_parks_even_via_mark_needs_reauth(self):
+        """v1.0.5 · no caller can strand a working Item by passing a warning."""
+        for code in reconnect.WARNING_CODES:
+            with self.subTest(code=code):
+                item = self._item(f'item-{code.lower()}')
+                self.assertTrue(reconnect.mark_needs_reauth(item, code))
+                self.assertFalse(item.needs_reauth)
+                self.assertEqual(item.reauth_reason, code)
+
+    def test_a_warning_does_not_overwrite_a_hard_reason(self):
+        item = self._item()
+        reconnect.mark_needs_reauth(item, 'ITEM_LOGIN_REQUIRED')
+        self.assertFalse(reconnect.note_warning(item, 'PENDING_EXPIRATION'))
+        self.assertTrue(item.needs_reauth)
+        self.assertEqual(item.reauth_reason, 'ITEM_LOGIN_REQUIRED')
+
+    def test_a_warning_is_not_a_reauth_error(self):
+        """The sync-error path must not park on warning text either."""
+        for code in reconnect.WARNING_CODES:
+            self.assertNotIn(code, reconnect.REAUTH_CODES)
+            self.assertNotIn(code, reconnect.REAUTH_WEBHOOK_CODES)
+            self.assertEqual(reconnect.is_reauth_error(
+                PlaidError(f'{{"error_code": "{code}"}}')), '')
 
     def test_clearing(self):
         item = self._item(needs_reauth=True)
@@ -151,7 +176,7 @@ class ReauthDetectionTests(ReconnectBase):
         self.assertFalse(reconnect.clear_reauth(item))
 
     def test_every_code_has_operator_facing_help(self):
-        for code in reconnect.REAUTH_CODES:
+        for code in (*reconnect.REAUTH_CODES, *reconnect.WARNING_CODES):
             self.assertTrue(reconnect.REAUTH_HELP.get(code), code)
 
 
@@ -207,6 +232,61 @@ class PollSkipTests(ReconnectBase):
                               FakeERPClient())
         db.session.refresh(item)
         self.assertFalse(item.needs_reauth)
+
+    def test_a_successful_pull_keeps_a_fresh_warning(self):
+        """PENDING_EXPIRATION arrives ~a week before the Item stops working and
+        pulls keep succeeding until then — clearing on the next pull would
+        lose the only advance notice Plaid gives."""
+        item = self._item()
+        reconnect.note_warning(item, 'PENDING_EXPIRATION')
+        sync_engine.sync_item(item, FakePlaidClient(accounts=[], pages=[page()]),
+                              FakeERPClient())
+        db.session.refresh(item)
+        self.assertEqual(item.reauth_reason, 'PENDING_EXPIRATION')
+        self.assertFalse(item.needs_reauth)
+
+    def test_a_successful_pull_clears_an_aged_warning(self):
+        """Self-healing: past WARNING_TTL the warning has either come true
+        (the pull would have failed and parked) or was resolved at the bank."""
+        item = self._item()
+        reconnect.note_warning(item, 'PENDING_EXPIRATION')
+        item.reauth_detected_at = (reconnect._now() - reconnect.WARNING_TTL
+                                   - timedelta(minutes=1))
+        db.session.commit()
+        res = sync_engine.sync_all(
+            FakePlaidClient(accounts=[], pages=[page(), page()]), FakeERPClient())
+        self.assertEqual([r.get('item_id') for r in res['results']], ['item-abc'])
+        db.session.refresh(item)
+        self.assertIsNone(item.reauth_reason)
+        self.assertIsNone(item.reauth_detected_at)
+        self.assertFalse(item.needs_reauth)
+
+    def test_reconnect_clears_a_warning(self):
+        item = self._item()
+        reconnect.note_warning(item, 'NEW_ACCOUNTS_AVAILABLE')
+        self.assertTrue(reconnect.clear_reauth(item))
+        self.assertIsNone(item.reauth_reason)
+
+    def test_migration_unparks_warning_only_items(self):
+        """Items the pre-v1.0.5 bug parked are released on boot; hard parks
+        stay put."""
+        from app import migrations
+        stuck = self._item('item-stuck', needs_reauth=True)
+        stuck.reauth_reason = 'PENDING_EXPIRATION'
+        dead = self._item('item-dead', needs_reauth=True)
+        dead.reauth_reason = 'ITEM_LOGIN_REQUIRED'
+        db.session.commit()
+        migrations._unpark_warning_only_items()
+        migrations._unpark_warning_only_items()  # idempotent
+        db.session.expire_all()
+        stuck = db.session.get(PlaidItem, stuck.id)
+        dead = db.session.get(PlaidItem, dead.id)
+        self.assertFalse(stuck.needs_reauth)
+        self.assertEqual(stuck.reauth_reason, 'PENDING_EXPIRATION')
+        self.assertTrue(dead.needs_reauth)
+        items, parked = sync_engine._syncable_items()
+        self.assertEqual({i.item_id for i in items}, {'item-stuck'})
+        self.assertEqual({i.item_id for i in parked}, {'item-dead'})
 
     def test_a_disconnected_item_is_not_counted_as_parked(self):
         self._item('item-gone', disconnected=True, needs_reauth=True)
@@ -377,15 +457,58 @@ class WebhookTests(ReconnectBase):
         self.assertTrue(item.needs_reauth)
         self.assertEqual(item.reauth_reason, 'ITEM_LOGIN_REQUIRED')
 
-    def test_pending_expiration_parks_the_item(self):
-        """The only advance notice Plaid gives — an operator who reconnects in
-        the warning window never has a failed sync at all."""
+    def test_pending_expiration_warns_but_keeps_polling(self):
+        """v1.0.5 · a WARNING — the Item still works. It is surfaced (the only
+        advance notice Plaid gives) but must stay in the poll set: parking it
+        was permanent, because only a pull clears the flag."""
+        item = self._item()
+        resp = self._post({'webhook_type': 'ITEM',
+                           'webhook_code': 'PENDING_EXPIRATION',
+                           'item_id': 'item-abc'})
+        self.assertEqual(resp.status_code, 200)
+        db.session.refresh(item)
+        self.assertFalse(item.needs_reauth)
+        self.assertEqual(item.reauth_reason, 'PENDING_EXPIRATION')
+        self.assertTrue(reconnect.has_warning(item))
+        items, parked = sync_engine._syncable_items()
+        self.assertEqual([i.item_id for i in items], ['item-abc'])
+        self.assertEqual(parked, [])
+        res = sync_engine.sync_all(FakePlaidClient(accounts=[], pages=[page()]),
+                                   FakeERPClient())
+        self.assertEqual([r.get('item_id') for r in res['results']], ['item-abc'])
+
+    def test_new_accounts_available_warns_but_keeps_polling(self):
         item = self._item()
         self._post({'webhook_type': 'ITEM',
-                    'webhook_code': 'PENDING_EXPIRATION',
+                    'webhook_code': 'NEW_ACCOUNTS_AVAILABLE',
+                    'item_id': 'item-abc'})
+        db.session.refresh(item)
+        self.assertFalse(item.needs_reauth)
+        self.assertEqual(item.reauth_reason, 'NEW_ACCOUNTS_AVAILABLE')
+
+    def test_item_login_required_still_parks_after_a_warning(self):
+        item = self._item()
+        self._post({'webhook_type': 'ITEM', 'webhook_code': 'PENDING_EXPIRATION',
+                    'item_id': 'item-abc'})
+        self._post({'webhook_type': 'ITEM', 'webhook_code': 'ITEM_LOGIN_REQUIRED',
                     'item_id': 'item-abc'})
         db.session.refresh(item)
         self.assertTrue(item.needs_reauth)
+        self.assertEqual(item.reauth_reason, 'ITEM_LOGIN_REQUIRED')
+        items, parked = sync_engine._syncable_items()
+        self.assertEqual(items, [])
+        self.assertEqual([i.item_id for i in parked], ['item-abc'])
+
+    def test_accounts_page_shows_a_warning_banner(self):
+        item = self._item()
+        reconnect.note_warning(item, 'PENDING_EXPIRATION')
+        resp = self.client.get('/admin/accounts')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_data(as_text=True)
+        self.assertIn('Reconnect soon', body)
+        self.assertIn('still running', body)
+        self.assertIn('data-bb-reconnect="item-abc"', body)
+        self.assertNotIn('⚠ Needs reconnect', body)
 
     def test_an_error_webhook_reads_the_nested_code(self):
         item = self._item()

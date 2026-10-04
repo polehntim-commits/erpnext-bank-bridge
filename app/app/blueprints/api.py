@@ -315,6 +315,13 @@ def plaid_webhook():
                 audit.record('item_needs_reauth', subject_type='PlaidItem',
                              subject_id=item_id, after={'code': code},
                              notes=f'Plaid ITEM webhook: {code}')
+            elif reconnect.is_warning(code):
+                # v1.0.5 · a WARNING — the Item still works. Surface it on the
+                # Accounts page but keep polling; parking here was permanent.
+                if reconnect.note_warning(item, code, source='webhook'):
+                    audit.record('item_reauth_warning', subject_type='PlaidItem',
+                                 subject_id=item_id, after={'code': code},
+                                 notes=f'Plaid ITEM webhook: {code}')
         return jsonify({'ok': True})
 
     # v0.4.11 · the TRANSACTIONS branch kicks a full sync, which DOES cost Plaid
