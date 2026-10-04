@@ -56,6 +56,7 @@ import calendar
 import logging
 import os
 import re
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -64,10 +65,14 @@ from flask import current_app
 from . import audit
 from . import crypto
 from . import db
-from .models import BankTransaction, PlaidAccount, PlaidItem, PlaidStatement
+from .models import (BankTransaction, PlaidAccount, PlaidItem,
+                     PlaidStatement, PlaidSyncLog)
 from .plaid_client import PlaidError
 
 log = logging.getLogger('bankbridge.statements')
+
+# v1.0.6 · one refresh pull at a time per process (see run_refresh_pull).
+_REFRESH_LOCK = threading.Lock()
 
 
 def _now() -> datetime:
@@ -3121,23 +3126,161 @@ def _plaid_client_or_none(plaid_client=None):
 
 def _blank_stats() -> dict:
     return {'listed': 0, 'stored': 0, 'skipped_existing': 0, 'parsed': 0,
-            'failed': 0, 'items': 0, 'errors': []}
+            'failed': 0, 'items': 0, 'errors': [],
+            # v1.0.6 · /statements/refresh outcomes for this run.
+            'refresh_requested': 0, 'refresh_completed': 0,
+            'refresh_timed_out': 0, 'unsupported': 0}
+
+
+# ── v1.0.6 · /statements/refresh ────────────────────────────────────────────
+#
+# THE GAP. Plaid extracts an Item's statements ONCE, at Link, for the window the
+# link token named. After that /statements/list keeps answering with that same
+# set until someone calls /statements/refresh — which Bank Bridge never did. So
+# every monthly pull re-listed the Link-time statements, stored nothing, and
+# reported success; on OML the ••6030 brokerage sat at June 2026 for three
+# months. The scheduled pull now asks for a refresh first, waits for Plaid's
+# STATEMENTS_REFRESH_COMPLETE webhook (or polls past it), then lists.
+
+# Plaid error codes meaning "this Item cannot serve statements at all" — the
+# product isn't enabled on the application, wasn't requested at Link, or the
+# institution doesn't offer it. Recorded as `unsupported`, not `failed`: it is a
+# standing fact about the Item, not something that went wrong this run.
+UNSUPPORTED_CODES = ('PRODUCTS_NOT_SUPPORTED', 'PRODUCT_NOT_ENABLED',
+                     'INVALID_PRODUCT', 'ADDITIONAL_CONSENT_REQUIRED',
+                     'PRODUCT_NOT_READY', 'INSTITUTION_NOT_SUPPORTED')
+
+# How far back a refresh reaches when the Item holds no statement yet — the
+# same 24-month ceiling Link uses (PlaidClient.STATEMENTS_MAX_MONTHS × 30d).
+_REFRESH_MAX_DAYS = 720
+# How much of the newest held statement's month a refresh re-covers, so a
+# statement whose date Plaid attributes a few days either side is not missed.
+_REFRESH_OVERLAP_DAYS = 31
+
+
+def classify_error(e) -> str:
+    """'unsupported' for the product-not-available codes, else 'failed'."""
+    text = str(e or '').upper()
+    return 'unsupported' if any(c in text for c in UNSUPPORTED_CODES) \
+        else 'failed'
+
+
+def _pull_record(item_id: str, direction: str, count: int, status: str,
+                 message: str = '') -> None:
+    """One PlaidSyncLog row for a statements step — the pull record an operator
+    (and `get_erpnext_push_status`-style diagnostics) read. Best-effort."""
+    try:
+        db.session.add(PlaidSyncLog(item_id=(item_id or '')[:120],
+                                    direction=direction, count=count,
+                                    status=status,
+                                    error_message=(message or None)))
+        db.session.commit()
+    except Exception:  # pragma: no cover - defensive
+        db.session.rollback()
+        log.warning('could not write the %s pull record', direction,
+                    exc_info=True)
+
+
+def refresh_window(item: PlaidItem, today: date | None = None) -> tuple:
+    """(start, end) for a refresh: from a month before the newest statement
+    already held for this Item (else 24 months back) to today."""
+    today = today or date.today()
+    newest = (db.session.query(db.func.max(PlaidStatement.period_end))
+              .filter(PlaidStatement.plaid_item_id == item.item_id).scalar())
+    floor = today - timedelta(days=_REFRESH_MAX_DAYS)
+    if newest is None:
+        return floor, today
+    start = max(floor, newest + timedelta(days=1)
+                - timedelta(days=_REFRESH_OVERLAP_DAYS))
+    return min(start, today), today
+
+
+def request_refresh(item: PlaidItem, client, access_token: str, *,
+                    waiting: bool = True) -> str:
+    """Ask Plaid to refresh this Item's statements. Returns the status written
+    to the Item: 'pending' (asked; a caller will wait), 'timeout' (asked; no
+    one will wait, so the webhook fetches on arrival), 'failed' or
+    'unsupported'. Never raises — the error goes on the pull record."""
+    start, end = refresh_window(item)
+    # Written BEFORE the call: Plaid can answer the webhook faster than this
+    # function returns, and a status written afterwards would overwrite the
+    # webhook's 'complete' and leave the waiter polling to its deadline.
+    status = 'pending' if waiting else 'timeout'
+    item.statements_refresh_status = status
+    item.statements_refresh_requested_at = _now()
+    item.statements_refresh_completed_at = None
+    db.session.commit()
+    try:
+        client.statements_refresh(access_token, start, end)
+    except Exception as e:
+        status = classify_error(e)
+        item.statements_refresh_status = status
+        db.session.commit()
+        _pull_record(item.item_id, 'statements_refresh', 0, status,
+                     str(e)[:2000])
+        log.warning('statements refresh %s for item %s: %s', status,
+                    item.item_id, e)
+        return status
+    _pull_record(item.item_id, 'statements_refresh', 0, 'success',
+                 f'requested {start.isoformat()} → {end.isoformat()}')
+    db.session.refresh(item)
+    return item.statements_refresh_status or status
+
+
+def wait_for_refresh(item_id: str, deadline: float, *,
+                     poll_seconds: float = 10.0) -> str:
+    """Block until the Item's refresh leaves 'pending' (the webhook landed, on
+    any worker — the state is in the database) or `deadline` (time.monotonic)
+    passes. A timeout flips the status to 'timeout', which tells a late webhook
+    that nobody is waiting and it should fetch itself. Returns the status."""
+    while True:
+        db.session.expire_all()
+        item = PlaidItem.query.filter_by(item_id=item_id).first()
+        status = (item.statements_refresh_status if item else '') or ''
+        if status != 'pending':
+            return status
+        if time.monotonic() >= deadline:
+            item.statements_refresh_status = 'timeout'
+            db.session.commit()
+            return 'timeout'
+        time.sleep(max(0.0, min(poll_seconds, deadline - time.monotonic())))
+
+
+def mark_refresh_complete(item_id: str, result: str) -> bool:
+    """Record Plaid's STATEMENTS_REFRESH_COMPLETE webhook. Returns True when no
+    pull is waiting on it, so the caller should fetch the statements itself."""
+    item = PlaidItem.query.filter_by(item_id=item_id).first()
+    if item is None or item.disconnected:
+        return False
+    ok = (result or '').upper() == 'SUCCESS'
+    was = item.statements_refresh_status or ''
+    item.statements_refresh_status = 'complete' if ok else 'failed'
+    item.statements_refresh_completed_at = _now()
+    db.session.commit()
+    _pull_record(item_id, 'statements_refresh', 0,
+                 'success' if ok else 'failed',
+                 f'STATEMENTS_REFRESH_COMPLETE: {result or "?"}')
+    return ok and was != 'pending'
 
 
 def fetch_statements_for_item(item: PlaidItem, *, plaid_client=None,
                               account_ids=None, limit: int | None = None,
-                              oldest_first: bool = True) -> dict:
+                              oldest_first: bool = True,
+                              refresh: bool = False) -> dict:
     """List and download every statement for one Item that isn't already stored.
 
     `account_ids` restricts the pull to specific Plaid accounts (the import path
     passes the one account it just linked). `limit` caps how many statements are
     DOWNLOADED in this pass — the import path takes just the oldest, since that
     is the one carrying the earliest opening balance, while the monthly job
-    takes everything new.
+    takes everything new. `refresh` (v1.0.6) asks Plaid for a
+    /statements/refresh first WITHOUT waiting — fetch_all is the waiting path.
 
     Idempotent on two independent levels: a statement whose row already exists
     AND whose PDF is on disk is skipped without a download, and a row whose PDF
-    has gone missing is re-downloaded into the same row. Never raises."""
+    has gone missing is re-downloaded into the same row. Never raises; every
+    listing failure is written to the pull record (PlaidSyncLog,
+    direction='statements_pull') instead of reading as "nothing new"."""
     stats = _blank_stats()
     if not is_enabled():
         return stats
@@ -3152,26 +3295,31 @@ def fetch_statements_for_item(item: PlaidItem, *, plaid_client=None,
         log.warning('cannot decrypt access token for item %s: %s',
                     item.item_id, e)
         stats['errors'].append(f'{item.item_id}: token unreadable')
+        _pull_record(item.item_id, 'statements_pull', 0, 'failed',
+                     'access token unreadable')
         return stats
+    if refresh:
+        if request_refresh(item, client, access_token,
+                           waiting=False) != 'unsupported':
+            stats['refresh_requested'] += 1
 
-    # statements_list already swallows Plaid's own errors and returns [], but it
-    # can still raise before it gets that far — the SDK's request models are
-    # imported lazily inside it, so a missing/partial `plaid` wheel surfaces as
-    # an ImportError here rather than as an API failure. Either way this is a
-    # best-effort read that must degrade to "no statements".
     try:
         listed = client.statements_list(access_token)
     except Exception as e:
-        log.info('statements unavailable for item %s: %s', item.item_id, e)
+        status = classify_error(e)
+        log.warning('statements listing %s for item %s: %s', status,
+                    item.item_id, e)
         stats['errors'].append(f'{item.item_id}: {e}')
+        if status == 'unsupported':
+            stats['unsupported'] += 1
+        _pull_record(item.item_id, 'statements_pull', 0, status,
+                     str(e)[:2000])
         return stats
     stats['items'] = 1
     wanted = set(account_ids) if account_ids else None
     rows = [s for s in listed
             if not wanted or s.get('account_id') in wanted]
     stats['listed'] = len(rows)
-    if not rows:
-        return stats
 
     # Oldest first: the earliest statement carries the earliest opening balance,
     # which is the one an anchor wants. Statements with no usable period sort
@@ -3205,6 +3353,15 @@ def fetch_statements_for_item(item: PlaidItem, *, plaid_client=None,
             stats['parsed'] += 1
         else:
             stats['failed'] += 1
+    newest = (db.session.query(db.func.max(PlaidStatement.period_end))
+              .filter(PlaidStatement.plaid_item_id == item.item_id).scalar())
+    _pull_record(item.item_id, 'statements_pull', stats['stored'],
+                 'failed' if stats['failed'] and not stats['stored']
+                 else 'success',
+                 f"listed {stats['listed']}, stored {stats['stored']}, "
+                 f"skipped {stats['skipped_existing']}, failed "
+                 f"{stats['failed']}; newest held period ends "
+                 f"{newest.isoformat() if newest else 'n/a'}")
     return stats
 
 
@@ -3274,23 +3431,129 @@ def fetch_for_account(account: PlaidAccount, *, plaid_client=None,
         limit=limit)
 
 
-def fetch_all(*, plaid_client=None, limit_per_item: int | None = None) -> dict:
+def fetch_all(*, plaid_client=None, limit_per_item: int | None = None,
+              refresh: bool = False, wait_seconds: float = 0,
+              poll_seconds: float = 10.0) -> dict:
     """Pull new statements for every connected Item — the monthly job and the
-    backfill script's entry point. Aggregates per-Item stats; never raises."""
+    backfill script's entry point. Aggregates per-Item stats; never raises.
+
+    v1.0.6 · `refresh` asks Plaid for a /statements/refresh on EVERY Item first,
+    then waits — up to `wait_seconds` in total, shared across Items — for each
+    one's STATEMENTS_REFRESH_COMPLETE webhook before listing it. An Item whose
+    webhook does not arrive in time is listed anyway (the poll fallback), and
+    left in 'timeout' so its late webhook triggers a fetch of its own."""
     totals = _blank_stats()
     if not is_enabled():
         totals['errors'].append('statements are disabled (STATEMENTS_ENABLED)')
         return totals
     items = PlaidItem.query.filter(
         PlaidItem.disconnected.is_(False)).order_by(PlaidItem.id).all()
+    skip_refresh = set()
+    if refresh:
+        client = _plaid_client_or_none(plaid_client)
+        for item in items:
+            if client is None:
+                break
+            try:
+                token = crypto.decrypt(item.access_token_encrypted)
+            except Exception:
+                continue
+            status = request_refresh(item, client, token,
+                                     waiting=wait_seconds > 0)
+            if status in ('pending', 'timeout', 'complete'):
+                totals['refresh_requested'] += 1
+            if status == 'complete':      # webhook beat the call's return
+                totals['refresh_completed'] += 1
+            if status == 'unsupported':
+                skip_refresh.add(item.item_id)
+        deadline = time.monotonic() + max(0.0, float(wait_seconds or 0))
+        for item in items:
+            if (item.statements_refresh_status or '') != 'pending':
+                continue
+            got = wait_for_refresh(item.item_id, deadline,
+                                   poll_seconds=poll_seconds)
+            if got == 'complete':
+                totals['refresh_completed'] += 1
+            elif got == 'timeout':
+                totals['refresh_timed_out'] += 1
     for item in items:
         stats = fetch_statements_for_item(item, plaid_client=plaid_client,
                                           limit=limit_per_item)
         for key in ('listed', 'stored', 'skipped_existing', 'parsed', 'failed',
-                    'items'):
+                    'items', 'unsupported'):
             totals[key] += stats[key]
         totals['errors'].extend(stats['errors'])
     return totals
+
+
+def run_refresh_pull(app, *, wait_seconds: float | None = None) -> dict:
+    """The full refresh → wait → list → anchor pass, in its own app context —
+    what the admin button runs on a background thread and a late webhook runs
+    for its Item. Serialized per process so two clicks don't download the same
+    statement twice. Never raises."""
+    if not _REFRESH_LOCK.acquire(blocking=False):
+        return {'busy': True}
+    try:
+        with app.app_context():
+            audit.set_context('statements')
+            wait = (app.config.get('STATEMENTS_REFRESH_WAIT_SECONDS', 300)
+                    if wait_seconds is None else wait_seconds)
+            result = fetch_all(refresh=True, wait_seconds=wait)
+            if result.get('stored'):
+                try:
+                    result['anchors'] = rebuild_statement_anchors()
+                except Exception:  # pragma: no cover - never fail the pull
+                    db.session.rollback()
+                    log.exception('anchor rebuild after the statement pull '
+                                  'crashed')
+            audit.record('statements_pulled', subject_type=None, after=result,
+                         notes=pull_summary(result))
+            return result
+    except Exception:  # pragma: no cover - defensive
+        log.exception('statement refresh pull crashed')
+        return {'error': True}
+    finally:
+        _REFRESH_LOCK.release()
+
+
+def fetch_item_after_webhook(app, item_id: str) -> dict:
+    """A late STATEMENTS_REFRESH_COMPLETE (nobody waiting): list and store that
+    one Item's statements, then rebuild anchors if anything new arrived."""
+    with app.app_context():
+        audit.set_context('webhook')
+        item = PlaidItem.query.filter_by(item_id=item_id).first()
+        if item is None:
+            return _blank_stats()
+        result = fetch_statements_for_item(item)
+        if result.get('stored'):
+            try:
+                rebuild_statement_anchors()
+            except Exception:  # pragma: no cover - never fail the webhook
+                db.session.rollback()
+                log.exception('anchor rebuild after webhook fetch crashed')
+        audit.record('statements_pulled', subject_type='PlaidItem',
+                     subject_id=item_id, after=result,
+                     notes='after STATEMENTS_REFRESH_COMPLETE — '
+                           + pull_summary(result))
+        return result
+
+
+def pull_summary(result: dict) -> str:
+    """The one-line audit/log summary of a pull — errors included, because a
+    summary that reads clean over a failed listing is the bug this replaced."""
+    line = (f"listed {result.get('listed', 0)}, stored "
+            f"{result.get('stored', 0)}, skipped "
+            f"{result.get('skipped_existing', 0)}")
+    if result.get('refresh_requested'):
+        line += (f"; refresh asked {result['refresh_requested']}, completed "
+                 f"{result.get('refresh_completed', 0)}, timed out "
+                 f"{result.get('refresh_timed_out', 0)}")
+    if result.get('unsupported'):
+        line += f"; {result['unsupported']} Item(s) cannot serve statements"
+    if result.get('errors'):
+        line += (f"; {len(result['errors'])} error(s), first: "
+                 f"{str(result['errors'][0])[:200]}")
+    return line
 
 
 # ── reconciliation ──────────────────────────────────────────────────────────

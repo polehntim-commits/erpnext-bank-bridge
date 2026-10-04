@@ -77,6 +77,17 @@ class PlaidItem(db.Model):
                              index=True)
     reauth_reason = db.Column(db.String(255), nullable=True)
     reauth_detected_at = db.Column(db.DateTime, nullable=True)
+    # v1.0.6 · the last /statements/refresh asked of Plaid for this Item.
+    # Plaid extracts statements once at Link; a refresh is how a statement the
+    # bank issued later becomes listable. `statements_refresh_status`:
+    #   pending  — asked, and a pull is waiting on the webhook right now
+    #   timeout  — asked, nobody is waiting; the webhook kicks a fetch itself
+    #   complete — Plaid said SUCCESS   ·   failed — Plaid said FAILURE, or the
+    #   refresh request itself was refused   ·   unsupported — this Item cannot
+    #   serve statements at all (product not enabled / institution)
+    statements_refresh_status = db.Column(db.String(20), nullable=True)
+    statements_refresh_requested_at = db.Column(db.DateTime, nullable=True)
+    statements_refresh_completed_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=_now)
     last_synced_at = db.Column(db.DateTime, nullable=True)
     # v0.4.28 · timestamp of the most recent successful /investments/*

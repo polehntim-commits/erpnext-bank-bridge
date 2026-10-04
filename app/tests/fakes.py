@@ -58,6 +58,18 @@ class FakePlaidClient:
             raise self.statements_error
         return [dict(s) for s in self.statements]
 
+    def statements_refresh(self, access_token, start_date, end_date):
+        """v1.0.6 · /statements/refresh. Set `refresh_error` to a PlaidError to
+        script a refusal; `on_refresh` (a callable) to model Plaid making new
+        statements listable once the refresh completes."""
+        self.calls.append(('statements_refresh', start_date, end_date))
+        if getattr(self, 'refresh_error', None) is not None:
+            raise self.refresh_error
+        hook = getattr(self, 'on_refresh', None)
+        if hook is not None:
+            hook()
+        return 'req-refresh-1'
+
     def statements_download(self, access_token, statement_id):
         self.calls.append(('statements_download', statement_id))
         seen = self.download_attempts.get(statement_id, 0) + 1

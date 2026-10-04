@@ -607,21 +607,24 @@ class PlaidClient:
         which is why app/statements.py parses them out of extracted text rather
         than reading them off this response.
 
-        Returns [] — never raises — when the Item can't serve Statements. That
-        is the common case, not an edge one: the product must be approved on the
-        Plaid application AND requested at Link time AND supported by the
-        institution, so an install that has none of that must degrade to "no
-        statements" rather than break the caller. A genuine outage looks the
-        same from here and is safe to treat identically, because every caller's
-        fallback (the v0.4.4 estimate) is correct on its own."""
+        WHAT IT LISTS is what Plaid has extracted for the Item: the statements
+        requested at Link time, plus whatever a later /statements/refresh
+        fetched (see statements_refresh). Nothing newer appears on its own.
+
+        v1.0.6 · RAISES PlaidError on failure. It used to return [] for every
+        error, which made "this Item cannot serve statements", "this Item needs
+        re-authentication" and "Plaid is down" indistinguishable from "there
+        is nothing new" — and is how three months of missing statements on a
+        brokerage read as a quiet, successful pull. The caller
+        (statements.fetch_statements_for_item) records the error on the pull
+        record and classifies the product-not-available codes."""
         from plaid.model.statements_list_request import StatementsListRequest
         api = self._get_api()
         try:
             resp = api.statements_list(
                 StatementsListRequest(access_token=access_token))
         except Exception as e:
-            log.warning('statements_list unavailable for this Item: %s', e)
-            return []
+            raise PlaidError(f'statements_list failed: {e}') from e
         out = []
         for acct in (_resp_get(resp, 'accounts') or []):
             d = _to_dict(acct)
@@ -640,6 +643,28 @@ class PlaidClient:
                     'date_posted': str(posted) if posted is not None else None,
                 })
         return out
+
+    def statements_refresh(self, access_token: str, start_date,
+                           end_date) -> str:
+        """Ask Plaid to fetch the Item's statements for a date window
+        (/statements/refresh, v1.0.6). Returns Plaid's request_id.
+
+        Statements are extracted ONCE at Link time; without this call
+        /statements/list never shows a statement the bank issued after the Item
+        was linked. The refresh is ASYNCHRONOUS: Plaid answers at once and
+        fires a STATEMENTS / STATEMENTS_REFRESH_COMPLETE webhook when the new
+        statements are listable (statements.mark_refresh_complete). Raises
+        PlaidError on failure."""
+        from plaid.model.statements_refresh_request import \
+            StatementsRefreshRequest
+        api = self._get_api()
+        try:
+            resp = api.statements_refresh(StatementsRefreshRequest(
+                access_token=access_token, start_date=start_date,
+                end_date=end_date))
+        except Exception as e:
+            raise PlaidError(f'statements_refresh failed: {e}') from e
+        return str(_resp_get(resp, 'request_id') or '')
 
     def statements_download(self, access_token: str,
                             statement_id: str) -> bytes:

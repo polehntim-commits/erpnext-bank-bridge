@@ -10,6 +10,59 @@ architecture rather than the API surface.
 
 ---
 
+## [1.0.6] — 2026-10-03
+
+**New bank statements arrive again.**
+
+### Fixed
+
+- **Statements stopped at the Link date.** Plaid extracts an Item's statements
+  once, at Link, for the window the link token names. Statements the bank
+  issues later only become listable after `/statements/refresh`, which Bank
+  Bridge never called. Every monthly pull re-listed the Link-time set, stored
+  nothing, and reported success. On OML the ••6030 brokerage sat at June 2026,
+  and its June reconciliation waited on a July statement that could never
+  arrive.
+- **A failing statement listing no longer reads as "nothing new".**
+  `PlaidClient.statements_list` used to return `[]` for every error, so an Item
+  that couldn't serve statements, an Item needing re-auth, and a Plaid outage
+  all looked like a quiet, successful pull. It now raises, and the pull writes
+  the error to its pull record.
+
+### Changed
+
+- **The scheduled statement pull refreshes first.** It asks Plaid for
+  `/statements/refresh` on every Item. The window runs from a month before the
+  newest statement held, or 24 months back if none, up to today. The pull then
+  waits for each Item's `STATEMENTS_REFRESH_COMPLETE` webhook, up to
+  `STATEMENTS_REFRESH_WAIT_SECONDS` (default 300) shared across Items, and
+  lists. An Item whose webhook doesn't arrive in time is listed anyway (the
+  poll fallback), so an install with no public webhook URL still works.
+- **`STATEMENTS_REFRESH_COMPLETE` webhook handled.** If a pull is waiting, in
+  either gunicorn worker, it proceeds. If nobody is waiting (the refresh timed
+  out), the webhook fetches that Item's statements itself on a background
+  thread and rebuilds anchors if anything new arrived.
+- **The *Pull statements* button on `/admin/statements`** runs the same
+  refresh → wait → list → rebuild-anchors pass on a background thread and
+  returns immediately. Only one runs per process at a time.
+- **Pull records.** Each statements step writes a `plaid_sync_log` row:
+  - direction `statements_refresh` (`success` / `failed` / `unsupported`,
+    with the requested window or Plaid's error), and
+  - direction `statements_pull` (listed/stored/skipped/failed counts and the
+    newest period held).
+
+  Product-not-available codes (`PRODUCTS_NOT_SUPPORTED`, `PRODUCT_NOT_ENABLED`,
+  …) are recorded as `unsupported` rather than `failed`. The `statements_pulled`
+  audit note now names refresh outcomes and errors.
+
+### Added
+
+- `plaid_items.statements_refresh_status`, `statements_refresh_requested_at`
+  and `statements_refresh_completed_at`. These are additive, migrate at boot,
+  and are NULL on upgrade.
+
+---
+
 ## [1.0.5] — 2026-10-03
 
 **A Plaid warning no longer stops a bank syncing forever.**

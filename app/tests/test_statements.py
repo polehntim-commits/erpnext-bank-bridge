@@ -441,15 +441,17 @@ class StatementsAPITest(StatementsBase):
         self.assertEqual(rows[0]['date_posted'], '2026-07-02')
         self.assertIsNone(rows[1]['date_posted'])
 
-    def test_statements_list_returns_empty_for_unsupported_bank(self):
-        """An Item without the Statements product is the COMMON case, not an
-        error — the product must be approved on the application, requested at
-        Link, and offered by the institution. Returning [] lets every caller
-        fall back to v0.4.4 behaviour instead of breaking."""
+    def test_statements_list_raises_rather_than_hiding_an_error(self):
+        """v1.0.6 · it used to return [] here, which made an unsupported Item,
+        an Item needing re-auth and a Plaid outage all read as "nothing new" —
+        three months of missing statements went unnoticed that way. The caller
+        now records the error (statements.fetch_statements_for_item)."""
         api = unittest.mock.Mock()
         api.statements_list.side_effect = Exception(
             'PRODUCT_NOT_READY: statements is not enabled for this Item')
-        self.assertEqual(PlaidClient(api=api).statements_list('access-x'), [])
+        with self.assertRaises(PlaidError) as cm:
+            PlaidClient(api=api).statements_list('access-x')
+        self.assertIn('PRODUCT_NOT_READY', str(cm.exception))
 
     def test_statements_list_skips_rows_with_no_id(self):
         api = unittest.mock.Mock()

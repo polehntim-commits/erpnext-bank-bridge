@@ -462,6 +462,15 @@ class Config:
     #   * where the PDFs live. Blank → {DATA_DIR}/statements, which is
     #     /data/statements in the stock container and keeps the files on the same
     #     persistent volume as everything else that must survive a redeploy.
+    # v1.0.6 · how long the scheduled statement pull waits for Plaid's
+    # STATEMENTS_REFRESH_COMPLETE webhook after asking for a refresh, before
+    # listing anyway (the poll fallback — an install with no public webhook URL
+    # relies on it). Shared across every Item in one run.
+    try:
+        STATEMENTS_REFRESH_WAIT_SECONDS = max(0, int(os.environ.get(
+            'STATEMENTS_REFRESH_WAIT_SECONDS', '300')))
+    except ValueError:
+        STATEMENTS_REFRESH_WAIT_SECONDS = 300
     STATEMENTS_STORAGE_PATH = os.environ.get(
         'STATEMENTS_STORAGE_PATH', '').strip() or os.path.join(
             DATA_DIR, 'statements')

@@ -6528,21 +6528,28 @@ def statement_pdf(statement_id: str):
 
 @bp.post('/admin/statements/pull')
 def statements_pull():
-    """Operator-triggered statement pull — the same work the monthly job does."""
+    """Operator-triggered statement pull — the same work the monthly job does.
+
+    v1.0.6 · asks Plaid for a /statements/refresh first, which completes
+    asynchronously (minutes), so the pull runs on a background thread and this
+    returns at once. The result lands on the pull record and the audit log."""
     from .. import statements as stmts
     if not stmts.is_enabled():
         return redirect('/admin/statements?flash=' + quote_plus(
             'Statements are disabled (STATEMENTS_ENABLED).'))
-    try:
-        result = stmts.fetch_all()
-    except Exception as e:
+    app = current_app._get_current_object()
+    if app.config.get('TESTING'):
+        result = stmts.run_refresh_pull(app, wait_seconds=0)
         return redirect('/admin/statements?flash=' + quote_plus(
-            f'Statement pull failed: {e}'))
-    msg = (f"Listed {result['listed']}, stored {result['stored']}, "
-           f"already had {result['skipped_existing']}.")
-    if result['failed']:
-        msg += f" {result['failed']} could not be downloaded."
-    return redirect('/admin/statements?flash=' + quote_plus(msg))
+            'Statement pull already running.' if result.get('busy')
+            else 'Statement pull: ' + stmts.pull_summary(result)))
+    import threading
+    threading.Thread(target=stmts.run_refresh_pull, args=(app,),
+                     daemon=True).start()
+    return redirect('/admin/statements?flash=' + quote_plus(
+        'Asked Plaid to refresh statements. New statements download as soon '
+        'as Plaid finishes, usually within a few minutes; reload this page '
+        'to see them. Anchors are rebuilt automatically when one arrives.'))
 
 
 @bp.post('/admin/statements/reparse')

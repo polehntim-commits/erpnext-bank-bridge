@@ -271,12 +271,17 @@ def _run_statements_pull(app) -> None:
                 log.info('[scheduler] Plaid not configured — skipping '
                          'statement pull')
             else:
-                result = statements.fetch_all()
+                # v1.0.6 · ask Plaid to refresh first, then wait for the
+                # STATEMENTS_REFRESH_COMPLETE webhook (or poll past it) —
+                # without the refresh, Plaid lists only what it extracted at
+                # Link and nothing newer ever arrives.
+                result = statements.fetch_all(
+                    refresh=True,
+                    wait_seconds=app.config.get(
+                        'STATEMENTS_REFRESH_WAIT_SECONDS', 300))
                 audit.record('statements_pulled', subject_type=None,
                              after=result,
-                             notes=(f"listed {result['listed']}, stored "
-                                    f"{result['stored']}, skipped "
-                                    f"{result['skipped_existing']}"))
+                             notes=statements.pull_summary(result))
                 log.info('[scheduler] statement pull complete: %s', result)
                 # v1.0.0 — a NEWLY ARRIVED statement now gets its anchor here.
                 #

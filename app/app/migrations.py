@@ -387,6 +387,12 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # refused to cancel. NULL = nothing to review.
     ('bank_transactions', 'pending_transaction_id', 'VARCHAR(120)'),
     ('bank_transactions', 'review_reason', 'TEXT'),
+
+    # v1.0.6 — /statements/refresh bookkeeping on the Item. All NULL on
+    # upgrade = "never refreshed", which is true of every existing Item.
+    ('plaid_items', 'statements_refresh_status', 'VARCHAR(20)'),
+    ('plaid_items', 'statements_refresh_requested_at', 'TIMESTAMP'),
+    ('plaid_items', 'statements_refresh_completed_at', 'TIMESTAMP'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,

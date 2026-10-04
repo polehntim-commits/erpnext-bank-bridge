@@ -324,6 +324,24 @@ def plaid_webhook():
                                  notes=f'Plaid ITEM webhook: {code}')
         return jsonify({'ok': True})
 
+    # v1.0.6 · Plaid finished a /statements/refresh. Free to handle: it flips
+    # a row. When a scheduled pull is waiting on it (status 'pending', possibly
+    # in the other gunicorn worker) that pull proceeds; when nobody is waiting,
+    # this fetches the Item's statements itself, on a background thread so
+    # Plaid's webhook call returns at once.
+    if (webhook_type == 'STATEMENTS'
+            and webhook_code == 'STATEMENTS_REFRESH_COMPLETE' and item_id):
+        from .. import statements as stmts
+        if stmts.mark_refresh_complete(item_id, data.get('result') or ''):
+            app = current_app._get_current_object()
+            if app.config.get('TESTING'):
+                stmts.fetch_item_after_webhook(app, item_id)
+            else:
+                import threading
+                threading.Thread(target=stmts.fetch_item_after_webhook,
+                                 args=(app, item_id), daemon=True).start()
+        return jsonify({'ok': True})
+
     # v0.4.11 · the TRANSACTIONS branch kicks a full sync, which DOES cost Plaid
     # calls beyond the scheduled poll. That has been the behaviour since the
     # pilot, so it stays on by default — but an operator watching their bill can
