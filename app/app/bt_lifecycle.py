@@ -35,7 +35,9 @@ WHAT THIS MODULE OWNS.
     `payment_entries`), the way ERPNext's Bank Reconciliation Tool does, so the
     BT reads Reconciled and no other job books it again.
   * `find_duplicates` / `cleanup_duplicates` — the after-the-fact repair for
-    installs that already carry pending/posted duplicate pairs.
+    installs that already carry pending/posted duplicate pairs. Since v1.0.6 a
+    stale Bank Transaction is FLAGGED (is_duplicate / duplicate_of), prefixed,
+    cancelled and KEPT — never deleted.
 
 THE RULE THIS MODULE KEEPS. One Plaid transaction, one live Bank Transaction,
 one live Journal Entry. When keeping that rule would mean editing or deleting
@@ -616,7 +618,11 @@ def find_duplicates(client, *, bank_accounts: list | None = None,
                 'amount': _bt_amount(q), 'description': q.get('description'),
                 'reference_number': q.get('reference_number'),
                 'journal_entries': qj},
-            'keep': keep, 'remove': remove, 'notes': notes})
+            'keep': keep, 'remove': remove, 'notes': notes,
+            # v1.0.6 · what cleanup_duplicate_bank_transactions takes for this
+            # pair, once the Journal Entries on the pending side are cancelled.
+            'cleanup_entry': ({'bank_transaction': p['name'],
+                               'duplicate_of': q['name']} if same else None)})
     removable = [d for pr in out for d in pr['remove']]
     return {'since': since.isoformat(), 'until': until.isoformat(),
             'bank_accounts': targets, 'bank_transactions_scanned': scanned,
@@ -628,74 +634,277 @@ def find_duplicates(client, *, bank_accounts: list | None = None,
             'pairs': out, 'unmatched_pending': unmatched}
 
 
-def cleanup_duplicates(client, approved: list, *, dry_run: bool = True,
-                       report: dict | None = None) -> dict:
-    """Cancel an explicitly approved list of duplicate documents. CANCELS
-    ONLY — never deletes, never edits.
+# ── v1.0.6 · flag-and-keep: the duplicate marker fields ────────────────────
+#
+# A stale duplicate Bank Transaction is KEPT — it is the audit trail of what
+# Bank Bridge once booked — but flagged and cancelled so it leaves Pending and
+# never reaches bank reconciliation. Two Custom Fields carry the flag.
+#
+# WHY BANK BRIDGE PROVISIONS THEM (and not erpnext_mcp): erpnext_mcp promises
+# in its hooks.py that it adds no field to a doctype it did not create, with one
+# argued exception (compliance). Bank Bridge already provisions Custom Fields on
+# ERPNext doctypes over REST, idempotently (erpnext_statements.
+# ensure_status_custom_fields), and these two describe Bank Bridge's own
+# dedup decision. No cross-repo deploy is needed.
+#
+# allow_on_submit=1 so the flag can be written onto an already-SUBMITTED Bank
+# Transaction before it is cancelled (a cancelled doc can no longer be edited).
+DUPLICATE_FIELDS = (
+    {'fieldname': 'is_duplicate', 'fieldtype': 'Check',
+     'label': 'Is Duplicate', 'default': '0', 'read_only': 1,
+     'allow_on_submit': 1, 'in_standard_filter': 1,
+     'insert_after': 'reference_number',
+     'description': 'Set by Bank Bridge: this Bank Transaction duplicates '
+                    'another one for the same charge and was cancelled and '
+                    'kept for the audit trail.'},
+    {'fieldname': 'duplicate_of', 'fieldtype': 'Link',
+     'options': 'Bank Transaction', 'label': 'Duplicate Of', 'read_only': 1,
+     'allow_on_submit': 1, 'depends_on': 'eval:doc.is_duplicate',
+     'insert_after': 'is_duplicate',
+     'description': 'The Bank Transaction kept for this charge.'},
+)
+CUSTOM_FIELD_DT = 'Custom Field'
 
-    `approved` is [{'doctype': 'Journal Entry'|'Bank Transaction', 'name'}].
-    Every entry must appear under some pair's `remove` in `report` (a fresh
-    find_duplicates run): anything else is refused, so an approval list cannot
-    be used to cancel an arbitrary document. Journal Entries go first — ERPNext
-    will not cancel a Bank Transaction a live JE still references."""
+
+def duplicate_fields_present(client) -> bool:
+    try:
+        rows = client.list_docs(
+            CUSTOM_FIELD_DT,
+            filters=[['dt', '=', BT_DT],
+                     ['fieldname', 'in',
+                      [f['fieldname'] for f in DUPLICATE_FIELDS]]],
+            fields=['fieldname'], limit_page_length=0) or []
+    except (ERPNextAPIError, ERPNextError):
+        return False
+    return {r.get('fieldname') for r in rows} >= {
+        f['fieldname'] for f in DUPLICATE_FIELDS}
+
+
+def ensure_duplicate_fields(client) -> bool:
+    """Idempotently add is_duplicate / duplicate_of to Bank Transaction.
+    Returns True when both exist afterwards."""
+    for spec in DUPLICATE_FIELDS:
+        try:
+            have = client.list_docs(
+                CUSTOM_FIELD_DT, filters=[['dt', '=', BT_DT],
+                                          ['fieldname', '=', spec['fieldname']]],
+                fields=['name'], limit_page_length=1)
+            if not have:
+                client.create_doc(CUSTOM_FIELD_DT, {'dt': BT_DT, **spec})
+                log.info('provisioned Bank Transaction field %s',
+                         spec['fieldname'])
+        except (ERPNextAPIError, ERPNextError) as e:
+            log.warning('could not provision Bank Transaction field %s: %s',
+                        spec['fieldname'], e)
+            return False
+    return duplicate_fields_present(client)
+
+
+DUPLICATE_PREFIX = 'DUPLICATE of '
+
+
+def _live_links(client, name: str) -> list:
+    """Live (draft/submitted) Journal Entries tied to a Bank Transaction by
+    either route. Raises on an ERPNext error — this guards a cancel."""
+    out = []
+    for filters in ([['Journal Entry Account', 'reference_type', '=', BT_DT],
+                     ['Journal Entry Account', 'reference_name', '=', name],
+                     ['docstatus', 'in', [0, 1]]],
+                    [['cheque_no', '=', name], ['docstatus', 'in', [0, 1]]]):
+        for r in client.list_docs(JE_DT, filters=filters, fields=['name'],
+                                  limit_page_length=0) or []:
+            if r.get('name') and r['name'] not in out:
+                out.append(r['name'])
+    return out
+
+
+def _check_item(client, stale: str, keep: str, doc: dict, kdoc: dict) -> str:
+    """Why this (stale, keep) pair must NOT be flagged, or ''."""
+    if not stale or not keep:
+        return ('both bank_transaction and duplicate_of are required '
+                '(duplicate_of could not be resolved from the duplicate '
+                'finder — name the kept Bank Transaction explicitly)')
+    if stale == keep:
+        return 'a Bank Transaction cannot be a duplicate of itself'
+    if not doc:
+        return f'Bank Transaction {stale} not found'
+    if not kdoc:
+        return f'kept Bank Transaction {keep} not found'
+    if _docstatus(kdoc) == 2 or kdoc.get('is_duplicate'):
+        return (f'{keep} is cancelled or itself flagged as a duplicate — '
+                'choose the live Bank Transaction to keep')
+    if (doc.get('bank_account') or '') != (kdoc.get('bank_account') or ''):
+        return (f'different Bank Accounts ({doc.get("bank_account")} vs '
+                f'{kdoc.get("bank_account")})')
+    if _bt_amount(doc) != _bt_amount(kdoc):
+        return (f'amounts differ ({_bt_amount(doc):.2f} vs '
+                f'{_bt_amount(kdoc):.2f}) — not the same charge')
+    if _docstatus(doc) == 1 and doc.get('payment_entries'):
+        vouchers = ', '.join(f"{p.get('payment_document')} "
+                             f"{p.get('payment_entry')}"
+                             for p in doc['payment_entries'])
+        return f'{stale} is reconciled against {vouchers} — unreconcile first'
+    live = _live_links(client, stale)
+    if live:
+        return (f'{stale} still has live Journal Entr'
+                f'{"y" if len(live) == 1 else "ies"} {", ".join(live)} — '
+                'cancel them first (this tool flags Bank Transactions whose '
+                'Journal Entries are already cancelled)')
+    return ''
+
+
+def resolve_kept(client, items: list, report: dict | None = None) -> list:
+    """Fill in `duplicate_of` for items that name only the stale Bank
+    Transaction, from the duplicate finder's pairs (pending → its posted twin).
+    An item the finder cannot pair keeps an empty `duplicate_of` and is then
+    refused — the kept Bank Transaction is never guessed."""
+    if all((it or {}).get('duplicate_of') for it in items or []):
+        return items
     report = report if report is not None else find_duplicates(client)
-    removable = {(d['doctype'], d['name']) for pr in report['pairs']
-                 for d in pr['remove']}
-    seen, jes, bts, refused = set(), [], [], []
-    for item in approved or []:
-        dt = (item or {}).get('doctype')
-        name = ((item or {}).get('name') or '').strip()
-        key = (dt, name)
-        if key in seen:
+    twin = {pr['cleanup_entry']['bank_transaction']:
+            pr['cleanup_entry']['duplicate_of']
+            for pr in report.get('pairs', []) if pr.get('cleanup_entry')}
+    out = []
+    for it in items or []:
+        it = dict(it or {})
+        stale = (it.get('bank_transaction') or '').strip()
+        if not (it.get('duplicate_of') or '').strip() and stale in twin:
+            it['duplicate_of'] = twin[stale]
+            it['resolved_by'] = 'find_duplicates'
+        out.append(it)
+    return out
+
+
+def cleanup_duplicates(client, items: list, *, dry_run: bool = True,
+                       reason: str = '', actor: str = 'mcp',
+                       report: dict | None = None) -> dict:
+    """Flag-and-keep an explicit list of stale duplicate Bank Transactions.
+
+    `items` is [{'bank_transaction': stale, 'duplicate_of': kept,
+    'reason'?: str}] — e.g. the list an earlier cleanup already identified,
+    or the `cleanup_entry` of each find_duplicates pair. For each stale BT that
+    passes every check (_check_item), and only when `dry_run` is False:
+
+      1. is_duplicate=1, duplicate_of=<kept>; on a DRAFT also the description
+         is prefixed "DUPLICATE of <kept> — " (a submitted Bank Transaction's
+         description is locked by ERPNext, so the flag fields and the comment
+         below carry the marker there);
+      2. it is CANCELLED — a draft is submitted first, because Frappe cancels
+         only submitted documents — ending at docstatus 2, status Cancelled,
+         out of Pending and out of the Bank Reconciliation Tool for good;
+      3. a Comment on the document records who (the ERPNext API user the
+         Comment is owned by, plus `actor`), when and why — it survives on a
+         cancelled document;
+      4. any local row still pointing at the stale BT is repointed at the kept
+         one, so a later Plaid modification cannot resurrect the duplicate.
+
+    NEVER deletes anything, and never touches a Journal Entry: a stale BT with
+    a live JE is refused. Idempotent — an item already flagged and cancelled is
+    reported as `already_flagged`."""
+    items = resolve_kept(client, items, report)
+    seen, plan, refused = set(), [], []
+    stale_set = {((it or {}).get('bank_transaction') or '').strip()
+                 for it in items or []}
+    for it in items or []:
+        stale = ((it or {}).get('bank_transaction') or '').strip()
+        keep = ((it or {}).get('duplicate_of') or '').strip()
+        why_item = ((it or {}).get('reason') or reason or '').strip()
+        if stale in seen:
             continue
-        seen.add(key)
-        if key not in removable:
-            refused.append({'doctype': dt, 'name': name,
-                            'reason': 'not recommended for removal in the '
-                                      'current duplicate report'})
+        seen.add(stale)
+        doc = client.get_doc(BT_DT, stale) if stale else None
+        kdoc = client.get_doc(BT_DT, keep) if keep else None
+        if doc and _docstatus(doc) == 2:
+            if doc.get('is_duplicate') and doc.get('duplicate_of') == keep:
+                refused.append({'bank_transaction': stale,
+                                'duplicate_of': keep,
+                                'outcome': 'already_flagged'})
+            else:
+                refused.append({'bank_transaction': stale, 'duplicate_of': keep,
+                                'outcome': 'refused',
+                                'reason': 'already cancelled (not flagged) — '
+                                          'a cancelled document cannot be '
+                                          'edited'})
             continue
-        (jes if dt == JE_DT else bts).append(name)
-    result = {'dry_run': dry_run, 'refused': refused, 'cancelled': [],
-              'would_cancel': [], 'already_cancelled': [], 'failed': []}
-    for dt, names in ((JE_DT, jes), (BT_DT, bts)):
-        for name in names:
-            doc = client.get_doc(dt, name) or {}
-            if not doc or _docstatus(doc) == 2:
-                result['already_cancelled'].append({'doctype': dt,
-                                                    'name': name})
-                continue
-            if _docstatus(doc) == 0:
-                result['failed'].append({
-                    'doctype': dt, 'name': name,
-                    'reason': 'draft — cannot be cancelled, and this tool '
-                              'never deletes; delete it in ERPNext'})
-                continue
-            if dry_run:
-                result['would_cancel'].append({'doctype': dt, 'name': name})
-                continue
-            try:
-                if dt == BT_DT:
-                    if not erpnext_bank.cancel_bank_transaction(client, name):
-                        raise ERPNextError('still linked to another document')
-                else:
-                    client.call_method('frappe.client.cancel',
-                                       http_method='POST',
-                                       json_body={'doctype': dt, 'name': name})
-                    for g in GeneratedJournalEntry.query.filter_by(
-                            erpnext_journal_entry_name=name).all():
-                        g.state = 'cancelled'
-                        g.error_message = ('Cancelled as a pending/posted '
-                                           'duplicate by '
-                                           'cleanup_duplicate_bank_transactions.')
-                        g.updated_at = _now()
-                result['cancelled'].append({'doctype': dt, 'name': name})
-                audit.record('duplicate_bank_document_cancelled',
-                             subject_type=dt, subject_id=name,
-                             after={'doctype': dt, 'name': name},
-                             notes='cleanup_duplicate_bank_transactions',
-                             actor='mcp', commit=False)
-            except (ERPNextAPIError, ERPNextError) as e:
-                result['failed'].append({'doctype': dt, 'name': name,
-                                         'reason': str(e)[:500]})
-    db.session.commit()
+        why = ('kept Bank Transaction is itself in the list'
+               if keep in stale_set else '')
+        try:
+            why = why or _check_item(client, stale, keep, doc or {},
+                                     kdoc or {})
+        except (ERPNextAPIError, ERPNextError) as e:
+            why = f'could not check live Journal Entries: {e}'
+        if why:
+            refused.append({'bank_transaction': stale, 'duplicate_of': keep,
+                            'outcome': 'refused', 'reason': why})
+            continue
+        plan.append({'bank_transaction': stale, 'duplicate_of': keep,
+                     'reason': why_item,
+                     'route': ('draft → flag + prefix → submit → cancel'
+                               if _docstatus(doc) == 0
+                               else 'submitted → flag → cancel'),
+                     'amount': _bt_amount(doc), 'date': str(doc.get('date')),
+                     'description': doc.get('description') or '',
+                     'docstatus': _docstatus(doc)})
+    result = {'dry_run': dry_run,
+              'fields_present': duplicate_fields_present(client),
+              'would_flag': plan if dry_run else [],
+              'flagged': [], 'failed': [],
+              'already_flagged': [r for r in refused
+                                  if r['outcome'] == 'already_flagged'],
+              'refused': [r for r in refused if r['outcome'] == 'refused']}
+    if dry_run or not plan:
+        return result
+    if not ensure_duplicate_fields(client):
+        result['failed'] = [{**p, 'reason': 'could not provision the '
+                             'is_duplicate / duplicate_of fields'}
+                            for p in plan]
+        return result
+    result['fields_present'] = True
+    for p in plan:
+        stale, keep = p['bank_transaction'], p['duplicate_of']
+        stage = 'flag'
+        try:
+            patch = {'is_duplicate': 1, 'duplicate_of': keep}
+            prefix = f'{DUPLICATE_PREFIX}{keep} — '
+            if p['docstatus'] == 0 and not p['description'].startswith(
+                    DUPLICATE_PREFIX):
+                patch['description'] = prefix + p['description']
+            client.update_doc(BT_DT, stale, patch)
+            got = client.get_doc(BT_DT, stale) or {}
+            if not got.get('is_duplicate') or got.get('duplicate_of') != keep:
+                raise ERPNextError('ERPNext did not store the duplicate flag')
+            stage = 'cancel'
+            if not erpnext_bank.cancel_bank_transaction(client, stale):
+                raise ERPNextError('ERPNext refused to cancel it')
+            stage = 'comment'
+            when = _now().strftime('%Y-%m-%d %H:%M UTC')
+            client.create_doc('Comment', {
+                'comment_type': 'Comment', 'reference_doctype': BT_DT,
+                'reference_name': stale,
+                'content': (f'Flagged as DUPLICATE of {keep} and cancelled by '
+                            f'Bank Bridge (cleanup_duplicate_bank_transactions,'
+                            f' requested by {actor}) at {when}. Reason: '
+                            f'{p["reason"] or "pending/posted duplicate of the same charge"}. '
+                            'Kept for the audit trail; nothing was deleted.')})
+            moved = []
+            for row in BankTransaction.query.filter_by(
+                    erpnext_bank_transaction_id=stale).all():
+                if not row.removed:
+                    row.erpnext_bank_transaction_id = keep
+                    row.updated_at = _now()
+                    moved.append(row.plaid_transaction_id)
+            audit.record('bank_transaction_flagged_duplicate',
+                         subject_type=BT_DT, subject_id=stale,
+                         after={'bank_transaction': stale,
+                                'duplicate_of': keep, 'reason': p['reason'],
+                                'route': p['route'],
+                                'local_rows_repointed': moved},
+                         notes=f'{stale} → DUPLICATE of {keep}', actor=actor,
+                         commit=False)
+            db.session.commit()
+            result['flagged'].append({**p, 'local_rows_repointed': moved})
+        except (ERPNextAPIError, ERPNextError) as e:
+            db.session.rollback()
+            result['failed'].append({**p, 'stage': stage,
+                                     'reason': str(e)[:500]})
     return result

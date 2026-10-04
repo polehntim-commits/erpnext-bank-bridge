@@ -1724,33 +1724,46 @@ def _find_duplicate_bank_transactions(args: dict):
 
 def _cleanup_duplicate_bank_transactions(args: dict):
     from .. import bt_lifecycle
-    approved = args.get('approved')
-    if not isinstance(approved, list) or not approved:
-        raise ToolError('approved must be a non-empty list of '
-                        '{"doctype": "Journal Entry"|"Bank Transaction", '
-                        '"name": "..."} taken from '
+    items = args.get('items')
+    if not isinstance(items, list) or not items:
+        raise ToolError('items must be a non-empty list of {"bank_transaction":'
+                        ' "<stale ACC-BTN-…>", "duplicate_of": "<kept '
+                        'ACC-BTN-…>"} — e.g. each pair\'s cleanup_entry from '
                         'find_duplicate_bank_transactions')
-    for item in approved:
-        if not isinstance(item, dict) or item.get('doctype') not in (
-                bt_lifecycle.JE_DT, bt_lifecycle.BT_DT) \
-                or not (item.get('name') or '').strip():
-            raise ToolError(f'bad approved entry {item!r} — each needs doctype '
-                            '"Journal Entry" or "Bank Transaction" and a name')
+    if len(items) > 500:
+        raise ToolError('at most 500 items per call')
+    for item in items:
+        if isinstance(item, str):
+            continue
+        if not isinstance(item, dict) \
+                or not (item.get('bank_transaction') or '').strip():
+            raise ToolError(f'bad item {item!r} — each needs bank_transaction '
+                            '(and ideally duplicate_of)')
+    items = [{'bank_transaction': i} if isinstance(i, str) else i
+             for i in items]
     dry_run = _flag(args, 'dry_run', True)
+    reason = (args.get('reason') or '').strip()
+    if not dry_run and not reason:
+        raise ToolError('reason is required when dry_run is false — it is '
+                        'written onto every flagged Bank Transaction')
     client = _erp_client_or_error()
     try:
-        report = bt_lifecycle.find_duplicates(client, **_duplicate_scope(args))
-        result = bt_lifecycle.cleanup_duplicates(client, approved,
+        report = None
+        if any(not (i.get('duplicate_of') or '').strip() for i in items):
+            report = bt_lifecycle.find_duplicates(client,
+                                                  **_duplicate_scope(args))
+        result = bt_lifecycle.cleanup_duplicates(client, items,
                                                  dry_run=dry_run,
+                                                 reason=reason, actor='mcp',
                                                  report=report)
     except (ERPNextAPIError, ERPNextError) as e:
         raise ToolError(f'ERPNext refused: {e}')
-    done = result['would_cancel'] if dry_run else result['cancelled']
-    return result, ((f'DRY RUN: would cancel {len(done)}' if dry_run
-                     else f'cancelled {len(done)}')
-                    + f", refused {len(result['refused'])}, "
-                    f"failed {len(result['failed'])}, already cancelled "
-                    f"{len(result['already_cancelled'])}")
+    done = result['would_flag'] if dry_run else result['flagged']
+    return result, ((f'DRY RUN: would flag {len(done)}' if dry_run
+                     else f'flagged and cancelled {len(done)}')
+                    + f", refused {len(result['refused'])}, failed "
+                    f"{len(result['failed'])}, already flagged "
+                    f"{len(result['already_flagged'])}")
 
 
 def _set_je_gate(args: dict, on: bool):
@@ -2675,8 +2688,9 @@ TOOLS = {
             '"pending_link" (Plaid\'s pending_transaction_id — exact) or '
             '"amount_date" (same amount, posted within 10 days of a row Bank '
             'Bridge knows was pending — check these). Pairs whose amounts '
-            'differ are marked "review", never removal. Pass the `remove` '
-            'entries you approve to cleanup_duplicate_bank_transactions. '
+            'differ are marked "review", never removal. Each pair\'s '
+            '`cleanup_entry` is what cleanup_duplicate_bank_transactions '
+            'takes, once the pending side\'s Journal Entries are cancelled. '
             'Read-only.',
             {'account_mask': {'type': 'string',
                               'description': '4-digit mask; omit for every '
@@ -2688,34 +2702,48 @@ TOOLS = {
         'handler': _find_duplicate_bank_transactions},
     'cleanup_duplicate_bank_transactions': {
         **_tool(
-            'Cancel an explicitly approved list of duplicate documents found by '
-            'find_duplicate_bank_transactions. CANCELS ONLY — never deletes, '
-            'never edits. Every entry must appear under some pair\'s `remove` '
-            'in a fresh duplicate report for the same scope, or it is refused. '
-            'Journal Entries are cancelled before Bank Transactions (ERPNext '
-            'will not cancel a Bank Transaction a live Journal Entry still '
-            'references). dry_run defaults to TRUE: pass dry_run=false to '
-            'actually cancel. MUTATING — requires the '
+            'Flag stale duplicate ERPNext Bank Transactions and take them out '
+            'of Pending, KEEPING them for the audit trail. Takes an explicit '
+            'list of {bank_transaction (stale), duplicate_of (the one kept)} - '
+            'each pair\'s cleanup_entry from find_duplicate_bank_transactions, '
+            'or a list identified earlier. An item may be just the stale name '
+            '(a string, or no duplicate_of): the kept twin is then taken from '
+            'the duplicate finder for the same scope (account_mask / since / '
+            'until), and an item it cannot pair is refused, never guessed. '
+            'Each stale Bank Transaction is '
+            'checked first: same Bank Account and amount as the kept one, the '
+            'kept one live, no live Journal Entry on the stale one (its JEs '
+            'must already be cancelled), not reconciled. Then: is_duplicate=1 '
+            'and duplicate_of set (Custom Fields Bank Bridge provisions on '
+            'first use); a draft\'s description prefixed "DUPLICATE of '
+            'ACC-BTN-…"; cancelled (a draft is submitted first, since ERPNext '
+            'only cancels submitted documents) so it ends Cancelled; a Comment '
+            'on it records who, when and why. NEVER deletes and never touches '
+            'a Journal Entry. dry_run defaults to TRUE; reason is required '
+            'when dry_run is false. MUTATING - requires the '
             'cleanup_duplicate_bank_transactions kill switch ON (off by '
             'default).',
-            {'approved': {'type': 'array',
-                          'items': {'type': 'object',
-                                    'properties': {
-                                        'doctype': {
-                                            'type': 'string',
-                                            'enum': ['Journal Entry',
-                                                     'Bank Transaction']},
-                                        'name': {'type': 'string'}},
-                                    'required': ['doctype', 'name']},
-                          'description': 'the `remove` entries you approve'},
+            {'items': {'type': 'array',
+                       'items': {'type': ['object', 'string'],
+                                 'properties': {
+                                     'bank_transaction': {'type': 'string'},
+                                     'duplicate_of': {'type': 'string'},
+                                     'reason': {'type': 'string'}},
+                                 'required': ['bank_transaction']},
+                       'description': 'stale → kept pairs, or stale names '
+                                      '(max 500)'},
              'dry_run': {'type': 'boolean',
-                         'description': 'default TRUE — report what would be '
-                                        'cancelled, change nothing'},
+                         'description': 'default TRUE - report what would be '
+                                        'flagged, change nothing'},
+             'reason': {'type': 'string',
+                        'description': 'why — written on every flagged Bank '
+                                       'Transaction; required when dry_run '
+                                       'is false'},
              'account_mask': {'type': 'string',
-                              'description': 'same scope you passed to '
-                                             'find_duplicate_bank_transactions'},
+                              'description': 'finder scope, used only to '
+                                             'resolve a missing duplicate_of'},
              'since': _STR, 'until': _STR},
-            required=('approved',), mutating=True),
+            required=('items',), mutating=True),
         'handler': _cleanup_duplicate_bank_transactions},
 }
 

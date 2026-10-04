@@ -10,6 +10,57 @@ architecture rather than the API surface.
 
 ---
 
+## [1.0.7] — 2026-10-03
+
+**Stale duplicate Bank Transactions are flagged and kept, never deleted.**
+
+### Changed
+
+- **`cleanup_duplicate_bank_transactions` now flags and keeps.**
+  - **Input:** an explicit list of `{bank_transaction (stale), duplicate_of
+    (kept)}`. A bare stale name is also accepted; its kept twin is resolved
+    from `find_duplicate_bank_transactions` and never guessed. Each pair in
+    the finder's output now carries the `cleanup_entry` to pass.
+  - **Checks on each stale BT:** same Bank Account and amount as the kept
+    one; the kept one is live and not itself flagged; no live Journal Entry
+    on the stale one (its JEs must already be cancelled); not reconciled.
+  - **Flag:** `is_duplicate = 1` and `duplicate_of = <kept>`.
+  - **Description:** on a draft it is prefixed `DUPLICATE of ACC-BTN-… — `.
+    ERPNext locks a submitted BT's description, so there the flag fields and
+    the comment carry the marker.
+  - **Cancel:** a draft is submitted first, because Frappe cancels only
+    submitted documents. It ends at docstatus 2, status *Cancelled*, out of
+    Pending and out of the Bank Reconciliation Tool.
+  - **Audit:** a Comment on the Bank Transaction records who, when and why,
+    and an AuditEvent is written. A local row still pointing at the stale BT
+    is repointed at the kept one.
+  - **Safety:** it never deletes anything and never touches a Journal Entry.
+    `dry_run` defaults to true, `reason` is required for a real run, and the
+    kill switch is off by default.
+- **Plaid removals of draft Bank Transactions** are submitted then cancelled,
+  instead of failing to cancel and being flagged for review.
+
+### Added
+
+- **`Bank Transaction.is_duplicate` (Check) and `duplicate_of` (Link → Bank
+  Transaction).** These are Custom Fields with `allow_on_submit`, provisioned
+  by Bank Bridge over REST on first use, the same way it provisions the Bank
+  Statement status fields. They live in Bank Bridge, not erpnext_mcp, because
+  erpnext_mcp promises to add no fields to doctypes it didn't create.
+- `erpnext_bank.submit_bank_transaction` submits a draft Bank Transaction
+  with its full document.
+
+### Known, not changed
+
+- **Every Bank Transaction the sync creates stays a draft (Pending).**
+  `erpnext_bank._submit` sends a `{doctype, name}` stub, and Frappe rejects it
+  with `TimestampMismatchError`. The code logs "left as draft" and carries on.
+  This is the same bug v0.4.0.4 fixed for Journal Entries. Switching the sync
+  to `submit_bank_transaction` would move every new Bank Transaction into the
+  Bank Reconciliation Tool, so that is left for the operator to decide.
+
+---
+
 ## [1.0.6] — 2026-10-03
 
 **New bank statements arrive again.**

@@ -70,6 +70,7 @@ class StrictERP(FakeERPClient):
         super().__init__(**kw)
         self.payment_entries = {}     # bt name → [{payment_document, payment_entry}]
         self.je_meta = {}             # je name → extra header fields
+        self.comments = []            # Comment docs created
 
     # ── state helpers ────────────────────────────────────────────────────
     def _ds(self, name):
@@ -138,8 +139,11 @@ class StrictERP(FakeERPClient):
         return super().get_doc(doctype, name)
 
     def update_doc(self, doctype, name, doc):
+        if doctype == BT and self._ds(name) == 2:
+            raise _err(417, 'ValidationError', 'Cannot edit cancelled document')
         if doctype == BT and self._ds(name) == 1:
-            illegal = set(doc) - {'reference_number', 'payment_entries'}
+            illegal = set(doc) - {'reference_number', 'payment_entries',
+                                  'is_duplicate', 'duplicate_of'}
             if illegal:
                 self.calls.append(('update_doc', doctype, name, doc))
                 raise _err(417, 'UpdateAfterSubmitError',
@@ -175,9 +179,23 @@ class StrictERP(FakeERPClient):
         return super().call_method(method, params=params,
                                    http_method=http_method, json_body=json_body)
 
+    def create_doc(self, doctype, doc):
+        if doctype == 'Comment':
+            self.comments.append(dict(doc))
+            return {'name': f'CMT-{len(self.comments)}'}
+        return super().create_doc(doctype, doc)
+
     def list_docs(self, doctype, filters=None, fields=None,
                   limit_page_length=20, **kw):
         filters = filters or []
+        if doctype == 'Custom Field':
+            names = set()
+            for f in filters:
+                if f[0] == 'fieldname':
+                    names = set(f[2]) if f[1] == 'in' else {f[2]}
+            return [{'name': n, 'fieldname': d['fieldname']}
+                    for n, d in self.created['Custom Field'].items()
+                    if d.get('dt') == BT and d['fieldname'] in names]
         if doctype == JE and any(len(f) == 4 or f[0] == 'cheque_no'
                                  for f in filters):
             self.calls.append(('list_docs', doctype, filters))
@@ -195,7 +213,8 @@ class StrictERP(FakeERPClient):
                         ok &= bool(hits)
                         hit = next(iter(hits), None)
                     elif f[0] == 'cheque_no':
-                        ok &= d.get('cheque_no') in f[2]
+                        want = f[2] if f[1] == 'in' else [f[2]]
+                        ok &= d.get('cheque_no') in want
                 if ok:
                     out.append({**d, 'name': n, 'docstatus': self._ds(n),
                                 'total_debit': d['accounts'][0].get(
@@ -432,7 +451,7 @@ class RemovedTests(Base):
         self.assertNotIn(bt, self.erp.cancelled)
 
 
-class DuplicateToolTests(Base):
+class DuplicateBase(Base):
     """OML's shape: a pending BT + rule JE, the posted BT + its own rule JE,
     and a 9/24-style 'Bank Entry' (cheque_no = BT name) on the posted BT."""
 
@@ -470,6 +489,9 @@ class DuplicateToolTests(Base):
         return res, json.loads(res['content'][0]['text']) \
             if not res.get('isError') else res['content'][0]['text']
 
+
+
+class DuplicateToolTests(DuplicateBase):
     def test_finder_reports_the_pair_and_recommends(self):
         res, rep = self.tool('find_duplicate_bank_transactions', {})
         self.assertFalse(res.get('isError'))
@@ -506,47 +528,164 @@ class DuplicateToolTests(Base):
         self.assertEqual('review', rep['pairs'][0]['recommendation'])
         self.assertEqual([], rep['pairs'][0]['remove'])
 
-    def test_cleanup_is_gated_off_by_default(self):
+    def test_finder_hands_over_a_cleanup_entry(self):
+        _, rep = self.tool('find_duplicate_bank_transactions', {})
+        self.assertEqual({'bank_transaction': self.p_bt,
+                          'duplicate_of': self.q_bt},
+                         rep['pairs'][0]['cleanup_entry'])
+
+
+class FlagAndKeepTests(DuplicateBase):
+    """v1.0.6 · a stale duplicate is FLAGGED, cancelled and KEPT — never
+    deleted. OML's 50 are the shape staged here: the pending Bank Transaction's
+    Journal Entry is already cancelled."""
+
+    def setUp(self):
+        super().setUp()
+        self.erp.cancelled.add('ACC-JV-0001')     # Tim's earlier cleanup
+        mcp_settings.save({'cleanup_duplicate_bank_transactions': True})
+        self.items = [{'bank_transaction': self.p_bt,
+                       'duplicate_of': self.q_bt}]
+
+    def run_tool(self, **kw):
+        return self.tool('cleanup_duplicate_bank_transactions',
+                         {'items': self.items, **kw})
+
+    def test_gated_off_by_default(self):
+        mcp_settings.save({'cleanup_duplicate_bank_transactions': False})
         self.assertFalse(mcp_settings._DEFAULTS[
             'cleanup_duplicate_bank_transactions'])
-        res, text = self.tool('cleanup_duplicate_bank_transactions',
-                              {'approved': [{'doctype': JE,
-                                             'name': 'ACC-JV-0001'}]})
+        res, text = self.run_tool()
         self.assertTrue(res['isError'])
         self.assertIn('kill switch', text)
 
-    def test_cleanup_dry_runs_by_default_and_refuses_unrecommended(self):
-        mcp_settings.save({'cleanup_duplicate_bank_transactions': True})
-        approved = [{'doctype': JE, 'name': 'ACC-JV-0001'},
-                    {'doctype': BT, 'name': self.p_bt},
-                    {'doctype': JE, 'name': 'ACC-JV-0002'}]   # the keeper
-        res, out = self.tool('cleanup_duplicate_bank_transactions',
-                             {'approved': approved})
-        self.assertFalse(res.get('isError'))
-        self.assertTrue(out['dry_run'])
-        self.assertEqual([(JE, 'ACC-JV-0001'), (BT, self.p_bt)],
-                         [(d['doctype'], d['name'])
-                          for d in out['would_cancel']])
-        self.assertEqual(['ACC-JV-0002'], [d['name'] for d in out['refused']])
-        self.assertEqual(set(), self.erp.cancelled)
-
-    def test_cleanup_cancels_jes_before_the_bt_and_never_deletes(self):
-        mcp_settings.save({'cleanup_duplicate_bank_transactions': True})
-        approved = [{'doctype': BT, 'name': self.p_bt},
-                    {'doctype': JE, 'name': 'ACC-JV-0001'},
-                    {'doctype': JE, 'name': 'ACC-JV-0003'}]
-        res, out = self.tool('cleanup_duplicate_bank_transactions',
-                             {'approved': approved, 'dry_run': False})
+    def test_dry_run_is_the_default_and_changes_nothing(self):
+        res, out = self.run_tool()
         self.assertFalse(res.get('isError'), out)
-        self.assertEqual([], out['failed'])
-        self.assertEqual({self.p_bt, 'ACC-JV-0001', 'ACC-JV-0003'},
-                         self.erp.cancelled)
-        self.assertEqual(set(), self.erp.deleted)
-        self.assertEqual([self.q_bt], self.erp.live_bts())
-        self.assertEqual(['ACC-JV-0002'], self.erp.live_jes())
-        self.assertEqual('cancelled', GeneratedJournalEntry.query.filter_by(
-            plaid_transaction_id='p1').one().state)
+        self.assertTrue(out['dry_run'])
+        self.assertEqual([self.p_bt],
+                         [p['bank_transaction'] for p in out['would_flag']])
+        self.assertEqual('submitted → flag → cancel',
+                         out['would_flag'][0]['route'])
+        self.assertFalse(out['fields_present'])
+        self.assertEqual({'ACC-JV-0001'}, self.erp.cancelled)
+        self.assertEqual({}, self.erp.created['Custom Field'])
+        self.assertEqual([], self.erp.comments)
 
+    def test_flags_cancels_comments_and_never_deletes(self):
+        res, out = self.run_tool(dry_run=False, reason='OML Aug–Sep dedupe')
+        self.assertFalse(res.get('isError'), out)
+        self.assertEqual([], out['failed'], out)
+        self.assertEqual([self.p_bt],
+                         [p['bank_transaction'] for p in out['flagged']])
+        self.assertEqual({'Bank Transaction-is_duplicate',
+                          'Bank Transaction-duplicate_of'},
+                         set(self.erp.created['Custom Field']))
+        doc = self.erp.docs[self.p_bt]
+        self.assertEqual(1, doc['is_duplicate'])
+        self.assertEqual(self.q_bt, doc['duplicate_of'])
+        self.assertIn(self.p_bt, self.erp.cancelled)
+        self.assertNotIn(self.q_bt, self.erp.cancelled)
+        self.assertEqual(set(), self.erp.deleted)
+        self.assertEqual({'ACC-JV-0001'}, self.erp.cancelled - {self.p_bt},
+                         'a Journal Entry was touched')
+        [c] = self.erp.comments
+        self.assertEqual(self.p_bt, c['reference_name'])
+        self.assertIn(f'DUPLICATE of {self.q_bt}', c['content'])
+        self.assertIn('OML Aug–Sep dedupe', c['content'])
+        self.assertIn('UTC', c['content'])
+        from app.models import AuditEvent
+        self.assertEqual(1, AuditEvent.query.filter_by(
+            event_type='bank_transaction_flagged_duplicate').count())
+
+    def test_a_draft_is_prefixed_submitted_then_cancelled(self):
+        self.erp.submitted.discard(self.p_bt)          # OML's are Pending
+        self.erp.docs[self.p_bt]['description'] = 'TRANSFER APPLE CASH'
+        _, out = self.run_tool(dry_run=False, reason='dedupe')
+        self.assertEqual([], out['failed'], out)
+        doc = self.erp.docs[self.p_bt]
+        self.assertEqual(f'DUPLICATE of {self.q_bt} — TRANSFER APPLE CASH',
+                         doc['description'])
+        self.assertIn(self.p_bt, self.erp.submitted)
+        self.assertIn(self.p_bt, self.erp.cancelled)
+        self.assertEqual(set(), self.erp.deleted)
+
+    def test_rerun_is_idempotent(self):
+        self.run_tool(dry_run=False, reason='dedupe')
+        _, out = self.run_tool(dry_run=False, reason='dedupe')
+        self.assertEqual([], out['flagged'])
+        self.assertEqual([self.p_bt], [r['bank_transaction']
+                                       for r in out['already_flagged']])
+        self.assertEqual(1, len(self.erp.comments))
+
+    def test_refuses_a_stale_bt_whose_je_is_still_live(self):
+        self.erp.cancelled.discard('ACC-JV-0001')
+        _, out = self.run_tool(dry_run=False, reason='dedupe')
+        self.assertEqual([], out['flagged'])
+        self.assertIn('ACC-JV-0001', out['refused'][0]['reason'])
+        self.assertNotIn(self.p_bt, self.erp.cancelled)
+
+    def test_refuses_mismatches(self):
+        cases = {
+            'amounts differ': lambda: self.erp.docs[self.q_bt].update(
+                withdrawal=51.0),
+            'different Bank Accounts': lambda: self.erp.docs[self.q_bt].update(
+                bank_account='Other - Ops'),
+            'is cancelled': lambda: self.erp.cancelled.add(self.q_bt),
+        }
+        for needle, mutate in cases.items():
+            with self.subTest(needle=needle):
+                saved = (dict(self.erp.docs[self.q_bt]),
+                         set(self.erp.cancelled))
+                mutate()
+                _, out = self.run_tool()
+                self.assertIn(needle, out['refused'][0]['reason'])
+                self.erp.docs[self.q_bt], self.erp.cancelled = saved
+        self.items = [{'bank_transaction': self.p_bt,
+                       'duplicate_of': self.p_bt}]
+        _, out = self.run_tool()
+        self.assertIn('itself', out['refused'][0]['reason'])
+
+    def test_a_bare_stale_name_resolves_its_kept_twin(self):
+        self.items = [self.p_bt]
+        _, out = self.run_tool()
+        self.assertEqual([(self.p_bt, self.q_bt)],
+                         [(p['bank_transaction'], p['duplicate_of'])
+                          for p in out['would_flag']])
+
+    def test_an_unpairable_bare_name_is_refused_not_guessed(self):
+        self.items = ['ACC-BTN-9999']
+        _, out = self.run_tool()
+        self.assertEqual([], out['would_flag'])
+        self.assertIn('duplicate_of', out['refused'][0]['reason'])
+
+    def test_reason_is_required_for_a_real_run(self):
+        res, text = self.run_tool(dry_run=False)
+        self.assertTrue(res['isError'])
+        self.assertIn('reason', text)
+
+    def test_a_live_local_row_on_the_stale_bt_is_repointed(self):
+        self.row('p1').removed = False
+        db.session.commit()
+        _, out = self.run_tool(dry_run=False, reason='dedupe')
+        self.assertEqual(['p1'], out['flagged'][0]['local_rows_repointed'])
+        self.assertEqual(self.q_bt, self.row('p1').erpnext_bank_transaction_id)
+
+
+class DraftRemovalTests(Base):
+    def test_a_removed_draft_bt_is_submitted_then_cancelled_not_deleted(self):
+        """OML's Bank Transactions are drafts (Pending). Frappe cancels only
+        submitted documents, and deleting would lose the audit trail."""
+        bt = self.erp.stage_bt('d1', 20.0, '2026-09-20', submitted=False)
+        db.session.add(BankTransaction(
+            plaid_transaction_id='d1', account_id=ACC, amount=20.0,
+            date=date(2026, 9, 20), erpnext_bank_transaction_id=bt,
+            posted_at=sync_engine._now()))
+        db.session.commit()
+        self.sync(page(removed=['d1']))
+        self.assertIn(bt, self.erp.submitted)
+        self.assertIn(bt, self.erp.cancelled)
+        self.assertEqual(set(), self.erp.deleted)
 
 
 class SettingsPageTests(Base):

@@ -9307,9 +9307,9 @@ _MCP_SWITCH_DESC = {
                            'Bank Account — only ones not already attached; '
                            'never replaces or deletes a file',
     'cleanup_duplicate_bank_transactions':
-        'Cancel pending/posted duplicate Bank Transactions and Journal Entries '
-        'you approved from find_duplicate_bank_transactions — cancels only, '
-        'never deletes; dry-run by default',
+        'Flag stale duplicate Bank Transactions (is_duplicate / duplicate_of), '
+        'cancel and KEEP them — never deletes, never touches a Journal Entry; '
+        'dry-run by default',
 }
 
 

@@ -1221,18 +1221,61 @@ def cost_center_exists(client: ERPNextClient | None, cost_center: str,
     return bool(rows)
 
 
+def submit_bank_transaction(client: ERPNextClient, name: str) -> None:
+    """Submit a DRAFT Bank Transaction, by name — the working form (v1.0.6).
+
+    `frappe.client.submit` submits the document object it is HANDED and checks
+    its `modified` timestamp; the bare {doctype, name} stub `_submit` sends
+    fails with TimestampMismatchError, which is why every Bank Bridge Bank
+    Transaction has sat in Pending (draft). Same bug, same fix, as
+    categorization._submit_je (v0.4.0.4). Raises on refusal.
+
+    `_submit` is deliberately NOT switched over here: making the sync submit
+    for real would move every new Bank Transaction from Pending into the Bank
+    Reconciliation Tool, which is an operator decision, not a side effect."""
+    import json
+    doc = client.get_doc(DOCTYPE, name)
+    if not doc:
+        raise ERPNextAPIError(f'Bank Transaction {name} not found',
+                              status_code=404)
+    doc = {**doc, 'doctype': DOCTYPE, 'name': name}
+    client.call_method('frappe.client.submit', http_method='POST',
+                       json_body={'doc': json.dumps(doc, default=str)})
+
+
 def cancel_bank_transaction(client: ERPNextClient, name: str) -> bool:
-    """Cancel a posted Bank Transaction (Plaid removed / superseded). Returns
-    True when the doc ends up cancelled (or never existed), False when ERPNext
-    refused — the caller decides what a refusal means.
+    """Take a Bank Transaction off the books by CANCELLING it — never deleting.
+    Returns True when the doc ends up cancelled (or never existed), False when
+    ERPNext refused — the caller decides what a refusal means.
 
     v1.0.4 · a 417 is NOT "already cancelled". It is also what Frappe answers
     with LinkExistsError, when a submitted Journal Entry still references the
     Bank Transaction — and reading that as success is exactly how every
     pending card charge stayed on the books beside its posted twin. On a
-    409/417 the doc is re-read and only a real docstatus 2 counts."""
+    409/417 the doc is re-read and only a real docstatus 2 counts.
+
+    v1.0.6 · a DRAFT cannot be cancelled in Frappe (only submitted docs can),
+    and it must not be deleted — the record is the audit trail. So a draft is
+    submitted first, then cancelled: it ends at docstatus 2, status Cancelled."""
     if not name:
         return True
+    try:
+        doc = client.get_doc(DOCTYPE, name)
+    except (ERPNextAPIError, ERPNextError):
+        doc = {}
+    if doc is None:
+        log.info('cancel of %s no-op (gone)', name)
+        return True
+    status = int((doc or {}).get('docstatus') or 0)
+    if doc and status == 2:
+        return True
+    if doc and status == 0:
+        try:
+            submit_bank_transaction(client, name)
+        except (ERPNextAPIError, ERPNextError) as e:
+            log.warning('could not submit draft %s before cancelling: %s',
+                        name, e)
+            return False
     try:
         _cancel(client, name)
         return True
@@ -1242,10 +1285,10 @@ def cancel_bank_transaction(client: ERPNextClient, name: str) -> bool:
             return True
         if e.status_code in (409, 417):
             try:
-                doc = client.get_doc(DOCTYPE, name)
+                after = client.get_doc(DOCTYPE, name)
             except (ERPNextAPIError, ERPNextError):
-                doc = {}
-            if doc is None or int((doc or {}).get('docstatus') or 0) == 2:
+                after = {}
+            if after is None or int((after or {}).get('docstatus') or 0) == 2:
                 log.info('cancel of %s no-op (%s, already cancelled)', name,
                          e.status_code)
                 return True
