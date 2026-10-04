@@ -38,6 +38,7 @@ from .. import account_cleanup
 from .. import account_visibility as av
 from .. import statements as stmts_mod
 from .. import audit
+from .. import bt_lifecycle
 from .. import categorization
 from .. import claude_desktop
 from .. import counterparty
@@ -4561,6 +4562,13 @@ def _approve_entry(g) -> _ActionResult:
     g.state = 'approved'
     g.error_message = None
     g.updated_at = categorization._now()
+    # v1.0.4 · now that it is on the ledger, record it against its Bank
+    # Transaction (fail-soft) so nothing else books that BT again.
+    row = BankTransaction.query.filter_by(
+        plaid_transaction_id=g.plaid_transaction_id).first()
+    if row is not None and g.intercompany_pair_id is None:
+        bt_lifecycle.allocate_je(erp, row.erpnext_bank_transaction_id,
+                                 g.erpnext_journal_entry_name, row.amount)
     audit.record('journal_entry_approved', subject_type='GeneratedJournalEntry',
                  subject_id=g.id, before=before, after=g.to_dict(),
                  notes=f'submitted {g.erpnext_journal_entry_name} in ERPNext',
@@ -5892,6 +5900,29 @@ ERPNEXT_SETTINGS_BODY = """
     </button>
   </form>
 </div>
+
+<h2>Pending transactions</h2>
+<div class="card">
+  <p>
+    A <b>pending</b> transaction is a charge the bank has authorized but not
+    posted yet. It can still change amount, post under a new id, or be
+    dropped. By default Bank Bridge waits until it posts and books it once.
+  </p>
+  <p style="color:#666">
+    Currently <b>{{ 'pushing pending transactions' if pending_on
+    else 'waiting for transactions to post' }}</b>. When pushing is on, a
+    pending charge appears in ERPNext as an unmatched Bank Transaction with
+    <b>no</b> Journal Entry; when it posts, that same Bank Transaction is
+    updated instead of a second one being added.
+  </p>
+  <form method="post" action="/admin/erpnext_settings/push_pending" style="margin:0">
+    <input type="hidden" name="enabled" value="{{ '0' if pending_on else '1' }}">
+    <button type="submit" class="secondary">
+      {{ 'Stop pushing pending transactions' if pending_on
+         else 'Push pending transactions as unmatched' }}
+    </button>
+  </form>
+</div>
 """
 
 
@@ -5899,6 +5930,7 @@ def _erpnext_settings_page(flash_msg='', probe=None):
     return _page(ERPNEXT_SETTINGS_BODY, page='erpnext_settings',
                  s=erps.load(), masked=erps.masked_secret(),
                  je_on=erps.je_generation_enabled(),
+                 pending_on=erps.push_pending_enabled(),
                  env_default=bool(current_app.config.get(
                      'ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES', False)),
                  flash_msg=flash_msg, probe=probe)
@@ -5939,6 +5971,23 @@ def set_je_gate():
         'Journal Entry generation is now '
         + ('ON — matching transactions will post to ERPNext.' if enabled
            else 'OFF — nothing will post to your general ledger.')))
+
+
+@bp.post('/admin/erpnext_settings/push_pending')
+def set_push_pending():
+    """Choose whether Plaid PENDING transactions reach ERPNext (v1.0.4)."""
+    enabled = (request.form.get('enabled') or '').strip() in ('1', 'true', 'on')
+    before = erps.push_pending_enabled()
+    erps.set_push_pending(enabled)
+    audit.record('push_pending_changed', subject_type=None,
+                 before={'push_pending_transactions': before},
+                 after={'push_pending_transactions': enabled},
+                 notes='pending transactions '
+                       + ('pushed as unmatched' if enabled else 'held'))
+    return redirect('/admin/erpnext_settings?flash=' + quote_plus(
+        'Pending transactions are now '
+        + ('pushed as unmatched Bank Transactions (no Journal Entry).'
+           if enabled else 'held until they post.')))
 
 
 def _doctype_status_line(status: dict) -> str:
@@ -9232,6 +9281,10 @@ _MCP_SWITCH_DESC = {
     'push_statement_pdfs': 'Attach brokerage statement PDFs to their ERPNext '
                            'Bank Account — only ones not already attached; '
                            'never replaces or deletes a file',
+    'cleanup_duplicate_bank_transactions':
+        'Cancel pending/posted duplicate Bank Transactions and Journal Entries '
+        'you approved from find_duplicate_bank_transactions — cancels only, '
+        'never deletes; dry-run by default',
 }
 
 

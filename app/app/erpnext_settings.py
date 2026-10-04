@@ -34,12 +34,17 @@ _FIELDS = ('url', 'api_key', 'api_secret', 'default_company',
            # anchors and pairings are pushed to ERPNext either way, because a
            # rollback that also stopped the outward flow would leave ERPNext
            # silently stale rather than merely unused.
-           'anchor_source', 'rules_source', 'advisory_source')
+           'anchor_source', 'rules_source', 'advisory_source',
+           # v1.0.4 — push Plaid PENDING transactions (as unmatched Bank
+           # Transactions, never with a Journal Entry). Default off; a file
+           # written before v1.0.4 lacks the key and falls through to the env
+           # default, which is the migrate-on-read the DATA_DIR rule asks for.
+           'push_pending_transactions')
 
 # Fields whose persisted value is a bool rather than a string. Kept explicit so
 # `load` coerces them through `_as_bool` rather than `bool()` — this file is
 # operator-editable, and `bool("false")` is True.
-_BOOL_FIELDS = ('auto_generate_journal_entries',)
+_BOOL_FIELDS = ('auto_generate_journal_entries', 'push_pending_transactions')
 
 # The three consolidation flags, and the only two values each may take. A
 # hand-edited file holding anything else falls back to ERPNEXT rather than to
@@ -80,6 +85,8 @@ def _defaults() -> dict:
         'anchor_source': _as_source(c.get('ANCHOR_SOURCE')),
         'rules_source': _as_source(c.get('RULES_SOURCE')),
         'advisory_source': _as_source(c.get('ADVISORY_SOURCE')),
+        'push_pending_transactions': bool(
+            c.get('ERPNEXT_PUSH_PENDING_TRANSACTIONS', False)),
     }
 
 
@@ -132,6 +139,23 @@ def set_je_generation(enabled: bool) -> bool:
     d['auto_generate_journal_entries'] = bool(enabled)
     _write(d)
     return d['auto_generate_journal_entries']
+
+
+def push_pending_enabled() -> bool:
+    """Whether Plaid PENDING transactions are pushed to ERPNext (v1.0.4).
+
+    Off by default: a pending row is held locally until Plaid posts it. On, it
+    is pushed as an unmatched Bank Transaction and never categorized — the
+    Journal Entry waits for the posted version. The one place that decides."""
+    return bool(load().get('push_pending_transactions', False))
+
+
+def set_push_pending(enabled: bool) -> bool:
+    """Persist the pending-push toggle and return the value now in force."""
+    d = load()
+    d['push_pending_transactions'] = bool(enabled)
+    _write(d)
+    return d['push_pending_transactions']
 
 
 # ── v1.0.0 · the consolidation source flags ─────────────────────────────────

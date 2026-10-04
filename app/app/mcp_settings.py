@@ -109,6 +109,11 @@ _DEFAULTS = {
     # the line with the rest. Every sync does the same work ungated; this
     # switch only decides whether an AI may trigger it.
     'push_statement_pdfs': False,
+    # v1.0.4 — cancels Journal Entries and Bank Transactions on the books. It
+    # only ever cancels what a fresh duplicate report recommends removing, it
+    # dry-runs by default and it never deletes — and it is still a ledger
+    # write, so it sits behind its own switch like the rest.
+    'cleanup_duplicate_bank_transactions': False,
 }
 
 _FIELDS = tuple(_DEFAULTS.keys())

@@ -1858,6 +1858,12 @@ def generate_journal_entry(client, row, *, supplier_name=None,
         if submitted:
             _submit_je(client, name)
             gje.state = 'approved'
+            # v1.0.4 · record the JE against its Bank Transaction, so the BT
+            # reads Reconciled and no other job books it a second time.
+            # Fail-soft: an unallocated JE is still a correct JE.
+            from . import bt_lifecycle
+            bt_lifecycle.allocate_je(client, row.erpnext_bank_transaction_id,
+                                     name, row.amount)
         else:
             gje.state = cfg.get('ERPNEXT_JOURNAL_ENTRY_REVIEW_STATE',
                                 'pending_review') or 'pending_review'
@@ -1944,9 +1950,13 @@ def rerun_rules(erp_client) -> dict:
             .filter(db.or_(
                 GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None),
                 GeneratedJournalEntry.state == 'dedup_skipped'))}
+    # v1.0.4 · a PENDING row (pushed only when the push-pending toggle is on)
+    # never gets a Journal Entry: the posted version does.
     eligible = (BankTransaction.query
                 .filter(BankTransaction.posted_at.isnot(None),
-                        BankTransaction.removed.is_(False)).all())
+                        BankTransaction.removed.is_(False),
+                        db.or_(BankTransaction.pending.is_(False),
+                               BankTransaction.pending.is_(None))).all())
     stats = {'considered': 0, 'matched': 0, 'generated': 0, 'dedup_skipped': 0,
              # v1.0.0 · which rule set actually fired, and what the refresh did.
              # A rerun that generated nothing has two very different causes —
@@ -1987,6 +1997,11 @@ def categorize_after_push(erp_client, row):
     count a `dedup_skipped` outcome in its summary. Every pre-v0.8.5 caller
     ignored the return, so handing one back changes nothing for them."""
     if erp_client is None or row is None or row.removed:
+        return None
+    # v1.0.4 · a PENDING authorization gets no Supplier and no Journal Entry.
+    # It may post at a different amount, under a new Plaid id, or never; the
+    # posted version inherits this Bank Transaction and is categorized then.
+    if row.pending:
         return None
     cfg = current_app.config
     supplier_name = None

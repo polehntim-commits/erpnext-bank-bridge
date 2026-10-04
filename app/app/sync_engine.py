@@ -14,11 +14,16 @@ Two phases per Item, each independently logged to PlaidSyncLog:
   2. PUSH  (direction='erpnext_push')
      Post every settled local row to ERPNext (see app/erpnext_bank.py).
 
-Row state machine (uses existing columns, no extra flags):
+Row state machine:
   * posted_at IS NULL                       → pending ERPNext work (the queue)
+  * pending=True (Plaid PENDING)            → HELD: not pushed unless the
+                                              push-pending toggle is on, and
+                                              never categorized (v1.0.4)
   * removed=True                            → Plaid removed it → cancel the doc
-  * erpnext_bank_transaction_id set + NULL  → a MODIFIED repost: cancel old,
-    posted_at + not removed                   create+submit a replacement
+                                              (and Bank Bridge's own JE first)
+  * erpnext_bank_transaction_id set + NULL  → MODIFIED, or a posted row that
+    posted_at + not removed                   took over its pending twin's BT:
+                                              update that BT (bt_lifecycle)
   * no erpnext id + NULL posted_at          → a fresh create+submit
 Once the ERPNext state is settled, posted_at is stamped so the row leaves the
 queue. A row whose account isn't mapped/enabled stays pending (posted_at NULL)
@@ -37,6 +42,7 @@ from datetime import date, datetime, timezone
 from flask import current_app
 
 from . import audit
+from . import bt_lifecycle
 from . import db
 from . import categorization
 from . import erpnext_accounts
@@ -344,13 +350,22 @@ def _upsert_txn(t: dict, is_modification: bool) -> BankTransaction:
     row.merchant_name = (t.get('merchant_name', '') or '')[:255]
     row.category = (t.get('category', '') or '')[:255]
     row.pending = bool(t.get('pending', False))
+    row.pending_transaction_id = (t.get('pending_transaction_id')
+                                  or row.pending_transaction_id or None)
     row.removed = False
     if is_new or is_modification:
         # Re-queue for the ERPNext push phase. Keep any existing
-        # erpnext_bank_transaction_id so push knows to cancel+replace.
+        # erpnext_bank_transaction_id so push knows to update it in place.
         row.posted_at = None
         row.sync_error = None
     row.updated_at = _now()
+    # v1.0.4 · a posted transaction that replaces a pending one Bank Bridge
+    # already booked takes over that Bank Transaction (and its JE record)
+    # rather than booking the same money twice. See app/bt_lifecycle.py.
+    if not row.pending and row.pending_transaction_id:
+        if is_new:
+            db.session.flush()
+        bt_lifecycle.link_posted_to_pending(row)
     return row
 
 
@@ -581,27 +596,53 @@ def unpostable_by_account() -> dict:
             for account_id, count in q.group_by(BankTransaction.account_id).all()}
 
 
-def _push_row(erp_client, row: BankTransaction, account: PlaidAccount) -> bool:
-    """Bring one local row's ERPNext doc to its intended state. Returns True if
-    an ERPNext operation was performed (and posted_at stamped)."""
+def _push_row(erp_client, row: BankTransaction, account: PlaidAccount) -> str:
+    """Bring one local row's ERPNext doc to its intended state and stamp
+    posted_at. Returns what happened:
+
+      * removed rows — 'noop' | 'cancelled' | 'review' (bt_lifecycle.
+        cancel_removed; a refusal is flagged on review_reason, not retried)
+      * others — 'created' (fresh BT) or 'refreshed' (an existing BT, from a
+        Plaid modification or a pending twin, brought up to date)"""
     bank_account = account.erpnext_bank_account_name
     if row.removed:
-        if row.erpnext_bank_transaction_id:
-            erpnext_bank.cancel_bank_transaction(
-                erp_client, row.erpnext_bank_transaction_id)
+        outcome = bt_lifecycle.cancel_removed(erp_client, row)
         row.posted_at = _now()
         row.sync_error = None
-        return True
+        return outcome
 
     if row.erpnext_bank_transaction_id:
-        # Modified repost: cancel the stale doc, create a fresh submitted one.
-        erpnext_bank.cancel_bank_transaction(
-            erp_client, row.erpnext_bank_transaction_id)
-    name = erpnext_bank.create_bank_transaction(erp_client, row, bank_account)
-    row.erpnext_bank_transaction_id = name
+        bt_lifecycle.refresh_bank_transaction(erp_client, row, bank_account)
+        outcome = 'refreshed'
+    else:
+        row.erpnext_bank_transaction_id = erpnext_bank.create_bank_transaction(
+            erp_client, row, bank_account)
+        outcome = 'created'
     row.posted_at = _now()
     row.sync_error = None
-    return True
+    return outcome
+
+
+def _has_generated_je(tid: str) -> bool:
+    from .models import GeneratedJournalEntry
+    return db.session.query(GeneratedJournalEntry.id).filter(
+        GeneratedJournalEntry.plaid_transaction_id == tid,
+        GeneratedJournalEntry.erpnext_journal_entry_name.isnot(None)).first() \
+        is not None
+
+
+def _held_pending(q):
+    """Narrow a push-queue query to what may actually be pushed (v1.0.4).
+
+    A Plaid PENDING row is held back unless the push-pending toggle is on — it
+    is an authorization, not yet money that moved. A pending row Plaid REMOVED
+    still goes through, so anything an older version already booked for it is
+    cancelled."""
+    if erpnext_settings.push_pending_enabled():
+        return q
+    return q.filter(db.or_(BankTransaction.pending.is_(False),
+                           BankTransaction.pending.is_(None),
+                           BankTransaction.removed.is_(True)))
 
 
 def _push_bucket(by_account: dict, account_id: str) -> dict:
@@ -624,6 +665,10 @@ def push_pending(erp_client, item_id: str = '',
     eligible account", the pre-v0.8.5 behaviour and what the sweep uses."""
     stats = {'posted': 0, 'cancelled': 0, 'failed': 0, 'skipped': 0, 'drift': 0,
              'paired': 0, 'pairs_booked': 0, 'unpostable': 0,
+             # v1.0.4 · rows a human must look at (bt_lifecycle review flags):
+             # a removal Bank Bridge would not cancel, or a posted amount that
+             # disagrees with the pending one already booked.
+             'review': 0,
              # v0.8.5 · bank-side JEs the categorization pipeline declined to
              # write because ERPNext already carried one for the same Bank
              # Transaction (app/je_dedup.py). Reported rather than swallowed:
@@ -657,6 +702,7 @@ def push_pending(erp_client, item_id: str = '',
         # Nothing is mapped yet: there is provably nothing to post, and an
         # unbounded `IN ()` is not worth constructing.
         q = q.filter(db.false())
+    q = _held_pending(q)
     pending = q.order_by(BankTransaction.date.asc()).all()
     # v0.4.1 · pair BEFORE categorizing. A transfer between two Companies the
     # operator owns must not be seen by the ordinary rules engine at all — so the
@@ -692,12 +738,15 @@ def push_pending(erp_client, item_id: str = '',
             continue
         try:
             was_removed = row.removed
-            _push_row(erp_client, row, account)
+            outcome = _push_row(erp_client, row, account)
             db.session.commit()
+            if row.review_reason and outcome in ('review', 'refreshed'):
+                stats['review'] += 1
             if was_removed:
-                stats['cancelled'] += 1
-                _push_bucket(stats['by_account'],
-                             row.account_id)['cancelled'] += 1
+                if outcome == 'cancelled':
+                    stats['cancelled'] += 1
+                    _push_bucket(stats['by_account'],
+                                 row.account_id)['cancelled'] += 1
             else:
                 stats['posted'] += 1
                 _push_bucket(stats['by_account'], row.account_id)['posted'] += 1
@@ -711,7 +760,15 @@ def push_pending(erp_client, item_id: str = '',
                                     'account_id': row.account_id})
                 # v0.3.0: auto-Supplier + rules-based JE. Best-effort and
                 # self-guarding — a failure here never unwinds the posted row.
+                # v1.0.4 · a BT this row inherited (pending twin) or refreshed
+                # (Plaid modification) may carry a JE generated earlier and
+                # never allocated — record it against the BT now. A JE the
+                # rules engine writes below allocates itself.
+                inherited_je = outcome == 'refreshed' and \
+                    _has_generated_je(row.plaid_transaction_id)
                 gje = categorization.categorize_after_push(erp_client, row)
+                if inherited_je:
+                    bt_lifecycle.allocate_for_row(erp_client, row)
                 if gje is not None and (gje.state or '') == 'dedup_skipped':
                     stats['dedup_skipped'] += 1
                     _push_bucket(stats['by_account'],
@@ -740,7 +797,7 @@ def push_pending(erp_client, item_id: str = '',
     except Exception:  # noqa: BLE001 — never fail a push on pair booking
         db.session.rollback()
         log.warning('intercompany JE generation failed after push', exc_info=True)
-    handled = stats['posted'] + stats['cancelled']
+    handled = stats['posted'] + stats['cancelled'] + stats['review']
     status = 'failed' if stats['failed'] and not handled else 'success'
     # v0.4.13 · say how much is mirrored-but-unpostable. The rows are no longer
     # scanned (see the query above), so without this the situation would be
@@ -757,7 +814,7 @@ def push_pending(erp_client, item_id: str = '',
          f"failed={stats['failed']} skipped={stats['skipped']} "
          f"unpostable={stats['unpostable']} "
          f"drift={stats['drift']} paired={stats['paired']} "
-         f"pairs_booked={stats['pairs_booked']}")
+         f"pairs_booked={stats['pairs_booked']} review={stats['review']}")
     return stats
 
 
@@ -811,6 +868,10 @@ def retry_row(row_id: int) -> tuple[bool, str]:
         return False, 'account not mapped to an ERPNext Bank Account'
     if not account.sync_enabled:
         return False, 'sync is disabled for this account'
+    if row.pending and not row.removed \
+            and not erpnext_settings.push_pending_enabled():
+        return False, ('pending at the bank — Bank Bridge books it once Plaid '
+                       'posts it (or turn on pushing pending transactions)')
     erp_client = get_erp_client_or_none()
     if erp_client is None:
         return False, 'ERPNext not configured'
@@ -1108,7 +1169,7 @@ def _dry_run(accounts_by_id: dict, items: list, parked: list,
         base = BankTransaction.query.filter(
             BankTransaction.account_id == account.account_id,
             BankTransaction.posted_at.is_(None))
-        row['would_post'] = base.filter(
+        row['would_post'] = _held_pending(base).filter(
             BankTransaction.removed.is_(False)).count() \
             if account.account_id in eligible else 0
         row['would_cancel'] = base.filter(

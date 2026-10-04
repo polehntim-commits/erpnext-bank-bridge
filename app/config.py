@@ -269,6 +269,14 @@ class Config:
     # (Draft) — the conservative choice.
     ERPNEXT_JOURNAL_ENTRY_AUTO_SUBMIT = _bool(
         'ERPNEXT_JOURNAL_ENTRY_AUTO_SUBMIT', False)
+    # v1.0.4 · push Plaid PENDING transactions to ERPNext at all? Default OFF:
+    # a pending authorization is not yet money that moved — it may post at a
+    # different amount, under a new Plaid id, or be dropped by the bank. ON
+    # pushes it as an unmatched Bank Transaction with NO Journal Entry; the
+    # posted version then updates that same Bank Transaction. Seeds the
+    # persisted toggle (erpnext_settings.push_pending_enabled).
+    ERPNEXT_PUSH_PENDING_TRANSACTIONS = _bool(
+        'ERPNEXT_PUSH_PENDING_TRANSACTIONS', False)
     # Initial GeneratedJournalEntry.state for a freshly generated (Draft) JE.
     ERPNEXT_JOURNAL_ENTRY_REVIEW_STATE = os.environ.get(
         'ERPNEXT_JOURNAL_ENTRY_REVIEW_STATE', 'pending_review').strip() \

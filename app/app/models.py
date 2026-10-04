@@ -422,6 +422,18 @@ class BankTransaction(db.Model):
     merchant_name = db.Column(db.String(255), default='')
     category = db.Column(db.String(255), default='')
     pending = db.Column(db.Boolean, default=False, index=True)
+    # v1.0.4 · on a POSTED transaction, the Plaid id of the pending
+    # authorization it replaced. Plaid issues a new transaction_id when a
+    # pending charge posts and lists the old one under `removed`; this pointer
+    # is what lets the push update the Bank Transaction already booked for the
+    # pending row instead of booking the same money a second time.
+    pending_transaction_id = db.Column(db.String(120), nullable=True,
+                                       index=True)
+    # v1.0.4 · why a human must look at this row, or NULL. Set when the posted
+    # amount differs from the pending amount already booked (a submitted
+    # Journal Entry is never edited), or when Plaid removed a transaction whose
+    # Journal Entry was reconciled or not Bank Bridge's own to cancel.
+    review_reason = db.Column(db.Text, nullable=True)
     # v0.4.1 · the IntercompanyTransferPair this transaction belongs to, once the
     # detector has matched it against its counterparty in ANOTHER Company's linked
     # account (see app/intercompany.py). NULL = not paired, which is every
@@ -487,6 +499,8 @@ class BankTransaction(db.Model):
             'date': self.date.isoformat() if self.date else None,
             'name': self.name, 'merchant_name': self.merchant_name,
             'category': self.category, 'pending': bool(self.pending),
+            'pending_transaction_id': self.pending_transaction_id,
+            'review_reason': self.review_reason,
             'intercompany_pair_id': self.intercompany_pair_id,
             'erpnext_bank_transaction_id': self.erpnext_bank_transaction_id,
             'posted_at': self.posted_at.isoformat() if self.posted_at else None,

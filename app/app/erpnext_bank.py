@@ -8,10 +8,11 @@ row and keeps the two in sync:
               then SUBMIT (docstatus 0 → 1) so it appears in ERPNext's Bank
               Reconciliation Tool. The returned docname is written back onto
               the local row.
-  * modify  → Plaid's `modified` list. A submitted Bank Transaction is
-              immutable in Frappe, so we CANCEL the existing doc (docstatus 2)
-              and create+submit a fresh one, repointing the local row.
-  * remove  → Plaid's `removed` list. CANCEL the existing doc (docstatus 2).
+  * modify  → Plaid's `modified` list, or a posted transaction taking over
+              its pending twin's doc (v1.0.4). Updated in place where ERPNext
+              allows it — see app/bt_lifecycle.refresh_bank_transaction.
+  * remove  → Plaid's `removed` list. CANCEL the existing doc (docstatus 2),
+              after Bank Bridge's own Journal Entry (bt_lifecycle).
 
 Idempotent: every create first checks ERPNext for an existing Bank Transaction
 with the same reference_number, so a re-run (or a lost local pointer) never
@@ -1220,17 +1221,34 @@ def cost_center_exists(client: ERPNextClient | None, cost_center: str,
     return bool(rows)
 
 
-def cancel_bank_transaction(client: ERPNextClient, name: str) -> None:
-    """Cancel a posted Bank Transaction (Plaid removed / superseded). Tolerates
-    an already-cancelled or missing doc."""
+def cancel_bank_transaction(client: ERPNextClient, name: str) -> bool:
+    """Cancel a posted Bank Transaction (Plaid removed / superseded). Returns
+    True when the doc ends up cancelled (or never existed), False when ERPNext
+    refused — the caller decides what a refusal means.
+
+    v1.0.4 · a 417 is NOT "already cancelled". It is also what Frappe answers
+    with LinkExistsError, when a submitted Journal Entry still references the
+    Bank Transaction — and reading that as success is exactly how every
+    pending card charge stayed on the books beside its posted twin. On a
+    409/417 the doc is re-read and only a real docstatus 2 counts."""
     if not name:
-        return
+        return True
     try:
         _cancel(client, name)
+        return True
     except ERPNextAPIError as e:
-        # 417/409 → already cancelled or not submittable; 404 → gone. All are
-        # acceptable end-states for a cancel.
-        if e.status_code in (404, 409, 417):
-            log.info('cancel of %s no-op (%s)', name, e.status_code)
-            return
+        if e.status_code == 404:
+            log.info('cancel of %s no-op (404)', name)
+            return True
+        if e.status_code in (409, 417):
+            try:
+                doc = client.get_doc(DOCTYPE, name)
+            except (ERPNextAPIError, ERPNextError):
+                doc = {}
+            if doc is None or int((doc or {}).get('docstatus') or 0) == 2:
+                log.info('cancel of %s no-op (%s, already cancelled)', name,
+                         e.status_code)
+                return True
+            log.warning('ERPNext refused to cancel %s: %s', name, e)
+            return False
         raise

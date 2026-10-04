@@ -17,7 +17,7 @@ where the bump was forgotten, and only a hand-written expectation does that.
 """
 import unittest
 
-EXPECTED_VERSION = '1.0.3'
+EXPECTED_VERSION = '1.0.4'
 
 
 class VersionTest(unittest.TestCase):

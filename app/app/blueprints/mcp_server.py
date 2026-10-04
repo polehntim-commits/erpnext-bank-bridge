@@ -1687,6 +1687,72 @@ def _push_statement_pdfs(args: dict):
                     f"failed {len(result['failed'])}")
 
 
+# ── v1.0.4 · pending/posted duplicate repair ───────────────────────────────
+
+def _duplicate_scope(args: dict) -> dict:
+    """The find_duplicates scope from tool args: an optional account mask
+    (→ its ERPNext Bank Account) and an optional since/until window."""
+    from .. import reconnect
+    scope = {}
+    if (args.get('account_mask') or '').strip():
+        account = _account_by_mask(args.get('account_mask'))
+        account = reconnect.mapped_account_for(account.account_id) or account
+        if not (account.erpnext_bank_account_name or '').strip():
+            raise ToolError(f'account {account.mask} is not mapped to an '
+                            'ERPNext Bank Account')
+        scope['bank_accounts'] = [account.erpnext_bank_account_name]
+    if args.get('since'):
+        scope['since'] = _iso_date(args.get('since'), 'since')
+    if args.get('until'):
+        scope['until'] = _iso_date(args.get('until'), 'until')
+    return scope
+
+
+def _find_duplicate_bank_transactions(args: dict):
+    from .. import bt_lifecycle
+    client = _erp_client_or_error()
+    try:
+        report = bt_lifecycle.find_duplicates(client, **_duplicate_scope(args))
+    except (ERPNextAPIError, ERPNextError) as e:
+        raise ToolError(f'could not read Bank Transactions from ERPNext: {e}')
+    return report, (f"{report['pair_count']} pending/posted pair(s) in "
+                    f"{report['bank_transactions_scanned']} Bank Transactions: "
+                    f"{report['journal_entries_to_remove']} JE(s) and "
+                    f"{report['bank_transactions_to_remove']} BT(s) "
+                    'recommended for removal')
+
+
+def _cleanup_duplicate_bank_transactions(args: dict):
+    from .. import bt_lifecycle
+    approved = args.get('approved')
+    if not isinstance(approved, list) or not approved:
+        raise ToolError('approved must be a non-empty list of '
+                        '{"doctype": "Journal Entry"|"Bank Transaction", '
+                        '"name": "..."} taken from '
+                        'find_duplicate_bank_transactions')
+    for item in approved:
+        if not isinstance(item, dict) or item.get('doctype') not in (
+                bt_lifecycle.JE_DT, bt_lifecycle.BT_DT) \
+                or not (item.get('name') or '').strip():
+            raise ToolError(f'bad approved entry {item!r} — each needs doctype '
+                            '"Journal Entry" or "Bank Transaction" and a name')
+    dry_run = _flag(args, 'dry_run', True)
+    client = _erp_client_or_error()
+    try:
+        report = bt_lifecycle.find_duplicates(client, **_duplicate_scope(args))
+        result = bt_lifecycle.cleanup_duplicates(client, approved,
+                                                 dry_run=dry_run,
+                                                 report=report)
+    except (ERPNextAPIError, ERPNextError) as e:
+        raise ToolError(f'ERPNext refused: {e}')
+    done = result['would_cancel'] if dry_run else result['cancelled']
+    return result, ((f'DRY RUN: would cancel {len(done)}' if dry_run
+                     else f'cancelled {len(done)}')
+                    + f", refused {len(result['refused'])}, "
+                    f"failed {len(result['failed'])}, already cancelled "
+                    f"{len(result['already_cancelled'])}")
+
+
 def _set_je_gate(args: dict, on: bool):
     from .. import audit
     from .. import erpnext_settings
@@ -2594,6 +2660,63 @@ TOOLS = {
                                      "'direct': single read and upload"}},
             mutating=True),
         'handler': _push_statement_pdfs},
+    # ── v1.0.4 · pending/posted duplicates ──────────────────────────────────
+    'find_duplicate_bank_transactions': {
+        **_tool(
+            'List charges that are on the books TWICE because Bank Bridge '
+            'booked the bank\'s PENDING authorization and then the POSTED '
+            'transaction separately (before v1.0.4). Each pair names both '
+            'ERPNext Bank Transactions, every live Journal Entry on either one '
+            '(Bank Bridge rule JEs, and "Bank Entry" vouchers whose cheque_no '
+            'is the Bank Transaction), and a recommendation: keep the posted '
+            'Bank Transaction and ONE Journal Entry on it; remove the pending '
+            'Bank Transaction, its Journal Entries, and any extra Journal '
+            'Entry on the posted one. `match` says how the pair was found: '
+            '"pending_link" (Plaid\'s pending_transaction_id — exact) or '
+            '"amount_date" (same amount, posted within 10 days of a row Bank '
+            'Bridge knows was pending — check these). Pairs whose amounts '
+            'differ are marked "review", never removal. Pass the `remove` '
+            'entries you approve to cleanup_duplicate_bank_transactions. '
+            'Read-only.',
+            {'account_mask': {'type': 'string',
+                              'description': '4-digit mask; omit for every '
+                                             'mapped account'},
+             'since': {'type': 'string',
+                       'description': 'YYYY-MM-DD; default 120 days ago'},
+             'until': {'type': 'string',
+                       'description': 'YYYY-MM-DD; default today'}}),
+        'handler': _find_duplicate_bank_transactions},
+    'cleanup_duplicate_bank_transactions': {
+        **_tool(
+            'Cancel an explicitly approved list of duplicate documents found by '
+            'find_duplicate_bank_transactions. CANCELS ONLY — never deletes, '
+            'never edits. Every entry must appear under some pair\'s `remove` '
+            'in a fresh duplicate report for the same scope, or it is refused. '
+            'Journal Entries are cancelled before Bank Transactions (ERPNext '
+            'will not cancel a Bank Transaction a live Journal Entry still '
+            'references). dry_run defaults to TRUE: pass dry_run=false to '
+            'actually cancel. MUTATING — requires the '
+            'cleanup_duplicate_bank_transactions kill switch ON (off by '
+            'default).',
+            {'approved': {'type': 'array',
+                          'items': {'type': 'object',
+                                    'properties': {
+                                        'doctype': {
+                                            'type': 'string',
+                                            'enum': ['Journal Entry',
+                                                     'Bank Transaction']},
+                                        'name': {'type': 'string'}},
+                                    'required': ['doctype', 'name']},
+                          'description': 'the `remove` entries you approve'},
+             'dry_run': {'type': 'boolean',
+                         'description': 'default TRUE — report what would be '
+                                        'cancelled, change nothing'},
+             'account_mask': {'type': 'string',
+                              'description': 'same scope you passed to '
+                                             'find_duplicate_bank_transactions'},
+             'since': _STR, 'until': _STR},
+            required=('approved',), mutating=True),
+        'handler': _cleanup_duplicate_bank_transactions},
 }
 
 

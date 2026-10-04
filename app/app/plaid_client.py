@@ -839,6 +839,8 @@ def _normalize_txn(t) -> dict:
         'merchant_name': _get(d, 'merchant_name', '') or '',
         'category': _category_str(d),
         'pending': bool(_get(d, 'pending', False)),
+        # v1.0.4 · on a posted transaction, the pending one it replaced.
+        'pending_transaction_id': _get(d, 'pending_transaction_id', None) or None,
     }
 
 

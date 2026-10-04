@@ -376,6 +376,17 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     # by erpnext_push.PUSH_FINGERPRINT_CONTRACT, in the hash input — exact,
     # clockless, and self-resolving on the first verified push of each row,
     # which a timestamp cutoff here could be none of.
+
+    # v1.0.4 — the pending → posted lifecycle. `pending_transaction_id` is the
+    # id Plaid gives a POSTED transaction pointing back at the pending
+    # authorization it replaced; before this it was dropped by the normalizer,
+    # so a posted charge could not be matched to the pending one Bank Bridge
+    # had already booked. Backfills to NULL (no link known for history).
+    # `review_reason` is the flag a human must clear: an amount that changed
+    # between pending and posted, or a removal whose Journal Entry Bank Bridge
+    # refused to cancel. NULL = nothing to review.
+    ('bank_transactions', 'pending_transaction_id', 'VARCHAR(120)'),
+    ('bank_transactions', 'review_reason', 'TEXT'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,

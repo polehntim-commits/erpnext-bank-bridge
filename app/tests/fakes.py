@@ -425,6 +425,14 @@ class FakeERPClient:
             return {**doc, 'name': name} if doc is not None else None
         if (doctype, name) in self.link_docs:
             return {'name': name, 'is_group': 0}
+        if doctype == 'Bank Transaction' and name in self.docs:
+            # v1.0.4 · the BT lifecycle reads docstatus to decide between
+            # rewriting a draft, updating a submitted doc, or re-creating a
+            # cancelled one — so the fake reports the state its own submit /
+            # cancel helpers put it in.
+            return {**self.docs[name], 'name': name,
+                    'docstatus': (2 if name in self.cancelled else
+                                  1 if name in self.submitted else 0)}
         return self.docs.get(name)
 
     @staticmethod

@@ -10,6 +10,80 @@ architecture rather than the API surface.
 
 ---
 
+## [1.0.4] — 2026-10-03
+
+**A pending card charge is booked once — when it posts.**
+
+### Fixed
+
+- **Pending charges were expensed twice.** Plaid reports a card charge first as
+  a PENDING authorization, then as a POSTED transaction under a new
+  `transaction_id` (its `pending_transaction_id` points back) while listing the
+  pending id under `removed`. Bank Bridge booked the pending row immediately (a
+  Bank Transaction plus a submitted rule Journal Entry), then booked the posted
+  row as a second Bank Transaction and a second JE. The removal was meant to
+  cancel the first Bank Transaction, but ERPNext refuses to cancel one that a
+  submitted JE still references (`LinkExistsError`, HTTP 417), and
+  `cancel_bank_transaction` read every 417 as "already cancelled". Nothing was
+  cancelled and nothing said so.
+- **`cancel_bank_transaction` no longer reads a refusal as success.** On a
+  409/417 it re-reads the document and only a real docstatus 2 counts. It now
+  returns True/False.
+
+### Changed
+
+- **Pending transactions are held until they post** (new default). Turn on
+  *Push pending transactions as unmatched* on `/admin/erpnext_settings` (or
+  `ERPNEXT_PUSH_PENDING_TRANSACTIONS=true`) to push them as Bank Transactions
+  with **no** Journal Entry. A pending row never gets a Supplier or a JE either
+  way, and `rerun_rules` skips it.
+- **A posted transaction takes over its pending twin.** `pending_transaction_id`
+  is stored now. When it names a row already pushed, the posted row inherits
+  that Bank Transaction and its Journal Entry record: the BT's reference
+  number moves to the posted id, a draft BT is rewritten in full, and the
+  existing JE is reused — never a second one. ERPNext allows only the reference
+  number to change on a submitted Bank Transaction, so it keeps the pending
+  date and description. If the posted amount differs, the row is **flagged for
+  review** (`review_reason`) and neither document is edited.
+- **A removed transaction is cancelled properly.** Bank Bridge's own rule JE is
+  cancelled first (ERPNext then lets the Bank Transaction go), then the BT. If
+  the JE is reconciled elsewhere, or isn't an active Bank Bridge rule entry,
+  nothing is cancelled and the row is flagged for review instead. A draft JE is
+  left alone and flagged, because drafts can't be cancelled.
+- **A rule JE is allocated to its Bank Transaction.** When a rule JE is
+  submitted (auto-submit or Approve), it is reconciled against its BT through
+  ERPNext's own `reconcile_vouchers`. The BT then reads Reconciled, and no
+  other job (ERPNext's Bank Reconciliation Tool, an AI "Bank Entry" run) books
+  it again. Fail-soft: a BT something else already reconciled is left as is.
+- Plaid `modified` rows use the same update path. A submitted BT that nothing
+  links to is still cancelled and replaced as before. One that something links
+  to keeps its document and gets a review flag if the amount changed.
+
+### Added
+
+- **`find_duplicate_bank_transactions` MCP tool** (read-only). Lists
+  pending/posted pairs that are both still live in ERPNext, with every live
+  Journal Entry on either one. That covers both rule JEs and "Bank Entry"
+  vouchers whose `cheque_no` is the BT name. Each pair gets a keep/remove
+  recommendation: keep the posted BT and one JE (preferring the Bank Bridge
+  rule JE); remove the pending BT, its JEs, and any extra JE on the posted BT.
+  A pair whose amounts differ is marked `review`.
+- **`cleanup_duplicate_bank_transactions` MCP tool.** Cancels an explicit
+  approved list, and refuses anything a fresh report doesn't recommend
+  removing. It cancels JEs before BTs, never deletes anything, and defaults to
+  `dry_run=true`. It has its own kill switch, **off by default**.
+- `bank_transactions.pending_transaction_id` and `.review_reason` columns.
+  These are additive and migrate at boot. The push summary has a new `review`
+  count.
+
+### Upgrade notes
+
+Existing duplicate pairs are **not** touched by the upgrade. Run
+`find_duplicate_bank_transactions`, check the pairs, then pass the approved
+`remove` entries to `cleanup_duplicate_bank_transactions` (dry run first).
+
+---
+
 ## [1.0.3] — 2026-09-26
 
 **Brokerage statement PDFs land on their ERPNext Bank Account.**
