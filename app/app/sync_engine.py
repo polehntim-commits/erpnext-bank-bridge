@@ -766,6 +766,8 @@ def push_pending(erp_client, item_id: str = '',
                 # (Plaid modification) may carry a JE generated earlier and
                 # never allocated — record it against the BT now. A JE the
                 # rules engine writes below allocates itself.
+                if outcome == 'refreshed':
+                    bt_lifecycle.drop_dead_inherited_je(erp_client, row)
                 inherited_je = outcome == 'refreshed' and \
                     _has_generated_je(row.plaid_transaction_id)
                 gje = categorization.categorize_after_push(erp_client, row)

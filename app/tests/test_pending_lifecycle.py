@@ -365,6 +365,19 @@ class PendingToPostedTests(Base):
                          self.erp.payment_entries[bt])
         self.assertNotIn(bt, self.erp.cancelled)
 
+    def test_an_inherited_cancelled_je_is_replaced_not_reused(self):
+        """OML's 10/3 cleanup cancelled the pending rows' JEs by hand. A posted
+        twin arriving later must book a fresh JE, not inherit a dead one."""
+        bt, je = self.stage_legacy_pending()
+        self.erp.cancelled.add(je)
+        self.sync(page(added=[self.posted()], removed=['p1']))
+        self.assertEqual([bt], self.erp.live_bts())
+        live = self.erp.live_jes()
+        self.assertEqual(1, len(live))
+        self.assertNotEqual(je, live[0])
+        self.assertEqual(live[0], GeneratedJournalEntry.query.filter_by(
+            plaid_transaction_id='q1').one().erpnext_journal_entry_name)
+
     def test_removed_page_before_added_page_still_links(self):
         bt, je = self.stage_legacy_pending()
         self.sync(page(removed=['p1'], has_more=True, next_cursor='c1'),
@@ -658,6 +671,34 @@ class FlagAndKeepTests(DuplicateBase):
         _, out = self.run_tool()
         self.assertEqual([], out['would_flag'])
         self.assertIn('duplicate_of', out['refused'][0]['reason'])
+
+    def test_an_approved_amount_difference_needs_the_explicit_flag(self):
+        self.erp.docs[self.q_bt]['withdrawal'] = 58.0          # tip added
+        _, out = self.run_tool()
+        self.assertIn('amounts differ', out['refused'][0]['reason'])
+        self.items[0]['allow_amount_difference'] = True
+        _, out = self.run_tool()
+        self.assertEqual([self.p_bt],
+                         [p['bank_transaction'] for p in out['would_flag']])
+
+    def test_no_twin_flags_without_duplicate_of_and_needs_a_reason(self):
+        self.erp.submitted.discard(self.p_bt)
+        self.erp.docs[self.p_bt]['description'] = 'AMAZON AUTH'
+        self.items = [{'bank_transaction': self.p_bt, 'no_twin': True}]
+        _, out = self.run_tool()
+        self.assertIn('reason', out['refused'][0]['reason'])
+        self.items[0]['reason'] = 'authorization reversed (A39/A40)'
+        _, out = self.run_tool(dry_run=False, reason='dedupe')
+        self.assertEqual([], out['failed'], out)
+        doc = self.erp.docs[self.p_bt]
+        self.assertEqual(1, doc['is_duplicate'])
+        self.assertIsNone(doc['duplicate_of'])
+        self.assertTrue(doc['description'].startswith(
+            'DUPLICATE (stale pending, no posted twin) — AMAZON AUTH'))
+        self.assertIn(self.p_bt, self.erp.cancelled)
+        self.assertIn('no posted twin', self.erp.comments[0]['content'])
+        _, again = self.run_tool(dry_run=False, reason='dedupe')
+        self.assertEqual(1, len(again['already_flagged']))
 
     def test_reason_is_required_for_a_real_run(self):
         res, text = self.run_tool(dry_run=False)

@@ -39,6 +39,33 @@ architecture rather than the API surface.
     kill switch is off by default.
 - **Plaid removals of draft Bank Transactions** are submitted then cancelled,
   instead of failing to cancel and being flagged for review.
+- **Two explicit item options**, each for a case a human has already ruled on
+  and never inferred:
+  - `no_twin: true` (requires a `reason`) for a stale pending row with no
+    posted twin to keep, such as a reversed authorization. It is flagged with
+    `duplicate_of` empty and the prefix `DUPLICATE (stale pending, no posted
+    twin) — `.
+  - `allow_amount_difference: true` for a kept twin whose amount
+    legitimately differs, such as a tip. The direction (in or out) must still
+    match.
+
+### Fixed
+
+- **A posted charge inheriting a cancelled JE.** When a posted transaction
+  took over its pending twin's Bank Transaction and Journal Entry record, and
+  that JE had since been cancelled by hand (OML's 10/3 cleanup did this),
+  the posted charge ended up with no live JE. The push now checks the
+  inherited JE in ERPNext and books a fresh one if it is cancelled or gone.
+
+### Verified on dev
+
+- `/statements/refresh` against the live Wells Fargo Item: before the call
+  Plaid listed 26 statements ending June 2026; 20 s after, 36 statements
+  through September 2026.
+- The real flag-and-keep code run end-to-end against dev ERPNext on fresh
+  test Bank Transactions: paired, tip difference and no-twin cases were all
+  flagged, prefixed, submitted, cancelled and commented. The dry run changed
+  nothing, and a re-run reported them as already flagged.
 
 ### Added
 

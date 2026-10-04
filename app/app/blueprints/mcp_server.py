@@ -1749,7 +1749,8 @@ def _cleanup_duplicate_bank_transactions(args: dict):
     client = _erp_client_or_error()
     try:
         report = None
-        if any(not (i.get('duplicate_of') or '').strip() for i in items):
+        if any(not (i.get('duplicate_of') or '').strip()
+               and not i.get('no_twin') for i in items):
             report = bt_lifecycle.find_duplicates(client,
                                                   **_duplicate_scope(args))
         result = bt_lifecycle.cleanup_duplicates(client, items,
@@ -2728,7 +2729,16 @@ TOOLS = {
                                  'properties': {
                                      'bank_transaction': {'type': 'string'},
                                      'duplicate_of': {'type': 'string'},
-                                     'reason': {'type': 'string'}},
+                                     'reason': {'type': 'string'},
+                                     'no_twin': {
+                                         'type': 'boolean',
+                                         'description': 'no posted twin to '
+                                         'keep (needs reason); duplicate_of '
+                                         'left empty'},
+                                     'allow_amount_difference': {
+                                         'type': 'boolean',
+                                         'description': 'kept amount '
+                                         'legitimately differs (e.g. a tip)'}},
                                  'required': ['bank_transaction']},
                        'description': 'stale → kept pairs, or stale names '
                                       '(max 500)'},

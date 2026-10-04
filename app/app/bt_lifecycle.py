@@ -371,6 +371,40 @@ def cancel_removed(client, row: BankTransaction) -> str:
 
 # ── allocation: the rule JE recorded against its Bank Transaction ───────────
 
+def drop_dead_inherited_je(client, row: BankTransaction) -> bool:
+    """Forget a Journal Entry this row inherited from its pending twin when that
+    JE is no longer live in ERPNext (cancelled, or gone). Returns True when it
+    was dropped, so the rules engine books a fresh one for the posted charge.
+
+    Without this, a posted charge whose pending twin's JE had already been
+    cancelled by hand (OML's 10/3 cleanup did exactly that) would inherit the
+    cancelled entry and end up with no live JE at all — the local
+    one-JE-per-transaction record would claim one existed."""
+    gje = GeneratedJournalEntry.query.filter_by(
+        plaid_transaction_id=row.plaid_transaction_id).first()
+    if gje is None or not gje.erpnext_journal_entry_name:
+        return False
+    try:
+        doc = client.get_doc(JE_DT, gje.erpnext_journal_entry_name)
+    except (ERPNextAPIError, ERPNextError):
+        return False                       # can't tell: keep it, never double-book
+    if doc and _docstatus(doc) in (0, 1):
+        return False
+    audit.record('inherited_journal_entry_dropped',
+                 subject_type='GeneratedJournalEntry', subject_id=gje.id,
+                 before={'journal_entry': gje.erpnext_journal_entry_name,
+                         'state': gje.state},
+                 after={'plaid_transaction_id': row.plaid_transaction_id},
+                 notes='inherited JE is cancelled in ERPNext — booking afresh',
+                 commit=False)
+    gje.erpnext_journal_entry_name = None
+    gje.state = 'superseded'
+    gje.error_message = 'The inherited Journal Entry was cancelled in ERPNext.'
+    gje.updated_at = _now()
+    db.session.commit()
+    return True
+
+
 def allocate_je(client, bank_transaction: str, journal_entry: str,
                 amount: float = 0.0) -> bool:
     """Reconcile a SUBMITTED Journal Entry against its Bank Transaction, through
@@ -718,8 +752,26 @@ def _live_links(client, name: str) -> list:
     return out
 
 
-def _check_item(client, stale: str, keep: str, doc: dict, kdoc: dict) -> str:
-    """Why this (stale, keep) pair must NOT be flagged, or ''."""
+def _check_item(client, stale: str, keep: str, doc: dict, kdoc: dict,
+                item: dict | None = None) -> str:
+    """Why this (stale, keep) pair must NOT be flagged, or ''.
+
+    Two explicit, per-item escapes, each for a case a human has already ruled
+    on — neither is ever inferred:
+      * `no_twin: true` (+ a `reason`) — a stale pending row with no posted
+        twin to keep: a reversed authorization, or one whose twin cannot be
+        identified uniquely. Flagged with duplicate_of left empty.
+      * `allow_amount_difference: true` — the posted amount legitimately
+        differs (a tip added to a restaurant charge)."""
+    item = item or {}
+    if item.get('no_twin'):
+        if not stale or not doc:
+            return f'Bank Transaction {stale} not found'
+        if keep:
+            return 'no_twin and duplicate_of are mutually exclusive'
+        if not (item.get('reason') or '').strip():
+            return 'no_twin needs a reason saying why there is no posted twin'
+        return _check_stale_side(client, stale, doc)
     if not stale or not keep:
         return ('both bank_transaction and duplicate_of are required '
                 '(duplicate_of could not be resolved from the duplicate '
@@ -736,9 +788,19 @@ def _check_item(client, stale: str, keep: str, doc: dict, kdoc: dict) -> str:
     if (doc.get('bank_account') or '') != (kdoc.get('bank_account') or ''):
         return (f'different Bank Accounts ({doc.get("bank_account")} vs '
                 f'{kdoc.get("bank_account")})')
-    if _bt_amount(doc) != _bt_amount(kdoc):
+    if _bt_amount(doc) != _bt_amount(kdoc) and not (
+            item.get('allow_amount_difference')
+            and (_bt_amount(doc) > 0) == (_bt_amount(kdoc) > 0)):
         return (f'amounts differ ({_bt_amount(doc):.2f} vs '
-                f'{_bt_amount(kdoc):.2f}) — not the same charge')
+                f'{_bt_amount(kdoc):.2f}) — not the same charge (pass '
+                'allow_amount_difference: true if a human ruled it is, e.g. '
+                'a tip)')
+    return _check_stale_side(client, stale, doc)
+
+
+def _check_stale_side(client, stale: str, doc: dict) -> str:
+    """The checks on the stale Bank Transaction alone: not reconciled, and no
+    live Journal Entry on it."""
     if _docstatus(doc) == 1 and doc.get('payment_entries'):
         vouchers = ', '.join(f"{p.get('payment_document')} "
                              f"{p.get('payment_entry')}"
@@ -758,7 +820,8 @@ def resolve_kept(client, items: list, report: dict | None = None) -> list:
     Transaction, from the duplicate finder's pairs (pending → its posted twin).
     An item the finder cannot pair keeps an empty `duplicate_of` and is then
     refused — the kept Bank Transaction is never guessed."""
-    if all((it or {}).get('duplicate_of') for it in items or []):
+    if all((it or {}).get('duplicate_of') or (it or {}).get('no_twin')
+           for it in items or []):
         return items
     report = report if report is not None else find_duplicates(client)
     twin = {pr['cleanup_entry']['bank_transaction']:
@@ -768,7 +831,8 @@ def resolve_kept(client, items: list, report: dict | None = None) -> list:
     for it in items or []:
         it = dict(it or {})
         stale = (it.get('bank_transaction') or '').strip()
-        if not (it.get('duplicate_of') or '').strip() and stale in twin:
+        if not (it.get('duplicate_of') or '').strip() and not it.get('no_twin') \
+                and stale in twin:
             it['duplicate_of'] = twin[stale]
             it['resolved_by'] = 'find_duplicates'
         out.append(it)
@@ -815,7 +879,8 @@ def cleanup_duplicates(client, items: list, *, dry_run: bool = True,
         doc = client.get_doc(BT_DT, stale) if stale else None
         kdoc = client.get_doc(BT_DT, keep) if keep else None
         if doc and _docstatus(doc) == 2:
-            if doc.get('is_duplicate') and doc.get('duplicate_of') == keep:
+            if doc.get('is_duplicate') and (doc.get('duplicate_of') or '') \
+                    == keep:
                 refused.append({'bank_transaction': stale,
                                 'duplicate_of': keep,
                                 'outcome': 'already_flagged'})
@@ -830,7 +895,7 @@ def cleanup_duplicates(client, items: list, *, dry_run: bool = True,
                if keep in stale_set else '')
         try:
             why = why or _check_item(client, stale, keep, doc or {},
-                                     kdoc or {})
+                                     kdoc or {}, it)
         except (ERPNextAPIError, ERPNextError) as e:
             why = f'could not check live Journal Entries: {e}'
         if why:
@@ -838,6 +903,7 @@ def cleanup_duplicates(client, items: list, *, dry_run: bool = True,
                             'outcome': 'refused', 'reason': why})
             continue
         plan.append({'bank_transaction': stale, 'duplicate_of': keep,
+                     'no_twin': bool(it.get('no_twin')),
                      'reason': why_item,
                      'route': ('draft → flag + prefix → submit → cancel'
                                if _docstatus(doc) == 0
@@ -864,14 +930,16 @@ def cleanup_duplicates(client, items: list, *, dry_run: bool = True,
         stale, keep = p['bank_transaction'], p['duplicate_of']
         stage = 'flag'
         try:
-            patch = {'is_duplicate': 1, 'duplicate_of': keep}
-            prefix = f'{DUPLICATE_PREFIX}{keep} — '
+            patch = {'is_duplicate': 1, 'duplicate_of': keep or None}
+            prefix = (f'{DUPLICATE_PREFIX}{keep} — ' if keep else
+                      'DUPLICATE (stale pending, no posted twin) — ')
             if p['docstatus'] == 0 and not p['description'].startswith(
-                    DUPLICATE_PREFIX):
+                    'DUPLICATE'):
                 patch['description'] = prefix + p['description']
             client.update_doc(BT_DT, stale, patch)
             got = client.get_doc(BT_DT, stale) or {}
-            if not got.get('is_duplicate') or got.get('duplicate_of') != keep:
+            if not got.get('is_duplicate') \
+                    or (got.get('duplicate_of') or '') != keep:
                 raise ERPNextError('ERPNext did not store the duplicate flag')
             stage = 'cancel'
             if not erpnext_bank.cancel_bank_transaction(client, stale):
@@ -881,7 +949,9 @@ def cleanup_duplicates(client, items: list, *, dry_run: bool = True,
             client.create_doc('Comment', {
                 'comment_type': 'Comment', 'reference_doctype': BT_DT,
                 'reference_name': stale,
-                'content': (f'Flagged as DUPLICATE of {keep} and cancelled by '
+                'content': ((f'Flagged as DUPLICATE of {keep}' if keep else
+                             'Flagged as DUPLICATE (stale pending, no posted '
+                             'twin)') + ' and cancelled by '
                             f'Bank Bridge (cleanup_duplicate_bank_transactions,'
                             f' requested by {actor}) at {when}. Reason: '
                             f'{p["reason"] or "pending/posted duplicate of the same charge"}. '
@@ -889,7 +959,7 @@ def cleanup_duplicates(client, items: list, *, dry_run: bool = True,
             moved = []
             for row in BankTransaction.query.filter_by(
                     erpnext_bank_transaction_id=stale).all():
-                if not row.removed:
+                if not row.removed and keep:
                     row.erpnext_bank_transaction_id = keep
                     row.updated_at = _now()
                     moved.append(row.plaid_transaction_id)
@@ -899,7 +969,8 @@ def cleanup_duplicates(client, items: list, *, dry_run: bool = True,
                                 'duplicate_of': keep, 'reason': p['reason'],
                                 'route': p['route'],
                                 'local_rows_repointed': moved},
-                         notes=f'{stale} → DUPLICATE of {keep}', actor=actor,
+                         notes=f'{stale} → DUPLICATE of {keep or "(no twin)"}',
+                         actor=actor,
                          commit=False)
             db.session.commit()
             result['flagged'].append({**p, 'local_rows_repointed': moved})
