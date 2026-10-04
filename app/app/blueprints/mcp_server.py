@@ -1767,6 +1767,29 @@ def _cleanup_duplicate_bank_transactions(args: dict):
                     f"{len(result['already_flagged'])}")
 
 
+def _dedupe_statements(args: dict):
+    """v1.0.8 · remove re-issued duplicate statement rows (Bank Bridge's own
+    mirror only). Dry run by default."""
+    account_id = ''
+    if (args.get('account_mask') or '').strip():
+        account_id = _account_by_mask(args.get('account_mask')).account_id
+    dry_run = _flag(args, 'dry_run', True)
+    client = None
+    try:
+        client = _erp_client_or_error()
+    except ToolError:
+        client = None            # the ERPNext report is optional
+    result = stmts.dedupe_statements(account_id=account_id, dry_run=dry_run,
+                                     erp_client=client, actor='mcp')
+    n = len(result['removed'])
+    return result, ((f'DRY RUN: would remove {n}' if dry_run
+                     else f'removed {n}')
+                    + f" duplicate statement row(s) across "
+                    f"{len(result['groups'])} period(s); kept apart "
+                    f"{len(result['kept_apart'])}; ERPNext Bank Statements "
+                    f"for removed copies: {len(result['erpnext_bank_statements'])}")
+
+
 def _set_je_gate(args: dict, on: bool):
     from .. import audit
     from .. import erpnext_settings
@@ -2674,6 +2697,27 @@ TOOLS = {
                                      "'direct': single read and upload"}},
             mutating=True),
         'handler': _push_statement_pdfs},
+    'dedupe_statements': {
+        **_tool(
+            'Remove duplicate STATEMENT rows: a /statements/refresh makes Plaid '
+            're-issue every statement in its window under a new statement_id, '
+            'and v1.0.6 stored each as a new row (OML: May and June twice). '
+            'Keeps the ORIGINAL row (lowest id) per account + period; removes '
+            'a copy only when its PDF is byte-identical, moving its manual '
+            'adjustments and any synthesized transactions onto the original '
+            'and dropping its derived lines and anchor; a copy that differs is '
+            'kept and reported. Then rebuilds anchors for the affected '
+            'accounts. Bank Bridge\'s own data only: ERPNext Bank Statement '
+            'records for removed copies are LISTED in erpnext_bank_statements, '
+            'never changed. PDF files stay on disk. dry_run defaults to TRUE. '
+            'Run it BEFORE trigger_reparse. MUTATING — requires the '
+            'dedupe_statements kill switch ON (off by default).',
+            {'account_mask': {'type': 'string',
+                              'description': '4-digit mask; omit for all'},
+             'dry_run': {'type': 'boolean',
+                         'description': 'default TRUE — report only'}},
+            mutating=True),
+        'handler': _dedupe_statements},
     # ── v1.0.4 · pending/posted duplicates ──────────────────────────────────
     'find_duplicate_bank_transactions': {
         **_tool(

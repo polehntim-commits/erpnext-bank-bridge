@@ -9310,6 +9310,10 @@ _MCP_SWITCH_DESC = {
         'Flag stale duplicate Bank Transactions (is_duplicate / duplicate_of), '
         'cancel and KEEP them — never deletes, never touches a Journal Entry; '
         'dry-run by default',
+    'dedupe_statements':
+        'Remove duplicate statement rows a statements refresh re-issued — keeps '
+        'the original, byte-identical copies only, Bank Bridge data only (never '
+        'ERPNext); dry-run by default',
 }
 
 

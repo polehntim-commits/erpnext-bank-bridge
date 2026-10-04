@@ -114,6 +114,10 @@ _DEFAULTS = {
     # default, never deletes and never touches a Journal Entry — and it still
     # writes to the books, so it sits behind its own switch like the rest.
     'cleanup_duplicate_bank_transactions': False,
+    # v1.0.8 — removes duplicate statement rows from Bank Bridge's own mirror
+    # (never ERPNext). Byte-identical copies only, dry-run by default — still a
+    # delete, so it has its own switch, off like the rest.
+    'dedupe_statements': False,
 }
 
 _FIELDS = tuple(_DEFAULTS.keys())

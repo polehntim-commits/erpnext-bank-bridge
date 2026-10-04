@@ -160,10 +160,23 @@ class ErrorRecordTests(RefreshBase):
 
 
 class WindowAndClientTests(RefreshBase):
-    def test_window_starts_a_month_before_the_newest_statement(self):
-        start, end = stmts.refresh_window(self.fresh_item(), today=date(2026, 10, 3))
-        self.assertEqual(date(2026, 10, 3), end)
-        self.assertEqual(date(2026, 5, 31), start)   # still covers June
+    def test_window_starts_the_day_after_the_newest_statement(self):
+        """v1.0.8 · no overlap: Plaid re-issues every statement inside the
+        window under a new id, so re-covering a held month made copies."""
+        start, end = stmts.refresh_window(self.fresh_item(),
+                                          today=date(2026, 10, 3))
+        self.assertEqual((date(2026, 7, 1), date(2026, 10, 3)), (start, end))
+
+    def test_window_follows_the_account_furthest_behind(self):
+        self._account(account_id='acct-2')
+        self._statement('st-2-aug', account_id='acct-2', month=8)
+        start, _ = stmts.refresh_window(self.fresh_item(),
+                                        today=date(2026, 10, 3))
+        self.assertEqual(date(2026, 7, 1), start)
+
+    def test_nothing_to_ask_for_when_up_to_date(self):
+        self.assertIsNone(stmts.refresh_window(self.fresh_item(),
+                                               today=date(2026, 6, 30)))
 
     def test_window_with_nothing_held_reaches_back_24_months(self):
         PlaidStatement.query.delete()
@@ -189,6 +202,122 @@ class WindowAndClientTests(RefreshBase):
         resp = self.app.test_client().post('/admin/statements/pull')
         self.assertEqual(302, resp.status_code)
         self.assertIn('statements_refresh', [c[0] for c in self.plaid.calls])
+
+
+class DuplicateStatementTests(RefreshBase):
+    """v1.0.8 · a re-issued statement id for a period already held."""
+
+    def test_a_reissued_id_for_a_held_period_is_skipped_without_download(self):
+        self.plaid.statements.append(self._listed('st-jun-again', month=6))
+        result = stmts.fetch_all()
+        self.assertEqual(1, result['skipped_same_period'])
+        self.assertIsNone(PlaidStatement.query.filter_by(
+            statement_id='st-jun-again').first())
+        self.assertNotIn(('statements_download', 'st-jun-again'),
+                         self.plaid.calls)
+
+    def test_a_second_pull_is_refused_while_one_holds_the_lock(self):
+        with stmts.pull_lock(self.app) as got:
+            self.assertTrue(got)
+            self.assertEqual({'busy': True},
+                             stmts.run_refresh_pull(self.app, wait_seconds=0))
+
+    def test_a_pull_that_stores_runs_the_full_pipeline(self):
+        self.make_july_listable()
+        with unittest.mock.patch.object(
+                stmts, 'run_reconcile_pipeline',
+                return_value={'matched': 3}) as pipe:
+            result = stmts.run_refresh_pull(self.app, wait_seconds=0)
+        self.assertEqual(1, result['stored'])
+        pipe.assert_called_once()
+        self.assertEqual({'matched': 3}, result['pipeline'])
+
+    # ── the cleanup ──────────────────────────────────────────────────────
+    def _copy(self, sid='st-jun-copy', pdf_bytes=None):
+        st = self._statement(sid, month=6, year=2026)
+        if pdf_bytes is not None:
+            with open(st.pdf_path, 'wb') as fh:
+                fh.write(pdf_bytes)
+        return st
+
+    def test_copies_are_skipped_by_the_anchor_rebuild(self):
+        copy = self._copy()
+        self.assertEqual({copy.id}, stmts.later_copies())
+        stmts.rebuild_statement_anchors('acct-1')
+        from app.models import StatementAnchor
+        self.assertIsNone(StatementAnchor.query.filter_by(
+            statement_id=copy.id).first())
+
+    def test_dedupe_dry_run_reports_and_changes_nothing(self):
+        copy = self._copy()
+        out = stmts.dedupe_statements()
+        self.assertTrue(out['dry_run'])
+        self.assertEqual(['st-jun-copy'],
+                         [r['statement_id'] for r in out['removed']])
+        self.assertEqual('st-jun', out['removed'][0]['keep_statement_id'])
+        self.assertIsNotNone(db.session.get(PlaidStatement, copy.id))
+
+    def test_dedupe_keeps_the_original_and_carries_human_work_over(self):
+        from app.models import (BankTransaction, ErpnextPushQueue,
+                                StatementAdjustment, StatementAnchor,
+                                StatementTransaction)
+        orig = PlaidStatement.query.filter_by(statement_id='st-jun').one()
+        copy = self._copy()
+        line = StatementTransaction(statement_id=copy.id, sequence=4)
+        keep_line = StatementTransaction(statement_id=orig.id, sequence=4)
+        db.session.add_all([line, keep_line])
+        db.session.flush()
+        synth = BankTransaction(plaid_transaction_id='stmt-x', account_id='acct-1',
+                                amount=5.0, source='statement',
+                                source_statement_txn_id=line.id)
+        adj = StatementAdjustment(statement_id=copy.id, amount=12.5,
+                                  offset_account='Fees - EC')
+        anchor = StatementAnchor(statement_id=copy.id, account_id='acct-1')
+        db.session.add_all([synth, adj, anchor])
+        db.session.flush()
+        db.session.add(ErpnextPushQueue(kind='anchor', method='m',
+                                        dedupe_key=f'anchor:{anchor.id}'))
+        db.session.commit()
+        out = stmts.dedupe_statements(dry_run=False)
+        self.assertEqual(1, len(out['removed']))
+        self.assertIsNone(db.session.get(PlaidStatement, copy.id))
+        self.assertIsNotNone(db.session.get(PlaidStatement, orig.id))
+        self.assertEqual(orig.id, db.session.get(StatementAdjustment,
+                                                 adj.id).statement_id)
+        self.assertEqual(keep_line.id, db.session.get(
+            BankTransaction, synth.id).source_statement_txn_id)
+        import json
+        self.assertEqual(
+            [orig.id], [json.loads(q.payload).get('source_statement_id')
+                        for q in ErpnextPushQueue.query.all()],
+            'a push for the removed copy is still queued')
+        self.assertEqual(0, StatementTransaction.query.filter_by(
+            statement_id=copy.id).count())
+        self.assertEqual(set(), stmts.later_copies())
+        again = stmts.dedupe_statements(dry_run=False)
+        self.assertEqual([], again['removed'])
+
+    def test_a_copy_that_differs_is_kept_and_reported(self):
+        copy = self._copy(pdf_bytes=b'%PDF-1.4 a corrected statement')
+        out = stmts.dedupe_statements(dry_run=False)
+        self.assertEqual([], out['removed'])
+        self.assertIn('differs', out['kept_apart'][0]['reason'])
+        self.assertIsNotNone(db.session.get(PlaidStatement, copy.id))
+
+    def test_the_mcp_tool_is_gated_and_dry_runs_by_default(self):
+        from app import mcp_settings
+        from app.blueprints import mcp_server
+        self._copy()
+        self.assertFalse(mcp_settings._DEFAULTS['dedupe_statements'])
+        with self.app.test_request_context():
+            res = mcp_server.dispatch_tool('dedupe_statements', {})
+            self.assertTrue(res['isError'])
+            mcp_settings.save({'dedupe_statements': True})
+            with unittest.mock.patch.object(
+                    mcp_server, '_erp_client_or_error', return_value=None):
+                res = mcp_server.dispatch_tool('dedupe_statements', {})
+        self.assertFalse(res.get('isError'), res)
+        self.assertEqual(1, len(stmts.later_copies()))
 
 
 if __name__ == '__main__':

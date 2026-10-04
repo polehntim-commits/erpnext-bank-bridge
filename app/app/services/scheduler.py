@@ -275,38 +275,27 @@ def _run_statements_pull(app) -> None:
                 # STATEMENTS_REFRESH_COMPLETE webhook (or poll past it) —
                 # without the refresh, Plaid lists only what it extracted at
                 # Link and nothing newer ever arrives.
-                result = statements.fetch_all(
-                    refresh=True,
-                    wait_seconds=app.config.get(
-                        'STATEMENTS_REFRESH_WAIT_SECONDS', 300))
-                audit.record('statements_pulled', subject_type=None,
-                             after=result,
-                             notes=statements.pull_summary(result))
-                log.info('[scheduler] statement pull complete: %s', result)
-                # v1.0.0 — a NEWLY ARRIVED statement now gets its anchor here.
-                #
-                # It did not before, and the gap was invisible: `reparse_stale`
-                # below only re-reads statements parsed by an OLDER recognizer,
-                # and a statement that just arrived was parsed by the current
-                # one — so a fresh month sat on disk, parsed and unanchored,
-                # until an operator happened to press Rebuild on
-                # /admin/statements. The period's reconciliation simply did not
-                # exist in the meantime.
-                #
-                # That became load-bearing with the consolidation: the anchor is
-                # what gets pushed to ERPNext (which owns reconciliation truth
-                # now), so an anchor nobody built is a month ERPNext never hears
-                # about. Gated on `stored` so a settled install pays nothing,
-                # and fail-soft in its own block like every other step here.
-                if result.get('stored'):
-                    try:
-                        rebuilt = statements.rebuild_statement_anchors()
-                        log.info('[scheduler] anchors after statement pull: %s',
-                                 rebuilt)
-                    except Exception:  # pragma: no cover - never fail the job
-                        db.session.rollback()
-                        log.exception('[scheduler] anchor rebuild after the '
-                                      'statement pull crashed')
+                # v1.0.8 · under the container-wide pull lock (two workers plus
+                # this thread used to pull at once), and a pull that stored
+                # anything runs the FULL reconcile pipeline — matching the new
+                # statements' Activity lines, not only rebuilding anchors.
+                with statements.pull_lock(app) as got:
+                    if not got:
+                        log.info('[scheduler] statement pull skipped — another '
+                                 'pull is running')
+                    else:
+                        result = statements.fetch_all(
+                            refresh=True,
+                            wait_seconds=app.config.get(
+                                'STATEMENTS_REFRESH_WAIT_SECONDS', 300))
+                        if result.get('stored'):
+                            statements._pipeline_into(result)
+                        audit.record('statements_pulled', subject_type=None,
+                                     after=result,
+                                     notes=statements.pull_summary(result))
+                        log.info('[scheduler] statement pull complete: %s',
+                                 {k: v for k, v in result.items()
+                                  if k != 'errors'})
         except Exception:  # pragma: no cover - never let the job die
             log.exception('[scheduler] statement pull crashed')
         # v0.4.42 — re-read any statement whose figures predate the running

@@ -10,6 +10,61 @@ architecture rather than the API surface.
 
 ---
 
+## [1.0.8] — 2026-10-04
+
+**One statement per period, and a statement pull now reconciles what it pulls.**
+
+### Fixed
+
+- **Duplicate statement rows after a refresh.** `/statements/refresh` makes
+  Plaid re-issue every statement in its window under a new `statement_id`,
+  and `/statements/list` keeps listing the old ids beside the new ones.
+  Statements were keyed on `statement_id` alone, and v1.0.6's window
+  deliberately re-covered the newest month held, so OML got second copies of
+  May and June; dev got up to four of each May–September statement. The copies
+  re-anchored their periods out of order, which set a false
+  `chain_gap_from_prior`, and their anchors and Bank Statement records were
+  pushed to ERPNext.
+  - A statement whose (account, period_start, period_end) is already held is
+    now skipped without being downloaded, and the original row is kept.
+  - The refresh window starts the day after the newest statement held,
+    following the account furthest behind, with no overlap. Nothing is
+    requested when everything up to today is already held.
+- **Two pulls at once.** v1.0.6's lock covered one process only. Gunicorn's
+  two workers and the scheduler thread could pull at the same moment and store
+  the same re-issued statements. A file lock in `DATA_DIR` now serializes the
+  scheduled pull, the *Pull statements* button and the webhook fetch across
+  the container.
+- **A pull didn't reconcile what it pulled.** New statements only had their
+  anchors rebuilt. Their Activity lines were never matched, so a boundary
+  purchase (bank-dated in the new month, Plaid-dated in the old) could not
+  move; OML's June +76.37 stayed open after July arrived. A pull that stores
+  anything now runs the same pipeline as *Re-parse*: pair companions → match
+  lines (stamp the bank's posted dates) → synthesize → rebuild anchors.
+- Matching, synthesis and the anchor rebuild skip later copies, so duplicates
+  still on disk can't double-count a line or fake a chain gap.
+
+### Added
+
+- **`dedupe_statements` MCP tool** (kill switch `dedupe_statements`, off by
+  default; `dry_run` defaults to true).
+  - It removes re-issued copies from Bank Bridge's own mirror, keeping the
+    original (lowest id) per account and period.
+  - A copy goes only when its PDF is byte-identical. Its manual adjustments
+    and any synthesized transactions move to the original first, and its
+    derived lines, anchor and queued ERPNext push are dropped.
+  - Copies that differ are kept and reported. PDF files stay on disk.
+  - It never writes ERPNext. Bank Statement records it holds for removed copies
+    are listed in `erpnext_bank_statements`.
+
+### Dev, read-only
+
+- 28 duplicate statement rows across 6030 and 9401 (May–September 2026). All
+  are byte-identical, with no lines, synthesized rows or adjustments; each has
+  an anchor.
+
+---
+
 ## [1.0.7] — 2026-10-03
 
 **Stale duplicate Bank Transactions are flagged and kept, never deleted.**

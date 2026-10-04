@@ -56,7 +56,9 @@ import calendar
 import logging
 import os
 import re
-import threading
+import contextlib
+import fcntl
+import hashlib
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -71,8 +73,7 @@ from .plaid_client import PlaidError
 
 log = logging.getLogger('bankbridge.statements')
 
-# v1.0.6 · one refresh pull at a time per process (see run_refresh_pull).
-_REFRESH_LOCK = threading.Lock()
+# v1.0.8 · one statement pull at a time PER CONTAINER (see pull_lock).
 
 
 def _now() -> datetime:
@@ -206,6 +207,35 @@ def store_pdf(path: str, data: bytes) -> int:
         fh.write(data)
     os.replace(tmp, path)
     return len(data)
+
+
+def later_copies(account_id: str | None = None) -> set:
+    """Ids of statement rows that duplicate an EARLIER row for the same
+    (account, period_start, period_end) — the re-issued copies a v1.0.6
+    refresh stored. The lowest id in each group is the original and is never
+    in this set. Matching, synthesis and the anchor rebuild skip these, so a
+    copy can neither double-count a statement line nor re-anchor a period with
+    a false chain gap; dedupe_statements removes them."""
+    q = (db.session.query(PlaidStatement.plaid_account_id,
+                          PlaidStatement.period_start,
+                          PlaidStatement.period_end,
+                          db.func.min(PlaidStatement.id))
+         .filter(PlaidStatement.period_start.isnot(None),
+                 PlaidStatement.period_end.isnot(None)))
+    if account_id:
+        q = q.filter(PlaidStatement.plaid_account_id == account_id)
+    groups = q.group_by(PlaidStatement.plaid_account_id,
+                        PlaidStatement.period_start,
+                        PlaidStatement.period_end).having(
+        db.func.count(PlaidStatement.id) > 1).all()
+    out = set()
+    for acct, start, end, keep in groups:
+        out.update(i for (i,) in db.session.query(PlaidStatement.id).filter(
+            PlaidStatement.plaid_account_id == acct,
+            PlaidStatement.period_start == start,
+            PlaidStatement.period_end == end,
+            PlaidStatement.id != keep).all())
+    return out
 
 
 def pdf_exists(statement: PlaidStatement) -> bool:
@@ -2148,7 +2178,10 @@ def match_all_statements() -> dict:
            StatementTransaction.query.with_entities(
                StatementTransaction.statement_id).distinct()}
     # …plus any that SHOULD have rows but don't yet (standalone use).
+    copies = later_copies()
     for st in PlaidStatement.query.all():
+        if st.id in copies:
+            continue
         try:
             has_rows = st.id in ids
             if not has_rows and statement_needs_activity(st):
@@ -2246,7 +2279,10 @@ def synthesize_missing_transactions(account_id: str = '') -> dict:
     q = PlaidStatement.query.filter(PlaidStatement.period_start.isnot(None))
     if account_id:
         q = q.filter(PlaidStatement.plaid_account_id == account_id)
+    copies = later_copies(account_id or None)
     for statement in q.all():
+        if statement.id in copies:
+            continue
         try:
             account = PlaidAccount.query.filter_by(
                 account_id=statement.plaid_account_id).first()
@@ -2367,6 +2403,8 @@ def rebuild_statement_anchors(account_id: str | None = None) -> dict:
                 .order_by(PlaidStatement.period_start.asc(),
                           PlaidStatement.id.asc())
                 .all())
+        copies = later_copies(account.account_id)
+        rows = [r for r in rows if r.id not in copies]
         if not rows:
             continue
         stats['accounts'] += 1
@@ -3027,10 +3065,22 @@ def reparse_stored(account_id: str = '', *, only_stale: bool = False) -> dict:
         if flag_parse_continuity(row):
             stats['suspect'] += 1
     db.session.commit()
-    # v0.5.4 · the full downstream pipeline, IN ORDER, so reparse_stored (the
-    # admin-button path) heals end to end and not only reparse_stale did:
-    #   pairing (companion) → match (stamp bank dates) → anchors (use them).
-    # Each isolated so a failure in one still commits the work before it.
+    stats.update(run_reconcile_pipeline())
+    return stats
+
+
+def run_reconcile_pipeline() -> dict:
+    """The downstream pipeline, IN ORDER: pair cash-services companions →
+    extract + match statement Activity lines (stamping the bank's posted date
+    onto BankTransactions) → synthesize rows Plaid never returned → rebuild
+    anchors. Each step isolated so a failure still commits the work before it.
+
+    v1.0.8 · lifted out of reparse_stored so a statement PULL runs it too.
+    Before, a newly downloaded statement only had its anchors rebuilt: its
+    Activity lines were never matched, so a boundary purchase (bank-dated in
+    the new month, Plaid-dated in the old) could never move — which is why
+    OML's June +76.37 stayed open after July's statement arrived."""
+    stats = {}
     try:
         stats['paired'] = autolink_cash_services()['paired']
     except Exception:  # pragma: no cover
@@ -3129,7 +3179,9 @@ def _blank_stats() -> dict:
             'failed': 0, 'items': 0, 'errors': [],
             # v1.0.6 · /statements/refresh outcomes for this run.
             'refresh_requested': 0, 'refresh_completed': 0,
-            'refresh_timed_out': 0, 'unsupported': 0}
+            'refresh_timed_out': 0, 'unsupported': 0,
+            # v1.0.8 · re-issued statement ids for a period already held.
+            'skipped_same_period': 0}
 
 
 # ── v1.0.6 · /statements/refresh ────────────────────────────────────────────
@@ -3181,18 +3233,31 @@ def _pull_record(item_id: str, direction: str, count: int, status: str,
                     exc_info=True)
 
 
-def refresh_window(item: PlaidItem, today: date | None = None) -> tuple:
-    """(start, end) for a refresh: from a month before the newest statement
-    already held for this Item (else 24 months back) to today."""
+def refresh_window(item: PlaidItem, today: date | None = None):
+    """(start, end) for a refresh, or None when there is nothing to ask for.
+
+    v1.0.8 · NO OVERLAP. Plaid re-extracts every statement inside the window
+    under a fresh statement_id, so re-covering a month already held only
+    manufactures duplicates (the v1.0.6 window re-covered a month on purpose,
+    and OML grew second copies of May and June). The window now starts the day
+    after the newest statement held — taken per account, and the OLDEST of
+    those, so an account that is a month behind its siblings still catches up.
+    An account whose newest statement is over a year old is treated as closed
+    and ignored. With nothing held, it reaches back 24 months, as Link does."""
     today = today or date.today()
-    newest = (db.session.query(db.func.max(PlaidStatement.period_end))
-              .filter(PlaidStatement.plaid_item_id == item.item_id).scalar())
     floor = today - timedelta(days=_REFRESH_MAX_DAYS)
-    if newest is None:
+    newest = [d for (d,) in (
+        db.session.query(db.func.max(PlaidStatement.period_end))
+        .filter(PlaidStatement.plaid_item_id == item.item_id,
+                PlaidStatement.period_end.isnot(None))
+        .group_by(PlaidStatement.plaid_account_id).all())
+        if d is not None and d >= today - timedelta(days=365)]
+    if not newest:
         return floor, today
-    start = max(floor, newest + timedelta(days=1)
-                - timedelta(days=_REFRESH_OVERLAP_DAYS))
-    return min(start, today), today
+    start = max(floor, min(newest) + timedelta(days=1))
+    if start > today:
+        return None
+    return start, today
 
 
 def request_refresh(item: PlaidItem, client, access_token: str, *,
@@ -3201,7 +3266,10 @@ def request_refresh(item: PlaidItem, client, access_token: str, *,
     to the Item: 'pending' (asked; a caller will wait), 'timeout' (asked; no
     one will wait, so the webhook fetches on arrival), 'failed' or
     'unsupported'. Never raises — the error goes on the pull record."""
-    start, end = refresh_window(item)
+    window = refresh_window(item)
+    if window is None:
+        return 'complete'      # everything up to today is already held
+    start, end = window
     # Written BEFORE the call: Plaid can answer the webhook faster than this
     # function returns, and a status written afterwards would overwrite the
     # webhook's 'complete' and leave the waiter polling to its deadline.
@@ -3342,8 +3410,10 @@ def fetch_statements_for_item(item: PlaidItem, *, plaid_client=None,
             stats['failed'] += 1
             stats['errors'].append(f"{row.get('statement_id')}: {e}")
             continue
-        if result == 'skipped':
+        if result in ('skipped', 'skipped_same_period'):
             stats['skipped_existing'] += 1
+            if result == 'skipped_same_period':
+                stats['skipped_same_period'] += 1
             continue
         downloaded += 1
         if result == 'stored':
@@ -3376,6 +3446,18 @@ def _store_one(item: PlaidItem, row: dict, client, access_token: str) -> str:
         return 'skipped'
 
     start, end = period_bounds(row.get('month'), row.get('year'))
+    # v1.0.8 · ONE statement per (account, period). A /statements/refresh makes
+    # Plaid re-extract every statement in its window under a NEW statement_id,
+    # and /statements/list keeps listing the old ids beside the new ones — so
+    # keying on statement_id alone stored the same June PDF up to four times.
+    # The ORIGINAL row is kept; the re-issued id is skipped without a download.
+    if existing is None and start is not None and end is not None:
+        held = (PlaidStatement.query
+                .filter_by(plaid_account_id=account_id, period_start=start,
+                           period_end=end)
+                .order_by(PlaidStatement.id.asc()).first())
+        if held is not None and pdf_exists(held):
+            return 'skipped_same_period'
     label = period_label(start)
     data = download_with_retry(client, access_token, statement_id)
 
@@ -3480,62 +3562,238 @@ def fetch_all(*, plaid_client=None, limit_per_item: int | None = None,
         stats = fetch_statements_for_item(item, plaid_client=plaid_client,
                                           limit=limit_per_item)
         for key in ('listed', 'stored', 'skipped_existing', 'parsed', 'failed',
-                    'items', 'unsupported'):
+                    'items', 'unsupported', 'skipped_same_period'):
             totals[key] += stats[key]
         totals['errors'].extend(stats['errors'])
     return totals
 
 
-def run_refresh_pull(app, *, wait_seconds: float | None = None) -> dict:
-    """The full refresh → wait → list → anchor pass, in its own app context —
-    what the admin button runs on a background thread and a late webhook runs
-    for its Item. Serialized per process so two clicks don't download the same
-    statement twice. Never raises."""
-    if not _REFRESH_LOCK.acquire(blocking=False):
-        return {'busy': True}
+@contextlib.contextmanager
+def pull_lock(app):
+    """Hold the container-wide statement-pull lock, or yield False when another
+    process already holds it. A file lock in DATA_DIR, because gunicorn runs two
+    workers plus the scheduler thread: v1.0.6's in-process lock let two pulls
+    run at once, and both stored the same re-issued statements."""
+    path = os.path.join(app.config.get('DATA_DIR', '/tmp'),
+                        'statements_pull.lock')
+    fh = None
     try:
-        with app.app_context():
-            audit.set_context('statements')
-            wait = (app.config.get('STATEMENTS_REFRESH_WAIT_SECONDS', 300)
-                    if wait_seconds is None else wait_seconds)
-            result = fetch_all(refresh=True, wait_seconds=wait)
-            if result.get('stored'):
-                try:
-                    result['anchors'] = rebuild_statement_anchors()
-                except Exception:  # pragma: no cover - never fail the pull
-                    db.session.rollback()
-                    log.exception('anchor rebuild after the statement pull '
-                                  'crashed')
-            audit.record('statements_pulled', subject_type=None, after=result,
-                         notes=pull_summary(result))
-            return result
+        fh = open(path, 'a+')
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        if fh is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fh.close()
+
+
+def _pipeline_into(result: dict) -> None:
+    try:
+        result['pipeline'] = run_reconcile_pipeline()
+    except Exception:  # pragma: no cover - never fail the pull
+        db.session.rollback()
+        log.exception('reconcile pipeline after the statement pull crashed')
+
+
+def run_refresh_pull(app, *, wait_seconds: float | None = None) -> dict:
+    """The full refresh → wait → list → reconcile pass, in its own app context
+    — what the admin button runs on a background thread. One at a time per
+    container (pull_lock). Never raises."""
+    try:
+        with pull_lock(app) as got:
+            if not got:
+                return {'busy': True}
+            with app.app_context():
+                audit.set_context('statements')
+                wait = (app.config.get('STATEMENTS_REFRESH_WAIT_SECONDS', 300)
+                        if wait_seconds is None else wait_seconds)
+                result = fetch_all(refresh=True, wait_seconds=wait)
+                if result.get('stored'):
+                    _pipeline_into(result)
+                audit.record('statements_pulled', subject_type=None,
+                             after=result, notes=pull_summary(result))
+                return result
     except Exception:  # pragma: no cover - defensive
         log.exception('statement refresh pull crashed')
         return {'error': True}
-    finally:
-        _REFRESH_LOCK.release()
 
 
 def fetch_item_after_webhook(app, item_id: str) -> dict:
     """A late STATEMENTS_REFRESH_COMPLETE (nobody waiting): list and store that
-    one Item's statements, then rebuild anchors if anything new arrived."""
-    with app.app_context():
-        audit.set_context('webhook')
-        item = PlaidItem.query.filter_by(item_id=item_id).first()
-        if item is None:
-            return _blank_stats()
-        result = fetch_statements_for_item(item)
-        if result.get('stored'):
-            try:
-                rebuild_statement_anchors()
-            except Exception:  # pragma: no cover - never fail the webhook
-                db.session.rollback()
-                log.exception('anchor rebuild after webhook fetch crashed')
-        audit.record('statements_pulled', subject_type='PlaidItem',
-                     subject_id=item_id, after=result,
-                     notes='after STATEMENTS_REFRESH_COMPLETE — '
-                           + pull_summary(result))
-        return result
+    one Item's statements, then run the reconcile pipeline if anything new
+    arrived. Skips when another pull holds the lock — that pull lists too."""
+    with pull_lock(app) as got:
+        if not got:
+            return {'busy': True}
+        with app.app_context():
+            audit.set_context('webhook')
+            item = PlaidItem.query.filter_by(item_id=item_id).first()
+            if item is None:
+                return _blank_stats()
+            result = fetch_statements_for_item(item)
+            if result.get('stored'):
+                _pipeline_into(result)
+            audit.record('statements_pulled', subject_type='PlaidItem',
+                         subject_id=item_id, after=result,
+                         notes='after STATEMENTS_REFRESH_COMPLETE — '
+                               + pull_summary(result))
+            return result
+
+
+def _pdf_sha256(statement: PlaidStatement) -> str | None:
+    path = resolve_pdf_path(statement)
+    if not path:
+        return None
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1 << 16), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def dedupe_statements(*, account_id: str = '', dry_run: bool = True,
+                      erp_client=None, actor: str = 'mcp') -> dict:
+    """Remove the re-issued duplicate statement rows a v1.0.6 refresh stored,
+    keeping the ORIGINAL (lowest id) for each (account, period). Bank Bridge's
+    own mirror only — ERPNext is never written; Bank Statement records it holds
+    for a removed copy are REPORTED (`erpnext_bank_statements`) for a separate
+    decision.
+
+    A copy is removed only when it is the same document: identical PDF bytes
+    (sha256), or — with a PDF missing on one side — identical size and parsed
+    opening/closing. A copy that differs is left alone and reported. For each
+    removed copy:
+      * its manual StatementAdjustments are moved onto the original (they are
+        human attributions, never discarded);
+      * any synthesized BankTransaction built from one of its statement lines
+        is repointed to the original's line with the same sequence (the
+        original's lines are extracted first if needed) — a copy whose lines
+        cannot all be mapped is left alone;
+      * its derived rows go: statement lines, its anchor, and any queued
+        ERPNext push for that anchor;
+      * its PDF file stays on disk (named in the result).
+    Then anchors are rebuilt for the affected accounts. Idempotent; dry_run
+    defaults to True and changes nothing."""
+    from .models import (ErpnextPushQueue, StatementAdjustment,
+                         StatementAnchor, StatementTransaction)
+    copies = sorted(later_copies(account_id or None))
+    result = {'dry_run': dry_run, 'groups': [], 'removed': [], 'kept_apart': [],
+              'erpnext_bank_statements': []}
+    by_group = {}
+    for sid in copies:
+        st = db.session.get(PlaidStatement, sid)
+        key = (st.plaid_account_id, st.period_start, st.period_end)
+        by_group.setdefault(key, []).append(st)
+    affected = set()
+    for (acct, start, end), dups in sorted(by_group.items(),
+                                           key=lambda kv: (kv[0][0], kv[0][1])):
+        keep = (PlaidStatement.query
+                .filter_by(plaid_account_id=acct, period_start=start,
+                           period_end=end)
+                .order_by(PlaidStatement.id.asc()).first())
+        group = {'account_id': acct, 'period_start': start.isoformat(),
+                 'period_end': end.isoformat(), 'keep_id': keep.id,
+                 'keep_statement_id': keep.statement_id,
+                 'copies': [d.statement_id for d in dups]}
+        result['groups'].append(group)
+        keep_hash = _pdf_sha256(keep)
+        for dup in dups:
+            entry = {'id': dup.id, 'statement_id': dup.statement_id,
+                     'account_id': acct, 'period_end': end.isoformat(),
+                     'keep_statement_id': keep.statement_id,
+                     'pdf_path': dup.pdf_path or ''}
+            dup_hash = _pdf_sha256(dup)
+            if keep_hash and dup_hash:
+                same = keep_hash == dup_hash
+            else:
+                same = ((dup.pdf_bytes or 0) == (keep.pdf_bytes or 0)
+                        and dup.opening_balance == keep.opening_balance
+                        and dup.closing_balance == keep.closing_balance)
+            if not same:
+                result['kept_apart'].append({**entry, 'reason':
+                                             'differs from the original — '
+                                             'review by hand'})
+                continue
+            lines = StatementTransaction.query.filter_by(
+                statement_id=dup.id).all()
+            line_ids = [ln.id for ln in lines]
+            synth = (BankTransaction.query.filter(
+                BankTransaction.source_statement_txn_id.in_(line_ids)).all()
+                if line_ids else [])
+            mapping = {}
+            if synth:
+                if not dry_run and StatementTransaction.query.filter_by(
+                        statement_id=keep.id).count() == 0:
+                    store_statement_transactions(keep)
+                keep_by_seq = {ln.sequence: ln.id for ln in
+                               StatementTransaction.query.filter_by(
+                                   statement_id=keep.id).all()}
+                by_id = {ln.id: ln.sequence for ln in lines}
+                for row in synth:
+                    target = keep_by_seq.get(by_id.get(
+                        row.source_statement_txn_id))
+                    if target is None and not dry_run:
+                        mapping = None
+                        break
+                    mapping[row.id] = target
+                if mapping is None:
+                    result['kept_apart'].append({**entry, 'reason':
+                                                 'synthesized transactions '
+                                                 'built from it cannot be '
+                                                 'mapped to the original'})
+                    continue
+            adjustments = StatementAdjustment.query.filter_by(
+                statement_id=dup.id).all()
+            anchor = StatementAnchor.query.filter_by(statement_id=dup.id).first()
+            entry.update(statement_lines=len(lines),
+                         synthesized_repointed=len(synth),
+                         adjustments_moved=len(adjustments),
+                         anchor_removed=anchor is not None)
+            if erp_client is not None:
+                try:
+                    from . import erpnext_statements
+                    found = erpnext_statements.find_by_plaid_id(
+                        erp_client, dup.statement_id)
+                    if found:
+                        result['erpnext_bank_statements'].append(
+                            {'name': found.get('name'),
+                             'plaid_statement_id': dup.statement_id,
+                             'period_end': end.isoformat()})
+                except Exception:  # noqa: BLE001 - a report, never a blocker
+                    pass
+            result['removed'].append(entry)
+            if dry_run:
+                continue
+            for row in synth:
+                row.source_statement_txn_id = mapping[row.id]
+            for adj in adjustments:
+                adj.statement_id = keep.id
+            if anchor is not None:
+                ErpnextPushQueue.query.filter_by(
+                    dedupe_key=f'anchor:{anchor.id}').delete()
+                db.session.delete(anchor)
+            for ln in lines:
+                db.session.delete(ln)
+            db.session.flush()
+            db.session.delete(dup)
+            audit.record('statement_duplicate_removed',
+                         subject_type='PlaidStatement', subject_id=dup.statement_id,
+                         after=entry, notes=f'copy of {keep.statement_id} '
+                                            f'({end.isoformat()})',
+                         actor=actor, commit=False)
+            affected.add(acct)
+    if not dry_run:
+        db.session.commit()
+        result['anchors'] = {a: rebuild_statement_anchors(a).get('written', 0)
+                             for a in sorted(affected)}
+    return result
 
 
 def pull_summary(result: dict) -> str:
@@ -3550,6 +3808,9 @@ def pull_summary(result: dict) -> str:
                  f"{result.get('refresh_timed_out', 0)}")
     if result.get('unsupported'):
         line += f"; {result['unsupported']} Item(s) cannot serve statements"
+    if result.get('skipped_same_period'):
+        line += (f"; {result['skipped_same_period']} re-issued id(s) for a "
+                 'period already held, skipped')
     if result.get('errors'):
         line += (f"; {len(result['errors'])} error(s), first: "
                  f"{str(result['errors'][0])[:200]}")
