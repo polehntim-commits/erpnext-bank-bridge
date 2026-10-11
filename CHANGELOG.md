@@ -10,6 +10,59 @@ architecture rather than the API surface.
 
 ---
 
+## [1.0.9] — 2026-10-11
+
+**Every categorization rule belongs to one Company, before Constancy Farms,
+LLC is linked.**
+
+### Changed
+
+- **Rules are company-scoped, and matching refuses to cross Companies.** A
+  blank `applies_to_company` used to mean "every Company". On OML 65 of 67 rules
+  were blank, so linking Constancy would have sent its cash withdrawals to OML's
+  Member Distributions (182 "CASH"), a payment to Tim to OML's management fees
+  (171/172), and its Oregon DOR payroll tax to a licence fee (168).
+  - A rule now fires only on transactions whose account EXPLICITLY belongs to
+    the rule's Company: the account's owning Company, or its Item's.
+  - A blank-scope rule matches nothing.
+  - An account nobody assigned matches nothing once any Company has been
+    assigned. It doesn't borrow the default Company's rules, so a Constancy
+    account linked without picking its Company is not categorized as OML.
+  - `generate_journal_entry` refuses a rule handed in across Companies (audit
+    `rule_refused_cross_company`), and the JE books into the rule's Company.
+- **A logical offset resolves under the rule's Company** for every rule. Before,
+  only an unscoped rule resolved "Member Distributions" to its account; a
+  scoped one sent the bare name. "Mode B" (one agnostic rule resolving per
+  Company) is gone: each Company has its own rules.
+- **One rule source of truth: Bank Bridge's rule table.**
+  - `RULES_SOURCE` now defaults to `local`.
+  - A stored `erpnext` with no ERPNext-mirrored rules (OML: `rules_source=
+    erpnext`, `rule_source_in_force=local`) is migrated to `local` on first
+    read, once, so the flag and the engine agree. Opting into `erpnext`
+    afterwards is explicit and sticks.
+  - `list_rules`, `create_rule` and `update_rule` are no longer marked
+    deprecated.
+- **Authoring requires a Company.** `create_rule` requires `applies_to_company`,
+  checked against ERPNext's Companies. `update_rule` refuses to leave a rule
+  unscoped. The rule form has no "all Companies" option and refuses a blank
+  one. The rules list flags an unscoped rule "⚠ none — never fires".
+  `list_rules` filters by `company`.
+
+### Added
+
+- **Boot migration** (`rule_scope.apply_scope`). It assigns every unscoped live
+  rule to the install's Company: `RULE_SCOPE_MIGRATION_COMPANY` if set, else the
+  one Company every already-scoped rule uses (OML: rules 110 and 184, "Orchard
+  Meadow, LLC"), else the only Company in play. When that's ambiguous it assigns
+  nothing and says why. Once only, recorded by an `items_company_pinned`
+  AuditEvent, it also stamps Items with no Company with that Company, so OML's
+  accounts keep matching; a later unassigned Item is never pinned.
+- **`get_rule_scope_report` MCP tool** (read-only). Lists unscoped rules
+  (should be 0), Items with no Company, and the migration target and its
+  reason.
+
+---
+
 ## [1.0.8] — 2026-10-04
 
 **One statement per period, and a statement pull now reconciles what it pulls.**

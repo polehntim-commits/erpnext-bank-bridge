@@ -333,12 +333,15 @@ def _rule_eligible_for_paired(rule, row) -> bool:
 
 
 def _rule_applies_to_company(rule, row_company: str) -> bool:
-    """Whether a company-scoped rule is in scope for this transaction. A rule
-    with a blank `applies_to_company` is company-agnostic and always applies
-    (v0.3.x behavior); a scoped rule applies only when the transaction's linked
-    account resolves to that same Company."""
-    scope = (getattr(rule, 'applies_to_company', None) or '').strip()
-    return not scope or scope == row_company
+    """Whether a rule is in scope for this transaction.
+
+    v1.0.9 · EVERY rule needs a Company, and fires only on transactions whose
+    account belongs to that same Company. A blank scope used to mean "all
+    Companies" — which, the day a second entity is linked, sends its cash
+    withdrawals to the first entity's Member Distributions. Blank now means
+    "nothing": see app/rule_scope.py."""
+    from . import rule_scope
+    return rule_scope.rule_in_scope(rule, row_company)
 
 
 # ── v1.0.0 · the matcher's fast path ────────────────────────────────────────
@@ -489,9 +492,11 @@ def evaluate_rules(row):
     v1.0.0: matches against the cached snapshots (see rule_snapshots) and
     hydrates ONLY the winner. A run that matches nothing now touches the rules
     table for one aggregate rather than for every transaction."""
-    from . import erpnext_accounts
-    row_company = erpnext_accounts.owning_company_for_account_id(
-        getattr(row, 'account_id', None))
+    from . import rule_scope
+    # v1.0.9 · the account's EXPLICIT Company (rule_scope.matching_company), not
+    # owning_company_for's default fallback: an account nobody assigned must not
+    # borrow the default Company's rules.
+    row_company = rule_scope.matching_company(getattr(row, 'account_id', None))
     merchant = row.merchant_name
     description = (row.name or '')
     category = (row.category or '')
@@ -1700,6 +1705,24 @@ def generate_journal_entry(client, row, *, supplier_name=None,
     if rule is None:
         return None  # no rule matched → leave for manual reconciliation
 
+    from . import rule_scope
+    # v1.0.9 · a rule never books into another Company. evaluate_rules already
+    # refuses the match; this is the same refusal for a caller that hands a
+    # rule in directly. The JE books into the rule's Company — which, for any
+    # match that got here, is the transaction account's explicit Company.
+    row_company = rule_scope.matching_company(getattr(row, 'account_id', None))
+    if not rule_scope.rule_in_scope(rule, row_company):
+        log.warning('rule %s (%s) is not in scope for %s (account Company %r) '
+                    '— no Journal Entry', rule.id, rule.applies_to_company,
+                    tid, row_company)
+        audit.record('rule_refused_cross_company', subject_type='BankTransaction',
+                     subject_id=tid,
+                     after={'rule_id': rule.id,
+                            'rule_company': rule.applies_to_company,
+                            'account_company': row_company},
+                     notes='rule not in scope for this account\'s Company')
+        return None
+
     # v0.4.49 · stamp the internal attribution tag the moment the rule is known
     # to match — BEFORE any of the JE machinery below, because a rule matching
     # is what earns the tag and JE generation is a separate concern that may
@@ -1710,8 +1733,7 @@ def generate_journal_entry(client, row, *, supplier_name=None,
     # v0.4.0 multi-entity: the JE books to the Company that owns the
     # transaction's Bank Account (per-account/Item choice → default).
     from . import erpnext_accounts
-    company = erpnext_accounts.owning_company_for_account_id(
-        getattr(row, 'account_id', None))
+    company = row_company
     remark = render_description(rule, row, supplier_name=supplier_name)
 
     # v0.4.0.7 · settle the party FIRST — before the GeneratedJournalEntry row
@@ -1758,10 +1780,14 @@ def generate_journal_entry(client, row, *, supplier_name=None,
         # backstop. The shape test (logical_account_name is a fixed point on an
         # already-logical name) is what distinguishes the two.
         offset_override = None
-        is_agnostic = not (getattr(rule, 'applies_to_company', None) or '').strip()
         offset = (rule.offset_account or '').strip()
         logical = offset if logical_account_name(offset) == offset else ''
-        if is_agnostic and logical:
+        # v1.0.9 · every rule is scoped now, and a LOGICAL offset ("Member
+        # Distributions") resolves to that name's account under the rule's —
+        # i.e. the transaction's — Company. Before, only an unscoped rule
+        # resolved; a scoped one sent the bare name verbatim, which ERPNext
+        # rejects. A fully-qualified offset is still used as written.
+        if logical:
             offset_override = erpnext_accounts.resolve_logical_account(
                 client, logical, company)
             if offset_override is None:

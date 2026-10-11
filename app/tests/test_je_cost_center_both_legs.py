@@ -43,7 +43,8 @@ from app import mcp_settings, migrations  # noqa: E402
 from app.models import CategorizationRule  # noqa: E402
 
 from tests.test_categorization import Base  # noqa: E402
-from tests.test_rule_cost_center import (CostCenterMcpBase,  # noqa: E402
+from tests.test_rule_cost_center import (RULE_COMPANY,  # noqa: E402
+                                         CostCenterMcpBase,
                                          FakeCostCenterClient)
 
 NONE = categorization.BANK_LEG_NO_COST_CENTER
@@ -281,6 +282,7 @@ class CreateRuleBankCostCenterTest(CostCenterMcpBase):
         self._stub_erpnext(FakeCostCenterClient(leaves=('Harvest - OML',)))
         _, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'SORREN',
+            'applies_to_company': RULE_COMPANY,
             'offset_account': '6400 Professional Services - OML',
             'cost_center': 'Harvest - OML'})
         payload = self._payload(body)
@@ -295,6 +297,7 @@ class CreateRuleBankCostCenterTest(CostCenterMcpBase):
             leaves=('Harvest - OML', 'Treasury - OML')))
         _, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'SORREN',
+            'applies_to_company': RULE_COMPANY,
             'offset_account': 'Repairs - OML', 'cost_center': 'Harvest - OML',
             'bank_cost_center': 'Treasury - OML'})
         self.assertEqual(self._payload(body)['created_rule']['bank_cost_center'],
@@ -306,6 +309,7 @@ class CreateRuleBankCostCenterTest(CostCenterMcpBase):
         self._stub_erpnext(FakeCostCenterClient(leaves=('Harvest - OML',)))
         _, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'SORREN',
+            'applies_to_company': RULE_COMPANY,
             'offset_account': 'Repairs - OML', 'cost_center': 'Harvest - OML',
             'bank_cost_center': 'Treasurey - OML'})       # typo
         self.assertIn('not a Cost Center', self._error_text(body))
@@ -318,6 +322,7 @@ class CreateRuleBankCostCenterTest(CostCenterMcpBase):
         self._stub_erpnext(client)
         _, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'SORREN',
+            'applies_to_company': RULE_COMPANY,
             'offset_account': 'Repairs - OML', 'cost_center': 'Harvest - OML',
             'bank_cost_center': NONE})
         self.assertEqual(self._payload(body)['created_rule']['bank_cost_center'],
@@ -418,6 +423,7 @@ class AdminRuleEditorBankCostCenterTest(Base):
             'id': str(rule.id), 'name': 'napa', 'priority': '100',
             'active': 'on', 'match_type': 'merchant_contains',
             'match_value': 'NAPA', 'offset_account': 'Repairs - OML',
+            'applies_to_company': RULE_COMPANY,
             'offset_direction': 'auto', 'cost_center': 'Harvest - OML',
             'bank_cost_center': 'Treasury - OML'})
         self.assertEqual(resp.status_code, 302)
@@ -432,6 +438,7 @@ class AdminRuleEditorBankCostCenterTest(Base):
             'id': str(rule.id), 'name': 'napa', 'priority': '100',
             'active': 'on', 'match_type': 'merchant_contains',
             'match_value': 'NAPA', 'offset_account': 'Repairs - OML',
+            'applies_to_company': RULE_COMPANY,
             'offset_direction': 'auto', 'cost_center': 'Harvest - OML',
             'bank_cost_center': ''})
         live = CategorizationRule.query.filter_by(archived=False).one()
@@ -444,6 +451,7 @@ class AdminRuleEditorBankCostCenterTest(Base):
             'id': str(rule.id), 'name': 'napa', 'priority': '100',
             'active': 'on', 'match_type': 'merchant_contains',
             'match_value': 'NAPA', 'offset_account': 'Repairs - OML',
+            'applies_to_company': RULE_COMPANY,
             'offset_direction': 'auto', 'cost_center': 'Harvest - OML',
             'bank_cost_center': NONE})
         live = CategorizationRule.query.filter_by(archived=False).one()

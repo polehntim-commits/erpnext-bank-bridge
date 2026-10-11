@@ -168,7 +168,9 @@ class TestErpnextCompanyField(MultiEntityBase):
                                   match_type='merchant_contains',
                                   match_value='Chevron',
                                   offset_account='Fuel Expense - EC',
-                                  offset_direction='auto')
+                                  offset_direction='auto',
+                                  # v1.0.9 · a rule fires only in its Company
+                                  applies_to_company='Orchard LLC')
         db.session.add(rule)
         row = BankTransaction(plaid_transaction_id='t1', account_id=ACC,
                               amount=50.0, merchant_name='Chevron',

@@ -368,7 +368,8 @@ class SkipParty(Base):
             'match_value': 'CREDIT CARD .* PAYMENT',
             'offset_account': 'Checking 1111 - T', 'offset_direction': 'auto',
             'party_type': 'Supplier', 'active': 'on', 'priority': '10',
-            'skip_party': 'on'})
+            'skip_party': 'on',
+            'applies_to_company': 'Testing'})
         rule = CategorizationRule.query.filter_by(name='CC Payment').first()
         self.assertIsNotNone(rule)
         self.assertTrue(rule.skip_party)
@@ -379,7 +380,8 @@ class SkipParty(Base):
             'name': 'Fuel', 'match_type': 'merchant_contains',
             'match_value': 'CHEVRON', 'offset_account': 'Fuel Expense - T',
             'offset_direction': 'auto', 'party_type': 'Supplier',
-            'active': 'on', 'priority': '20'})
+            'active': 'on', 'priority': '20',
+            'applies_to_company': 'Testing'})
         self.assertFalse(
             CategorizationRule.query.filter_by(name='Fuel').first().skip_party)
 

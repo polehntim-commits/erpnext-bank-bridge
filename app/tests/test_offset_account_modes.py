@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: MIT
-"""Two-mode Rule offset accounts (v0.4.0.3).
+"""Rule offset accounts: fully-qualified vs logical (v0.4.0.3, v1.0.9).
 
-A rule's offset is interpreted by its scope:
+v1.0.9 · EVERY rule belongs to exactly one Company (applies_to_company) and
+fires only on transactions whose account belongs to that Company. A rule with a
+blank scope matches NOTHING — the old "company-agnostic" Mode B rule, where ONE
+rule resolved a logical offset under each Company in turn, is gone: each Company
+needs its own rule. What survives of the two modes is the offset's SHAPE:
 
-  * Mode A — SCOPED rule (applies_to_company set): offset_account is a specific,
-    fully-qualified GL account, used verbatim (v0.4.0.2 behaviour).
-  * Mode B — AGNOSTIC rule (applies_to_company NULL) whose offset is a bare
-    LOGICAL name ('Meals & Entertainment'): resolved to the transaction's own
-    Company's chart at JE time, so ONE rule books to each Company's own account.
-    A Company lacking that account is skipped (no JE, no auto-create) and audited.
+  * a fully-qualified offset ('Meals & Entertainment - BBT') is used verbatim;
+  * a bare LOGICAL name ('Meals & Entertainment') is resolved under the rule's
+    Company at JE time — now for every rule, not only unscoped ones. A Company
+    lacking that account is skipped (no JE, no auto-create) and audited.
 
-An agnostic rule whose offset is still fully-qualified (a legacy value, a
-single-Company install, or one not yet auto-migrated) is used verbatim — the
-push-time cross-Company guard remains its backstop. A boot migration converts
-legacy agnostic offsets to logical names.
+The boot migration that converts legacy agnostic offsets to logical names is
+still exercised below; the dropdown feed still serves both shapes.
 
     cd app
     python3 -m unittest discover -s tests -v
@@ -126,12 +126,14 @@ class Base(unittest.TestCase):
         self._account(ACC_BBT, 'Bank Bridge Test', 'WF Checking - BBT')
         self._account(ACC_T2, 'Testing II', 'Checking II - T2')
 
-    def _agnostic_rule(self, offset='Meals & Entertainment'):
+    def _rule(self, company, offset='Meals & Entertainment'):
+        """A rule scoped to `company` (None → the legacy unscoped shape, which
+        v1.0.9 never fires)."""
         rule = CategorizationRule(
-            name='Uber Eats → Meals', priority=100, active=True,
+            name=f'Uber Eats → Meals ({company})', priority=100, active=True,
             match_type='merchant_contains', match_value='Uber Eats',
             offset_account=offset, offset_direction='auto',
-            applies_to_company=None)
+            applies_to_company=company)
         db.session.add(rule)
         db.session.commit()
         return rule
@@ -151,12 +153,12 @@ class Base(unittest.TestCase):
                     if 'Meals' in (l['account'] or ''))
 
 
-# ── Mode B: one agnostic logical rule resolves per-Company ───────────────────
+# ── a logical offset resolves under the RULE's Company ──────────────────────
 
-class TestModeBFiresPerCompany(Base):
-    def test_resolves_to_bbt_meals_for_bbt_transaction(self):
+class TestLogicalOffsetResolvesPerRuleCompany(Base):
+    def test_bbt_rule_resolves_to_bbt_meals(self):
         self._both_accounts()
-        self._agnostic_rule()
+        self._rule('Bank Bridge Test')
         erp = _chart_erp()
         categorization.generate_journal_entry(erp, self._row(ACC_BBT, 't1'))
         self.assertEqual(len(erp.created['Journal Entry']), 1)
@@ -165,20 +167,31 @@ class TestModeBFiresPerCompany(Base):
             plaid_transaction_id='t1').first()
         self.assertIsNotNone(gje.erpnext_journal_entry_name)
 
-    def test_same_rule_resolves_to_testing_ii_meals(self):
+    def test_testing_ii_rule_resolves_to_testing_ii_meals(self):
         self._both_accounts()
-        self._agnostic_rule()
+        self._rule('Testing II')
         erp = _chart_erp()
         categorization.generate_journal_entry(erp, self._row(ACC_T2, 't2'))
         self.assertEqual(self._offset_line(erp), 'Meals & Entertainment - T2')
         je = list(erp.created['Journal Entry'].values())[0]
         self.assertEqual(je['company'], 'Testing II')
 
-    def test_one_rule_books_to_both_companies_own_accounts(self):
-        # The whole point: a SINGLE agnostic rule, two Companies, each JE offset
-        # lands in that Company's own Meals account.
+    def test_a_rule_does_not_fire_on_another_companys_account(self):
+        # v1.0.9 · the BBT rule is out of scope for a Testing II transaction —
+        # no JE, rather than borrowing the rule into the other Company.
         self._both_accounts()
-        self._agnostic_rule()
+        self._rule('Bank Bridge Test')
+        erp = _chart_erp()
+        categorization.generate_journal_entry(erp, self._row(ACC_T2, 't2'))
+        self.assertEqual(len(erp.created['Journal Entry']), 0)
+
+    def test_each_company_needs_its_own_rule(self):
+        # Replaces Mode B's "one rule books to both Companies": two rules with
+        # the SAME logical offset, one per Company, each landing in that
+        # Company's own Meals account.
+        self._both_accounts()
+        self._rule('Bank Bridge Test')
+        self._rule('Testing II')
         erp = _chart_erp()
         categorization.generate_journal_entry(erp, self._row(ACC_BBT, 't1'))
         categorization.generate_journal_entry(erp, self._row(ACC_T2, 't2'))
@@ -188,11 +201,21 @@ class TestModeBFiresPerCompany(Base):
         self.assertEqual(
             offsets, {'Meals & Entertainment - BBT', 'Meals & Entertainment - T2'})
 
-    def test_resolved_offset_passes_the_push_guard(self):
-        # Mode B resolves to the target Company's own account, so the v0.4.0.2
-        # cross-Company guard must NOT block it (no false positive).
+    def test_unscoped_rule_never_fires(self):
+        # Fail closed: a blank applies_to_company matches nothing, on any
+        # Company's account.
         self._both_accounts()
-        self._agnostic_rule()
+        self._rule(None)
+        erp = _chart_erp()
+        categorization.generate_journal_entry(erp, self._row(ACC_BBT, 't1'))
+        categorization.generate_journal_entry(erp, self._row(ACC_T2, 't2'))
+        self.assertEqual(len(erp.created['Journal Entry']), 0)
+
+    def test_resolved_offset_passes_the_push_guard(self):
+        # The logical name resolves to the target Company's own account, so the
+        # v0.4.0.2 cross-Company guard must NOT block it (no false positive).
+        self._both_accounts()
+        self._rule('Bank Bridge Test')
         erp = _chart_erp()
         categorization.generate_journal_entry(erp, self._row(ACC_BBT, 't1'))
         gje = GeneratedJournalEntry.query.filter_by(
@@ -202,14 +225,14 @@ class TestModeBFiresPerCompany(Base):
             event_type='journal_entry_blocked_cross_company').count(), 0)
 
 
-# ── Mode B: a Company missing the logical account is skipped ─────────────────
+# ── a Company missing the logical account is skipped ─────────────────────────
 
-class TestModeBMissingAccount(Base):
+class TestLogicalOffsetMissingAccount(Base):
     def test_missing_target_account_skips_and_audits(self):
-        # 'Marketing' exists only under BBT. A Testing II transaction on a
-        # 'Marketing' rule has nowhere to book → skipped, not posted, not created.
+        # 'Marketing' exists only under BBT. A Testing II rule on 'Marketing'
+        # has nowhere to book → skipped, not posted, not created.
         self._both_accounts()
-        self._agnostic_rule(offset='Marketing')
+        self._rule('Testing II', offset='Marketing')
         erp = _chart_erp()
         categorization.generate_journal_entry(erp, self._row(ACC_T2, 't2'))
         self.assertEqual(len(erp.created['Journal Entry']), 0)
@@ -223,10 +246,12 @@ class TestModeBMissingAccount(Base):
         self.assertIsNotNone(ev)
         self.assertEqual(ev.subject_type, 'GeneratedJournalEntry')
 
-    def test_same_rule_still_fires_for_the_company_that_has_it(self):
-        # The 'Marketing' rule is skipped for Testing II but books for BBT.
+    def test_each_companys_rule_is_judged_against_its_own_chart(self):
+        # Same logical 'Marketing' offset on a rule per Company: BBT books,
+        # Testing II (no such account) is skipped.
         self._both_accounts()
-        self._agnostic_rule(offset='Marketing')
+        self._rule('Bank Bridge Test', offset='Marketing')
+        self._rule('Testing II', offset='Marketing')
         erp = _chart_erp()
         categorization.generate_journal_entry(erp, self._row(ACC_BBT, 't1'))
         categorization.generate_journal_entry(erp, self._row(ACC_T2, 't2'))
@@ -253,15 +278,14 @@ class TestModeAScoped(Base):
         categorization.generate_journal_entry(erp, self._row(ACC_BBT, 't1'))
         self.assertEqual(self._offset_line(erp), 'Meals & Entertainment - BBT')
 
-    def test_agnostic_rule_with_legacy_qualified_offset_posts_verbatim(self):
-        # Backward-compat at fire time: an agnostic rule whose offset is still
-        # fully-qualified (not yet migrated) is used as-is under its own Company.
+    def test_unscoped_rule_with_legacy_qualified_offset_never_fires(self):
+        # v1.0.9 · a fully-qualified offset no longer rescues an unscoped rule:
+        # blank scope matches nothing, even on the offset's own Company.
         self._both_accounts()
-        self._agnostic_rule(offset='Meals & Entertainment - BBT')
+        self._rule(None, offset='Meals & Entertainment - BBT')
         erp = _chart_erp()
         categorization.generate_journal_entry(erp, self._row(ACC_BBT, 't1'))
-        self.assertEqual(self._offset_line(erp), 'Meals & Entertainment - BBT')
-        self.assertEqual(len(erp.created['Journal Entry']), 1)
+        self.assertEqual(len(erp.created['Journal Entry']), 0)
 
 
 # ── the dropdown feed: Mode A fully-qualified vs Mode B logical ──────────────
@@ -307,14 +331,28 @@ class TestDropdownFeed(Base):
 # ── save path: mode is inferred from applies_to_company ──────────────────────
 
 class TestSaveInfersMode(Base):
-    def test_agnostic_rule_saves_logical_name_untouched(self):
-        self.client.post('/admin/rules/save', data={
+    def test_blank_company_is_refused(self):
+        # v1.0.9 · an unscoped rule would never fire, so the form won't save one.
+        r = self.client.post('/admin/rules/save', data={
             'name': 'Uber Eats → Meals', 'priority': '100', 'active': '1',
             'match_type': 'merchant_contains', 'match_value': 'Uber Eats',
             'offset_account': 'Meals & Entertainment', 'offset_direction': 'auto',
             'applies_to_company': ''})
+        self.assertIn('Choose the Company this rule belongs to',
+                      r.get_data(as_text=True))
+        self.assertEqual(CategorizationRule.query.count(), 0)
+
+    def test_scoped_rule_saves_logical_name_untouched(self):
+        # A logical offset on a scoped rule is stored as typed; it resolves
+        # under the rule's Company at JE time.
+        self.client.post('/admin/rules/save', data={
+            'name': 'Uber Eats → Meals', 'priority': '100', 'active': '1',
+            'match_type': 'merchant_contains', 'match_value': 'Uber Eats',
+            'offset_account': 'Meals & Entertainment', 'offset_direction': 'auto',
+            'applies_to_company': 'Bank Bridge Test',
+            'confirm_scope_mismatch': '1', 'confirm_party_mismatch': '1'})
         rule = CategorizationRule.query.filter_by(archived=False).first()
-        self.assertIsNone(rule.applies_to_company)          # agnostic → Mode B
+        self.assertEqual(rule.applies_to_company, 'Bank Bridge Test')
         self.assertEqual(rule.offset_account, 'Meals & Entertainment')
 
     def test_scoped_rule_saves_specific_offset(self):

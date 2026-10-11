@@ -20,6 +20,7 @@ Covered here:
   * JE build — the offset line under both directions, the deprecated
     debit/credit pair, and no key at all when unset
   * MCP create_rule — accepts cost_center, backwards-compatible without it
+    (v1.0.9: applies_to_company is required, so every call here passes one)
   * MCP update_rule — kill switch (its OWN, separate from create_rule),
     partial patch, clone-and-supersede, archived refusal, validation refusals
   * MCP list_rules — reports cost_center on every row
@@ -46,7 +47,7 @@ from app import erpnext_bank, mcp_settings, migrations  # noqa: E402
 from app.models import CategorizationRule  # noqa: E402
 
 from tests.fakes import unwrap_tool_payload  # noqa: E402
-from tests.test_categorization import Base  # noqa: E402
+from tests.test_categorization import COMPANY, Base  # noqa: E402
 from tests.test_mcp_server import McpBase  # noqa: E402
 
 
@@ -253,11 +254,17 @@ class CostCenterLookupTest(Base):
 
 
 # ── MCP tools ───────────────────────────────────────────────────────────────
+# v1.0.9 · every rule belongs to one Company; update_rule refuses to touch an
+# unscoped one without scoping it, so seeded rules carry this by default.
+RULE_COMPANY = 'Orchard Meadow, LLC'
+
+
 class CostCenterMcpBase(McpBase):
     def _rule(self, **kw):
         defaults = dict(name='napa', priority=100, active=True,
                         match_type='merchant_contains', match_value='NAPA',
-                        offset_account='Repairs - OML')
+                        offset_account='Repairs - OML',
+                        applies_to_company=RULE_COMPANY)
         defaults.update(kw)
         rule = CategorizationRule(**defaults)
         db.session.add(rule)
@@ -295,6 +302,7 @@ class CreateRuleCostCenterTest(CostCenterMcpBase):
         self._stub_erpnext(FakeCostCenterClient(leaves=('Harvest - OML',)))
         _, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'COASTAL FARM',
+            'applies_to_company': RULE_COMPANY,
             'offset_account': 'Crop Protection - OML',
             'cost_center': 'Harvest - OML'})
         payload = self._payload(body)
@@ -307,6 +315,7 @@ class CreateRuleCostCenterTest(CostCenterMcpBase):
         """Backwards compatibility: the pre-v0.7.3 call shape is unchanged."""
         _, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'TESTVENDOR',
+            'applies_to_company': RULE_COMPANY,
             'offset_account': '5000 - Test', 'tag': 'test'})
         payload = self._payload(body)
         self.assertEqual(payload['created_rule']['cost_center'], '')
@@ -316,6 +325,7 @@ class CreateRuleCostCenterTest(CostCenterMcpBase):
         self._stub_erpnext(FakeCostCenterClient(leaves=('Harvest - OML',)))
         _, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'COASTAL FARM',
+            'applies_to_company': RULE_COMPANY,
             'offset_account': 'Crop Protection - OML',
             'cost_center': 'Harvset - OML'})     # typo
         self.assertIn('not a Cost Center', self._error_text(body))
@@ -329,6 +339,7 @@ class CreateRuleCostCenterTest(CostCenterMcpBase):
             raises=ERPNextAPIError('down', status_code=500)))
         _, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'COASTAL FARM',
+            'applies_to_company': RULE_COMPANY,
             'offset_account': 'Crop Protection - OML',
             'cost_center': 'Harvest - OML'})
         self.assertEqual(self._payload(body)['created_rule']['cost_center'],
@@ -338,10 +349,20 @@ class CreateRuleCostCenterTest(CostCenterMcpBase):
         self._stub_erpnext(None)
         _, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'ANTHROPIC',
+            'applies_to_company': RULE_COMPANY,
             'offset_account': 'Software - OML',
             'cost_center': 'Support - OML'})
         self.assertEqual(self._payload(body)['created_rule']['cost_center'],
                          'Support - OML')
+
+    def test_a_rule_without_a_company_is_refused(self):
+        """v1.0.9 · an unscoped rule matches nothing, so creating one would
+        create a rule that silently never fires."""
+        _, body = self._call_tool('create_rule', {
+            'match_type': 'merchant_contains', 'match_value': 'COASTAL FARM',
+            'offset_account': 'Crop Protection - OML'})
+        self.assertIn('applies_to_company is required', self._error_text(body))
+        self.assertEqual(CategorizationRule.query.count(), 0)
 
 
 class UpdateRuleTest(CostCenterMcpBase):
@@ -466,6 +487,21 @@ class UpdateRuleTest(CostCenterMcpBase):
         self.assertEqual(CategorizationRule.query.count(), 1)
         self.assertFalse(db.session.get(CategorizationRule, rule.id).archived)
 
+    def test_an_unscoped_rule_can_only_be_updated_into_a_company(self):
+        """v1.0.9 · a patch that leaves a rule with no Company would supersede
+        it with another rule that never fires."""
+        mcp_settings.save({'update_rule': True})
+        rule = self._rule(applies_to_company=None)
+        _, body = self._call_tool('update_rule', {
+            'rule_id': rule.id, 'cost_center': 'Harvest - OML'})
+        self.assertIn('has no Company', self._error_text(body))
+        self.assertFalse(db.session.get(CategorizationRule, rule.id).archived)
+        _, body = self._call_tool('update_rule', {
+            'rule_id': rule.id, 'applies_to_company': RULE_COMPANY})
+        new = db.session.get(CategorizationRule,
+                             self._payload(body)['updated_rule']['id'])
+        self.assertEqual(new.applies_to_company, RULE_COMPANY)
+
     def test_an_empty_patch_is_refused(self):
         mcp_settings.save({'update_rule': True})
         rule = self._rule()
@@ -529,7 +565,8 @@ class AdminRuleEditorCostCenterTest(Base):
             'id': str(rule.id), 'name': 'napa', 'priority': '100',
             'active': 'on', 'match_type': 'merchant_contains',
             'match_value': 'NAPA', 'offset_account': 'Repairs - OML',
-            'offset_direction': 'auto', 'cost_center': 'Harvest - OML'})
+            'offset_direction': 'auto', 'cost_center': 'Harvest - OML',
+            'applies_to_company': COMPANY})
         self.assertEqual(resp.status_code, 302)
         live = CategorizationRule.query.filter_by(archived=False).one()
         self.assertEqual(live.cost_center, 'Harvest - OML')
@@ -541,7 +578,8 @@ class AdminRuleEditorCostCenterTest(Base):
             'id': str(rule.id), 'name': 'napa', 'priority': '100',
             'active': 'on', 'match_type': 'merchant_contains',
             'match_value': 'NAPA', 'offset_account': 'Repairs - OML',
-            'offset_direction': 'auto', 'cost_center': ''})
+            'offset_direction': 'auto', 'cost_center': '',
+            'applies_to_company': COMPANY})
         live = CategorizationRule.query.filter_by(archived=False).one()
         self.assertIsNone(live.cost_center)
 

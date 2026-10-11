@@ -134,7 +134,8 @@ class KillSwitchTest(McpBase):
     def test_mutating_tool_blocked_when_kill_switch_off(self):
         resp, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'TESTVENDOR',
-            'offset_account': '5000 - Test', 'tag': 'test'})
+            'offset_account': '5000 - Test', 'tag': 'test',
+            'applies_to_company': 'Test Co'})
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(body['result']['isError'])
         self.assertIn('kill switch', body['result']['content'][0]['text'])
@@ -144,11 +145,24 @@ class KillSwitchTest(McpBase):
         mcp_settings.save({'create_rule': True})
         resp, body = self._call_tool('create_rule', {
             'match_type': 'merchant_contains', 'match_value': 'TESTVENDOR',
-            'offset_account': '5000 - Test', 'tag': 'test'})
+            'offset_account': '5000 - Test', 'tag': 'test',
+            'applies_to_company': 'Test Co'})
         self.assertFalse(body['result']['isError'])
         self.assertEqual(CategorizationRule.query.count(), 1)
         self.assertEqual(CategorizationRule.query.first().match_value,
                          'TESTVENDOR')
+
+    def test_create_rule_requires_a_company(self):
+        """v1.0.9 · every rule belongs to one Company; an unscoped one would
+        match nothing, so it is refused rather than created inert."""
+        mcp_settings.save({'create_rule': True})
+        _, body = self._call_tool('create_rule', {
+            'match_type': 'merchant_contains', 'match_value': 'TESTVENDOR',
+            'offset_account': '5000 - Test'})
+        self.assertTrue(body['result']['isError'])
+        self.assertIn('applies_to_company is required',
+                      body['result']['content'][0]['text'])
+        self.assertEqual(CategorizationRule.query.count(), 0)
 
     def test_read_tools_are_never_gated(self):
         # No kill switch touched — a read tool still works.
@@ -168,7 +182,8 @@ class AuditLogTest(McpBase):
 
     def test_blocked_mutation_is_logged_with_ok_false(self):
         self._call_tool('create_rule', {'match_type': 'merchant_contains',
-                                        'match_value': 'X'})
+                                        'match_value': 'X',
+                                        'applies_to_company': 'Test Co'})
         row = AiActionLog.query.filter_by(tool_name='create_rule').first()
         self.assertIsNotNone(row)
         self.assertFalse(row.ok)

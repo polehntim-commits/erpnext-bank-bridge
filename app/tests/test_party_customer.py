@@ -200,20 +200,35 @@ class AutoPartyTypeFromOffset(Base):
         self.assertEqual(erp.created['Customer'], {})
         self.assertEqual(erp.created['Supplier'], {})
 
-    def test_auto_resolves_a_logical_offset_for_an_agnostic_rule(self):
-        """A Mode B (Company-agnostic) rule names a LOGICAL account, so the
-        type lookup has to fall back from docname to account_name."""
+    def test_auto_resolves_a_logical_offset(self):
+        """A rule may name a LOGICAL account ('Grower Receivable'), resolved
+        under the rule's Company at JE time (v1.0.9: for every rule, not only
+        the old Company-agnostic ones), so the type lookup still has to fall
+        back from docname to account_name."""
         erp = _erp()
-        rule = self._rule(applies_to_company=None,
-                          offset_account='Grower Receivable',
+        rule = self._rule(offset_account='Grower Receivable',
                           party_name='Broker Co')
-        row = self._txn(tid='t-agnostic', amount=-800.0)
+        row = self._txn(tid='t-logical', amount=-800.0)
 
         gje = categorization.generate_journal_entry(erp, row, rule=rule)
 
         line = self._party_line(self._je_for(erp, gje))
         self.assertEqual(line['party_type'], 'Customer')
         self.assertIn('Broker Co', erp.created['Customer'])
+
+    def test_an_unscoped_rule_books_nothing_and_creates_no_party(self):
+        """v1.0.9 · a rule with no Company is out of scope everywhere, even when
+        handed in directly — no JE, and no Customer conjured for it."""
+        erp = _erp()
+        rule = self._rule(applies_to_company=None,
+                          offset_account='Grower Receivable',
+                          party_name='Broker Co')
+        row = self._txn(tid='t-unscoped', amount=-800.0)
+
+        self.assertIsNone(
+            categorization.generate_journal_entry(erp, row, rule=rule))
+        self.assertEqual(erp.created['Journal Entry'], {})
+        self.assertEqual(erp.created['Customer'], {})
 
     def test_account_types_looked_up_once_per_offset_not_per_transaction(self):
         """sync_engine loops JE generation over EVERY row, so an un-memoized

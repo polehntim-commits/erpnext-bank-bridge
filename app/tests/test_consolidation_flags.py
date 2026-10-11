@@ -14,27 +14,80 @@ system would be worse than one that failed, because the two systems agree almost
 all of the time — which is exactly what makes a silent divergence hard to catch.
 
     cd app
+v1.0.9 · RULES_SOURCE is the exception: it defaults to 'local'. Bank Bridge's
+own rule table is the one source of truth for rules (it carries every rule's
+Company scope, and it is what every install actually ran on — RULES_SOURCE=
+erpnext with no mirrored rules fell back to the local table while the flag still
+said "erpnext"). A stored 'erpnext' with nothing mirrored migrates to 'local' on
+read, once; an explicit opt-in afterwards is kept.
+
     python3 -m unittest tests.test_consolidation_flags -v
 """
 import json
 from datetime import date
 
 from app import advisory, db, erpnext_push, erpnext_settings
-from app.models import PlaidStatement, StatementAnchor
+from app.models import CategorizationRule, PlaidStatement, StatementAnchor
 
 from tests.fakes import FakeERPClient, unwrap_tool_payload
 from tests.test_mcp_server import McpBase
 
 
 class FlagDefaultsTest(McpBase):
-    def test_all_three_default_to_erpnext(self):
+    def test_anchors_and_advisory_default_to_erpnext_rules_to_local(self):
         self.assertEqual(erpnext_settings.anchor_source(), 'erpnext')
-        self.assertEqual(erpnext_settings.rules_source(), 'erpnext')
+        self.assertEqual(erpnext_settings.rules_source(), 'local')
         self.assertEqual(erpnext_settings.advisory_source(), 'erpnext')
 
     def test_a_persisted_flag_wins_over_the_env_default(self):
         erpnext_settings.set_source('anchor_source', 'local')
         self.assertEqual(erpnext_settings.anchor_source(), 'local')
+        # ...and leaves the others at their own defaults.
+        self.assertEqual(erpnext_settings.rules_source(), 'local')
+        self.assertEqual(erpnext_settings.advisory_source(), 'erpnext')
+
+    def _store_rules_source(self, value):
+        """A settings file as a pre-v1.0.9 build left it: rules_source set,
+        no migration marker."""
+        import os
+        path = os.path.join(self.app.config['DATA_DIR'],
+                            'erpnext_settings.json')
+        try:
+            with open(path) as fh:
+                blob = json.load(fh)
+        except FileNotFoundError:
+            blob = {}
+        blob['rules_source'] = value
+        blob.pop('rules_source_migrated', None)
+        with open(path, 'w') as fh:
+            json.dump(blob, fh)
+
+    def test_a_stored_erpnext_with_no_mirrored_rules_migrates_to_local(self):
+        """v1.0.9 · the flag said 'erpnext' while the engine ran the local
+        table. Migrated on read, persisted with a marker, so the two agree."""
+        self._store_rules_source('erpnext')
+        self.assertEqual(erpnext_settings.rules_source(), 'local')
+        stored = erpnext_settings.load()
+        self.assertEqual(stored['rules_source'], 'local')
+        self.assertTrue(stored['rules_source_migrated'])
+
+    def test_a_stored_erpnext_with_mirrored_rules_is_kept(self):
+        """An install that genuinely runs on ERPNext's rules is not moved."""
+        db.session.add(CategorizationRule(
+            name='mirrored', match_type='merchant_contains',
+            match_value='chevron', erpnext_rule_name='BCR-0001', active=True,
+            applies_to_company='Orchard Meadow, LLC'))
+        db.session.commit()
+        self._store_rules_source('erpnext')
+        self.assertEqual(erpnext_settings.rules_source(), 'erpnext')
+        self.assertTrue(erpnext_settings.load()['rules_source_migrated'])
+
+    def test_an_explicit_opt_into_erpnext_is_sticky(self):
+        """The migration runs once; an operator who chooses 'erpnext' after it
+        keeps that choice even with nothing mirrored yet."""
+        self.assertEqual(erpnext_settings.rules_source(), 'local')
+        erpnext_settings.set_source('rules_source', 'erpnext')
+        self.assertEqual(erpnext_settings.rules_source(), 'erpnext')
         self.assertEqual(erpnext_settings.rules_source(), 'erpnext')
 
     def test_a_flag_survives_an_unrelated_settings_save(self):

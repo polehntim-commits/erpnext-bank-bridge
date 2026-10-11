@@ -70,6 +70,11 @@ SERVER_NAME = 'bank-bridge'
 # because ERPNext's amendment is a workflow: you supersede a Bank Categorization
 # Rule, you do not patch it, which is the same non-destructive shape
 # update_rule itself implements here.
+# v1.0.9 · list_rules / create_rule / update_rule are NOT here any more: Bank
+# Bridge's own rule table is the one source of truth for rules (it carries every
+# rule's Company scope, and it is what OML ran on all along), so pointing an AI
+# at ERPNext's Bank Categorization Rule tools would point it at a set that is
+# not consulted. See erpnext_settings.rules_source.
 DEPRECATED_TOOLS = {
     'get_reconciliation_status': 'erpnext.get_statement_anchor_chain',
     'list_unreconciled_statements': 'erpnext.list_unreconciled_anchors',
@@ -79,11 +84,6 @@ DEPRECATED_TOOLS = {
     'set_variance_tag': 'erpnext.set_anchor_variance_reason',
     'get_account_topology': 'erpnext.get_account_pairing',
     'pair_accounts': 'erpnext.pair_bank_accounts',
-    'list_rules': 'erpnext.list_bank_categorization_rules',
-    'create_rule': 'erpnext.create_bank_categorization_rule',
-    'update_rule': "ERPNext's Bank Categorization Rule amendment workflow "
-                   '(supersede via erpnext.create_bank_categorization_rule; '
-                   'a rule is never patched in place)',
     'create_advisory_agreement': 'erpnext.create_advisory_agreement',
     'get_advisory_agreement_summary': 'erpnext.get_advisory_agreement_summary',
     'update_advisory_agreement': 'erpnext.update_advisory_agreement',
@@ -413,6 +413,9 @@ def _list_rules(args: dict):
     q = CategorizationRule.query.filter(CategorizationRule.archived.is_(False))
     if active_only:
         q = q.filter(CategorizationRule.active.is_(True))
+    company = (args.get('company') or '').strip()
+    if company:
+        q = q.filter(CategorizationRule.applies_to_company == company)
     rules = q.order_by(CategorizationRule.priority.asc(),
                        CategorizationRule.id.asc()).all()
     slim = [{
@@ -439,9 +442,19 @@ def _list_rules(args: dict):
         'erpnext_rule_name': r.erpnext_rule_name or '',
     } for r in rules]
     from .. import categorization
-    return ({'rules': slim, 'count': len(slim),
+    return ({'rules': slim, 'count': len(slim), 'company': company or None,
              'rule_source': categorization.rule_source_in_force()},
-            f'{len(slim)} rule(s)')
+            f'{len(slim)} rule(s)' + (f' for {company}' if company else ''))
+
+
+def _get_rule_scope_report(args: dict):
+    """v1.0.9 · rules with no Company (should be none) and Items whose
+    accounts belong to no Company. Read-only."""
+    from .. import rule_scope
+    report = rule_scope.scope_report()
+    return report, (f"{report['unscoped_count']} unscoped rule(s), "
+                    f"{len(report['unassigned_items'])} Item(s) with no "
+                    f"Company; target {report['target_company']!r}")
 
 
 def _list_unmatched_statement_transactions(args: dict):
@@ -975,22 +988,44 @@ def _checked_bank_cost_center(raw, company: str = '') -> str:
     return _checked_cost_center(cc, company)
 
 
+def _checked_rule_company(raw) -> str:
+    """v1.0.9 · a rule's Company: REQUIRED, and — when ERPNext can be asked —
+    one of its Companies. A rule with no Company matches nothing, so accepting
+    one would create a rule that silently never fires."""
+    company = (raw or '').strip() if isinstance(raw, str) else ''
+    if not company:
+        raise ToolError('applies_to_company is required — every rule belongs to '
+                        'exactly one Company and only fires on that Company\'s '
+                        'accounts (e.g. "Orchard Meadow, LLC")')
+    try:
+        from .. import erpnext_bank
+        known = erpnext_bank.list_companies(_erp_client_or_error())
+    except Exception:  # noqa: BLE001 - unreachable: accept, unverified
+        known = []
+    if known and company not in known:
+        raise ToolError(f'unknown Company {company!r} — one of: '
+                        + ', '.join(known))
+    return company
+
+
 def _create_rule(args: dict):
+    company = _checked_rule_company(args.get('applies_to_company'))
     rule = CategorizationRule(
+        applies_to_company=company,
         match_type=(args.get('match_type') or 'merchant_contains'),
         match_value=(args.get('match_value') or ''),
         offset_account=(args.get('offset_account') or ''),
         # v0.7.3 · optional; '' (the pre-v0.7.3 behaviour) leaves the JE line
-        # blank so ERPNext applies its own Account/Company default. A new rule
-        # is always Company-agnostic here — create_rule takes no scope — so the
-        # lookup is unscoped, which only widens the bare-name fallback.
-        cost_center=(_checked_cost_center(args.get('cost_center')) or None),
+        # blank so ERPNext applies its own Account/Company default. v1.0.9 ·
+        # checked against the rule's (now required) Company.
+        cost_center=(_checked_cost_center(args.get('cost_center'), company)
+                     or None),
         # v0.8.5 · optional bank-leg override. Omitted (None) = MIRROR
         # cost_center onto the bank leg, which is what the fix wants by
         # default; pass '(none)' to leave the bank leg to ERPNext's own
         # default, or a docname to send it somewhere else entirely.
         bank_cost_center=(_checked_bank_cost_center(
-            args.get('bank_cost_center')) or None),
+            args.get('bank_cost_center'), company) or None),
         bb_internal_tag=(args.get('tag') or ''),
         name=(args.get('name') or args.get('match_value') or 'AI rule'))
     db.session.add(rule)
@@ -1083,8 +1118,13 @@ def _update_rule(args: dict):
     if 'active' in patch:
         patch['active'] = bool(patch['active'])
     if 'applies_to_company' in patch:
-        patch['applies_to_company'] = (
-            (patch['applies_to_company'] or '').strip() or None)
+        patch['applies_to_company'] = _checked_rule_company(
+            patch['applies_to_company'])
+    elif not (vals.get('applies_to_company') or '').strip():
+        # v1.0.9 · an unscoped rule can only be updated INTO a scope.
+        raise ToolError(f'rule {rule_id} has no Company — pass '
+                        'applies_to_company to scope it (an unscoped rule '
+                        'matches nothing)')
     if 'party_type' in patch:
         # Validated against the vocabulary, case-insensitively, because this
         # value is handed to ERPNext AS A DOCTYPE — an unchecked 'supplier' or
@@ -1980,10 +2020,26 @@ TOOLS = {
             'List categorization rules (match_type, match_value, offset_account, '
             'cost_center, internal tag, priority). An empty cost_center means '
             'the rule writes none and ERPNext applies the offset Account\'s or '
-            "the Company's own default — not that the line is uncosted. Set "
-            'active_only=false to include inactive rules. Read-only.',
-            {'active_only': _BOOL}),
+            "the Company's own default — not that the line is uncosted. Every "
+            'rule belongs to one Company (applies_to_company) and fires only on '
+            "that Company's accounts; pass company to list one Company's rules. "
+            "Set active_only=false to include inactive rules. Bank Bridge's "
+            'rule table is the source of truth for rules. Read-only.',
+            {'active_only': _BOOL,
+             'company': {'type': 'string',
+                         'description': 'e.g. "Orchard Meadow, LLC"; omit for '
+                                        'all'}}),
         'handler': _list_rules},
+    'get_rule_scope_report': {
+        **_tool(
+            'Company scoping health (v1.0.9). Lists every live rule with NO '
+            'Company — it should list none: an unscoped rule matches nothing — '
+            'and every Plaid Item whose accounts belong to no Company (their '
+            'transactions match no rule; set the owning Company on '
+            '/admin/accounts). Also says which Company the boot migration '
+            'assigns unscoped rules to and why. Read-only.',
+            {}),
+        'handler': _get_rule_scope_report},
     'list_unmatched_statement_transactions': {
         **_tool(
             'List an account\'s StatementTransactions with match_status='
@@ -2188,7 +2244,9 @@ TOOLS = {
 
     'create_rule': {
         **_tool(
-            'Create a categorization rule. Optionally set cost_center — the '
+            'Create a categorization rule for ONE Company (applies_to_company, '
+            'required) — it fires only on that Company\'s accounts. Optionally '
+            'set cost_center — the '
             'ERPNext Cost Center docname written onto BOTH legs of every '
             'Journal Entry this rule generates (v0.8.5; through v0.8.4 only '
             'the offset leg got one and ERPNext filled the bank leg with the '
@@ -2212,8 +2270,14 @@ TOOLS = {
                  'description': 'Bank-leg override. Omit to mirror '
                                 'cost_center (the default). "(none)" leaves '
                                 "the bank leg to ERPNext's own default."},
-             'tag': _STR, 'name': _STR},
-            required=('match_type', 'match_value'), mutating=True),
+             'tag': _STR, 'name': _STR,
+             'applies_to_company': {
+                 'type': 'string',
+                 'description': 'REQUIRED. The one ERPNext Company whose '
+                                'accounts this rule fires on, e.g. "Orchard '
+                                'Meadow, LLC".'}},
+            required=('match_type', 'match_value', 'applies_to_company'),
+            mutating=True),
         'handler': _create_rule},
     'update_rule': {
         **_tool(

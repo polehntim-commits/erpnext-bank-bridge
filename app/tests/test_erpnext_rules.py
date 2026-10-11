@@ -18,6 +18,10 @@ the ENGINE does not. So what is tested is the seam —
   * and the fast path — one rule fetch per run rather than one per transaction,
     which is what Tim's "maximum efficiency in rule matching" asked for.
 
+v1.0.9 · RULES_SOURCE defaults to 'local' (Bank Bridge's table is the one
+source of truth) and every rule needs a Company, so RulesBase opts into the
+mirror explicitly and every rule here — local or mirrored — names COMPANY.
+
     cd app
     python3 -m unittest tests.test_erpnext_rules -v
 """
@@ -27,16 +31,19 @@ from app import categorization, db, erpnext_rules, erpnext_settings
 from app.models import BankTransaction, CategorizationRule
 
 from tests.fakes import FakeERPClient
-from tests.test_categorization import ACC, Base
+from tests.test_categorization import ACC, COMPANY, Base
 
 
 def erp_rule(name, **kw):
     """One rule as ERPNext's list_bank_categorization_rules returns it —
     deliberately in ERPNext's OWN spellings (`pattern`, `account`, `enabled`,
-    `company`), because tolerating them is the thing under test."""
+    `company`), because tolerating them is the thing under test. v1.0.9 · it
+    carries a Company by default: a mirrored rule takes its scope from ERPNext,
+    and one with none matches nothing."""
     row = {'name': name, 'rule_name': kw.pop('rule_name', name),
            'match_type': 'merchant_contains', 'pattern': 'chevron',
-           'account': '5100 - Farm Fuel - OML', 'enabled': 1, 'priority': 100}
+           'account': '5100 - Farm Fuel - OML', 'enabled': 1, 'priority': 100,
+           'company': COMPANY}
     row.update(kw)
     return row
 
@@ -44,7 +51,10 @@ def erp_rule(name, **kw):
 class RulesBase(Base):
     def setUp(self):
         super().setUp()
-        erpnext_settings.save('http://erp.test', 'K', 'SECRET', 'Example Co')
+        erpnext_settings.save('http://erp.test', 'K', 'SECRET', COMPANY)
+        # v1.0.9 · rules_source defaults to 'local' now; everything here
+        # exercises the ERPNext mirror, which is an explicit opt-in.
+        erpnext_settings.set_source('rules_source', 'erpnext')
         erpnext_rules.reset_cache()
         categorization.invalidate_rule_cache()
         self.addCleanup(erpnext_rules.reset_cache)
@@ -57,7 +67,8 @@ class RulesBase(Base):
     def _local_rule(self, **kw):
         defaults = {'match_type': 'merchant_contains', 'match_value': 'local',
                     'offset_account': '5000 - Local - OML', 'priority': 50,
-                    'active': True, 'name': 'a local rule'}
+                    'active': True, 'name': 'a local rule',
+                    'applies_to_company': COMPANY}
         defaults.update(kw)
         rule = CategorizationRule(**defaults)
         db.session.add(rule)
@@ -288,6 +299,19 @@ class EligibleSetTest(RulesBase):
         winner, _ = categorization.evaluate_rules(self._txn())
         self.assertIsNone(winner.erpnext_rule_name)
         self.assertEqual(categorization.rule_source_in_force(), 'local')
+
+    def test_a_mirrored_rule_erpnext_sends_without_a_company_matches_nothing(
+            self):
+        """v1.0.9 · the mirror takes its scope from ERPNext and does not
+        invent one. Unscoped is inert, not "every Company"."""
+        unscoped = erp_rule('BCR-0001')
+        del unscoped['company']
+        self._serve([unscoped])
+        erpnext_rules.refresh(self.erp, force=True)
+        self.assertFalse(
+            (CategorizationRule.query.one().applies_to_company or '').strip())
+        winner, _ = categorization.evaluate_rules(self._txn())
+        self.assertIsNone(winner)
 
     def test_a_deactivated_mirrored_rule_stops_firing(self):
         self._serve([erp_rule('BCR-0001')])

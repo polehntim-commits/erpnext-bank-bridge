@@ -14,7 +14,7 @@ os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 from datetime import date  # noqa: E402
 
 from app import create_app, db, crypto  # noqa: E402
-from app import categorization  # noqa: E402
+from app import categorization, erpnext_settings  # noqa: E402
 from app.models import (BankTransaction, CategorizationRule,  # noqa: E402
                         GeneratedJournalEntry, Supplier)
 
@@ -61,7 +61,8 @@ class TestRulesCrud(AdminBase):
         data = dict(name='Fuel', priority='10', active='1',
                     match_type='merchant_contains', match_value='Chevron',
                     debit_account='Fuel - EC', credit_account='Bank - EC',
-                    party_type='', party_name='', description_template='')
+                    party_type='', party_name='', description_template='',
+                    applies_to_company='EC')   # v1.0.9 · required
         data.update(kw)
         return self.client.post('/admin/rules/save', data=data,
                                 follow_redirects=True)
@@ -78,6 +79,23 @@ class TestRulesCrud(AdminBase):
         self._add(match_type='bogus')
         self.assertEqual(CategorizationRule.query.count(), 0)
 
+    def test_blank_company_is_refused(self):
+        # v1.0.9 · an unscoped rule matches nothing, so the form refuses to
+        # save one rather than create a rule that silently never fires.
+        r = self._add(applies_to_company='')
+        self.assertIn('Choose the Company this rule belongs to',
+                      r.get_data(as_text=True))
+        self.assertEqual(CategorizationRule.query.count(), 0)
+
+    def test_unscoped_rule_listed_as_never_fires(self):
+        db.session.add(CategorizationRule(
+            name='Legacy', priority=10, active=True,
+            match_type='merchant_contains', match_value='Chevron',
+            offset_account='Fuel - EC', offset_direction='auto'))
+        db.session.commit()
+        body = self.client.get('/admin/rules').get_data(as_text=True)
+        self.assertIn('none — never fires', body)
+
     def test_edit_rule_supersedes_non_destructively(self):
         self._add()
         old = CategorizationRule.query.first()
@@ -86,7 +104,8 @@ class TestRulesCrud(AdminBase):
             id=str(rid), name='Fuel v2', priority='5', active='1',
             match_type='merchant_exact', match_value='Chevron',
             debit_account='Fuel - EC', credit_account='Bank - EC',
-            party_type='Supplier', party_name='', description_template=''),
+            party_type='Supplier', party_name='', description_template='',
+            applies_to_company='EC'),
             follow_redirects=True)
         # Old version is archived + points forward; new version is current.
         old = db.session.get(CategorizationRule, rid)
@@ -134,11 +153,18 @@ class TestRulesCrud(AdminBase):
 
 
 class TestRuleTestEndpoint(AdminBase):
+    def setUp(self):
+        super().setUp()
+        # v1.0.9 · the sample has no linked account, so it resolves to the
+        # default Company (nothing has an explicit owner) — and only a rule
+        # scoped to that Company can match it.
+        erpnext_settings.save('', '', None, 'EC')
+
     def test_matching_rule_shows_preview(self):
         db.session.add(CategorizationRule(
             name='Fuel', priority=10, active=True, match_type='merchant_contains',
             match_value='Chevron', debit_account='Fuel - EC',
-            credit_account='Bank - EC'))
+            credit_account='Bank - EC', applies_to_company='EC'))
         db.session.commit()
         r = self.client.post('/admin/rules/test', data={
             'merchant_name': 'Chevron', 'description': 'CHEVRON 01',
@@ -162,7 +188,7 @@ class TestRuleTestEndpoint(AdminBase):
         db.session.add(CategorizationRule(
             name='Fuel', priority=10, active=True, match_type='merchant_contains',
             match_value='Chevron', offset_account='Fuel Expense - EC',
-            offset_direction='auto'))
+            offset_direction='auto', applies_to_company='EC'))
         db.session.commit()
         r = self.client.post('/admin/rules/test', data={
             'merchant_name': 'Chevron', 'amount': '42.50'})
@@ -190,7 +216,8 @@ class TestOffsetRuleForm(AdminBase):
             name='Fuel', priority='10', active='1',
             match_type='merchant_contains', match_value='Chevron',
             offset_account='Fuel Expense - EC', offset_direction='always_debit',
-            party_type='', party_name='', description_template=''),
+            party_type='', party_name='', description_template='',
+            applies_to_company='EC'),
             follow_redirects=True)
         rule = CategorizationRule.query.first()
         self.assertEqual(rule.offset_account, 'Fuel Expense - EC')
@@ -200,7 +227,8 @@ class TestOffsetRuleForm(AdminBase):
         self.client.post('/admin/rules/save', data=dict(
             name='Fuel', priority='10', active='1',
             match_type='merchant_contains', match_value='Chevron',
-            offset_account='Fuel Expense - EC', offset_direction='sideways'),
+            offset_account='Fuel Expense - EC', offset_direction='sideways',
+            applies_to_company='EC'),
             follow_redirects=True)
         self.assertEqual(CategorizationRule.query.first().offset_direction, 'auto')
 
@@ -387,7 +415,8 @@ class TestRuleBuilderAutocomplete(AdminBase):
         r = self.client.post('/admin/rules/save', data=dict(
             name='New Fuel', priority='200', active='1',
             match_type='merchant_exact', match_value='Chevron',
-            offset_account='Fuel Expense - EC', offset_direction='auto'),
+            offset_account='Fuel Expense - EC', offset_direction='auto',
+            applies_to_company='EC'),
             follow_redirects=True)
         body = r.get_data(as_text=True)
         self.assertIn('already matches', body)
@@ -407,7 +436,8 @@ class TestRuleBuilderAutocomplete(AdminBase):
         r = self.client.post('/admin/rules/save', data=dict(
             name='New Fuel', priority='50', active='1',
             match_type='merchant_exact', match_value='Chevron',
-            offset_account='Fuel Expense - EC', offset_direction='auto'),
+            offset_account='Fuel Expense - EC', offset_direction='auto',
+            applies_to_company='EC'),
             follow_redirects=True)
         self.assertNotIn('already matches', r.get_data(as_text=True))
 

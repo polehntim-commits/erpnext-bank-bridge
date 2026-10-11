@@ -42,7 +42,7 @@ from app import statements as stmts  # noqa: E402
 from app.services import scheduler  # noqa: E402
 
 from tests.fakes import FakeERPClient  # noqa: E402
-from tests.test_statements import StatementsBase  # noqa: E402
+from tests.test_statements import COMPANY, StatementsBase  # noqa: E402
 
 
 class ERPStatementBase(StatementsBase):
@@ -1000,7 +1000,10 @@ class ReconciliationStatusPushTests(ERPStatementBase):
         db.session.add(CategorizationRule(
             name='owner', priority=100, active=True,
             match_type='description_regex', match_value='OWNER',
-            bb_internal_tag='owner_distribution'))
+            bb_internal_tag='owner_distribution',
+            # v1.0.9 · a rule fires only inside its own Company; no account
+            # here names one, so they resolve to the default Company.
+            applies_to_company=COMPANY))
         # The bank says cash went 100 -> 0; a single tagged draw of 100 out
         # explains it exactly, so the period reconciles.
         db.session.add(BankTransaction(
@@ -1138,7 +1141,7 @@ class ReconciliationStatusPushTests(ERPStatementBase):
         db.session.add(CategorizationRule(
             name='member', priority=90, active=True,
             match_type='description_regex', match_value='OWNER',
-            bb_internal_tag='member_distribution'))
+            bb_internal_tag='member_distribution', applies_to_company=COMPANY))
         db.session.commit()
         categorization.backfill_internal_tags()
         self.assertEqual(es.push_reconciliation(client, st), 'updated')

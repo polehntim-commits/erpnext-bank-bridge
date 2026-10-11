@@ -279,19 +279,30 @@ class SaveTimeValidation(Base):
                    offset_account='Grower Receivable - T')
         self.assertEqual(CategorizationRule.query.count(), 1)
 
-    def test_agnostic_rule_warns_but_saves_on_confirmation(self):
-        """Mode B · 'Shared Ledger' is Payable under Testing and an Expense
-        Account under Other Co. The operator may know the rule never fires
-        there, so the first save warns and the confirmed resubmit goes through."""
-        r = self._save(party_type='Supplier', offset_account='Shared Ledger',
-                       applies_to_company='')
-        self.assertEqual(CategorizationRule.query.count(), 0)
-        self.assertIn('Expense Account', r.data.decode())
-        self.assertIn('confirm_party_mismatch', r.data.decode())
-
+    def test_logical_offset_is_judged_under_the_rules_own_company(self):
+        """v1.0.9 · 'Shared Ledger' is Payable under Testing and an Expense
+        Account under Other Co. Every rule now has ONE Company, so the logical
+        name has one answer — the Mode B warn-but-allow across Companies is
+        gone: compatible under Testing saves, incompatible under Other Co is
+        blocked."""
         self._save(party_type='Supplier', offset_account='Shared Ledger',
-                   applies_to_company='', confirm_party_mismatch='1')
+                   applies_to_company='Testing')
         self.assertEqual(CategorizationRule.query.count(), 1)
+
+        r = self._save(name='Other', party_type='Supplier',
+                       offset_account='Shared Ledger',
+                       applies_to_company='Other Co')
+        self.assertEqual(CategorizationRule.query.count(), 1)
+        self.assertIn('Expense Account', r.data.decode())
+
+    def test_blank_company_is_refused_before_any_party_check(self):
+        """The old agnostic save (warn, then confirm) no longer exists: a blank
+        scope never fires, so even a confirmed resubmit saves nothing."""
+        r = self._save(party_type='Supplier', offset_account='Shared Ledger',
+                       applies_to_company='', confirm_party_mismatch='1')
+        self.assertEqual(CategorizationRule.query.count(), 0)
+        self.assertIn('Choose the Company this rule belongs to',
+                      r.data.decode())
 
     def test_validation_is_silent_when_erpnext_is_unconfigured(self):
         """No ERPNext to ask → no verdict → the save behaves exactly as it did

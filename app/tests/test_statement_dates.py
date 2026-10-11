@@ -29,7 +29,7 @@ from app import db, statements as stmts
 from app.models import (BankTransaction, PlaidAccount, PlaidItem,
                         PlaidStatement, StatementTransaction)
 
-from tests.test_statements import StatementsBase, make_pdf
+from tests.test_statements import COMPANY, StatementsBase, make_pdf
 
 
 def activity_pdf(rows, period='JUNE 1, 2026 - JUNE 30, 2026', extra=None,
@@ -603,7 +603,7 @@ class SynthesisTest(StatementsBase):
         db.session.add(CategorizationRule(
             name='Sweep interest', match_type='description_regex',
             match_value='INTEREST', bb_internal_tag='sweep-interest',
-            priority=10))
+            priority=10, applies_to_company=COMPANY))
         db.session.commit()
         self._seed_income()
         stmts.synthesize_missing_transactions()

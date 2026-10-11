@@ -2181,7 +2181,7 @@ class PeriodTagSummaryTest(StatementsBase):
         db.session.add(CategorizationRule(
             name='owner', priority=100, active=True,
             match_type='description_regex', match_value='OWNER',
-            bb_internal_tag='owner_distribution'))
+            bb_internal_tag='owner_distribution', applies_to_company=COMPANY))
         db.session.add(BankTransaction(
             plaid_transaction_id='ot', account_id='cash',
             date=date(2026, 2, 12), amount=-500.0, name='TEST OWNER DRAW'))

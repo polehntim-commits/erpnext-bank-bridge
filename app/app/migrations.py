@@ -563,8 +563,29 @@ def run_migrations() -> None:
         # v1.0.5: un-park Items a Plaid WARNING parked before warnings stopped
         # parking.
         _unpark_warning_only_items()
+        # v1.0.9: every categorization rule belongs to one Company. Assigns the
+        # unscoped ones (and, once, the Items with no Company) to the install's
+        # Company; a no-op when nothing is unscoped or the Company is ambiguous.
+        _scope_rules_to_company()
     except Exception:  # pragma: no cover - never block boot on a migration
         log.warning('schema migration failed; continuing', exc_info=True)
+
+
+def _scope_rules_to_company() -> None:
+    """v1.0.9 · see app/rule_scope.py. Best-effort, idempotent."""
+    from . import rule_scope
+    try:
+        report = rule_scope.apply_scope(dry_run=False, actor='migration')
+        if report.get('applied') or report.get('items_pinned'):
+            log.info('migration: scoped %d rule(s) and pinned %d Item(s) to %s',
+                     report.get('applied', 0), report.get('items_pinned', 0),
+                     report.get('target_company'))
+        elif report.get('unscoped_count'):
+            log.warning('migration: %d rule(s) left unscoped — %s',
+                        report['unscoped_count'], report.get('target_reason'))
+    except Exception:  # pragma: no cover - never block boot on this
+        db.session.rollback()
+        log.warning('could not scope categorization rules', exc_info=True)
 
 
 def _backfill_account_id_links() -> None:

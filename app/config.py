@@ -609,11 +609,13 @@ class Config:
     #     BOTH (local first, then pushed) — this only decides who answers.
     ANCHOR_SOURCE = (os.environ.get('ANCHOR_SOURCE', 'erpnext').strip().lower()
                      or 'erpnext')
-    #   * where the categorization rule set is read from. 'erpnext' fetches the
-    #     active rules over the API and mirrors them into the local table as a
-    #     read-through cache; the JE generation engine itself never moves.
-    RULES_SOURCE = (os.environ.get('RULES_SOURCE', 'erpnext').strip().lower()
-                    or 'erpnext')
+    #   * where the categorization rule set is read from. v1.0.9 · 'local' by
+    #     default: Bank Bridge's own rule table is the one source of truth (it
+    #     is where every rule's Company scope lives, and what OML actually ran
+    #     on all along). 'erpnext' is an explicit opt-in that mirrors ERPNext's
+    #     Bank Categorization Rules into that table.
+    RULES_SOURCE = (os.environ.get('RULES_SOURCE', 'local').strip().lower()
+                    or 'local')
     #   * where advisory-agreement TERMS are read from when a fee is computed.
     ADVISORY_SOURCE = (os.environ.get('ADVISORY_SOURCE', 'erpnext')
                        .strip().lower() or 'erpnext')

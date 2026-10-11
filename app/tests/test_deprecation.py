@@ -16,6 +16,12 @@ breaks exactly here rather than in forty places that were only ever asserting on
 what a tool returned.
 
     cd app
+v1.0.9 · eleven now. list_rules, create_rule and update_rule were reinstated:
+Bank Bridge's own rule table is the one source of truth for rules (it carries
+every rule's Company scope, and it is the set the engine actually runs), so
+pointing an AI at ERPNext's Bank Categorization Rule tools would point it at a
+set that is not consulted.
+
     python3 -m unittest tests.test_deprecation -v
 """
 import json
@@ -38,8 +44,6 @@ EXPECTED = {
     'set_variance_tag': 'erpnext.set_anchor_variance_reason',
     'get_account_topology': 'erpnext.get_account_pairing',
     'pair_accounts': 'erpnext.pair_bank_accounts',
-    'list_rules': 'erpnext.list_bank_categorization_rules',
-    'create_rule': 'erpnext.create_bank_categorization_rule',
     'create_advisory_agreement': 'erpnext.create_advisory_agreement',
     'get_advisory_agreement_summary': 'erpnext.get_advisory_agreement_summary',
     'update_advisory_agreement': 'erpnext.update_advisory_agreement',
@@ -60,6 +64,10 @@ PIPE_TOOLS = (
     'test_public_url', 'set_erpnext_config',
 )
 
+# v1.0.9 · the rule tools, back from deprecation (see the module note).
+RULE_TOOLS = ('list_rules', 'create_rule', 'update_rule',
+              'get_rule_scope_report')
+
 
 class MatrixTest(McpBase):
     def test_every_migrated_tool_carries_a_pointer(self):
@@ -67,15 +75,17 @@ class MatrixTest(McpBase):
             self.assertEqual(mcp_server.DEPRECATED_TOOLS.get(name), target,
                              f'{name} points somewhere unexpected')
 
-    def test_update_rule_points_at_the_amendment_workflow(self):
-        """ERPNext's amendment is a WORKFLOW, not a tool: a Bank Categorization
-        Rule is superseded, never patched — the same non-destructive shape
-        update_rule implements here."""
-        pointer = mcp_server.DEPRECATED_TOOLS['update_rule']
-        self.assertIn('amendment workflow', pointer)
+    def test_the_rule_tools_are_current_not_deprecated(self):
+        """v1.0.9 · Bank Bridge's rule table is the source of truth, so the
+        tools that read and write it must not send an AI to ERPNext's."""
+        for name in RULE_TOOLS:
+            self.assertIn(name, mcp_server.TOOLS, f'{name} disappeared')
+            self.assertNotIn(name, mcp_server.DEPRECATED_TOOLS,
+                             f'{name} is the rule source of truth')
 
-    def test_the_count_is_the_plans_fourteen(self):
-        self.assertEqual(len(mcp_server.DEPRECATED_TOOLS), 14)
+    def test_the_count_is_eleven(self):
+        """The plan's fourteen, less the three rule tools v1.0.9 reinstated."""
+        self.assertEqual(len(mcp_server.DEPRECATED_TOOLS), 11)
 
     def test_every_deprecated_name_is_a_real_tool(self):
         """A pointer on a tool that does not exist is a lie an AI cannot act
@@ -167,12 +177,14 @@ class ListingTest(McpBase):
 
     def test_the_original_description_survives_the_prefix(self):
         """The tool still works; its own documentation still has to be there."""
-        spec = self._tools()['list_rules']
-        self.assertIn('categorization rules', spec['description'])
+        spec = self._tools()['get_account_topology']
+        self.assertTrue(spec['description'].startswith('DEPRECATED'))
+        self.assertIn('List every Plaid account', spec['description'])
 
     def test_a_current_tool_keeps_a_clean_description(self):
-        spec = self._tools()['sync_now']
-        self.assertNotIn('DEPRECATED', spec['description'])
+        for name in ('sync_now', 'list_rules', 'create_rule'):
+            spec = self._tools()[name]
+            self.assertNotIn('DEPRECATED', spec['description'], name)
 
     def test_the_new_consolidation_tools_are_listed(self):
         tools = self._tools()

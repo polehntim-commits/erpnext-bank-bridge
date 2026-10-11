@@ -237,6 +237,9 @@ class StrictERP(FakeERPClient):
                                  limit_page_length=limit_page_length, **kw)
 
 
+COMPANY = 'Test Co'
+
+
 class Base(unittest.TestCase):
     EXTRA_CONFIG = {'ERPNEXT_AUTO_GENERATE_JOURNAL_ENTRIES': True,
                     'ERPNEXT_JOURNAL_ENTRY_AUTO_SUBMIT': True}
@@ -253,7 +256,10 @@ class Base(unittest.TestCase):
         self.item = PlaidItem(
             item_id='item-abc', status='active', institution_id='ins_1',
             institution_name='Test Bank',
-            access_token_encrypted=crypto.encrypt('access-sandbox-abc'))
+            access_token_encrypted=crypto.encrypt('access-sandbox-abc'),
+            # v1.0.9 · rules fire only inside their own Company, so the Item
+            # names one and the rule below is scoped to it.
+            owning_company=COMPANY)
         db.session.add(self.item)
         db.session.add(PlaidAccount(
             account_id=ACC, item_id='item-abc', name='Test Checking',
@@ -262,7 +268,8 @@ class Base(unittest.TestCase):
         db.session.add(CategorizationRule(
             name='fuel', priority=100, active=True,
             match_type='description_regex', match_value='TEST FUEL',
-            debit_account='Fuel - EC', credit_account='Checking - EC'))
+            debit_account='Fuel - EC', credit_account='Checking - EC',
+            applies_to_company=COMPANY))
         db.session.commit()
         self.erp = StrictERP()
         self.plaid = FakePlaidClient(accounts=[{

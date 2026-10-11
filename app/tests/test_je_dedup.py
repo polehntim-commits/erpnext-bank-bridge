@@ -300,7 +300,10 @@ class CategorizationDedupTests(InvestJEBase):
         rule = CategorizationRule(
             name='Fuel', match_type='merchant_exact', match_value='TESTCO FUEL',
             offset_account='Fuel - EC', offset_direction='always_debit',
-            priority=10, active=True)
+            priority=10, active=True,
+            # v1.0.9 · rules fire only inside their own Company — the one
+            # the 'cash' account is owned by.
+            applies_to_company=COMPANY)
         db.session.add(rule)
         row = BankTransaction(
             plaid_transaction_id='ptx-1', account_id='cash', amount=120.0,

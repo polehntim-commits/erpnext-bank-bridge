@@ -16,18 +16,23 @@ Synthetic rule/merchant names only.
 from datetime import datetime
 
 from app import db, rule_stats
-from app import categorization
+from app import categorization, erpnext_settings
 from app.models import CategorizationRule, GeneratedJournalEntry
 
 from tests.test_statements import StatementsBase
 
 
 class RuleActiveCountTest(StatementsBase):
+    # v1.0.9 · a rule fires only inside its own Company; with no Company
+    # assigned anywhere, a transaction resolves to the default Company.
+    COMPANY = 'Test Co'
+
     def _rule(self, activated_at, active=True):
         r = CategorizationRule(name='TEST RULE', match_type='merchant_contains',
                                match_value='TESTVENDOR', active=active,
                                activated_at=activated_at,
-                               created_at=activated_at)
+                               created_at=activated_at,
+                               applies_to_company=self.COMPANY)
         db.session.add(r)
         db.session.commit()
         return r
@@ -91,6 +96,7 @@ class RuleActiveCountTest(StatementsBase):
     def test_inactive_rule_does_not_fire(self):
         """The display's premise: an OFF rule is filtered out of evaluate_rules,
         so it truly matches nothing — the active count of 0 is real."""
+        erpnext_settings.save('', '', None, self.COMPANY)
         rule = self._rule(datetime(2026, 6, 1), active=False)
         row = type('Row', (), {'merchant_name': 'TESTVENDOR PURCHASE',
                                'name': 'TESTVENDOR PURCHASE', 'category': '',

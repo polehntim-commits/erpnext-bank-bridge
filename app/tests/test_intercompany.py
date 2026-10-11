@@ -363,7 +363,7 @@ class TestRuleDiversion(IntercompanyBase):
             name='Transfers', priority=10, active=True, archived=False,
             match_type='merchant_contains', match_value='',
             offset_account='Owner Draws', offset_direction='auto',
-            ignore_for_paired=ignore_for_paired)
+            ignore_for_paired=ignore_for_paired, applies_to_company=FARM)
         # match_contains on '' matches nothing; use a description regex instead
         # so the rule genuinely fires on the transfer text.
         rule.match_type = 'description_regex'
@@ -770,7 +770,7 @@ class TestSyncIntegration(IntercompanyBase):
             name='Transfers', priority=10, active=True, archived=False,
             match_type='description_regex', match_value='Transfer',
             offset_account='Owner Draws', offset_direction='auto',
-            ignore_for_paired=True))
+            ignore_for_paired=True, applies_to_company=FARM))
         out, inn = self._transfer()
         for row in (out, inn):
             row.posted_at = None
@@ -789,7 +789,8 @@ class TestSyncIntegration(IntercompanyBase):
         db.session.add(CategorizationRule(
             name='Transfers', priority=10, active=True, archived=False,
             match_type='description_regex', match_value='Transfer',
-            offset_account='Owner Draws', offset_direction='auto'))
+            offset_account='Owner Draws', offset_direction='auto',
+            applies_to_company=FARM))
         out, inn = self._transfer()
         for row in (out, inn):
             row.posted_at = None

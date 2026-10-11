@@ -39,12 +39,16 @@ _FIELDS = ('url', 'api_key', 'api_secret', 'default_company',
            # Transactions, never with a Journal Entry). Default off; a file
            # written before v1.0.4 lacks the key and falls through to the env
            # default, which is the migrate-on-read the DATA_DIR rule asks for.
-           'push_pending_transactions')
+           'push_pending_transactions',
+           # v1.0.9 — set once the one-time rules_source migration has run, so
+           # an operator who later opts into 'erpnext' on purpose keeps it.
+           'rules_source_migrated')
 
 # Fields whose persisted value is a bool rather than a string. Kept explicit so
 # `load` coerces them through `_as_bool` rather than `bool()` — this file is
 # operator-editable, and `bool("false")` is True.
-_BOOL_FIELDS = ('auto_generate_journal_entries', 'push_pending_transactions')
+_BOOL_FIELDS = ('auto_generate_journal_entries', 'push_pending_transactions',
+                'rules_source_migrated')
 
 # The three consolidation flags, and the only two values each may take. A
 # hand-edited file holding anything else falls back to ERPNEXT rather than to
@@ -87,6 +91,7 @@ def _defaults() -> dict:
         'advisory_source': _as_source(c.get('ADVISORY_SOURCE')),
         'push_pending_transactions': bool(
             c.get('ERPNEXT_PUSH_PENDING_TRANSACTIONS', False)),
+        'rules_source_migrated': False,
     }
 
 
@@ -171,8 +176,29 @@ def anchor_source() -> str:
 
 
 def rules_source() -> str:
-    """Where the categorization rule set is read from."""
-    return _as_source(load().get('rules_source'))
+    """Where the categorization rule set is read from.
+
+    v1.0.9 · ONE SOURCE OF TRUTH. Bank Bridge's local rule table is the
+    default and, on every install so far, the only set that ever ran: with
+    RULES_SOURCE=erpnext and no ERPNext-mirrored rules, the engine fell back to
+    the local table while every status read still said "erpnext" (OML:
+    rules_source=erpnext, rule_source_in_force=local). Migrated on read, once:
+    a stored 'erpnext' with no mirrored rules becomes 'local' and is persisted
+    with a marker, so the flag and the engine agree from then on — and an
+    operator who opts back into 'erpnext' afterwards keeps that choice."""
+    d = load()
+    value = _as_source(d.get('rules_source'))
+    if value == SOURCE_ERPNEXT and not d.get('rules_source_migrated'):
+        from . import erpnext_rules
+        if erpnext_rules.mirrored_rule_count() == 0:
+            value = SOURCE_LOCAL
+            d['rules_source'] = SOURCE_LOCAL
+        d['rules_source_migrated'] = True
+        try:
+            _write(d)
+        except OSError:      # a read-only data volume still reads correctly
+            pass
+    return value
 
 
 def advisory_source() -> str:
@@ -193,6 +219,8 @@ def set_source(field: str, value: str) -> str:
                          + f', got {value!r}')
     d = load()
     d[field] = v
+    if field == 'rules_source':
+        d['rules_source_migrated'] = True     # an explicit choice is final
     _write(d)
     return v
 

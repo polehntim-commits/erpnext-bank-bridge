@@ -79,6 +79,7 @@ class Base(unittest.TestCase):
             'priority': '100',
             'active': '1',
             'ignore_for_paired': '1',
+            'applies_to_company': COMPANY,   # v1.0.9 · required
         }
         data.update(overrides)
         with mock.patch('app.erpnext_bank.get_client', return_value=self.erp):

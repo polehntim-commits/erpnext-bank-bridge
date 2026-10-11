@@ -200,11 +200,14 @@ class PushGuardBase(ScopeBase):
             owning_company=owning_company))
         db.session.commit()
 
-    def _rule(self, offset_account):
+    def _rule(self, offset_account, company='Orchard LLC'):
+        # v1.0.9 · the rule belongs to the transaction's Company (else it would
+        # never match); the guard under test is about the OFFSET's Company.
         rule = CategorizationRule(
             name='fuel', priority=100, active=True,
             match_type='merchant_contains', match_value='Chevron',
-            offset_account=offset_account, offset_direction='auto')
+            offset_account=offset_account, offset_direction='auto',
+            applies_to_company=company)
         db.session.add(rule)
         db.session.commit()
         return rule

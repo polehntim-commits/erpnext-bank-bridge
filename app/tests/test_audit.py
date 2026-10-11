@@ -30,6 +30,9 @@ from app.models import (AuditEvent, BankTransaction, CategorizationRule,  # noqa
 from tests.fakes import FakePlaidClient, FakeERPClient, page, txn  # noqa: E402
 
 ACC = 'acct-wf-checking'
+# v1.0.9 · rules are Company-scoped. No Item names a Company here, so every
+# account resolves to the default Company configured in setUp.
+COMPANY = 'Test Co'
 
 
 class Base(unittest.TestCase):
@@ -48,6 +51,7 @@ class Base(unittest.TestCase):
         self.ctx = self.app.app_context()
         self.ctx.push()
         audit.set_context('system', None)
+        erpnext_settings.save('', '', None, COMPANY)
 
     def tearDown(self):
         db.session.remove()
@@ -124,7 +128,8 @@ class TestStateChangesLogged(Base):
         data = dict(name='Fuel', priority='10', active='1',
                     match_type='merchant_contains', match_value='Chevron',
                     debit_account='Fuel - EC', credit_account='Bank - EC',
-                    party_type='', party_name='', description_template='')
+                    party_type='', party_name='', description_template='',
+                    applies_to_company=COMPANY)
         self.client.post('/admin/rules/save', data=data)
         self.assertEqual(self._count('rule_created'), 1)
         rid = CategorizationRule.query.first().id
@@ -150,7 +155,8 @@ class TestStateChangesLogged(Base):
         db.session.add(CategorizationRule(
             name='Fuel', priority=10, active=True, archived=False,
             match_type='merchant_contains', match_value='Chevron',
-            debit_account='Fuel - EC', credit_account='Bank - EC'))
+            debit_account='Fuel - EC', credit_account='Bank - EC',
+            applies_to_company=COMPANY))
         db.session.commit()
         erp = FakeERPClient()
         categorization.generate_journal_entry(erp, self._row())
@@ -161,7 +167,8 @@ class TestStateChangesLogged(Base):
         db.session.add(CategorizationRule(
             name='Groceries', priority=10, active=True, archived=False,
             match_type='merchant_contains', match_value='Safeway',
-            debit_account='X', credit_account='Y'))
+            debit_account='X', credit_account='Y',
+            applies_to_company=COMPANY))
         db.session.commit()
         categorization.generate_journal_entry(FakeERPClient(), self._row())
         self.assertEqual(self._count('rule_matched'), 1)
@@ -171,7 +178,8 @@ class TestStateChangesLogged(Base):
         db.session.add(CategorizationRule(
             name='Fuel', priority=10, active=True, archived=False,
             match_type='merchant_contains', match_value='Chevron',
-            debit_account='Fuel - EC', credit_account='Bank - EC'))
+            debit_account='Fuel - EC', credit_account='Bank - EC',
+            applies_to_company=COMPANY))
         db.session.commit()
         categorization.generate_journal_entry(
             FakeERPClient(fail_je_create=True), self._row())
@@ -210,7 +218,8 @@ class TestPermanence(Base):
         data = dict(name='Fuel', priority='10', active='1',
                     match_type='merchant_contains', match_value='Chevron',
                     debit_account='Fuel - EC', credit_account='Bank - EC',
-                    party_type='', party_name='', description_template='')
+                    party_type='', party_name='', description_template='',
+                    applies_to_company=COMPANY)
         self.client.post('/admin/rules/save', data=data)
         after_create = AuditEvent.query.count()
         rid = CategorizationRule.query.first().id
@@ -227,7 +236,7 @@ class TestRuleHistory(Base):
         r = CategorizationRule(name='Fuel', priority=10, active=True,
                                archived=False, match_type='merchant_contains',
                                match_value='Chevron', debit_account='A',
-                               credit_account='B')
+                               credit_account='B', applies_to_company=COMPANY)
         db.session.add(r)
         db.session.commit()
         old_id = r.id
@@ -235,7 +244,8 @@ class TestRuleHistory(Base):
             id=str(old_id), name='Fuel v2', priority='5', active='1',
             match_type='merchant_exact', match_value='Chevron',
             debit_account='A', credit_account='B', party_type='',
-            party_name='', description_template=''))
+            party_name='', description_template='',
+            applies_to_company=COMPANY))
         old = db.session.get(CategorizationRule, old_id)
         self.assertTrue(old.archived)
         self.assertIsNotNone(old.superseded_by)
@@ -249,7 +259,8 @@ class TestRuleHistory(Base):
         db.session.add(CategorizationRule(
             name='old', priority=1, active=False, archived=True,
             match_type='merchant_contains', match_value='Chevron',
-            debit_account='A', credit_account='B'))
+            debit_account='A', credit_account='B',
+            applies_to_company=COMPANY))
         db.session.commit()
         self.assertIsNone(categorization.find_matching_rule(self._row()))
 
@@ -265,7 +276,8 @@ class TestRerun(Base):
         db.session.add(CategorizationRule(
             name='Fuel', priority=10, active=True, archived=False,
             match_type='merchant_contains', match_value='Chevron',
-            debit_account='Fuel - EC', credit_account='Bank - EC'))
+            debit_account='Fuel - EC', credit_account='Bank - EC',
+            applies_to_company=COMPANY))
         # A posted transaction with no JE yet.
         r = self._row()
         r.posted_at = categorization._now()

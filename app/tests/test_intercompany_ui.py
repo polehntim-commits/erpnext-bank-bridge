@@ -347,7 +347,8 @@ class TestRuleIgnoreForPaired(IntercompanyUIBase):
         self.client.post('/admin/rules/save', data={
             'name': 'Transfers', 'priority': '10', 'active': '1',
             'match_type': 'description_regex', 'match_value': 'Transfer',
-            'offset_account': 'Owner Draws', 'ignore_for_paired': '1'})
+            'offset_account': 'Owner Draws', 'ignore_for_paired': '1',
+            'applies_to_company': FARM})
         rule = CategorizationRule.query.filter_by(name='Transfers').first()
         self.assertTrue(rule.ignore_for_paired)
 
@@ -355,7 +356,7 @@ class TestRuleIgnoreForPaired(IntercompanyUIBase):
         self.client.post('/admin/rules/save', data={
             'name': 'Transfers', 'priority': '10', 'active': '1',
             'match_type': 'description_regex', 'match_value': 'Transfer',
-            'offset_account': 'Owner Draws'})
+            'offset_account': 'Owner Draws', 'applies_to_company': FARM})
         rule = CategorizationRule.query.filter_by(name='Transfers').first()
         self.assertFalse(rule.ignore_for_paired)
 
@@ -363,7 +364,7 @@ class TestRuleIgnoreForPaired(IntercompanyUIBase):
         self.client.post('/admin/rules/save', data={
             'name': 'Fuel', 'priority': '10', 'active': '1',
             'match_type': 'merchant_contains', 'match_value': 'Chevron',
-            'offset_account': 'Fuel'})
+            'offset_account': 'Fuel', 'applies_to_company': FARM})
         rule = CategorizationRule.query.filter_by(name='Fuel').first()
         self.assertFalse(rule.ignore_for_paired)
         html = self.client.get(f'/admin/rules?edit={rule.id}').data.decode()

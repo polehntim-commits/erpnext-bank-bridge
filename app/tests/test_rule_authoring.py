@@ -509,11 +509,21 @@ class TestScopeWarning(ScopeWarningBase):
         self._save(offset_account='Fuel Expense - AL')
         self.assertEqual(CategorizationRule.query.count(), 1)
 
-    def test_no_warning_for_a_company_agnostic_rule(self):
-        # Mode B (v0.4.0.3): a logical name resolves per-Company at JE time, so
-        # there is no single Company for it to disagree with.
-        self._save(applies_to_company='', offset_account='Fuel Expense')
-        self.assertEqual(CategorizationRule.query.count(), 1)
+    def test_no_warning_for_a_logical_offset(self):
+        # v1.0.9 · a bare LOGICAL name resolves under the rule's own Company at
+        # JE time, so it has no other Company to disagree with.
+        self._save(offset_account='Fuel Expense')
+        rule = CategorizationRule.query.one()
+        self.assertEqual(rule.offset_account, 'Fuel Expense')
+        self.assertEqual(rule.applies_to_company, 'Alpha LLC')
+
+    def test_blank_company_is_refused_not_warned(self):
+        # v1.0.9 · the old "company-agnostic" rule is gone: a blank scope never
+        # fires, so it is refused outright — not offered a Save-anyway.
+        body = self._save(applies_to_company='',
+                          offset_account='Fuel Expense').get_data(as_text=True)
+        self.assertIn('Choose the Company this rule belongs to', body)
+        self.assertEqual(CategorizationRule.query.count(), 0)
 
     def test_no_warning_when_erpnext_is_unconfigured(self):
         erpnext_settings.save('', '', '', '')
@@ -572,18 +582,18 @@ class TestRegressions(ScopeWarningBase):
         self.assertEqual(CategorizationRule.query.count(), 0)
         self.assertIn('⚠', body)
 
-    def test_v4003_mode_a_and_mode_b_offsets_are_preserved(self):
-        # Mode A: a scoped rule keeps its fully-qualified offset verbatim.
+    def test_v4003_qualified_and_logical_offsets_are_preserved(self):
+        # A fully-qualified offset is stored verbatim.
         self._save(offset_account='Fuel Expense - AL')
         scoped = CategorizationRule.query.one()
         self.assertEqual(scoped.offset_account, 'Fuel Expense - AL')
         self.assertEqual(scoped.applies_to_company, 'Alpha LLC')
-        # Mode B: an agnostic rule keeps its LOGICAL name and no Company.
-        self._save(name='Meals', match_value='Chipotle',
-                   applies_to_company='', offset_account='Meals')
-        agnostic = CategorizationRule.query.filter_by(name='Meals').one()
-        self.assertEqual(agnostic.offset_account, 'Meals')
-        self.assertIsNone(agnostic.applies_to_company)
+        # A LOGICAL name is stored as typed too — v1.0.9 still requires the
+        # Company (it's what the name resolves under at JE time).
+        self._save(name='Meals', match_value='Chipotle', offset_account='Meals')
+        logical = CategorizationRule.query.filter_by(name='Meals').one()
+        self.assertEqual(logical.offset_account, 'Meals')
+        self.assertEqual(logical.applies_to_company, 'Alpha LLC')
 
     def test_v4004_description_template_autofill_still_present(self):
         body = self.client.get('/admin/rules').get_data(as_text=True)

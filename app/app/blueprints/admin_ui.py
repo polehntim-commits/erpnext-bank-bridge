@@ -3047,11 +3047,11 @@ RULES_BODY = """
     </span>
   </div>
   <div style="display:flex;gap:12px;flex-wrap:wrap">
-    <label style="flex:1;min-width:220px">Applies to Company
-      <span style="font-weight:400;color:#888">— multi-entity scope</span>
-      <select name="applies_to_company"
-              title="Restrict this rule to transactions whose bank account belongs to one Company. Leave on 'all Companies' to apply everywhere.">
-        <option value="">— all Companies (company-agnostic) —</option>
+    <label style="flex:1;min-width:220px">Company
+      <span style="font-weight:400;color:#888">— required: the rule fires only on this Company's accounts</span>
+      <select name="applies_to_company" required
+              title="Every rule belongs to one Company and only fires on transactions whose bank account belongs to it.">
+        <option value="" disabled {{ '' if form.applies_to_company else 'selected' }}>— choose a Company —</option>
         {% for c in companies %}
         <option value="{{ c }}" {{ 'selected' if c == form.applies_to_company else '' }}>{{ c }}</option>
         {% endfor %}
@@ -3154,7 +3154,7 @@ RULES_BODY = """
     <td style="font-size:12px"><code>{{ r.match_type }}</code><br>{{ (r.match_value or '')[:50] }}</td>
     <td style="font-size:12px">{{ r.offset_account or r.debit_account }}{% if r.offset_account and not r.applies_to_company %}<span title="Logical name — resolves to each Company's own account at posting time" style="color:#b26a00;margin-left:4px">· logical</span>{% endif %}</td>
     <td style="font-size:12px">{{ r.offset_direction or 'auto' }}</td>
-    <td style="font-size:12px">{% if r.applies_to_company %}{{ r.applies_to_company }}{% else %}<span style="color:#999">all</span>{% endif %}</td>
+    <td style="font-size:12px">{% if r.applies_to_company %}{{ r.applies_to_company }}{% else %}<span style="color:#b00020" title="An unscoped rule matches nothing — edit it to choose a Company">⚠ none — never fires</span>{% endif %}</td>
     <td style="font-size:12px">{% if r.skip_party %}<span class="pill pill-muted" title="This rule books a transfer between accounts you own — the generated Journal Entry carries no Party.">no party</span>{% else %}{{ (r.party_type or '') }}{% if r.party_name %}: {{ r.party_name }}{% endif %}{% endif %}</td>
     {# v0.5.9 · two counts. Historical (bold, the audit lifetime number) stays
        even when the rule is OFF; Active (green) is matches since it was last
@@ -3939,7 +3939,7 @@ def _rule_form_values():
         # which is why the editor always emits it (see the hidden companion input).
         'ignore_for_paired': bool(request.form.get('ignore_for_paired')),
         'description_template': (request.form.get('description_template') or '').strip(),
-        # v0.4.0.1 · optional multi-entity scope. Blank → company-agnostic.
+        # v1.0.9 · REQUIRED — save_rule refuses a blank one (it would never fire).
         'applies_to_company': (request.form.get('applies_to_company') or '').strip() or None,
         # v0.4.49 · optional Bank-Bridge-internal attribution tag. Normalised to
         # a slug (lowercase, spaces → underscores) so 'Owner Distribution' and
@@ -4064,6 +4064,14 @@ def save_rule():
     if vals['match_type'] not in categorization.MATCH_TYPES:
         return redirect('/admin/rules?flash=' + quote_plus(
             f"Unknown match type '{vals['match_type']}'"))
+    # v1.0.9 · every rule belongs to exactly one Company; an unscoped rule
+    # matches nothing, so saving one would create a rule that silently never
+    # fires.
+    if not vals.get('applies_to_company'):
+        return _rules_page(flash_msg='⚠ Choose the Company this rule belongs '
+                                     'to — a rule only fires on its own '
+                                     "Company's accounts.",
+                           form=_redisplay_form(vals))
     # v0.4.0.9 · refuse a party_type the offset account can't carry. ERPNext
     # only accepts a Party on a Receivable/Payable account and enforces it at
     # SUBMIT, so without this check the rule saves, the JEs generate, and the

@@ -21,7 +21,7 @@ from types import SimpleNamespace
 os.environ.setdefault('DATABASE_URL', 'postgresql://x:x@localhost/x')
 
 from app import create_app, db, crypto  # noqa: E402
-from app import categorization, erpnext_bank, sync_engine  # noqa: E402
+from app import categorization, erpnext_bank, erpnext_settings, sync_engine  # noqa: E402
 from app.models import (BankTransaction, CategorizationRule,  # noqa: E402
                         GeneratedJournalEntry, PlaidAccount, PlaidItem,
                         Supplier)
@@ -29,6 +29,9 @@ from app.models import (BankTransaction, CategorizationRule,  # noqa: E402
 from tests.fakes import FakePlaidClient, FakeERPClient, page, txn  # noqa: E402
 
 ACC = 'acct-wf-checking'
+# v1.0.9 · every rule belongs to a Company and matches only that Company's
+# accounts. No Item here names one, so accounts resolve to the default Company.
+COMPANY = 'Test Co'
 
 
 class Base(unittest.TestCase):
@@ -48,6 +51,8 @@ class Base(unittest.TestCase):
         self.app = create_app(cfg)
         self.ctx = self.app.app_context()
         self.ctx.push()
+        # Default Company only (no URL/key): accounts resolve to COMPANY.
+        erpnext_settings.save('', '', None, COMPANY)
 
     def tearDown(self):
         db.session.remove()
@@ -96,7 +101,8 @@ class Base(unittest.TestCase):
         defaults = dict(name='r', priority=100, active=True,
                         match_type='merchant_contains', match_value='Chevron',
                         debit_account='Fuel Expense - EC',
-                        credit_account='Checking - EC')
+                        credit_account='Checking - EC',
+                        applies_to_company=COMPANY)
         defaults.update(kw)
         rule = CategorizationRule(**defaults)
         db.session.add(rule)
@@ -278,6 +284,26 @@ class TestRuleMatching(Base):
         row = self._row(merchant='Chevron')
         self.assertIsNone(categorization.find_matching_rule(row))
 
+    def test_unscoped_rule_matches_nothing(self):
+        # v1.0.9 · a blank Company no longer means "all Companies": fail closed.
+        self._rule(applies_to_company=None)
+        self.assertIsNone(categorization.find_matching_rule(self._row()))
+
+    def test_rule_for_another_company_does_not_match(self):
+        self._rule(applies_to_company='Other Co')
+        self.assertIsNone(categorization.find_matching_rule(self._row()))
+
+    def test_out_of_scope_rule_is_refused_at_je_time(self):
+        # A caller handing the rule in directly gets the same refusal.
+        rule = self._rule(applies_to_company='Other Co')
+        erp = FakeERPClient()
+        self.assertIsNone(categorization.generate_journal_entry(
+            erp, self._row(), rule=rule))
+        self.assertEqual(len(erp.created['Journal Entry']), 0)
+        from app.models import AuditEvent
+        self.assertEqual(AuditEvent.query.filter_by(
+            event_type='rule_refused_cross_company').count(), 1)
+
 
 # ── JE construction (amount sign) ──────────────────────────────────────
 
@@ -345,7 +371,8 @@ class TestOffsetJournalEntryBuild(Base):
     def _offset_rule(self, **kw):
         defaults = dict(name='fuel', priority=100, active=True,
                         match_type='merchant_contains', match_value='Chevron',
-                        offset_account='Fuel Expense - EC', offset_direction='auto')
+                        offset_account='Fuel Expense - EC', offset_direction='auto',
+                        applies_to_company=COMPANY)
         defaults.update(kw)
         rule = CategorizationRule(**defaults)
         db.session.add(rule)
@@ -611,14 +638,14 @@ class TestInternalTags(Base):
         self.assertEqual(row.bb_internal_tag or '', '')
 
     def test_the_tag_fires_even_when_je_generation_is_skipped(self):
-        """Matching earns the tag; JE generation is a separate concern. Here an
-        agnostic rule with a logical offset no Company can resolve skips the
+        """Matching earns the tag; JE generation is a separate concern. Here a
+        rule with a logical offset its own Company cannot resolve skips the
         JE, but the transaction is still tagged."""
         self._account()
         rule = self._rule(match_type='description_regex',
                           match_value='TEST OWNER', bb_internal_tag='owner_distribution',
                           offset_account='Nonexistent Logical Account',
-                          applies_to_company=None, debit_account='',
+                          debit_account='',
                           credit_account='')
         row = self._row(merchant='', name='TEST OWNER PAYMENT', tid='t1')
         gje = categorization.generate_journal_entry(FakeERPClient(), row)
