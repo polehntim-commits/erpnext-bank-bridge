@@ -83,10 +83,12 @@ def _now() -> datetime:
 # ── configuration ───────────────────────────────────────────────────────────
 
 def is_enabled() -> bool:
-    """Whether statements are pulled at all (STATEMENTS_ENABLED, default true).
-    Off means no listing, no download, no storage — and every opening balance
-    path behaves exactly as it did in v0.4.4."""
-    return bool(current_app.config.get('STATEMENTS_ENABLED', True))
+    """Whether Plaid statements are used at all. Off means no listing, no
+    download, no storage — and every opening balance path behaves exactly as it
+    did in v0.4.4. v1.0.10 · the persisted switch (plaid_settings.
+    statements_enabled), off by default; STATEMENTS_ENABLED only seeds it."""
+    from . import plaid_settings
+    return plaid_settings.statements_enabled()
 
 
 def storage_root() -> str:
@@ -3526,7 +3528,8 @@ def fetch_all(*, plaid_client=None, limit_per_item: int | None = None,
     left in 'timeout' so its late webhook triggers a fetch of its own."""
     totals = _blank_stats()
     if not is_enabled():
-        totals['errors'].append('statements are disabled (STATEMENTS_ENABLED)')
+        totals['errors'].append('statements are disabled (turn them on at '
+                                '/admin/statements)')
         return totals
     items = PlaidItem.query.filter(
         PlaidItem.disconnected.is_(False)).order_by(PlaidItem.id).all()
@@ -3600,6 +3603,21 @@ def _pipeline_into(result: dict) -> None:
     except Exception:  # pragma: no cover - never fail the pull
         db.session.rollback()
         log.exception('reconcile pipeline after the statement pull crashed')
+    # v1.0.10 · then hand the new PDFs to ERPNext straight away — onto each
+    # period's Statement Anchor (which the anchor rebuild above just pushed) —
+    # instead of waiting for the next transaction sync. Fail-soft.
+    try:
+        from . import erpnext_push
+        pushed = erpnext_push.push_statement_pdfs_to_anchors()
+        result['pdfs_to_anchors'] = {
+            k: len(pushed.get(k) or []) for k in
+            ('pushed', 'linked', 'skipped', 'failed')}
+        if pushed.get('error'):
+            result['pdfs_to_anchors']['error'] = pushed['error']
+    except Exception:  # pragma: no cover - never fail the pull
+        db.session.rollback()
+        log.warning('pushing statement PDFs to anchors after the pull failed',
+                    exc_info=True)
 
 
 def run_refresh_pull(app, *, wait_seconds: float | None = None) -> dict:

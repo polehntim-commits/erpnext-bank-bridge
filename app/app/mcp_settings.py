@@ -118,6 +118,9 @@ _DEFAULTS = {
     # (never ERPNext). Byte-identical copies only, dry-run by default — still a
     # delete, so it has its own switch, off like the rest.
     'dedupe_statements': False,
+    # v1.0.10 — runs the statement job on demand. It spends Plaid refresh
+    # calls (billed per statement extracted), so it is gated like sync_now.
+    'pull_statements': False,
 }
 
 _FIELDS = tuple(_DEFAULTS.keys())

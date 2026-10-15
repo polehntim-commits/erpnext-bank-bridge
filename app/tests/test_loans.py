@@ -515,8 +515,10 @@ class ProductLadderTests(LoanBase):
     # WHERE A REQUESTED PRODUCT ACTUALLY LANDS, which these tests have to read
     # from both keys rather than just `products`:
     #
-    #   products           transactions (always) + statements
-    #   optional_products  liabilities (v0.4.23) + investments (v0.4.26)
+    #   products                        transactions (always)
+    #   required_if_supported_products  statements (v1.0.10)
+    #   optional_products               liabilities (v0.4.23) + investments
+    #                                   (v0.4.26)
     #
     # Both moved OUT of `products` because a required product Link cannot fill
     # is a hard failure at the account-selection screen — 'No liability
@@ -528,8 +530,10 @@ class ProductLadderTests(LoanBase):
     @staticmethod
     def _requested(kwargs) -> list:
         """Every product a link-token call asked for, required or optional."""
-        return [str(p) for p in (list(kwargs.get('products') or [])
-                                 + list(kwargs.get('optional_products') or []))]
+        return [str(p) for p in (
+            list(kwargs.get('products') or [])
+            + list(kwargs.get('required_if_supported_products') or [])
+            + list(kwargs.get('optional_products') or []))]
 
     def test_a_fully_approved_link_makes_one_call(self):
         client = PlaidClient(client_id='c', secret='s', api=object())
@@ -550,8 +554,10 @@ class ProductLadderTests(LoanBase):
                         'investments'):
             self.assertTrue(any(product in p for p in asked), product)
         # …and each landed on the side that keeps Link from hard-failing.
-        self.assertTrue(any('statements' in str(p)
-                            for p in calls[0]['products']))
+        self.assertTrue(any('statements' in str(p) for p in
+                            calls[0]['required_if_supported_products']))
+        self.assertFalse(any('statements' in str(p)
+                             for p in calls[0]['products']))
         optional = [str(p) for p in calls[0]['optional_products']]
         self.assertTrue(any('liabilities' in p for p in optional))
         self.assertTrue(any('investments' in p for p in optional))

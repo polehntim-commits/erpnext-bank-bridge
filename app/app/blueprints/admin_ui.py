@@ -751,6 +751,14 @@ ACCOUNTS_BODY = """
     Reconnect
   </button>
   {% endif %}
+  {% if statements_on and not grp.item.disconnected %}
+  <button type="button" class="secondary"
+          style="vertical-align:middle;margin-left:8px;padding:3px 10px;font-size:12px"
+          data-bb-reconnect="{{ grp.item.item_id }}" data-bb-statements="1"
+          title="Opens Plaid Link for this same connection and asks only for Statements consent — no new connection, no re-mapping. Bank statement PDFs are then pulled automatically each month.">
+    {{ 'Statements enabled ✓ — re-consent' if grp.item.statements_consented_at else 'Enable statements for this connection' }}
+  </button>
+  {% endif %}
   <button type="button" class="secondary"
           style="vertical-align:middle;margin-left:8px;padding:3px 10px;font-size:12px"
           data-bb-disconnect="{{ grp.item.item_id }}"
@@ -1142,8 +1150,9 @@ ACCOUNTS_BODY = """
 </p>
 {% endif %}
 
-{% if any_needs_reauth %}
-<!-- v0.4.11 · Plaid Link, for the Reconnect button only. Loaded conditionally
+{% if any_needs_reauth or statements_on %}
+<!-- v0.4.11 · Plaid Link, for the Reconnect button only (v1.0.10: and the
+     "Enable statements" button, which is the same update-mode flow). Loaded conditionally
      so an accounts page with nothing to reconnect — the normal case — fetches
      no third-party script at all. -->
 <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
@@ -1172,10 +1181,13 @@ document.addEventListener('click', function (e) {
     t = t.parentNode;
   }
   if (t && t.getAttribute && t.getAttribute('data-bb-reconnect')) {
-    bbReconnect(t, t.getAttribute('data-bb-reconnect'));
+    bbReconnect(t, t.getAttribute('data-bb-reconnect'),
+                t.getAttribute('data-bb-statements') === '1');
   }
 });
-function bbReconnect(btn, itemId) {
+// v1.0.10 · withStatements = the "Enable statements" button: the same update
+// mode, with the Statements product added, then statements_consented.
+function bbReconnect(btn, itemId, withStatements) {
   var original = btn.textContent;
   btn.disabled = true; btn.textContent = 'Opening…';
   function fail(msg) {
@@ -1184,7 +1196,8 @@ function bbReconnect(btn, itemId) {
   }
   fetch('/bankbridge/api/plaid/create_link_token', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({item_id: itemId})
+    body: JSON.stringify({item_id: itemId,
+                          enable_statements: withStatements ? 1 : 0})
   }).then(function (r) { return r.json(); }).then(function (d) {
     if (!d.link_token) { fail(d.error || 'no link token'); return; }
     if (typeof Plaid === 'undefined') {
@@ -1193,8 +1206,9 @@ function bbReconnect(btn, itemId) {
     Plaid.create({
       token: d.link_token,
       onSuccess: function () {
-        btn.textContent = 'Reconnecting…';
-        fetch('/bankbridge/api/plaid/reconnect_complete', {
+        btn.textContent = withStatements ? 'Pulling statements…' : 'Reconnecting…';
+        fetch(withStatements ? '/bankbridge/api/plaid/statements_consented'
+                             : '/bankbridge/api/plaid/reconnect_complete', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({item_id: itemId})
         }).then(function () { window.location.reload(); })
@@ -1360,6 +1374,7 @@ def accounts_page():
                  opening_cell=_opening_balance_cell,
                  erpnext_ok=erps.is_configured(), companies=companies,
                  any_needs_reauth=any_needs_reauth,
+                 statements_on=stmts_mod.is_enabled(),
                  any_investment=any_investment, cost_centers=cost_centers,
                  cost_center_names={c['name'] for c in cost_centers},
                  members=members,
@@ -6155,12 +6170,24 @@ STATEMENTS_BODY = """
 {% if flash_msg %}<div class="creds"><b>{{ flash_msg }}</b></div>{% endif %}
 {% if not enabled %}
 <div class="banner-warn">
-  <h3>Statements are turned off</h3>
-  <p style="font-size:14px;margin:0">
-    <code>STATEMENTS_ENABLED</code> is false, so no statements are pulled and
-    opening balances fall back to the v0.4.4 estimate.
+  <h3>Plaid Statements are turned off</h3>
+  <p style="font-size:14px;margin:0 0 8px">
+    No statements are pulled from Plaid, and opening balances fall back to the
+    estimate. Turn this on only after the <b>Statements</b> product is enabled
+    for your Plaid application (Plaid Dashboard → Products). Then use
+    <b>Enable statements for this connection</b> on the Accounts page for each
+    bank that was linked before.
   </p>
+  <form method="post" action="/admin/statements/toggle" style="margin:0">
+    <input type="hidden" name="enabled" value="1">
+    <button type="submit">Turn Plaid Statements on</button>
+  </form>
 </div>
+{% else %}
+<form method="post" action="/admin/statements/toggle" style="margin:0 0 8px;text-align:right">
+  <input type="hidden" name="enabled" value="0">
+  <button type="submit" class="secondary" style="font-size:12px;padding:3px 10px">Turn Plaid Statements off</button>
+</form>
 {% endif %}
 <p style="font-size:14px;color:#555">
   Statement PDFs pulled from Plaid, with each period reconciled against the
@@ -6534,6 +6561,23 @@ def statement_pdf(statement_id: str):
     })
 
 
+@bp.post('/admin/statements/toggle')
+def statements_toggle():
+    """v1.0.10 · turn Plaid Statements on or off (persisted; no restart)."""
+    from .. import plaid_settings
+    enabled = (request.form.get('enabled') or '').strip() in ('1', 'true', 'on')
+    before = plaid_settings.statements_enabled()
+    plaid_settings.set_statements_enabled(enabled)
+    audit.record('statements_toggled', subject_type=None,
+                 before={'statements_enabled': before},
+                 after={'statements_enabled': enabled})
+    return redirect('/admin/statements?flash=' + quote_plus(
+        'Plaid Statements are now ' + ('ON — use “Enable statements for this '
+                                       'connection” on the Accounts page for '
+                                       'banks linked before.' if enabled
+                                       else 'OFF.')))
+
+
 @bp.post('/admin/statements/pull')
 def statements_pull():
     """Operator-triggered statement pull — the same work the monthly job does.
@@ -6544,7 +6588,7 @@ def statements_pull():
     from .. import statements as stmts
     if not stmts.is_enabled():
         return redirect('/admin/statements?flash=' + quote_plus(
-            'Statements are disabled (STATEMENTS_ENABLED).'))
+            'Plaid Statements are turned off — turn them on above first.'))
     app = current_app._get_current_object()
     if app.config.get('TESTING'):
         result = stmts.run_refresh_pull(app, wait_seconds=0)
@@ -9322,6 +9366,9 @@ _MCP_SWITCH_DESC = {
         'Remove duplicate statement rows a statements refresh re-issued — keeps '
         'the original, byte-identical copies only, Bank Bridge data only (never '
         'ERPNext); dry-run by default',
+    'pull_statements':
+        'Run the monthly Plaid statement job now (refresh, download, parse, '
+        'anchor, attach PDFs to ERPNext) — spends Plaid refresh calls',
 }
 
 

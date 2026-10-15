@@ -393,6 +393,8 @@ SCHEMA_MIGRATIONS: list[tuple[str, str, str]] = [
     ('plaid_items', 'statements_refresh_status', 'VARCHAR(20)'),
     ('plaid_items', 'statements_refresh_requested_at', 'TIMESTAMP'),
     ('plaid_items', 'statements_refresh_completed_at', 'TIMESTAMP'),
+    # v1.0.10 — Statements consent through Link update mode. NULL on upgrade.
+    ('plaid_items', 'statements_consented_at', 'TIMESTAMP'),
 ]
 
 # Additive UNIQUE indexes an upgrade introduces, as (index_name, table,

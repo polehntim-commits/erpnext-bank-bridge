@@ -1621,6 +1621,14 @@ def _get_erpnext_push_status(args: dict):
         # question that had no answerable form before the chain was recorded.
         'relinked_accounts': _relinked_account_chains(),
     }
+    # v1.0.10 · statement PDFs on ERPNext's Statement Anchors: how many anchors
+    # carry their PDF, and which do not yet. One list call; never raises.
+    try:
+        result['statement_pdfs'] = (erpnext_push.statement_pdf_status()
+                                    if erpnext_settings.is_configured()
+                                    else None)
+    except Exception as e:  # noqa: BLE001
+        result['statement_pdfs'] = {'error': f'{type(e).__name__}: {e}'}
     return result, (f"{result['queue_depth']} write(s) queued, "
                     f'{never_pushed} anchor(s) never pushed, '
                     f'{unmapped} unmapped account(s), '
@@ -1697,7 +1705,8 @@ def _push_statement_pdfs(args: dict):
         # The row that carries the Bank Account mapping — a re-link strips it
         # from the retired id, and the mask may resolve to either.
         account = reconnect.mapped_account_for(account.account_id) or account
-        if (account.type or '') != 'investment':
+        if (account.type or '') != 'investment' and \
+                (args.get('target') or 'both').strip().lower() == 'bank_account':
             raise ToolError(
                 f'account {account.mask} is a {account.type or "non-investment"}'
                 ' account. push_statement_pdfs attaches BROKERAGE statements '
@@ -1714,17 +1723,40 @@ def _push_statement_pdfs(args: dict):
     if mode not in erpnext_push.UPLOAD_MODES:
         raise ToolError(f"mode must be 'staged' or 'direct', got "
                         f"{args.get('mode')!r}")
+    target = (args.get('target') or 'both').strip().lower()
+    if target not in ('bank_account', 'anchors', 'both'):
+        raise ToolError("target must be 'bank_account', 'anchors' or 'both'")
     client = _erp_client_or_error()
-    result = erpnext_push.push_statement_pdfs(accounts, period=period,
-                                              client=client, dry_run=dry_run,
-                                              mode=mode)
-    if result.get('error'):
-        raise ToolError(result['error'])
+    if target == 'anchors':
+        result = {'mode': mode, 'dry_run': dry_run, 'pushed': [],
+                  'would_push': [], 'skipped': [], 'failed': []}
+    else:
+        result = erpnext_push.push_statement_pdfs(accounts, period=period,
+                                                  client=client,
+                                                  dry_run=dry_run, mode=mode)
+        if result.get('error'):
+            raise ToolError(result['error'])
+    if target in ('anchors', 'both'):
+        # v1.0.10 · onto each period's Statement Anchor, every account type.
+        anchor_accounts = accounts
+        result['anchors'] = erpnext_push.push_statement_pdfs_to_anchors(
+            anchor_accounts, period=period, client=client, dry_run=dry_run,
+            mode=mode)
     moved = result['would_push'] if dry_run else result['pushed']
-    return result, ((f'DRY RUN ({mode}): would push {len(moved)}' if dry_run
-                     else f'pushed {len(moved)} ({mode})')
-                    + f", skipped {len(result['skipped'])}, "
-                    f"failed {len(result['failed'])}")
+    line = ((f'DRY RUN ({mode}): would push {len(moved)}' if dry_run
+             else f'pushed {len(moved)} ({mode})')
+            + f", skipped {len(result['skipped'])}, "
+            f"failed {len(result['failed'])}")
+    anchors = result.get('anchors')
+    if anchors is not None:
+        if anchors.get('error'):
+            raise ToolError(anchors['error'])
+        a_moved = anchors['would_push'] if dry_run else anchors['pushed']
+        line += (f"; anchors: {'would push' if dry_run else 'pushed'} "
+                 f"{len(a_moved)}, linked {len(anchors.get('linked') or [])}, "
+                 f"skipped {len(anchors['skipped'])}, failed "
+                 f"{len(anchors['failed'])}")
+    return result, line
 
 
 # ── v1.0.4 · pending/posted duplicate repair ───────────────────────────────
@@ -1828,6 +1860,110 @@ def _dedupe_statements(args: dict):
                     f"{len(result['groups'])} period(s); kept apart "
                     f"{len(result['kept_apart'])}; ERPNext Bank Statements "
                     f"for removed copies: {len(result['erpnext_bank_statements'])}")
+
+
+# ── v1.0.10 · Plaid Statements ──────────────────────────────────────────────
+
+def _months_between(first, last) -> list:
+    out, y, m = [], first.year, first.month
+    while (y, m) <= (last.year, last.month):
+        out.append(f'{y:04d}-{m:02d}')
+        y, m = (y + (m == 12), m % 12 + 1)
+    return out
+
+
+def _get_statement_coverage(args: dict):
+    """Per account: does Plaid deliver its statements, the newest one held,
+    and which months are missing. Read-only."""
+    from .. import statements as st_mod
+    from ..models import PlaidSyncLog
+    enabled = st_mod.is_enabled()
+    today = date.today()
+    last_complete = date(today.year, today.month, 1) - date.resolution
+    rows = []
+    for acct in (PlaidAccount.query
+                 .filter(PlaidAccount.superseded_by_account_id.is_(None))
+                 .order_by(PlaidAccount.mask.asc()).all()):
+        if (args.get('account_mask') or '').strip() and \
+                acct.mask != args['account_mask'].strip():
+            continue
+        item = PlaidItem.query.filter_by(item_id=acct.item_id).first()
+        chain = list(st_mod.supersede_chain(acct.account_id))
+        held = (PlaidStatement.query
+                .filter(PlaidStatement.plaid_account_id.in_(tuple(chain)),
+                        PlaidStatement.period_end.isnot(None))
+                .order_by(PlaidStatement.period_end.asc()).all())
+        months = sorted({s.period_end.strftime('%Y-%m') for s in held})
+        last_pull = (PlaidSyncLog.query
+                     .filter_by(item_id=acct.item_id,
+                                direction='statements_pull')
+                     .order_by(PlaidSyncLog.id.desc()).first())
+        pull_status = last_pull.status if last_pull else None
+        pull_msg = (last_pull.error_message or '') if last_pull else ''
+        upper = pull_msg.upper()
+        if not enabled:
+            status = 'off'
+        elif held:
+            status = 'supported'
+        elif pull_status is None:
+            status = 'unknown'
+        elif any(c in upper for c in ('ADDITIONAL_CONSENT_REQUIRED',
+                                      'INVALID_PRODUCT', 'PRODUCT_NOT_READY')):
+            status = 'not_consented'
+        elif pull_status in ('success', 'unsupported'):
+            status = 'manual_upload_required'
+        else:
+            status = 'error'
+        missing = ([m for m in _months_between(held[0].period_end,
+                                                last_complete)
+                    if m not in months] if held else [])
+        rows.append({
+            'account_mask': acct.mask, 'name': acct.name or '',
+            'type': acct.type or '', 'subtype': acct.subtype or '',
+            'institution': (item.institution_name if item else '') or '',
+            'status': status,
+            'supported': status == 'supported',
+            'manual_upload_required': status == 'manual_upload_required',
+            'statements_held': len(held),
+            'first_statement': held[0].period_end.isoformat() if held else None,
+            'last_statement': held[-1].period_end.isoformat() if held else None,
+            'missing_months': missing,
+            'consented_via_update_mode': (
+                item.statements_consented_at.isoformat()
+                if item is not None and item.statements_consented_at else None),
+            'last_pull': ({'at': last_pull.at.isoformat() if last_pull.at
+                           else None, 'status': pull_status,
+                           'message': pull_msg[:300]} if last_pull else None),
+        })
+    by = {}
+    for r in rows:
+        by[r['status']] = by.get(r['status'], 0) + 1
+    return ({'statements_enabled': enabled, 'accounts': rows,
+             'count': len(rows), 'by_status': by},
+            f"{len(rows)} account(s): " + ', '.join(
+                f'{n} {k}' for k, n in sorted(by.items())))
+
+
+def _pull_statements(args: dict):
+    """Ask Plaid to refresh statements, then list, download, parse, anchor and
+    push the PDFs — the scheduled job, now. Runs on a background thread (the
+    refresh waits up to 5 minutes for Plaid's webhook)."""
+    from .. import statements as st_mod
+    if not st_mod.is_enabled():
+        raise ToolError('Plaid Statements are turned off — turn them on at '
+                        '/admin/statements first')
+    app = current_app._get_current_object()
+    if app.config.get('TESTING'):
+        result = st_mod.run_refresh_pull(app, wait_seconds=0)
+        if result.get('busy'):
+            return {'started': False, 'busy': True}, 'a pull is already running'
+        return result, st_mod.pull_summary(result)
+    import threading
+    threading.Thread(target=st_mod.run_refresh_pull, args=(app,),
+                     daemon=True).start()
+    return ({'started': True},
+            'statement pull started — check get_statement_coverage in a few '
+            'minutes')
 
 
 def _set_je_gate(args: dict, on: bool):
@@ -2755,6 +2891,12 @@ TOOLS = {
              'dry_run': {'type': 'boolean',
                          'description': 'report what would be pushed without '
                                         'uploading (default false)'},
+             'target': {'type': 'string',
+                        'enum': ['both', 'bank_account', 'anchors'],
+                        'description': "'both' (default): the brokerage's "
+                                       "Bank Account AND each period's "
+                                       "Statement Anchor; 'anchors': only the "
+                                       'anchors (every account type)'},
              'mode': {'type': 'string', 'enum': ['staged', 'direct'],
                       'description': "'staged' (default): chunked read, "
                                      'size + sha256 verified before upload. '
@@ -2782,6 +2924,32 @@ TOOLS = {
                          'description': 'default TRUE — report only'}},
             mutating=True),
         'handler': _dedupe_statements},
+    # ── v1.0.10 · Plaid Statements ──────────────────────────────────────────
+    'get_statement_coverage': {
+        **_tool(
+            'Per-account Plaid Statements coverage: status (supported — Plaid '
+            'delivers this account\'s statements; manual_upload_required — the '
+            'bank lists none for it, keep uploading by hand; not_consented — '
+            'the connection lacks Statements consent, use "Enable statements '
+            'for this connection" on /admin/accounts; unknown — never pulled; '
+            'off — Statements are turned off), how many statements are held, '
+            'the first and last, every MISSING month from the first held up to '
+            'last month, whether consent was added via Link update mode, and '
+            'the last pull\'s outcome. Pass account_mask for one account. '
+            'Read-only.',
+            {'account_mask': _STR}),
+        'handler': _get_statement_coverage},
+    'pull_statements': {
+        **_tool(
+            'Run the monthly statement job NOW: ask Plaid to refresh each '
+            'connection\'s statements, wait for them (up to 5 minutes), '
+            'download any new PDFs (one row per account and period, never '
+            'twice), parse and anchor them, and attach each PDF to its ERPNext '
+            'Statement Anchor. Runs in the background and returns at once; read '
+            'get_statement_coverage afterwards. Costs Plaid refresh calls. '
+            'MUTATING — requires the pull_statements kill switch ON.',
+            {}, mutating=True),
+        'handler': _pull_statements},
     # ── v1.0.4 · pending/posted duplicates ──────────────────────────────────
     'find_duplicate_bank_transactions': {
         **_tool(

@@ -1005,14 +1005,24 @@ def _institution_tag(account) -> str:
     return ''.join(w[0].upper() for w in words) or 'Bank'
 
 
+def _statement_kind(account) -> str:
+    """'Brokerage' for an investment account (the v1.0.3 name, kept so every
+    file already attached still matches), else the subtype ('Checking',
+    'Savings'), else 'Bank'."""
+    if (account.type or '') == 'investment':
+        return 'Brokerage'
+    sub = re.sub(r'[^A-Za-z0-9]+', '', (account.subtype or '').title())
+    return sub or 'Bank'
+
+
 def statement_pdf_filename(account, statement) -> str:
-    """`WF-Brokerage-9401-2026-06-30-Statement.pdf`.
+    """`WF-Brokerage-9401-2026-06-30-Statement.pdf` (or `WF-Checking-3158-…`).
 
     Keyed on `period_end` because that is the date ERPNext's anchor chain keys
     on, so the attachment and the anchor it substantiates carry the same date.
     The name is also the idempotency key — see `push_statement_pdfs`."""
-    return (f'{_institution_tag(account)}-Brokerage-{account.mask}-'
-            f'{statement.period_end.isoformat()}-Statement.pdf')
+    return (f'{_institution_tag(account)}-{_statement_kind(account)}-'
+            f'{account.mask}-{statement.period_end.isoformat()}-Statement.pdf')
 
 
 def statement_pdf_accounts(accounts=None) -> list:
@@ -1123,12 +1133,13 @@ def _staged_read(path: str, expected: bytes) -> bytes:
 
 
 def _upload_statement_pdf(client, mode: str, docname: str, file_name: str,
-                          data: bytes, *, path: str | None = None) -> dict:
+                          data: bytes, *, path: str | None = None,
+                          doctype: str = STATEMENT_PDF_DOCTYPE) -> dict:
     """Upload one PDF by `mode` and return ERPNext's File record. Raises
     ERPNextAPIError on an ERPNext refusal or an unreachable ERPNext."""
     if mode == MODE_STAGED and path:
         data = _staged_read(path, data)
-    return client.upload_file(file_name, data, doctype=STATEMENT_PDF_DOCTYPE,
+    return client.upload_file(file_name, data, doctype=doctype,
                               docname=docname, is_private=1) or {}
 
 
@@ -1281,6 +1292,226 @@ def push_statement_pdfs(accounts=None, *, period: str | None = None,
                                   'file': reply.get('name')})
             log.info('statement PDF %s -> %s (%s)', file_name, docname, mode)
     return out
+
+
+# ── v1.0.10 · statement PDFs, on the ERPNext Statement Anchor they prove ──────
+#
+# The anchor is the record that states "the bank said this account opened at X
+# and closed at Y for this period"; the PDF is the evidence. ERPNext's
+# Statement Anchor doctype carries a `statement_pdf` Attach field for it, so the
+# PDF is uploaded attached to the anchor AND that field is pointed at it. Same
+# rules as the Bank Account push above: read what is already there first and
+# upload only the difference; verify the reply (attached to the right anchor,
+# same bytes) and the field's echo; never raise. Every LIVE mapped account
+# whose statements Bank Bridge holds is in scope — checking and savings as well
+# as brokerage. An anchor push never clears the field: erpnext_mcp drops empty
+# arguments before it writes.
+
+STATEMENT_ANCHOR_DOCTYPE = 'Statement Anchor'
+
+
+def statement_anchor_accounts(accounts=None) -> list:
+    from .models import PlaidAccount
+    if accounts is None:
+        accounts = PlaidAccount.query.all()
+    out = [a for a in accounts
+           if not (a.superseded_by_account_id or '').strip()
+           and (a.erpnext_bank_account_name or '').strip()]
+    return sorted(out, key=lambda a: (a.mask or '', a.account_id))
+
+
+def _attached_urls(client, doctype: str, docnames) -> dict:
+    """{docname: {lower-cased file_name: file_url}} for Files attached to those
+    records. Raises — the caller must not upload blind."""
+    out = {d: {} for d in docnames}
+    if not docnames:
+        return out
+    rows = client.list_docs(
+        'File', filters=[['attached_to_doctype', '=', doctype],
+                         ['attached_to_name', 'in', list(docnames)]],
+        fields=['name', 'file_name', 'file_url', 'attached_to_name'],
+        limit_page_length=0)
+    for r in rows or []:
+        target = r.get('attached_to_name')
+        if target in out:
+            out[target][(r.get('file_name') or '').strip().lower()] = \
+                r.get('file_url') or ''
+    return out
+
+
+def _set_anchor_pdf(client, anchor: str, file_url: str) -> str:
+    """Point the anchor's `statement_pdf` at `file_url`; '' when ERPNext's echo
+    confirms it, else why not."""
+    client.update_doc(STATEMENT_ANCHOR_DOCTYPE, anchor,
+                      {'statement_pdf': file_url})
+    got = (client.get_doc(STATEMENT_ANCHOR_DOCTYPE, anchor) or {}).get(
+        'statement_pdf')
+    if got != file_url:
+        return (f'ERPNext did not keep statement_pdf on {anchor} '
+                f'(reads {got!r})')
+    return ''
+
+
+def push_statement_pdfs_to_anchors(accounts=None, *, period: str | None = None,
+                                   client=None, dry_run: bool = False,
+                                   mode: str = MODE_STAGED) -> dict:
+    """Attach each stored statement PDF to its ERPNext Statement Anchor — the
+    anchor on the account's Bank Account with the same period_start and
+    period_end — and set the anchor's `statement_pdf`. Never raises.
+
+    Returns {'mode', 'dry_run', 'pushed', 'would_push', 'linked', 'skipped',
+    'failed'} — `linked` is an anchor whose PDF was already attached and only
+    needed the field set. Skip reasons: already_attached, no_anchor (ERPNext
+    holds no anchor for that period yet), no_pdf, no_period."""
+    if mode not in UPLOAD_MODES:
+        raise ValueError(f'mode must be one of {", ".join(UPLOAD_MODES)}, '
+                         f'got {mode!r}')
+    out = {'mode': mode, 'dry_run': bool(dry_run), 'pushed': [],
+           'would_push': [], 'linked': [], 'skipped': [], 'failed': []}
+    targets = statement_anchor_accounts(accounts)
+    if not targets:
+        return out
+    if client is None:
+        client = _client_or_none()
+    if client is None:
+        out['error'] = 'ERPNext is not configured'
+        return out
+    docnames = sorted({a.erpnext_bank_account_name.strip() for a in targets})
+    try:
+        anchors = client.list_docs(
+            STATEMENT_ANCHOR_DOCTYPE,
+            filters=[['bank_account', 'in', docnames]],
+            fields=['name', 'bank_account', 'period_start', 'period_end',
+                    'statement_pdf'], limit_page_length=0) or []
+        attached = _attached_urls(client, STATEMENT_ANCHOR_DOCTYPE,
+                                  [a['name'] for a in anchors])
+    except Exception as e:  # noqa: BLE001 - never upload blind
+        log.warning('could not read Statement Anchors / attachments',
+                    exc_info=True)
+        out['error'] = (f'could not read the Statement Anchors or what is '
+                        f'attached to them ({type(e).__name__}: {e}) — nothing '
+                        'was uploaded')
+        return out
+    by_period = {}
+    for a in anchors:
+        key = (a.get('bank_account'), str(a.get('period_start') or '')[:10],
+               str(a.get('period_end') or '')[:10])
+        by_period.setdefault(key, []).append(a)
+
+    from . import statements as stmts
+    broken = ''
+    for account in targets:
+        docname = account.erpnext_bank_account_name.strip()
+        for st in _statements_to_attach(account, period):
+            row = {'account_mask': account.mask, 'bank_account': docname,
+                   'period': st.period_label(),
+                   'period_end': (st.period_end.isoformat()
+                                  if st.period_end else None)}
+            if st.period_start is None or st.period_end is None:
+                out['skipped'].append({**row, 'reason': 'no_period'})
+                continue
+            matches = by_period.get((docname, st.period_start.isoformat(),
+                                     st.period_end.isoformat()), [])
+            if not matches:
+                out['skipped'].append({**row, 'reason': 'no_anchor',
+                                       'detail': 'ERPNext holds no Statement '
+                                                 'Anchor for this period yet'})
+                continue
+            file_name = statement_pdf_filename(account, st)
+            row['file_name'] = file_name
+            data = path = None
+            for anchor in matches:
+                arow = {**row, 'anchor': anchor['name']}
+                have = attached.setdefault(anchor['name'], {})
+                url = have.get(file_name.lower())
+                if url and anchor.get('statement_pdf') == url:
+                    out['skipped'].append({**arow,
+                                           'reason': 'already_attached'})
+                    continue
+                if url:
+                    if dry_run:
+                        out['would_push'].append({**arow, 'link_only': True})
+                        continue
+                    problem = _set_anchor_pdf(client, anchor['name'], url)
+                    (out['failed'] if problem else out['linked']).append(
+                        {**arow, **({'error': problem} if problem
+                                    else {'file_url': url})})
+                    continue
+                if data is None:
+                    path = stmts.resolve_pdf_path(st)
+                    if not path:
+                        out['skipped'].append({**arow, 'reason': 'no_pdf'})
+                        break
+                    try:
+                        with open(path, 'rb') as fh:
+                            data = fh.read()
+                    except OSError as e:
+                        out['failed'].append({**arow, 'error': f'stored PDF '
+                                              f'unreadable ({type(e).__name__})'})
+                        break
+                arow['size_bytes'] = len(data)
+                if dry_run:
+                    out['would_push'].append(arow)
+                    continue
+                if broken:
+                    out['failed'].append({**arow,
+                                          'error': f'not attempted: {broken}'})
+                    continue
+                try:
+                    reply = _upload_statement_pdf(
+                        client, mode, anchor['name'], file_name, data,
+                        path=path, doctype=STATEMENT_ANCHOR_DOCTYPE)
+                    problem = (_unconfirmed(reply, anchor['name'], data)
+                               or _set_anchor_pdf(client, anchor['name'],
+                                                  reply.get('file_url')))
+                except ERPNextAPIError as e:
+                    if e.status_code is None or e.status_code >= 500:
+                        broken = 'ERPNext unreachable earlier in this run'
+                    out['failed'].append({**arow, 'error': str(e)[:500]})
+                    continue
+                except StatementUploadRefused as e:
+                    out['failed'].append({**arow, 'error': str(e)})
+                    continue
+                except Exception as e:  # noqa: BLE001 - never raise upward
+                    log.warning('anchor PDF upload %s raised', file_name,
+                                exc_info=True)
+                    out['failed'].append({**arow,
+                                          'error': f'{type(e).__name__}: {e}'})
+                    continue
+                if problem:
+                    out['failed'].append({**arow, 'error': problem})
+                    continue
+                have[file_name.lower()] = reply.get('file_url')
+                out['pushed'].append({**arow, 'mode': mode,
+                                      'file_url': reply.get('file_url')})
+                log.info('statement PDF %s -> %s (%s)', file_name,
+                         anchor['name'], mode)
+    return out
+
+
+def statement_pdf_status(client=None) -> dict:
+    """For get_erpnext_push_status: how many ERPNext Statement Anchors on
+    mapped accounts carry their PDF. Read-only; one list call."""
+    targets = statement_anchor_accounts()
+    docnames = sorted({a.erpnext_bank_account_name.strip() for a in targets})
+    if client is None:
+        client = _client_or_none()
+    if client is None or not docnames:
+        return {'anchors': 0, 'with_pdf': 0, 'missing_pdf': []}
+    try:
+        rows = client.list_docs(
+            STATEMENT_ANCHOR_DOCTYPE,
+            filters=[['bank_account', 'in', docnames]],
+            fields=['name', 'bank_account', 'period_end', 'statement_pdf'],
+            limit_page_length=0) or []
+    except Exception as e:  # noqa: BLE001 - a status read never raises
+        return {'error': f'{type(e).__name__}: {e}'}
+    missing = [{'anchor': r.get('name'), 'bank_account': r.get('bank_account'),
+                'period_end': str(r.get('period_end') or '')[:10]}
+               for r in rows if not (r.get('statement_pdf') or '').strip()]
+    return {'anchors': len(rows), 'with_pdf': len(rows) - len(missing),
+            'missing_pdf': sorted(missing, key=lambda m: (
+                m['bank_account'] or '', m['period_end']))[:50]}
 
 
 def statement_pdfs_summary(result: dict) -> dict:

@@ -354,14 +354,17 @@ class McpToolTest(StatementPdfBase):
         with self.assertRaises(mcp_server.ToolError):
             mcp_server._push_statement_pdfs({'period': 'June'})
 
-    def test_a_depository_mask_is_refused(self):
+    def test_a_depository_mask_is_refused_for_the_bank_account_target(self):
+        """v1.0.10 · a checking statement goes onto its Statement Anchor
+        (target 'anchors'/'both'), never onto the Bank Account."""
         db.session.add(PlaidAccount(account_id='acc-chk',
                                     item_id=self.item.item_id, mask='1111',
                                     type='depository',
                                     erpnext_bank_account_name='Checking - EC'))
         db.session.commit()
         with self.assertRaises(mcp_server.ToolError):
-            mcp_server._push_statement_pdfs({'account_mask': '1111'})
+            mcp_server._push_statement_pdfs({'account_mask': '1111',
+                                             'target': 'bank_account'})
 
 
 class SyncLegTest(StatementPdfBase):

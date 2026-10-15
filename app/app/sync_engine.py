@@ -1473,12 +1473,23 @@ def _push_statement_pdfs(erpnext_push, accounts, erp_client) -> dict:
     not upload can neither cost the metadata push its result nor stop the queue
     drain behind it."""
     try:
-        return erpnext_push.statement_pdfs_summary(
+        out = erpnext_push.statement_pdfs_summary(
             erpnext_push.push_statement_pdfs(accounts, client=erp_client))
     except Exception as e:  # noqa: BLE001
         db.session.rollback()
         log.warning('pushing statement PDFs to ERPNext failed', exc_info=True)
-        return {'error': f'{type(e).__name__}: {e}'}
+        out = {'error': f'{type(e).__name__}: {e}'}
+    # v1.0.10 · and onto each period's Statement Anchor, every account type.
+    try:
+        anchors = erpnext_push.push_statement_pdfs_to_anchors(
+            accounts, client=erp_client)
+        out['anchors'] = erpnext_push.statement_pdfs_summary(anchors)
+        out['anchors']['linked'] = len(anchors.get('linked') or [])
+    except Exception as e:  # noqa: BLE001
+        db.session.rollback()
+        log.warning('pushing statement PDFs to anchors failed', exc_info=True)
+        out['anchors'] = {'error': f'{type(e).__name__}: {e}'}
+    return out
 
 
 def _attribute(summaries: dict, res: dict, item: PlaidItem,

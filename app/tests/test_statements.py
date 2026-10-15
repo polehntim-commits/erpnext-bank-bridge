@@ -321,6 +321,9 @@ class StatementsBase(unittest.TestCase):
             'SQLALCHEMY_DATABASE_URI': f'sqlite:///{self._dbpath}',
             'DATA_DIR': self._datadir,
             'STATEMENTS_STORAGE_PATH': self._store,
+            # v1.0.10 · Plaid Statements are off by default; these tests are
+            # about what happens once an operator has turned them on.
+            'STATEMENTS_ENABLED': True,
             'FERNET_KEY': '',
             'SCHEDULER_ENABLED': False,
         })
@@ -499,8 +502,14 @@ class LinkTokenStatementsTest(StatementsBase):
         token = PlaidClient(api=api).create_link_token('u', statements=True)
         self.assertEqual(token, 'link-1')
         req = api.link_token_create.call_args[0][0]
-        self.assertIn('statements', [str(p.value) for p in req.products])
+        # v1.0.10 · REQUIRED-IF-SUPPORTED, so a bank without Statements still
+        # links — never in `products`, where it would fail the whole link.
+        self.assertEqual([str(p.value) for p in req.products], ['transactions'])
+        self.assertIn('statements', [str(p.value) for p in
+                                     req.required_if_supported_products])
         self.assertTrue(hasattr(req, 'statements'))
+        window = req.statements
+        self.assertLessEqual((window.end_date - window.start_date).days, 730)
 
     def test_link_token_falls_back_without_statements_when_plaid_refuses(self):
         """THE COMPATIBILITY GUARANTEE: an application not yet approved for
@@ -521,6 +530,27 @@ class LinkTokenStatementsTest(StatementsBase):
         self.assertEqual(len(calls), 2)
         self.assertEqual([str(p.value) for p in calls[1].products],
                          ['transactions'])
+
+    def test_update_mode_adds_statements_to_an_existing_item(self):
+        """v1.0.10 · "Enable statements for this connection": update mode
+        with products=['statements'] and the window — the documented way to
+        add a credit product to an Item without re-linking it."""
+        api = unittest.mock.Mock()
+        api.link_token_create.return_value = {'link_token': 'link-up'}
+        PlaidClient(api=api).create_link_token(
+            'u', access_token='access-x', add_statements=True)
+        req = api.link_token_create.call_args[0][0]
+        self.assertEqual('access-x', req.access_token)
+        self.assertEqual(['statements'], [str(p.value) for p in req.products])
+        self.assertTrue(hasattr(req, 'statements'))
+
+    def test_a_plain_reconnect_still_sends_no_products(self):
+        api = unittest.mock.Mock()
+        api.link_token_create.return_value = {'link_token': 'link-up'}
+        PlaidClient(api=api).create_link_token('u', access_token='access-x',
+                                               statements=True)
+        req = api.link_token_create.call_args[0][0]
+        self.assertFalse('products' in req.to_dict())
 
     def test_statements_not_requested_when_off(self):
         api = unittest.mock.Mock()
@@ -3060,7 +3090,7 @@ class AnchorTest(StatementsBase):
     def test_disabled_feature_never_anchors(self):
         account = self._account()
         self._statement(opening=17600.0, closing=17600.0)
-        self.app.config['STATEMENTS_ENABLED'] = False
+        plaid_settings.set_statements_enabled(False)   # v1.0.10 · persisted
         self.assertIsNone(stmts.anchor_for(account))
 
 
@@ -3266,8 +3296,19 @@ class SchedulerTest(StatementsBase):
         self.app.config['STATEMENTS_PULL_INTERVAL_DAYS'] = 'nonsense'
         self.assertEqual(scheduler.statements_interval_or_none(self.app), 30)
 
-    def test_disabled_feature_adds_no_job(self):
-        self.app.config['STATEMENTS_ENABLED'] = False
+    def test_disabled_feature_pulls_nothing(self):
+        """v1.0.10 · the job stays scheduled (so turning Statements on takes
+        effect without a restart) and checks the switch on every run."""
+        plaid_settings.set_statements_enabled(False)
+        self.assertIsNotNone(scheduler.statements_interval_or_none(self.app))
+        with unittest.mock.patch.object(stmts, 'fetch_all') as fetch, \
+                unittest.mock.patch.object(plaid_settings, 'is_configured',
+                                           return_value=True):
+            scheduler._run_statements_pull(self.app)
+        fetch.assert_not_called()
+
+    def test_a_non_positive_interval_adds_no_job(self):
+        self.app.config['STATEMENTS_PULL_INTERVAL_DAYS'] = 0
         self.assertIsNone(scheduler.statements_interval_or_none(self.app))
 
     def test_the_job_runs_a_pull_and_swallows_failure(self):

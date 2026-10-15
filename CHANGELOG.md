@@ -10,6 +10,49 @@ architecture rather than the API surface.
 
 ---
 
+## [1.0.10] — 2026-10-14
+
+**Plaid Statements, end to end: link, consent, pull, reconcile, and the PDF on
+its ERPNext Statement Anchor.** See `docs/plaid-statements.md`.
+
+### Changed
+
+- **Link requests Statements as `required_if_supported_products`**, not as a
+  `products` entry. A bank without Statements now links anyway (its Statements
+  endpoints answer PRODUCTS_NOT_SUPPORTED, shown as "manual upload
+  required"). The window runs from up to 24 months back to today. An
+  application without the product still falls back to a link without it.
+- **Plaid Statements are off by default** behind a persisted switch
+  (`/admin/statements`; `STATEMENTS_ENABLED` only seeds it). An install that
+  already holds Plaid statements, like OML, is migrated on once and persisted.
+  The monthly job is always scheduled and checks the switch on each run, so
+  turning it on needs no restart.
+
+### Added
+
+- **"Enable statements for this connection"** on `/admin/accounts`. This is
+  Link update mode with `products=["statements"]` and the window, so the user
+  sees only the Statements consent pane, and item and account ids are kept.
+  `POST /bankbridge/api/plaid/statements_consented` records the consent
+  (`plaid_items.statements_consented_at`) and starts a pull.
+- **PDFs on the ERPNext Statement Anchor.** Each statement PDF is uploaded
+  attached to the anchor for its Bank Account and period, and the anchor's
+  `statement_pdf` field is set and checked against ERPNext's echo. This covers
+  checking and savings as well as brokerage. It's idempotent: it reads what's
+  attached first and links an already-attached file without re-uploading it.
+  It runs after every statement pull, on every sync, and in
+  `push_statement_pdfs` (new `target`: `both` / `anchors` / `bank_account`).
+- **`get_statement_coverage` MCP tool** (read-only). Per account: supported /
+  manual_upload_required / not_consented / unknown / off, statements held,
+  first and last, missing months, consent date, and the last pull's outcome.
+- **`pull_statements` MCP tool.** It runs the monthly job now, in the
+  background, behind the kill switch `pull_statements` (off by default).
+- **`get_erpnext_push_status` → `statement_pdfs`**: anchors with and without
+  their PDF.
+- A test asserting that access tokens and PDF bytes never reach the logs.
+
+---
+
 ## [1.0.9] — 2026-10-11
 
 **Every categorization rule belongs to one Company, before Constancy Farms,

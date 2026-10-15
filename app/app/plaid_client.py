@@ -90,7 +90,8 @@ class PlaidClient:
                           statements_months: int = 24,
                           access_token: str = None,
                           liabilities: bool = False,
-                          investments: bool = False) -> str:
+                          investments: bool = False,
+                          add_statements: bool = False) -> str:
         """Create a short-lived link_token for Plaid Link. `redirect_uri` is
         required for OAuth-only banks (Wells Fargo) and must be registered in
         the Plaid dashboard. Returns the link_token string.
@@ -134,12 +135,25 @@ class PlaidClient:
         Plaid REJECTS `products` alongside `access_token` — an Item's products
         are fixed at creation and update mode cannot change them — so both the
         product list and the `statements` request are dropped here rather than
-        left to fail at the API."""
+        left to fail at the API.
+
+        v1.0.10 · `add_statements` (update mode only) is the one exception:
+        Plaid adds a CREDIT product such as Statements to an existing Item
+        through update mode with `products=["statements"]` and the `statements`
+        window, which takes the user through just the Statements consent pane
+        (no credentials, if the Item is under two years old). Item and account
+        ids are unchanged, so no mapping is lost — that is the "Enable
+        statements for this connection" button on /admin/accounts."""
         api = self._get_api()
         if access_token:
-            return self._link_token_create(
-                api, self._update_mode_kwargs(user_id, redirect_uri, webhook,
-                                              access_token))
+            kwargs = self._update_mode_kwargs(user_id, redirect_uri, webhook,
+                                              access_token)
+            if add_statements:
+                from plaid.model.products import Products
+                kwargs['products'] = [Products('statements')]
+                kwargs['statements'] = self._statements_config(
+                    statements_months)
+            return self._link_token_create(api, kwargs)
         base = self._link_token_kwargs(user_id, redirect_uri, webhook)
 
         # The optional products, each independently subject to approval on the
@@ -300,29 +314,43 @@ class PlaidClient:
     STATEMENTS_DAYS_PER_MONTH = 30
 
     @staticmethod
+    def _statements_config(months: int):
+        """The `statements` window: `months` back (clamped to Plaid's 24) to
+        today."""
+        from datetime import date, timedelta
+        from plaid.model.link_token_create_request_statements import \
+            LinkTokenCreateRequestStatements
+        end = date.today()
+        months_capped = max(1, min(int(months or 1),
+                                   PlaidClient.STATEMENTS_MAX_MONTHS))
+        start = end - timedelta(
+            days=PlaidClient.STATEMENTS_DAYS_PER_MONTH * months_capped)
+        return LinkTokenCreateRequestStatements(start_date=start, end_date=end)
+
+    @staticmethod
     def _with_statements(kwargs: dict, months: int) -> dict:
         """Add the `statements` product + its required date window to a set of
-        link-token kwargs. Plaid requires BOTH: the product in the list, and a
+        link-token kwargs. Plaid requires BOTH: the product, and a
         `statements` config naming the period Link should request.
+
+        v1.0.10 · REQUIRED-IF-SUPPORTED, not `products`. In `products`, an
+        institution that does not offer Statements fails the whole link; in
+        `required_if_supported_products` Plaid extracts statements where the
+        bank supports them and links the bank anyway where it does not (the
+        Statements endpoints then answer PRODUCTS_NOT_SUPPORTED, which the
+        coverage report shows as "manual upload required").
 
         Plaid caps the Statements window at 24 months
         (`STATEMENTS_MAX_MONTHS`); a wider ask is a hard 400 that takes the
         entire link-token creation with it, so we silently clamp here — a
         caller asking for 36 months is quietly downgraded to 24, which is
         strictly better than a Link that won't open at all. See v0.4.17."""
-        from datetime import date, timedelta
-        from plaid.model.link_token_create_request_statements import \
-            LinkTokenCreateRequestStatements
         from plaid.model.products import Products
-        end = date.today()
-        months_capped = max(1, min(int(months or 1),
-                                   PlaidClient.STATEMENTS_MAX_MONTHS))
-        start = end - timedelta(
-            days=PlaidClient.STATEMENTS_DAYS_PER_MONTH * months_capped)
-        kwargs['products'] = list(kwargs.get('products') or []) + \
+        kwargs = dict(kwargs)
+        kwargs['required_if_supported_products'] = list(
+            kwargs.get('required_if_supported_products') or []) + \
             [Products('statements')]
-        kwargs['statements'] = LinkTokenCreateRequestStatements(
-            start_date=start, end_date=end)
+        kwargs['statements'] = PlaidClient._statements_config(months)
         return kwargs
 
     @staticmethod

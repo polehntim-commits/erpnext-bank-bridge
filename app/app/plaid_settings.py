@@ -35,7 +35,10 @@ _FILENAME = 'plaid_settings.json'
 # the redirect URI is derived from it — and one settings blob beats two.
 _FIELDS = ('client_id', 'sandbox_secret', 'production_secret',
            'environment', 'redirect_uri', 'webhook_url', 'sync_interval_hours',
-           'funnel_hostname')
+           'funnel_hostname',
+           # v1.0.10 — the Plaid Statements switch. None = never chosen (see
+           # statements_enabled for how that resolves); True/False = chosen.
+           'statements_enabled')
 
 
 def _path() -> str:
@@ -65,6 +68,7 @@ def _defaults() -> dict:
         # no longer resolves. funnel.detect() reads the env separately and
         # prefers it, keeping this field purely "what the operator pasted".
         'funnel_hostname': '',
+        'statements_enabled': None,
     }
 
 
@@ -164,6 +168,49 @@ def save_public_url(funnel_hostname=None, redirect_uri=None) -> dict:
         # as the credentials form does it.
         _migrate_plaid_urls(d)
     return _write(d)
+
+
+def statements_enabled() -> bool:
+    """Whether Bank Bridge uses Plaid Statements at all (v1.0.10): asks for
+    the product at Link, pulls statements, offers "Enable statements".
+
+    OFF BY DEFAULT on a new install — the product has to be enabled on the
+    Plaid application first, and asking for it is billed per Item. An operator
+    turns it on on /admin/statements (or with STATEMENTS_ENABLED=true).
+
+    MIGRATED ON READ, ONCE: an install that never chose but already HOLDS
+    statements pulled from Plaid (OML, whose Wells Fargo Item has served them
+    since July) was using the feature under the old always-on default, and is
+    switched on and persisted rather than silently stopped by the upgrade."""
+    d = load()
+    value = d.get('statements_enabled')
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower() not in ('false', '0', 'no', 'off')
+    seeded = bool(current_app.config.get('STATEMENTS_ENABLED', False))
+    if not seeded:
+        try:
+            from .models import PlaidStatement
+            seeded = PlaidStatement.query.first() is not None
+        except Exception:  # noqa: BLE001 - no table yet → not in use
+            seeded = False
+        if seeded:
+            d['statements_enabled'] = True
+            try:
+                _write(d)
+                log.info('Plaid Statements: already in use on this install — '
+                         'kept ON (v1.0.10 default is off)')
+            except OSError:
+                pass
+    return seeded
+
+
+def set_statements_enabled(enabled: bool) -> bool:
+    d = load()
+    d['statements_enabled'] = bool(enabled)
+    _write(d)
+    return d['statements_enabled']
 
 
 def sync_interval_hours() -> int:

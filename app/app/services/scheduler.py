@@ -239,8 +239,9 @@ def statements_interval_or_none(app) -> int | None:
     disabled — either by STATEMENTS_ENABLED or by a non-positive interval. Pure,
     matching the three above; days rather than hours because a bank issues a
     statement monthly and checking more often just spends Plaid calls."""
-    if not app.config.get('STATEMENTS_ENABLED', True):
-        return None
+    # v1.0.10 · the on/off switch is a persisted setting now, checked inside
+    # the job on every run (statements.is_enabled), so turning it on takes
+    # effect without a restart. Only a non-positive interval removes the job.
     try:
         days = int(app.config.get('STATEMENTS_PULL_INTERVAL_DAYS', 30))
     except (TypeError, ValueError):

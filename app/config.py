@@ -449,7 +449,9 @@ class Config:
     # institution that doesn't support Statements is handled the same way.
     #   * master switch. Off → no statements are listed, downloaded or stored,
     #     and the opening balance path is exactly v0.4.4's.
-    STATEMENTS_ENABLED = _bool('STATEMENTS_ENABLED', True)
+    #     v1.0.10 · default OFF: only SEEDS plaid_settings.statements_enabled,
+    #     which an install already holding Plaid statements migrates to on.
+    STATEMENTS_ENABLED = _bool('STATEMENTS_ENABLED', False)
     #   * how often the background job checks each linked Item for statements it
     #     hasn't already stored. Monthly by default, because that is how often a
     #     bank issues one; 0 or negative disables the job (the import path and

@@ -88,6 +88,10 @@ class PlaidItem(db.Model):
     statements_refresh_status = db.Column(db.String(20), nullable=True)
     statements_refresh_requested_at = db.Column(db.DateTime, nullable=True)
     statements_refresh_completed_at = db.Column(db.DateTime, nullable=True)
+    # v1.0.10 · when the operator added the Statements product to this Item
+    # through Link update mode ("Enable statements for this connection").
+    # NULL = never done here (the Item may still have had it from its link).
+    statements_consented_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=_now)
     last_synced_at = db.Column(db.DateTime, nullable=True)
     # v0.4.28 · timestamp of the most recent successful /investments/*

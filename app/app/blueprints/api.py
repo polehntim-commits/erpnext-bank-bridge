@@ -42,6 +42,11 @@ def _prune_link_states() -> None:
         db.session.delete(row)
 
 
+def _statements_on() -> bool:
+    from .. import statements as stmts
+    return stmts.is_enabled()
+
+
 @bp.route('/bankbridge/api/plaid/create_link_token', methods=['GET', 'POST'])
 def create_link_token():
     """Mint a Plaid Link token. Persists it so the OAuth return page can
@@ -56,6 +61,18 @@ def create_link_token():
     # mapping survives), and no second billable Item is created at Plaid.
     data = request.get_json(silent=True) or request.form or {}
     item_id = (data.get('item_id') or request.args.get('item_id') or '').strip()
+    # v1.0.10 · "Enable statements for this connection": update mode that ALSO
+    # asks for the Statements product, so the user sees only its consent pane.
+    raw_enable = (data.get('enable_statements')
+                  or request.args.get('enable_statements') or '')
+    enable_statements = str(raw_enable).strip().lower() in ('1', 'true', 'yes',
+                                                            'on')
+    if enable_statements and not item_id:
+        return jsonify({'error': 'enable_statements needs the item_id of the '
+                                 'connection to add Statements to'}), 400
+    if enable_statements and not _statements_on():
+        return jsonify({'error': 'Statements are turned off — turn them on at '
+                                 '/admin/statements first'}), 409
     access_token = None
     if item_id:
         item = PlaidItem.query.filter_by(item_id=item_id).first()
@@ -84,7 +101,7 @@ def create_link_token():
         # are fixed when it is created.
         link_token = client.create_link_token(
             user_id='erpnext-bank-bridge',
-            statements=current_app.config.get('STATEMENTS_ENABLED', True),
+            statements=_statements_on(),
             # v0.4.14 · also request `liabilities`, so a linked mortgage or
             # student loan can report its own interest and principal figures.
             # Degrades the same way statements does: an application without the
@@ -97,7 +114,8 @@ def create_link_token():
             # skip on Items with no eligible accounts — a deposit-only
             # bank still links exactly as it did pre-v0.4.26.
             investments=current_app.config.get('INVESTMENTS_ENABLED', True),
-            access_token=access_token)
+            access_token=access_token,
+            add_statements=enable_statements)
     except (PlaidError, PlaidConfigError) as e:
         return jsonify({'error': str(e)}), 502
     try:
@@ -106,7 +124,41 @@ def create_link_token():
         db.session.commit()
     except Exception:  # pragma: no cover - non-fatal bookkeeping
         db.session.rollback()
-    return jsonify({'link_token': link_token, 'update_mode': bool(access_token)})
+    return jsonify({'link_token': link_token, 'update_mode': bool(access_token),
+                    'enable_statements': enable_statements})
+
+
+@bp.post('/bankbridge/api/plaid/statements_consented')
+def statements_consented():
+    """v1.0.10 · Link update mode finished adding Statements to an Item. The
+    access token is unchanged (update mode never re-issues it), so there is
+    nothing to exchange: record the consent, then pull — the refresh asks Plaid
+    for this Item's statements and the pipeline stores, parses and anchors
+    them. The pull runs on a background thread, so this returns at once."""
+    data = request.get_json(silent=True) or request.form or {}
+    item_id = (data.get('item_id') or '').strip()
+    item = PlaidItem.query.filter_by(item_id=item_id).first() if item_id \
+        else None
+    if item is None or item.disconnected:
+        return jsonify({'error': 'unknown or disconnected item_id'}), 404
+    from datetime import datetime, timezone
+    item.statements_consented_at = datetime.now(timezone.utc)
+    db.session.commit()
+    audit.record('statements_consented', subject_type='PlaidItem',
+                 subject_id=item_id,
+                 notes='Statements added to this connection via Link update '
+                       'mode')
+    from .. import statements as stmts
+    app = current_app._get_current_object()
+    if app.config.get('TESTING'):
+        result = stmts.run_refresh_pull(app, wait_seconds=0)
+    else:
+        import threading
+        threading.Thread(target=stmts.run_refresh_pull, args=(app,),
+                         daemon=True).start()
+        result = {'started': True}
+    return jsonify({'ok': True, 'item_id': item_id,
+                    'pull': 'busy' if result.get('busy') else 'started'})
 
 
 @bp.post('/bankbridge/api/plaid/reconnect_complete')
