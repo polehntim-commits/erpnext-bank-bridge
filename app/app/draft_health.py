@@ -59,6 +59,11 @@ log = logging.getLogger('bankbridge.draft_health')
 
 JOURNAL_ENTRY_DT = 'Journal Entry'
 
+# v1.0.11 · erpnext_mcp v0.334.0's "Discarded" marker on a draft JE. A discarded
+# draft is set aside on purpose — kept, recoverable, never to be posted — so it
+# is not part of the queue this module watches. Counted apart instead.
+DISCARD_FIELD = 'discarded'
+
 # The placeholder threshold, in force ONLY until there is enough history to
 # learn from. Tim's starting number; it is deliberately not tuned, because
 # tuning a constant is the thing this module exists to stop doing.
@@ -201,11 +206,21 @@ def snapshot(client, company: str = '', *, threshold: int | None = None) -> dict
     filters = [['docstatus', '=', 0]]
     if scope:
         filters.append(['company', '=', scope])
-    rows = client.list_docs(
-        JOURNAL_ENTRY_DT, filters=filters,
-        fields=['name', 'posting_date', 'creation', 'total_debit',
-                'user_remark', 'company'],
-        limit_page_length=0) or []
+    fields = ['name', 'posting_date', 'creation', 'total_debit', 'user_remark',
+              'company']
+    # v1.0.11 · leave discarded drafts out. An ERPNext without the column
+    # (erpnext_mcp before v0.334.0) refuses the filter; that is answered by
+    # counting every draft, as before — never by reporting nothing.
+    discard_aware = True
+    try:
+        rows = client.list_docs(
+            JOURNAL_ENTRY_DT, filters=filters + [[DISCARD_FIELD, '=', 0]],
+            fields=fields, limit_page_length=0) or []
+    except ERPNextAPIError:
+        discard_aware = False
+        rows = client.list_docs(JOURNAL_ENTRY_DT, filters=filters,
+                                fields=fields, limit_page_length=0) or []
+    discarded_count, discarded_amount = _discarded(client, filters, discard_aware)
 
     total = 0.0
     count = 0
@@ -265,6 +280,10 @@ def snapshot(client, company: str = '', *, threshold: int | None = None) -> dict
         'threshold_source': source,
         'baseline_samples': samples,
         'breached': breached,
+        # v1.0.11 · set aside in ERPNext (Discard), not in the count above.
+        'discarded_count': discarded_count,
+        'discarded_amount': discarded_amount,
+        'discard_aware': discard_aware,
         # The one-line verdict, phrased so an AI operator relaying it does not
         # have to decide what "breached: true" means.
         'status': 'warn' if breached else 'ok',
@@ -272,11 +291,32 @@ def snapshot(client, company: str = '', *, threshold: int | None = None) -> dict
                      f'{threshold} threshold ({source})'
                      if breached else
                      f'{count} draft Journal Entries — within the '
-                     f'{threshold} threshold ({source})'),
+                     f'{threshold} threshold ({source})')
+                    + (f'; {discarded_count} discarded (set aside, not counted)'
+                       if discarded_count else ''),
         # Non-fatal, and worth stating: the numbers below MIN_SAMPLES_FOR_BASELINE
         # rest on a constant, not on this install's own behaviour.
         'baseline_ready': source != 'default',
     }
+
+
+def _discarded(client, filters: list, discard_aware: bool) -> tuple:
+    """How many drafts are discarded, and their amount — (None, None) when unknown."""
+    if not discard_aware:
+        return None, None
+    try:
+        rows = client.list_docs(
+            JOURNAL_ENTRY_DT, filters=filters + [[DISCARD_FIELD, '=', 1]],
+            fields=['name', 'total_debit'], limit_page_length=0) or []
+    except (ERPNextAPIError, ERPNextError):
+        return None, None
+    amount = 0.0
+    for row in rows:
+        try:
+            amount += float((row or {}).get('total_debit') or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return len(rows), round(amount, 2)
 
 
 # ── the action, which is kairotic ───────────────────────────────────────────

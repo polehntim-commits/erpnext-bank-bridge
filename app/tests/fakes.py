@@ -246,6 +246,8 @@ class FakeERPClient:
         #   {"exception":"Error: No module named
         #    'frappe.core.doctype.account_subtype'","exc_type":"ImportError"}
         self.missing_doctypes = set(missing_doctypes or ())
+        # v1.0.11 · True stands for an ERPNext before erpnext_mcp v0.334.0.
+        self.no_discard_field = False
         # Mirror ERPNext instances that enforce a GL link on company Bank
         # Accounts: a create with is_company_account truthy and no `account`
         # link raises "Company Account is mandatory". A retry with
@@ -353,7 +355,7 @@ class FakeERPClient:
                         'Account': {}, 'Supplier': {}, 'Journal Entry': {},
                         'Supplier Group': {}, 'Customer': {},
                         'Customer Group': {}, 'Counterparty': {}, 'DocType': {},
-                        'Bank Statement': {},
+                        'Bank Statement': {}, 'Discarded Draft Log': {},
                         # v0.9.0 · Shareholder is mintable, Employee is not —
                         # the bucket exists so a test can ASSERT it stays empty.
                         'Shareholder': {}, 'Employee': {}}
@@ -672,8 +674,18 @@ class FakeERPClient:
             # the fake's submit/cancel helpers put on it.
             rows = []
             for name, d in self.created['Journal Entry'].items():
+                # v1.0.11 · `discarded` defaults to 0, as a Check column does —
+                # unless this fake stands for an ERPNext without the column.
+                if any(f[0] == 'discarded' for f in (filters or [])) and \
+                        self.no_discard_field:
+                    from app.erpnext_client import ERPNextAPIError
+                    raise ERPNextAPIError(
+                        'GET /api/resource/Journal Entry -> 417', status_code=417,
+                        response_body='{"exc_type":"DataError","exception":'
+                                      '"Field not permitted in query: discarded"}')
                 doc = {'docstatus': (2 if name in self.cancelled else
                                      1 if name in self.submitted else 0),
+                       'discarded': 0,
                        'creation': self.creations.get(name, ''),
                        'total_debit': sum(
                            float(a.get('debit_in_account_currency') or 0.0)
@@ -684,6 +696,11 @@ class FakeERPClient:
                 rows.append({k: doc.get(k) for k in fields} if fields
                             else {'name': name})
             return rows
+        if doctype == 'Discarded Draft Log':
+            rows = [{**d, 'name': n} for n, d in self.created[doctype].items()
+                    if self._matches({'allow_recreate': 0, **d}, filters)]
+            return [{k: r.get(k) for k in fields} for r in rows] if fields \
+                else [{'name': r['name']} for r in rows]
         if doctype in ('Bank', 'Custom Field'):
             return [{'name': n} for n, d in self.created[doctype].items()
                     if self._matches(d, filters)]

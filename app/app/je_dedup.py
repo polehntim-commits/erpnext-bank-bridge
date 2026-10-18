@@ -62,6 +62,14 @@ log = logging.getLogger('bankbridge.je_dedup')
 JOURNAL_ENTRY_DT = 'Journal Entry'
 BANK_TRANSACTION_DT = 'Bank Transaction'
 
+# v1.0.11 · erpnext_mcp v0.334.0. A DISCARDED draft is still docstatus 0, so the
+# lookups below already see it and the same duplicate is not drafted again. A
+# discarded draft that has been PURGED is gone from Journal Entry — but each purge
+# writes a row here first, and that row is treated as an occupant unless an
+# operator ticks its `allow_recreate`. Older ERPNext (no such doctype) answers an
+# error, which is Fail Safe like everything else: no tombstone, create.
+PURGE_LOG_DT = 'Discarded Draft Log'
+
 # Draft (0) and Submitted (1). A CANCELLED entry (2) is deliberately NOT a
 # duplicate: cancelling is how an operator says "this posting was wrong, replace
 # it", and treating it as an occupant would leave them unable to. That is the
@@ -162,7 +170,11 @@ def find_by_bank_transaction(client, bank_transaction: str, *,
                ['docstatus', 'in', list(LIVE_DOCSTATUS)]]
     if (company or '').strip():
         filters.append(['company', '=', company.strip()])
-    return _first_live(client, filters, what=f'Bank Transaction {bt}')
+    found = _first_live(client, filters, what=f'Bank Transaction {bt}')
+    if found is None:
+        found = _purged(client, [['bank_transactions', 'like', f'%{bt}%']], company=company,
+                        exact=lambda row: bt in _split(row.get('bank_transactions')))
+    return found
 
 
 def find_by_marker(client, kind: str, key: str, *,
@@ -179,7 +191,50 @@ def find_by_marker(client, kind: str, key: str, *,
                ['docstatus', 'in', list(LIVE_DOCSTATUS)]]
     if (company or '').strip():
         filters.append(['company', '=', company.strip()])
-    return _first_live(client, filters, what=token)
+    found = _first_live(client, filters, what=token)
+    if found is None:
+        found = _purged(client, [['user_remark', 'like', f'%{token}%']], company=company,
+                        exact=lambda row: token in str(row.get('user_remark') or ''))
+    return found
+
+
+def _split(text) -> list:
+    return [part.strip() for part in str(text or '').split(',') if part.strip()]
+
+
+def _purged(client, filters: list, *, company: str = '', exact=None) -> dict | None:
+    """A purged discard still occupying this identity, from the purge log, or None.
+
+    Fail Safe: any difficulty — an ERPNext without the doctype, a refused filter —
+    is None, which lets the caller create. The `exact` check runs on each row
+    because `like` on a comma-joined list can match a longer name containing this
+    one."""
+    query = list(filters) + [['allow_recreate', '=', 0]]
+    if (company or '').strip():
+        query.append(['company', '=', company.strip()])
+    try:
+        rows = client.list_docs(
+            PURGE_LOG_DT, filters=query,
+            fields=['name', 'document_name', 'amount', 'posting_date',
+                    'purged_at', 'bank_transactions', 'user_remark'],
+            limit_page_length=0) or []
+    except Exception:  # noqa: BLE001 — Fail Safe, see the module note
+        return None
+    for row in rows:
+        if not isinstance(row, dict) or (exact and not exact(row)):
+            continue
+        try:
+            amount = float(row.get('amount') or 0.0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        return {'journal_entry': row.get('document_name'),
+                'docstatus': None,
+                'state': 'discarded and purged',
+                'posting_date': row.get('posting_date'),
+                'user_remark': row.get('user_remark') or '',
+                'amount': amount,
+                'purge_log': row.get('name')}
+    return None
 
 
 # ── Fail Forward: what a skip leaves behind ─────────────────────────────────
@@ -191,6 +246,13 @@ def skip_reason(pipeline: str, identity: str, existing: dict) -> str:
     decide whether the skip was right: which pipeline declined, what it matched
     on, which JE already holds it, and whether that JE is a draft or already
     submitted."""
+    if existing.get('purge_log'):
+        return (f'Skipped (duplicate): {pipeline} already had {identity} on '
+                f"Journal Entry {existing.get('journal_entry')}, which was "
+                f"discarded and purged in ERPNext (Discarded Draft Log "
+                f"{existing.get('purge_log')}). No new entry was created. Tick "
+                'Allow Recreate on that log row if this transaction genuinely '
+                'needs a fresh one.')
     return (f'Skipped (duplicate): {pipeline} already has {identity} on '
             f"Journal Entry {existing.get('journal_entry')} "
             f"({existing.get('state')}, "
@@ -215,7 +277,8 @@ def record_skip(pipeline: str, identity: str, existing: dict, *,
                'existing_docstatus': existing.get('docstatus'),
                'existing_state': existing.get('state'),
                'existing_amount': existing.get('amount'),
-               'existing_posting_date': existing.get('posting_date')}
+               'existing_posting_date': existing.get('posting_date'),
+               'existing_purge_log': existing.get('purge_log')}
     if extra:
         payload.update(extra)
     log.warning('[dedup] %s skipped %s — %s already carries it (%s)',

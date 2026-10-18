@@ -10,6 +10,26 @@ architecture rather than the API surface.
 
 ---
 
+## [1.0.11] — 2026-10-18
+
+**Discarded drafts (erpnext_mcp v0.334.0).** ERPNext can now set a draft Journal
+Entry aside — "Discarded": kept, recoverable, never to be posted.
+
+### Changed
+
+- **Draft health leaves discarded drafts out** of the count, the amount and the
+  threshold, and reports them apart (`discarded_count`, `discarded_amount`; the
+  headline names them). An ERPNext without the column (erpnext_mcp before
+  v0.334.0) refuses the filter, and every draft is counted as before
+  (`discard_aware: false`) — never a count of zero.
+- **Dedupe honours a purged discard.** A discarded draft is still a draft, so
+  both lookups already treated it as an occupant. When one is PURGED in ERPNext
+  it is written to the Discarded Draft Log first, and both lookups now read that
+  log: the same bank transaction or `[BB:…]` marker is not drafted again unless
+  the log row's **Allow Recreate** is ticked. A missing log or a refused query is
+  Fail Safe — create, as every other dedup difficulty is. The skip reason names
+  the log row.
+
 ## [1.0.10] — 2026-10-14
 
 **Plaid Statements, end to end: link, consent, pull, reconcile, and the PDF on
